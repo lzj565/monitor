@@ -86,6 +86,8 @@ pub struct App {
     /// asks rather than on a timer, so a hub nobody opens makes no outbound
     /// request; see `api::versions`.
     pub releases: Mutex<Releases>,
+    sing_box_release: Mutex<Option<(std::time::Instant, Option<String>)>>,
+    sing_box_release_lookup: tokio::sync::Mutex<()>,
 }
 
 #[derive(Default, Clone)]
@@ -114,6 +116,8 @@ impl App {
             themes,
             notes,
             releases: Mutex::default(),
+            sing_box_release: Mutex::default(),
+            sing_box_release_lookup: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -158,6 +162,10 @@ fn forwarded_proto(headers: &HeaderMap) -> Option<&str> {
 /// anyway.
 pub const AGENT_REPO: &str = "monitor-probe/agent";
 pub const HUB_REPO: &str = "monitor-probe/monitor";
+const SING_BOX_REPO: &str = "SagerNet/sing-box";
+const SING_BOX_RELEASES_API: &str = "https://api.github.com/repos/SagerNet/sing-box/releases/latest";
+const SING_BOX_RELEASE_TTL: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+const SING_BOX_RELEASE_RETRY: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 /// The one-line installer pasted onto a new VPS.
 async fn install_script() -> Response {
@@ -181,9 +189,86 @@ fn release_url(app: &App, arch: &str) -> String {
     )
 }
 
-/// Places the panel's GitHub proxy in front of a github.com URL when one is
-/// set. Shared by the agent relay and the theme updater: a hub that cannot reach
-/// github.com for one cannot reach it for the other.
+fn valid_release_tag(tag: &str) -> bool {
+    !tag.is_empty()
+        && tag != "."
+        && tag != ".."
+        && tag.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'))
+}
+
+fn sing_box_release_url(app: &App, tag: &str, arch: &str) -> Option<String> {
+    let arch = match arch {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        _ => return None,
+    };
+    if !valid_release_tag(tag) {
+        return None;
+    }
+    let version = tag.strip_prefix('v').unwrap_or(tag);
+    Some(proxied(
+        app,
+        format!(
+            "https://github.com/{SING_BOX_REPO}/releases/download/{tag}/sing-box-{version}-linux-{arch}.tar.gz"
+        ),
+    ))
+}
+
+fn sing_box_release_cache_fresh(
+    cached: &Option<(std::time::Instant, Option<String>)>,
+    now: std::time::Instant,
+) -> bool {
+    let Some((checked_at, tag)) = cached else { return false };
+    let ttl = if tag.is_some() { SING_BOX_RELEASE_TTL } else { SING_BOX_RELEASE_RETRY };
+    now.duration_since(*checked_at) < ttl
+}
+
+async fn latest_sing_box_tag(app: &App) -> std::result::Result<String, &'static str> {
+    // 单独串行刷新并缓存成功与失败结果，避免批量安装时打满 GitHub API 限额。
+    let _lookup = app.sing_box_release_lookup.lock().await;
+    let now = std::time::Instant::now();
+    let cached = app.sing_box_release.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if sing_box_release_cache_fresh(&cached, now) {
+        return cached.and_then(|(_, tag)| tag).ok_or("the hub could not read the latest sing-box release");
+    }
+
+    let fetched = async {
+        let response = app
+            .http
+            .get(SING_BOX_RELEASES_API)
+            .header(header::USER_AGENT, "monitor-hub")
+            .send()
+            .await
+            .map_err(|e| {
+                warn!("reading the latest sing-box release failed: {e:#}");
+                "the hub could not read the latest sing-box release"
+            })?
+            .error_for_status()
+            .map_err(|e| {
+                warn!("reading the latest sing-box release failed: {e:#}");
+                "the hub could not read the latest sing-box release"
+            })?
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|e| {
+                warn!("reading the latest sing-box release failed: {e:#}");
+                "the hub could not read the latest sing-box release"
+            })?;
+        let tag = response
+            .get("tag_name")
+            .and_then(serde_json::Value::as_str)
+            .filter(|tag| valid_release_tag(tag))
+            .ok_or("the hub received an invalid sing-box release tag")?;
+        Ok(tag.to_owned())
+    }
+    .await;
+
+    let mut cache = app.sing_box_release.lock().unwrap_or_else(|e| e.into_inner());
+    *cache = Some((std::time::Instant::now(), fetched.as_ref().ok().cloned()));
+    fetched
+}
+
+/// 面板里配置的 GitHub proxy 用于 agent、sing-box 发布包和主题更新下载。
 pub fn proxied(app: &App, url: String) -> String {
     match app.db.get("github_proxy").filter(|v| !v.trim().is_empty()) {
         Some(proxy) => format!("{}/{url}", proxy.trim().trim_end_matches('/')),
@@ -193,10 +278,7 @@ pub fn proxied(app: &App, url: String) -> String {
 
 /// How many release downloads the hub relays concurrently.
 ///
-/// This route takes no credentials, and one request costs an outbound fetch from
-/// GitHub plus 1.8 MB of egress -- the most expensive operation an anonymous
-/// caller can request. Streaming bounds the memory each transfer holds; this
-/// bounds how many may run, closing the same gap as the password gate in `auth`.
+/// 这些公开接口无需凭证即可中转多 MB 发布包。响应采用流式传输以限制内存，信号量限制同时传输数。
 ///
 /// Four, because a node installs once: the load is a burst, not a sustained
 /// workload. A batch install or upgrade sent to many machines at once -- by an
@@ -211,32 +293,19 @@ pub fn proxied(app: &App, url: String) -> String {
 const RELAY_SLOTS: usize = 4;
 static RELAY_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(RELAY_SLOTS);
 
-/// Longest a request waits for a relay slot before the 503. Below the 60 s nginx
-/// and the 100 s Cloudflare allow for a response head, so the refusal is the
-/// hub's own and says why; `install.sh` retries it. At about a second per
-/// transfer, four slots drain some 120 queued machines within it.
+/// 等待中转名额的最长时间。超时后返回 503，由安装脚本延迟重试。
 const RELAY_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Longest a relay may hold its permit.
 ///
-/// Deliberately generous, since a node on a slow link must still transfer
-/// 1.8 MB; what it rules out is a transfer that never completes.
+/// 传输时限允许较慢的节点收完发布归档，同时防止连接永久占用名额。
 const RELAY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(180);
 
-/// Holds a relay permit until the last byte has been sent. The handler returns
-/// once the response head is built, so a permit dropped there would gate only
-/// the fetch and leave the transfer -- the expensive part -- unbounded.
+/// 中转响应头构建后 body 才开始传输；若名额随 handler 返回，就无法限制实际下载。
 ///
-/// The permit is not held here, because "until the last byte" has no upper bound
-/// of its own: a client that stops reading leaves hyper unable to flush, hyper
-/// then stops polling this stream, and a deadline checked in `poll_next` would
-/// never run -- nor would the upstream timeout on the reqwest body, which is
-/// equally poll-driven. Four connections that accept the response and never read
-/// it would hold all four slots for as long as they remained open, and
-/// `/agent/{arch}` is the path every node installs through. The permit therefore
-/// belongs to a task with its own timer, and this end of the channel -- dropped
-/// with the body, whether it completed or the connection died -- releases it
-/// early.
+/// 客户端可能停止读取 body，令基于 `poll_next` 的超时检查也停止运行。独立任务持有名额，
+/// 在 body 被丢弃或 [`RELAY_DEADLINE`] 到期时释放，确保 `/agent/{arch}` 和 `/sing-box/{arch}`
+/// 的中转请求不会永久占住名额。
 struct Metered<S> {
     inner: S,
     _done: tokio::sync::oneshot::Sender<()>,
@@ -306,6 +375,42 @@ async fn agent_binary(State(app): State<Shared>, Path(arch): Path<String>) -> Re
         // English, as `install.sh` prints it after its own English line.
         Err(e) => {
             warn!("relaying the agent from {url} failed: {e:#}");
+            api::answer(
+                StatusCode::BAD_GATEWAY,
+                "the hub could not reach GitHub or its GitHub proxy; its log has the details",
+            )
+        }
+    }
+}
+
+/// 经 hub 中转 sing-box 官方稳定版归档，节点无需直接访问 GitHub。
+async fn sing_box_binary(State(app): State<Shared>, Path(arch): Path<String>) -> Response {
+    if !matches!(arch.as_str(), "x86_64" | "aarch64") {
+        return api::answer(StatusCode::NOT_FOUND, "unknown architecture");
+    }
+    let tag = match latest_sing_box_tag(&app).await {
+        Ok(tag) => tag,
+        Err(message) => return api::answer(StatusCode::BAD_GATEWAY, message),
+    };
+    let Some(url) = sing_box_release_url(&app, &tag, &arch) else {
+        return api::answer(StatusCode::NOT_FOUND, "unknown architecture");
+    };
+    let Ok(Ok(permit)) = tokio::time::timeout(RELAY_WAIT, RELAY_GATE.acquire()).await else {
+        return api::answer(StatusCode::SERVICE_UNAVAILABLE, "too many downloads in flight, try again");
+    };
+    let fetched = app.http.get(&url).timeout(std::time::Duration::from_secs(120)).send().await;
+    match fetched {
+        Ok(res) if res.status().is_success() => (
+            [(header::CONTENT_TYPE, "application/octet-stream")],
+            axum::body::Body::from_stream(metered(Box::pin(res.bytes_stream()), permit)),
+        )
+            .into_response(),
+        Ok(res) => api::answer(
+            StatusCode::BAD_GATEWAY,
+            format!("GitHub answered {} for the sing-box release", res.status()),
+        ),
+        Err(e) => {
+            warn!("relaying sing-box from {url} failed: {e:#}");
             api::answer(
                 StatusCode::BAD_GATEWAY,
                 "the hub could not reach GitHub or its GitHub proxy; its log has the details",
@@ -531,6 +636,7 @@ async fn main() -> Result<()> {
                 .route("/api/agent/register", post(api::agent_register))
                 .route("/install.sh", get(install_script))
                 .route("/agent/{arch}", get(agent_binary))
+                .route("/sing-box/{arch}", get(sing_box_binary))
                 .layer(tower_http::limit::RequestBodyLimitLayer::new(64 * 1024))
                 .with_state(app.clone()),
         )
@@ -982,6 +1088,49 @@ mod tests {
         // the row.
         app.db.set("github_proxy", "").unwrap();
         assert_eq!(release_url(&app, "x86_64"), direct);
+    }
+
+    #[test]
+    fn sing_box_release_urls_map_supported_arches_and_use_the_github_proxy() {
+        let app = app("");
+        assert_eq!(
+            sing_box_release_url(&app, "v1.14.2", "x86_64").as_deref(),
+            Some("https://github.com/SagerNet/sing-box/releases/download/v1.14.2/sing-box-1.14.2-linux-amd64.tar.gz")
+        );
+        assert_eq!(
+            sing_box_release_url(&app, "v1.14.2", "aarch64").as_deref(),
+            Some("https://github.com/SagerNet/sing-box/releases/download/v1.14.2/sing-box-1.14.2-linux-arm64.tar.gz")
+        );
+        assert!(sing_box_release_url(&app, "v1.14.2", "armv7").is_none());
+        assert!(sing_box_release_url(&app, "../latest", "x86_64").is_none());
+
+        app.db.set("github_proxy", "https://ghfast.top/").unwrap();
+        assert_eq!(
+            sing_box_release_url(&app, "v1.14.2", "x86_64").as_deref(),
+            Some("https://ghfast.top/https://github.com/SagerNet/sing-box/releases/download/v1.14.2/sing-box-1.14.2-linux-amd64.tar.gz")
+        );
+    }
+
+    #[test]
+    fn sing_box_release_cache_has_short_success_and_failure_windows() {
+        let now = std::time::Instant::now();
+        let success =
+            Some((now - SING_BOX_RELEASE_TTL + std::time::Duration::from_secs(1), Some("v1.2.3".into())));
+        let failed = Some((now - SING_BOX_RELEASE_RETRY + std::time::Duration::from_secs(1), None));
+        assert!(sing_box_release_cache_fresh(&success, now));
+        assert!(sing_box_release_cache_fresh(&failed, now));
+        assert!(!sing_box_release_cache_fresh(
+            &Some((now - SING_BOX_RELEASE_TTL, Some("v1.2.3".into()))),
+            now
+        ));
+        assert!(!sing_box_release_cache_fresh(&Some((now - SING_BOX_RELEASE_RETRY, None)), now));
+        assert!(!sing_box_release_cache_fresh(&None, now));
+    }
+
+    #[tokio::test]
+    async fn sing_box_relay_rejects_unknown_architectures_without_fetching() {
+        let response = sing_box_binary(State(Arc::new(app(""))), Path("armv7".to_owned())).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[test]

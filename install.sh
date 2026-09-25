@@ -13,6 +13,8 @@ PATH="$PATH:/usr/sbin:/sbin"
 # single path to inspect and a single path to remove.
 ROOT="/opt/monitor"
 BIN="$ROOT/monitor-agent"
+SING_BOX_BIN="$ROOT/sing-box"
+SING_BOX_LIB="$ROOT/libcronet.so"
 ENV_FILE="$ROOT/agent.env"
 UNIT_FILE="/etc/systemd/system/monitor-agent.service"
 RC_FILE="/etc/init.d/monitor-agent"
@@ -61,11 +63,12 @@ if [ -n "$UNINSTALL" ]; then
 	rc-service monitor-agent stop 2>/dev/null || true
 	rc-update del monitor-agent default >/dev/null 2>&1 || true
 	systemctl disable --now monitor-agent 2>/dev/null || true
-	rm -f "$UNIT_FILE" "$RC_FILE" "$LOG_FILE" "$BIN" "$BIN.old" "$ENV_FILE"
+	rm -f "$UNIT_FILE" "$RC_FILE" "$LOG_FILE" "$BIN" "$BIN.old" \
+		"$SING_BOX_BIN" "$SING_BOX_BIN.new" "$SING_BOX_LIB" "$SING_BOX_LIB.new" "$ENV_FILE"
 	systemctl daemon-reload 2>/dev/null || true
 	userdel monitor-agent 2>/dev/null || deluser monitor-agent 2>/dev/null || true
 	rmdir "$ROOT" 2>/dev/null || true
-	echo "monitor-agent uninstalled"
+	echo "monitor-agent and sing-box uninstalled"
 	exit 0
 fi
 
@@ -212,36 +215,73 @@ x86_64 | amd64) ARCH=x86_64 ;;
 aarch64 | arm64) ARCH=aarch64 ;;
 *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
 esac
+case "$ARCH" in
+x86_64) SING_BOX_ARCH=amd64 ;;
+aarch64) SING_BOX_ARCH=arm64 ;;
+esac
 
 # The hub relays the binary, so a node need only reach the hub it already talks
 # to: an IPv6-only or blocked machine cannot resolve github.com. A hub unable to
 # fetch releases itself is configured with a GitHub proxy in its own settings,
 # which is why none is requested here.
 URL="${SERVER%/}/agent/$ARCH"
+SING_BOX_URL="${SERVER%/}/sing-box/$ARCH"
 TMP="$(mktemp)"
-trap 'rm -f "$TMP"' EXIT
+SING_BOX_TMPDIR="$(mktemp -d)"
+SING_BOX_ARCHIVE="$SING_BOX_TMPDIR/release.tar.gz"
+SING_BOX_BINARY="$SING_BOX_TMPDIR/sing-box"
+SING_BOX_LIBRARY="$SING_BOX_TMPDIR/libcronet.so"
+trap 'rm -f "$TMP"; rm -rf "$SING_BOX_TMPDIR"' EXIT
 
-echo "downloading monitor-agent ($ARCH)"
-# The hub relays four downloads at once and queues the rest for 30 seconds. A
-# batch run on more machines than drain in that time is turned away with 503,
-# which is retried here rather than failing the machine. Any other refusal is
-# final and shown with the hub's own reason, which --fail would discard.
-TRIES=0
-while :; do
-	CODE=$(curl -sSL --max-time 300 -w '%{http_code}' "$URL" -o "$TMP") || exit 1
-	[ "$CODE" = 503 ] && [ "$TRIES" -lt 5 ] || break
-	TRIES=$((TRIES + 1))
-	echo "the hub is busy relaying to other machines; retrying in 5 seconds"
-	sleep 5
-done
-[ "$CODE" = 200 ] ||
-	{ printf 'download failed (HTTP %s): %s\n' "$CODE" "$(head -n 1 "$TMP" | cut -c1-500)" >&2; exit 1; }
+fetch_asset() {
+	FETCH_URL="$1"
+	FETCH_FILE="$2"
+	FETCH_NAME="$3"
+	echo "downloading $FETCH_NAME"
+	TRIES=0
+	while :; do
+		CODE=$(curl -sSL --max-time 300 -w '%{http_code}' "$FETCH_URL" -o "$FETCH_FILE") || return 1
+		[ "$CODE" = 503 ] && [ "$TRIES" -lt 5 ] || break
+		TRIES=$((TRIES + 1))
+		echo "the hub is busy relaying to other machines; retrying in 5 seconds"
+		sleep 5
+	done
+	[ "$CODE" = 200 ] || {
+		printf 'download failed (HTTP %s): %s\n' "$CODE" "$(head -n 1 "$FETCH_FILE" | cut -c1-500)" >&2
+		return 1
+	}
+}
+
+# 批量下载超过中转并发数时会返回 503，等待后重试。
+fetch_asset "$URL" "$TMP" "monitor-agent ($ARCH)"
 # A relay can answer 200 with something other than the program, such as a
 # mirror's error page. Checked before the running agent is stopped, so a batch
 # run through such a relay leaves each machine on the agent it had, rather than
 # on bytes that cannot start while this script reports success.
 [ "$(head -c 4 "$TMP")" = "$(printf '\177ELF')" ] ||
 	{ echo "the download is not a Linux executable: $(head -n 1 "$TMP" | tr -cd '[:print:]' | cut -c1-200)" >&2; exit 1; }
+
+# 仅从符合架构的归档路径提取 sing-box 和运行库，避免解开其他归档成员。
+fetch_asset "$SING_BOX_URL" "$SING_BOX_ARCHIVE" "sing-box ($SING_BOX_ARCH)"
+SING_BOX_MEMBER=$(tar -tzf "$SING_BOX_ARCHIVE" | awk -v arch="$SING_BOX_ARCH" '
+	$0 ~ ("^sing-box-[^/]+-linux-" arch "/sing-box$") {
+		if (member != "") bad = 1
+		member = $0
+	}
+	END { if (member != "" && !bad) print member }
+')
+[ -n "$SING_BOX_MEMBER" ] || { echo "download is not a supported sing-box archive" >&2; exit 1; }
+SING_BOX_LIBRARY_MEMBER="${SING_BOX_MEMBER%/sing-box}/libcronet.so"
+tar -tzf "$SING_BOX_ARCHIVE" | grep -Fqx "$SING_BOX_LIBRARY_MEMBER" ||
+	{ echo "the sing-box archive is missing libcronet.so" >&2; exit 1; }
+tar -xOzf "$SING_BOX_ARCHIVE" "$SING_BOX_MEMBER" >"$SING_BOX_BINARY" ||
+	{ echo "could not extract sing-box from the release archive" >&2; exit 1; }
+tar -xOzf "$SING_BOX_ARCHIVE" "$SING_BOX_LIBRARY_MEMBER" >"$SING_BOX_LIBRARY" ||
+	{ echo "could not extract libcronet.so from the release archive" >&2; exit 1; }
+[ "$(head -c 4 "$SING_BOX_BINARY")" = "$(printf '\177ELF')" ] &&
+	[ "$(head -c 4 "$SING_BOX_LIBRARY")" = "$(printf '\177ELF')" ] &&
+	LD_LIBRARY_PATH="$SING_BOX_TMPDIR" "$SING_BOX_BINARY" version >/dev/null 2>&1 ||
+	{ echo "the sing-box release does not contain a runnable Linux executable" >&2; exit 1; }
 
 # Downloaded before the registration below, because that step spends a node: the
 # key returns a token and the panel gains a row, while the env file recording it
@@ -313,6 +353,10 @@ install -d -m 0755 "$ROOT"
 # in $BIN, and the copy is the one that ran before it.
 [ ! -f "$BIN" ] || [ -f "$BIN.old" ] || cp "$BIN" "$BIN.old"
 install -m 0755 "$TMP" "$BIN"
+install -m 0755 "$SING_BOX_BINARY" "$SING_BOX_BIN.new"
+install -m 0644 "$SING_BOX_LIBRARY" "$SING_BOX_LIB.new"
+mv -f "$SING_BOX_LIB.new" "$SING_BOX_LIB"
+mv -f "$SING_BOX_BIN.new" "$SING_BOX_BIN"
 
 # The token lives in a root-only environment file rather than the unit, keeping
 # it out of `systemctl cat` and the world-readable journal. 0600 root is what
@@ -380,6 +424,7 @@ RC
 	sleep 3
 	pidof monitor-agent >/dev/null || not_started "$LOG_FILE"
 	rm -f "$BIN.old"
+	echo "sing-box installed at: $SING_BOX_BIN"
 	echo "monitor-agent installed; follow it with: tail -f $LOG_FILE"
 	exit 0
 fi
@@ -427,4 +472,5 @@ systemctl restart monitor-agent
 sleep 3
 systemctl is-active --quiet monitor-agent || not_started "journalctl -u monitor-agent -n 20"
 rm -f "$BIN.old"
+echo "sing-box installed at: $SING_BOX_BIN"
 echo "monitor-agent installed; follow it with: journalctl -u monitor-agent -f"
