@@ -2802,7 +2802,7 @@ function Data() {
   )
 }
 
-const releaseUrl = (repo: string, version: string) => `https://github.com/monitor-probe/${repo}/releases/tag/v${version}`
+const releaseUrl = (repository: string, version: string) => `https://github.com/${repository}/releases/tag/v${version}`
 
 /** `v1.2.0 → v1.3.0` when something is published, the running version alone otherwise. */
 function VersionPair({ current, latest }: { current: string; latest: string }) {
@@ -2876,7 +2876,7 @@ function Update({ versions, reload, nodes, site, refusal }: {
             <VersionPair current={versions.hub} latest={versions.hub_latest} />
             {behind(versions.hub, versions.hub_latest) && (
               <Button size="sm" variant="ghost" asChild>
-                <a href={releaseUrl("monitor", versions.hub_latest)} target="_blank" rel="noreferrer">
+                <a href={releaseUrl("monitor-probe/monitor", versions.hub_latest)} target="_blank" rel="noreferrer">
                   发布说明
                 </a>
               </Button>
@@ -2912,7 +2912,7 @@ function Update({ versions, reload, nodes, site, refusal }: {
                   </Button>
                   {versions.agent_latest && (
                     <Button size="sm" variant="ghost" asChild>
-                      <a href={releaseUrl("agent", versions.agent_latest)} target="_blank" rel="noreferrer">
+                      <a href={releaseUrl("lzj565/agent", versions.agent_latest)} target="_blank" rel="noreferrer">
                         发布说明
                       </a>
                     </Button>

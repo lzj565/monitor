@@ -164,7 +164,7 @@ fn forwarded_proto(headers: &HeaderMap) -> Option<&str> {
 /// Where the agent binaries are published, and where this hub is published. Not
 /// settings: redirecting either implies a fork, which rebuilds these lines
 /// anyway.
-pub const AGENT_REPO: &str = "monitor-probe/agent";
+pub const AGENT_REPO: &str = "lzj565/agent";
 pub const HUB_REPO: &str = "lzj565/monitor";
 const SING_BOX_REPO: &str = "SagerNet/sing-box";
 const SING_BOX_RELEASES_API: &str = "https://api.github.com/repos/SagerNet/sing-box/releases/latest";
@@ -1084,7 +1084,7 @@ mod tests {
     fn a_github_proxy_prefixes_the_release_url_and_an_empty_one_does_not() {
         let app = app("");
         let direct = release_url(&app, "x86_64");
-        assert!(direct.starts_with("https://github.com/monitor-probe/agent/releases/"), "{direct}");
+        assert!(direct.starts_with("https://github.com/lzj565/agent/releases/"), "{direct}");
 
         for set in ["https://ghfast.top", "https://ghfast.top/", "  https://ghfast.top/  "] {
             app.db.set("github_proxy", set).unwrap();

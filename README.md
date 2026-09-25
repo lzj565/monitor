@@ -24,7 +24,7 @@ curl -fsSL https://github.com/lzj565/monitor/releases/latest/download/install-hu
 | 仓库 | 说明 |
 |---|---|
 | [monitor](https://github.com/lzj565/monitor) | hub：后台、API、公开页宿主 |
-| [agent](https://github.com/monitor-probe/agent) | Linux agent |
+| [agent](https://github.com/lzj565/agent) | Linux agent |
 | [monitor-theme-default](https://github.com/monitor-probe/monitor-theme-default) | 内置默认主题 |
 
 ```
