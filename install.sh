@@ -237,10 +237,24 @@ fetch_asset() {
 	FETCH_URL="$1"
 	FETCH_FILE="$2"
 	FETCH_NAME="$3"
-	echo "downloading $FETCH_NAME"
+	echo "downloading $FETCH_NAME from $FETCH_URL"
 	TRIES=0
 	while :; do
-		CODE=$(curl -sSL --max-time 300 -w '%{http_code}' "$FETCH_URL" -o "$FETCH_FILE") || return 1
+		if CURL_INFO=$(curl -sSL --max-time 300 \
+			-w 'http_code=%{http_code} content_type=%{content_type} bytes=%{size_download} time=%{time_total}s remote_ip=%{remote_ip}' \
+			"$FETCH_URL" -o "$FETCH_FILE"); then
+			CURL_EXIT=0
+		else
+			CURL_EXIT=$?
+		fi
+		CODE=$(printf '%s\n' "$CURL_INFO" | sed -n 's/.*http_code=\([0-9][0-9][0-9]\).*/\1/p')
+		[ -n "$CODE" ] || CODE=000
+		FILE_BYTES=$(wc -c <"$FETCH_FILE" | tr -d ' ')
+		echo "curl $FETCH_NAME: exit=$CURL_EXIT $CURL_INFO file_bytes=$FILE_BYTES"
+		if [ "$CURL_EXIT" -ne 0 ]; then
+			echo "curl failed while downloading $FETCH_NAME (exit $CURL_EXIT)" >&2
+			return 1
+		fi
 		[ "$CODE" = 503 ] && [ "$TRIES" -lt 5 ] || break
 		TRIES=$((TRIES + 1))
 		echo "the hub is busy relaying to other machines; retrying in 5 seconds"
@@ -263,6 +277,9 @@ fetch_asset "$URL" "$TMP" "monitor-agent ($ARCH)"
 
 # 仅从符合架构的归档路径提取 sing-box 和运行库，避免解开其他归档成员。
 fetch_asset "$SING_BOX_URL" "$SING_BOX_ARCHIVE" "sing-box ($SING_BOX_ARCH)"
+echo "sing-box diagnostics: host_arch=$(uname -m) mapped_arch=$SING_BOX_ARCH archive=$SING_BOX_ARCHIVE"
+echo "sing-box archive members:"
+tar -tzf "$SING_BOX_ARCHIVE" | sed -n '1,40p'
 SING_BOX_MEMBER=$(tar -tzf "$SING_BOX_ARCHIVE" | awk -v arch="$SING_BOX_ARCH" '
 	$0 ~ ("^sing-box-[^/]+-linux-" arch "/sing-box$") {
 		if (member != "") bad = 1
@@ -272,6 +289,8 @@ SING_BOX_MEMBER=$(tar -tzf "$SING_BOX_ARCHIVE" | awk -v arch="$SING_BOX_ARCH" '
 ')
 [ -n "$SING_BOX_MEMBER" ] || { echo "download is not a supported sing-box archive" >&2; exit 1; }
 SING_BOX_LIBRARY_MEMBER="${SING_BOX_MEMBER%/sing-box}/libcronet.so"
+echo "sing-box executable member: $SING_BOX_MEMBER"
+echo "sing-box runtime library member: $SING_BOX_LIBRARY_MEMBER"
 tar -tzf "$SING_BOX_ARCHIVE" | grep -Fqx "$SING_BOX_LIBRARY_MEMBER" ||
 	{ echo "the sing-box archive is missing libcronet.so" >&2; exit 1; }
 tar -xOzf "$SING_BOX_ARCHIVE" "$SING_BOX_MEMBER" >"$SING_BOX_BINARY" ||
@@ -282,10 +301,24 @@ tar -xOzf "$SING_BOX_ARCHIVE" "$SING_BOX_LIBRARY_MEMBER" >"$SING_BOX_LIBRARY" ||
 	{ echo "could not extract libcronet.so from the release archive" >&2; exit 1; }
 [ "$(head -c 4 "$SING_BOX_BINARY")" = "$(printf '\177ELF')" ] &&
 	[ "$(head -c 4 "$SING_BOX_LIBRARY")" = "$(printf '\177ELF')" ] ||
-	{ echo "the sing-box release does not contain a runnable Linux executable" >&2; exit 1; }
-SING_BOX_VERSION=$(LD_LIBRARY_PATH="$SING_BOX_TMPDIR" "$SING_BOX_BINARY" version 2>/dev/null) ||
-	{ echo "the sing-box release does not contain a runnable Linux executable" >&2; exit 1; }
+	{ echo "sing-box ELF check failed: binary=$(od -An -tx1 -N4 "$SING_BOX_BINARY" | tr -d ' \n') library=$(od -An -tx1 -N4 "$SING_BOX_LIBRARY" | tr -d ' \n')" >&2; exit 1; }
+echo "sing-box extracted files:"
+ls -ln "$SING_BOX_BINARY" "$SING_BOX_LIBRARY"
+echo "sing-box binary sha256: $(sha256sum "$SING_BOX_BINARY" 2>/dev/null | awk '{print $1}' || true)"
+SING_BOX_VERSION_LOG="$SING_BOX_TMPDIR/version.stderr"
+if SING_BOX_VERSION=$(LD_LIBRARY_PATH="$SING_BOX_TMPDIR" "$SING_BOX_BINARY" version 2>"$SING_BOX_VERSION_LOG"); then
+	:
+else
+	VERSION_EXIT=$?
+	echo "sing-box version check failed: exit=$VERSION_EXIT binary=$SING_BOX_BINARY LD_LIBRARY_PATH=$SING_BOX_TMPDIR" >&2
+	echo "sing-box version stderr:" >&2
+	[ ! -s "$SING_BOX_VERSION_LOG" ] || head -c 2000 "$SING_BOX_VERSION_LOG" >&2
+	echo >&2
+	command -v ldd >/dev/null 2>&1 && ldd "$SING_BOX_BINARY" 2>&1 | head -n 40 >&2 || true
+	exit 1
+fi
 SING_BOX_VERSION=$(printf '%s\n' "$SING_BOX_VERSION" | head -n 1 | cut -c1-200)
+echo "sing-box version check succeeded: $SING_BOX_VERSION"
 
 # Downloaded before the registration below, because that step spends a node: the
 # key returns a token and the panel gains a row, while the env file recording it
