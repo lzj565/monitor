@@ -55,6 +55,11 @@ reported() {
 	curl -fs "$URL/api/nodes" | jq -e '.nodes[0] | .online and .metrics != null'
 }
 
+command_succeeded() {
+	curl -fsS -H "Cookie: $COOKIE" "$URL/api/nodes/$NODE_ID/commands/$COMMAND_ID" |
+		jq -e --arg id "$COMMAND_ID" '.command_id == $id and .status == "succeeded"' >/dev/null
+}
+
 "$HUB" --listen "${URL#http://}" --db "$DIR/hub.db" --themes "$DIR/themes" >"$DIR/hub.log" 2>&1 &
 HUB_PID=$!
 wait_for "the hub to listen" curl -fs "$URL/api/me"
@@ -82,6 +87,31 @@ sleep 2
 
 PUBLIC=$(curl -fsS "$URL/api/nodes")
 ADMIN=$(curl -fsS -H "Cookie: $COOKIE" "$URL/api/nodes")
+NODE_ID=$(echo "$ADMIN" | jq -r '.nodes[0].id')
+
+# 新 hub 与新 agent 应完成一轮只读命令；跨版本 CI 遇到旧端时保留遥测兼容检查。
+COMMAND_CODE=$(curl -sS -o "$DIR/command.json" -w '%{http_code}' -H "Cookie: $COOKIE" \
+	-H 'content-type: application/json' -d '{"method":"agent.status","params":{}}' \
+	"$URL/api/nodes/$NODE_ID/commands")
+case "$COMMAND_CODE" in
+202)
+	COMMAND_ID=$(jq -r '.command_id // empty' "$DIR/command.json")
+	[ -n "$COMMAND_ID" ] || fail "the command API returned no command id: $(cat "$DIR/command.json")"
+	wait_for "agent.status to finish" command_succeeded
+	COMMAND_RESULT=$(curl -fsS -H "Cookie: $COOKIE" "$URL/api/nodes/$NODE_ID/commands/$COMMAND_ID")
+	echo "$COMMAND_RESULT" | jq -e --arg version "$(echo "$PUBLIC" | jq -r '.nodes[0].agent_version')" \
+		'.status == "succeeded" and .result.agent_version == $version and (.result.process_uptime_secs | type == "number") and (.result.report_interval_secs == 1) and (.result.counted_ifaces | type == "array")' \
+		>/dev/null || fail "agent.status returned an invalid result: $COMMAND_RESULT"
+	echo "e2e: agent.status round trip: ok"
+;;
+409)
+	grep -q '不支持 agent.status' "$DIR/command.json" || fail "the command API refused an online node: $(cat "$DIR/command.json")"
+;;
+404)
+	: # 老 hub 尚无管理员 Command API。
+;;
+*) fail "agent.status submission returned HTTP $COMMAND_CODE: $(cat "$DIR/command.json")" ;;
+esac
 
 # The public check below would pass on a node that has no private fields at
 # all, so the panel's view must carry them first.

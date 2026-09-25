@@ -27,6 +27,7 @@ macro_rules! refuse {
 mod agent_ws;
 mod api;
 mod auth;
+mod command;
 mod db;
 mod frontend;
 mod notify;
@@ -58,6 +59,8 @@ pub struct App {
     /// and its latest report. A single map, since connectivity and current
     /// figures are one fact about a node rather than two. See `agent_ws`.
     pub agents: RwLock<HashMap<i64, Agent>>,
+    /// 正在执行或等待查询结果的内存命令记录；hub 重启后重新建立。
+    pub commands: command::Registry,
     /// Each node's newest traffic reading, booked about once a minute rather
     /// than with every report. Per node rather than per connection; see
     /// `agent_ws::file`.
@@ -104,6 +107,7 @@ impl App {
         Self {
             db,
             agents: RwLock::default(),
+            commands: command::Registry::default(),
             readings: Mutex::default(),
             snapshot: Mutex::new([(0, Default::default()), (0, Default::default())]),
             throttle: auth::Throttle::default(),
@@ -595,6 +599,8 @@ async fn main() -> Result<()> {
         .route("/api/nodes/{id}", put(api::update_node).delete(api::delete_node))
         .route("/api/nodes/{id}/token", post(api::reset_token))
         .route("/api/nodes/{id}/traffic", put(api::patch_traffic))
+        .route("/api/nodes/{id}/commands", post(command::submit))
+        .route("/api/nodes/{id}/commands/{command_id}", get(command::status))
         .route("/api/ping-tasks", get(api::ping_tasks).post(api::save_ping_task))
         .route("/api/ping-tasks/order", put(api::reorder_ping_tasks))
         .route("/api/ping-tasks/{id}", delete(api::delete_ping_task))

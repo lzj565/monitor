@@ -2,13 +2,13 @@
 //! notifications. A single long-lived connection on which either end may speak
 //! first, with self-describing frames readable via curl or a browser console.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -76,6 +76,8 @@ pub struct Agent {
     pub session: u64,
     /// Outbound channel, used to push probe assignments.
     pub tx: mpsc::Sender<String>,
+    /// 本连接通过 `hello` 声明支持的内置命令。
+    pub capabilities: HashSet<String>,
     /// The latest report, or `Null` between connecting and the first one.
     pub metrics: serde_json::Value,
     pub last_seen: i64,
@@ -102,6 +104,7 @@ impl Agent {
         Self {
             session,
             tx,
+            capabilities: HashSet::new(),
             metrics: serde_json::Value::Null,
             last_seen: 0,
             last_minute: None,
@@ -201,6 +204,8 @@ impl Minute {
 /// handshakes if it is ever observed; reissuing the token ends it meanwhile.
 #[derive(Debug, Default)]
 struct Session {
+    /// 绑定命令响应与创建它的 WebSocket 连接，避免重连后的迟到帧串线。
+    tag: u64,
     greeted: bool,
     last_report: Option<Instant>,
     /// Start of the current result window and the results admitted in it.
@@ -254,9 +259,14 @@ impl Session {
 
 #[derive(Deserialize)]
 struct Rpc {
-    method: String,
+    #[serde(default)]
+    method: Option<String>,
     #[serde(default)]
     params: serde_json::Value,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
 }
 
 pub async fn handler(
@@ -294,7 +304,10 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> 
     // Online from the handshake rather than the first report: a panel reporting
     // otherwise for a whole interval would describe the hub's bookkeeping rather
     // than the machine.
-    app.agents.write().unwrap_or_else(|e| e.into_inner()).insert(node_id, Agent::new(tag, tx));
+    let previous = app.agents.write().unwrap_or_else(|e| e.into_inner()).insert(node_id, Agent::new(tag, tx));
+    if let Some(previous) = previous {
+        crate::command::disconnect(&app, node_id, previous.session);
+    }
     info!("node {node_id} connected from {ip}");
 
     // Send the probe list before the first report arrives.
@@ -308,7 +321,7 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> 
     // connection lasts; otherwise it would wait for the next hello, which on a
     // steady link is days away.
     let mut owed: Option<String> = None;
-    let mut session = Session::default();
+    let mut session = Session { tag, ..Session::default() };
 
     let outcome = loop {
         tokio::select! {
@@ -364,6 +377,7 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> 
 
     let ended = release(&app, node_id, tag);
     if ended.is_some() {
+        crate::command::disconnect(&app, node_id, tag);
         info!("node {node_id} went offline");
     }
     tokio::task::block_in_place(|| close(&app, node_id, ended.as_ref(), &mut session));
@@ -431,7 +445,19 @@ fn dispatch(
             session.complain(node_id, format_args!("filing probe results failed: {e:#}"));
         }
     }
-    match rpc.method.as_str() {
+    if let Some(id) = rpc.id.as_deref() {
+        let has_result = rpc.extra.contains_key("result");
+        let has_error = rpc.extra.contains_key("error");
+        let outcome = match (has_result, has_error) {
+            (true, false) => Ok(rpc.extra["result"].clone()),
+            (false, true) => Err(rpc.extra["error"].clone()),
+            _ => anyhow::bail!("command response must carry exactly one of result or error"),
+        };
+        crate::command::complete(app, id, node_id, session.tag, outcome);
+        return Ok(None);
+    }
+    let method = rpc.method.as_deref().context("message has neither a method nor a response id")?;
+    match method {
         "hello" => {
             if std::mem::replace(&mut session.greeted, true) {
                 session.complain(node_id, "a second hello on one connection was ignored");
@@ -440,6 +466,24 @@ fn dispatch(
             let field = |k: &str| rpc.params.get(k).and_then(|v| v.as_str()).unwrap_or("");
             let source =
                 country_source(ip, field("ipv4"), field("ipv6")).map_or_else(String::new, |a| a.to_string());
+            let capabilities = rpc
+                .params
+                .get("capabilities")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .collect::<HashSet<_>>();
+            if let Some(agent) = app
+                .agents
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_mut(&node_id)
+                .filter(|agent| agent.session == session.tag)
+            {
+                agent.capabilities = capabilities;
+            }
             let owed = app.db.save_facts(node_id, &rpc.params, ip, &source)?;
             return Ok(owed.then_some(source));
         }
@@ -837,6 +881,35 @@ mod tests {
         let (tx, rx) = mpsc::channel(4);
         app.agents.write().unwrap().insert(id, Agent::new(1, tx));
         (id, rx)
+    }
+
+    #[test]
+    fn hello_records_only_the_current_agents_command_capabilities() {
+        let app = app();
+        let id = node(&app);
+        let (tx, _rx) = mpsc::channel(4);
+        app.agents.write().unwrap().insert(id, Agent::new(7, tx));
+        let mut session = Session { tag: 7, ..Session::default() };
+        let hello = json!({
+            "jsonrpc": "2.0",
+            "method": "hello",
+            "params": {
+                "hostname": "command-node",
+                "capabilities": ["agent.status"]
+            }
+        });
+
+        dispatch(&app, id, "ip", &hello.to_string(), &mut session, Arrival::now()).unwrap();
+        let agents = app.agents.read().unwrap();
+        assert!(agents[&id].capabilities.contains("agent.status"));
+        assert_eq!(agents[&id].capabilities.len(), 1);
+    }
+
+    #[test]
+    fn a_json_rpc_response_preserves_a_null_result() {
+        let response: Rpc = serde_json::from_value(json!({"id": "command-1", "result": null})).unwrap();
+        assert_eq!(response.id.as_deref(), Some("command-1"));
+        assert_eq!(response.extra.get("result"), Some(&serde_json::Value::Null));
     }
 
     /// A frame arriving `ms` milliseconds after 23:58 on 31 January: a new minute
