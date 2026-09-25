@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useId, useRef, useState } from "react"
 import { flushSync } from "react-dom"
-import { ArrowUpCircle, Bell, CalendarClock, Check, ChevronDown, ChevronRight, Copy, Database, Download, GripVertical, Layers, Palette, Pencil, Plus, Radio, RefreshCw, Search, Send, Server, Settings, Shield, SlidersHorizontal, Trash2, Upload } from "lucide-react"
+import { ArrowUpCircle, Bell, CalendarClock, Check, ChevronDown, ChevronRight, Copy, Database, Download, FileText, GripVertical, Layers, Palette, Pencil, Plus, Radio, RefreshCw, Search, Send, Server, Settings, Shield, SlidersHorizontal, Trash2, Upload } from "lucide-react"
 import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
@@ -1227,11 +1227,88 @@ function InstallDialog({ node, site, onClose, onRotated }: {
   )
 }
 
+type ConfigResult = {
+  content: string
+  sha256: string
+  size_bytes: number
+  modified_at: number | null
+  config_path: string
+}
+
+type ConfigCommand = {
+  status: "pending" | "succeeded" | "failed" | "outcome_unknown"
+  result?: ConfigResult
+  error?: { message?: string }
+}
+
+function ConfigDialog({ node, onClose }: { node: Node; onClose: () => void }) {
+  const [config, setConfig] = useState<ConfigResult | null>(null)
+  const [error, setError] = useState("")
+
+  useEffect(() => {
+    let closed = false
+    async function load() {
+      try {
+        const submitted = await api<{ command_id: string }>(`/nodes/${node.id}/commands`, {
+          method: "POST",
+          body: JSON.stringify({ method: "singbox.config.get", params: {} }),
+          cache: "no-store",
+        })
+        const deadline = Date.now() + 12_000
+        while (!closed && Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 500))
+          if (closed) return
+          const command = await api<ConfigCommand>(`/nodes/${node.id}/commands/${submitted.command_id}`, { cache: "no-store" })
+          if (command.status === "pending") continue
+          if (command.status === "succeeded" && command.result) {
+            setConfig(command.result)
+          } else {
+            setError(command.error?.message || "配置读取失败")
+          }
+          return
+        }
+        if (!closed) setError("等待配置读取结果超时")
+      } catch (cause) {
+        if (!closed) setError((cause as Error).message)
+      }
+    }
+    void load()
+    return () => { closed = true }
+  }, [node.id])
+
+  return (
+    <Dialog open onOpenChange={(open) => !open && onClose()}>
+      <DialogContent className="sm:max-w-3xl">
+        <DialogHeader>
+          <DialogTitle>查看「{node.name}」的 sing-box 配置</DialogTitle>
+          <DialogDescription>配置可能包含私钥或密码，仅在此窗口中显示。</DialogDescription>
+        </DialogHeader>
+        {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
+        {!error && !config && <p className="text-sm text-muted-foreground">正在读取配置…</p>}
+        {config && (
+          <div className="min-w-0 space-y-3">
+            <dl className="grid gap-2 text-sm sm:grid-cols-[7rem_1fr]">
+              <dt className="text-muted-foreground">路径</dt><dd className="break-all">{config.config_path}</dd>
+              <dt className="text-muted-foreground">大小</dt><dd>{config.size_bytes} 字节</dd>
+              <dt className="text-muted-foreground">修改时间</dt>
+              <dd>{config.modified_at === null ? "未知" : new Date(config.modified_at * 1000).toLocaleString()}</dd>
+              <dt className="text-muted-foreground">SHA-256</dt><dd className="break-all font-mono text-xs">{config.sha256}</dd>
+            </dl>
+            <pre className="max-h-[50dvh] overflow-auto rounded-md border bg-muted p-3 text-xs leading-relaxed">{config.content}</pre>
+          </div>
+        )}
+        <DialogFooter><Button variant="outline" onClick={onClose}>关闭</Button></DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
 function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () => void; site: string; refusal: string }) {
   const [creating, setCreating] = useState(false)
   const [editing, setEditing] = useState<Node | null>(null)
   const [billing, setBilling] = useState<Node | null>(null)
   const [installing, setInstalling] = useState<Node | null>(null)
+  const [viewingConfig, setViewingConfig] = useState<Node | null>(null)
   const [registering, setRegistering] = useState(false)
   const reg = useRegisterWindow()
   const [deleting, setDeleting] = useState<Node | null>(null)
@@ -1351,6 +1428,9 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
                 </TableCell>
                 <TableCell className="text-sm">{n.expires_at || FOREVER}</TableCell>
                 <TableCell className="text-right whitespace-nowrap">
+                  <Button variant="ghost" size="icon" disabled={!n.online} onClick={() => setViewingConfig(n)} title="查看 sing-box 配置" aria-label="查看 sing-box 配置">
+                    <FileText />
+                  </Button>
                   <Button variant="ghost" size="icon" disabled={!!refusal} onClick={() => setInstalling(n)} title="安装 Agent" aria-label="安装 Agent">
                     <Download />
                   </Button>
@@ -1412,6 +1492,7 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
           onRotated={refresh}
         />
       )}
+      {viewingConfig && <ConfigDialog node={viewingConfig} onClose={() => setViewingConfig(null)} />}
       {deleting && (
         <ConfirmDialog
           title={`删除节点「${deleting.name}」？`}

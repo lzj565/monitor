@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -15,14 +15,16 @@ use tokio::sync::mpsc;
 use tracing::debug;
 
 use crate::api::{self, Admin};
-use crate::auth::random_token;
+use crate::auth::{random_token, sha256};
 use crate::{App, Shared};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const CONTROL_COMMAND_TIMEOUT: Duration = Duration::from_secs(35);
 const RESULT_RETENTION: Duration = Duration::from_secs(10 * 60);
+const CONFIG_RESULT_RETENTION: Duration = Duration::from_secs(60);
 const AGENT_STATUS_METHOD: &str = "agent.status";
 const SINGBOX_STATUS_METHOD: &str = "singbox.status";
+const SINGBOX_CONFIG_GET_METHOD: &str = "singbox.config.get";
 const SINGBOX_CONTROL_METHODS: [&str; 4] =
     ["singbox.start", "singbox.stop", "singbox.restart", "singbox.reload"];
 const REMOTE_TIMEOUT_CODE: i64 = -32001;
@@ -32,7 +34,18 @@ fn is_control_method(method: &str) -> bool {
 }
 
 fn is_supported_method(method: &str) -> bool {
-    method == AGENT_STATUS_METHOD || method == SINGBOX_STATUS_METHOD || is_control_method(method)
+    method == AGENT_STATUS_METHOD
+        || method == SINGBOX_STATUS_METHOD
+        || method == SINGBOX_CONFIG_GET_METHOD
+        || is_control_method(method)
+}
+
+fn result_retention(method: &str) -> Duration {
+    if method == SINGBOX_CONFIG_GET_METHOD {
+        CONFIG_RESULT_RETENTION
+    } else {
+        RESULT_RETENTION
+    }
 }
 
 fn command_timeout(method: &str) -> Duration {
@@ -108,6 +121,10 @@ impl Registry {
         self.lock().remove(id);
     }
 
+    fn purge_expired(&self) {
+        Self::purge(&mut self.lock(), Instant::now());
+    }
+
     fn finish(&self, id: &str, node_id: i64, session: u64, result: Result<Value, Value>) -> bool {
         let now = Instant::now();
         let mut records = self.lock();
@@ -116,6 +133,17 @@ impl Registry {
         if record.node_id != node_id || record.session != session || record.status != Status::Pending {
             return false;
         }
+        let result = if record.method == SINGBOX_CONFIG_GET_METHOD {
+            result.and_then(|mut value| {
+                let content = value.get("content").and_then(Value::as_str).ok_or_else(
+                    || json!({"code": -32603, "message": "agent 返回的 sing-box 配置格式不正确"}),
+                )?;
+                value["sha256"] = json!(sha256(content));
+                Ok(value)
+            })
+        } else {
+            result
+        };
         match result {
             Ok(result) => {
                 record.status = Status::Succeeded;
@@ -133,7 +161,7 @@ impl Registry {
                 record.error = Some(error);
             }
         }
-        record.expires_at = Some(now + RESULT_RETENTION);
+        record.expires_at = Some(now + result_retention(&record.method));
         true
     }
 
@@ -150,7 +178,7 @@ impl Registry {
             "reason": reason,
             "message": if reason == "timeout" { "命令等待响应超时，agent 可能已经执行" } else { "agent 连接中断，命令执行结果未知" }
         }));
-        record.expires_at = Some(now + RESULT_RETENTION);
+        record.expires_at = Some(now + result_retention(&record.method));
     }
 
     fn disconnect(&self, node_id: i64, session: u64) {
@@ -164,7 +192,7 @@ impl Registry {
                     "reason": "disconnected",
                     "message": "agent 连接中断，命令执行结果未知"
                 }));
-                record.expires_at = Some(now + RESULT_RETENTION);
+                record.expires_at = Some(now + result_retention(&record.method));
             }
         }
     }
@@ -244,8 +272,15 @@ pub async fn submit(
             tokio::spawn(async move {
                 tokio::time::sleep(timeout).await;
                 app_for_timeout.commands.outcome_unknown(&timeout_id, session, "timeout");
+                if method == SINGBOX_CONFIG_GET_METHOD {
+                    tokio::time::sleep(CONFIG_RESULT_RETENTION).await;
+                    app_for_timeout.commands.purge_expired();
+                }
             });
-            (StatusCode::ACCEPTED, Json(json!({"command_id": id, "status": Status::Pending}))).into_response()
+            no_store(
+                (StatusCode::ACCEPTED, Json(json!({"command_id": id, "status": Status::Pending})))
+                    .into_response(),
+            )
         }
         Err(mpsc::error::TrySendError::Full(_)) => {
             app.commands.remove(&id);
@@ -264,9 +299,14 @@ pub async fn status(
     Path((node_id, command_id)): Path<(i64, String)>,
 ) -> Response {
     match app.commands.get(&command_id, node_id) {
-        Some(view) => Json(view).into_response(),
-        None => api::answer(StatusCode::NOT_FOUND, "命令不存在或结果已过期"),
+        Some(view) => no_store(Json(view).into_response()),
+        None => no_store(api::answer(StatusCode::NOT_FOUND, "命令不存在或结果已过期")),
     }
+}
+
+fn no_store(mut response: Response) -> Response {
+    response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 /// 清理指定连接中仍未收到结果的命令，断连后的执行结果不能再被确认。
@@ -436,6 +476,59 @@ mod tests {
         let completed = response_json(response).await;
         assert_eq!(completed["status"], "succeeded");
         assert_eq!(completed["result"], result);
+    }
+
+    #[tokio::test]
+    async fn config_get_uses_the_existing_command_channel_and_no_store_response() {
+        let (app, node_id) = app_node();
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut agent = Agent::new(18, tx);
+        agent.capabilities.insert(SINGBOX_CONFIG_GET_METHOD.into());
+        app.agents.write().unwrap().insert(node_id, agent);
+
+        let response = submit(
+            Admin,
+            State(app.clone()),
+            Path(node_id),
+            Ok(Json(Request { method: SINGBOX_CONFIG_GET_METHOD.into(), params: json!({}) })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let created = response_json(response).await;
+        let id = created["command_id"].as_str().unwrap();
+        let sent: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        assert_eq!(sent["id"], id);
+        assert_eq!(sent["method"], SINGBOX_CONFIG_GET_METHOD);
+        assert_eq!(sent["params"], json!({}));
+
+        let result = json!({"content": "{}", "size_bytes": 2, "modified_at": null, "config_path": "/etc/sing-box/config.json"});
+        assert!(app.commands.complete(id, node_id, 18, Ok(result.clone())));
+        let response = status(Admin, State(app.clone()), Path((node_id, id.to_owned()))).await;
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let completed = response_json(response).await;
+        assert_eq!(completed["result"]["content"], result["content"]);
+        assert_eq!(
+            completed["result"]["sha256"],
+            "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+        );
+        let remaining = app.commands.lock()[id].expires_at.unwrap().duration_since(Instant::now());
+        assert!(remaining <= CONFIG_RESULT_RETENTION && remaining >= Duration::from_secs(55));
+    }
+
+    #[test]
+    fn malformed_config_result_fails_without_exposing_content_and_expires() {
+        let registry = Registry::default();
+        registry.insert("config-id".into(), 7, 11, SINGBOX_CONFIG_GET_METHOD.into());
+        assert!(registry.complete("config-id", 7, 11, Ok(json!({"unexpected": "secret"}))));
+        let result = registry.get("config-id", 7).unwrap();
+        assert_eq!(result.status, Status::Failed);
+        assert!(result.result.is_none());
+        assert_eq!(result.error.unwrap()["message"], "agent 返回的 sing-box 配置格式不正确");
+        registry.lock().get_mut("config-id").unwrap().expires_at =
+            Some(Instant::now() - Duration::from_secs(1));
+        registry.purge_expired();
+        assert!(registry.lock().is_empty());
     }
 
     #[tokio::test]
