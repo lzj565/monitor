@@ -5,9 +5,8 @@
 #   curl -fsSL https://hub.example.com/install.sh | sh -s -- --upgrade
 #   curl -fsSL https://hub.example.com/install.sh | sh -s -- --uninstall
 set -eu
-# useradd and rc-update reside in sbin, which a root shell entered through `su`
-# without `-` lacks on Debian: su keeps the caller's PATH unless ALWAYS_SET_PATH
-# is set, and Debian does not set it.
+# rc-update resides in sbin, which a root shell entered through `su` without `-`
+# lacks on Debian: su keeps the caller's PATH unless ALWAYS_SET_PATH is set.
 PATH="$PATH:/usr/sbin:/sbin"
 
 # Binary and token in one directory, the same one the hub uses, giving a node a
@@ -208,23 +207,6 @@ else
 	exit 1
 fi
 
-# Alpine ships BusyBox adduser rather than useradd: -S system, -D no password,
-# -H no home.
-add_user() {
-	if command -v useradd >/dev/null; then
-		useradd --system --no-create-home --shell /usr/sbin/nologin monitor-agent
-	else
-		adduser -S -D -H -s /sbin/nologin monitor-agent
-	fi
-}
-
-# The service user the agent runs as under either init system, created before
-# the download and the registration, so a host where this fails keeps the agent
-# it already runs and spends no registration key. One case passes this check
-# without a user and is settled after the old agent stops; see there.
-id -u monitor-agent >/dev/null 2>&1 || add_user ||
-	{ echo "cannot create the system user monitor-agent" >&2; exit 1; }
-
 case "$(uname -m)" in
 x86_64 | amd64) ARCH=x86_64 ;;
 aarch64 | arm64) ARCH=aarch64 ;;
@@ -324,16 +306,6 @@ if [ "$INIT" = openrc ]; then
 	rc-service monitor-agent stop 2>/dev/null || true
 else
 	systemctl stop monitor-agent 2>/dev/null || true
-	# An agent installed before the fixed user ran under DynamicUser=, and while
-	# it runs nss-systemd resolves its transient user of the same name: the check
-	# above passes, and useradd refuses the name as taken. Stopping the unit
-	# releases that user, so the fixed one is created here. Should that fail, the
-	# old binary and unit are still in place and are started again.
-	id -u monitor-agent >/dev/null 2>&1 || add_user || {
-		systemctl start monitor-agent 2>/dev/null || true
-		echo "cannot create the system user monitor-agent" >&2
-		exit 1
-	}
 fi
 install -d -m 0755 "$ROOT"
 # Kept until the new binary has proved it starts; see not_started. Never over
@@ -380,7 +352,7 @@ description="monitor agent"
 command="$BIN"
 command_args="--interval $INTERVAL${INSECURE:+ --insecure}"
 supervisor="supervise-daemon"
-command_user="monitor-agent"
+command_user="root"
 respawn_delay=5
 output_log="$LOG_FILE"
 error_log="$LOG_FILE"
@@ -389,12 +361,10 @@ depend() {
 	need net
 }
 
-# The token stays in the root-only env file rather than the service script;
-# this runs as root, and the agent inherits what it exports. supervise-daemon
-# opens the log only after dropping to command_user, so the file must be the
-# agent's, including one an earlier install left to root.
+# The token stays in the root-only env file rather than the service script.
+# supervise-daemon opens the log as command_user, which is root.
 start_pre() {
-	checkpath --file --owner monitor-agent --mode 0600 $LOG_FILE
+	checkpath --file --owner root --mode 0600 $LOG_FILE
 	set -a
 	. $ENV_FILE
 	set +a
@@ -426,12 +396,8 @@ EnvironmentFile=$ENV_FILE
 ExecStart=$BIN --interval $INTERVAL${INSECURE:+ --insecure}
 Restart=always
 RestartSec=5
-# A fixed user rather than DynamicUser=: when the mount namespace cannot be
-# created, as in an LXC container without nesting, systemd skips ProtectSystem=
-# and the other mount sandboxing for a unit with a static User=, but refuses to
-# start one with DynamicUser= and exits 226/NAMESPACE. DynamicUser= also implied
-# RestrictSUIDSGID=, which is therefore stated below.
-User=monitor-agent
+# Run as root; filesystem and device access remain bounded by the sandbox below.
+User=root
 NoNewPrivileges=yes
 RestrictSUIDSGID=yes
 ProtectSystem=strict
