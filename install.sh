@@ -279,9 +279,11 @@ tar -xOzf "$SING_BOX_ARCHIVE" "$SING_BOX_MEMBER" >"$SING_BOX_BINARY" ||
 tar -xOzf "$SING_BOX_ARCHIVE" "$SING_BOX_LIBRARY_MEMBER" >"$SING_BOX_LIBRARY" ||
 	{ echo "could not extract libcronet.so from the release archive" >&2; exit 1; }
 [ "$(head -c 4 "$SING_BOX_BINARY")" = "$(printf '\177ELF')" ] &&
-	[ "$(head -c 4 "$SING_BOX_LIBRARY")" = "$(printf '\177ELF')" ] &&
-	LD_LIBRARY_PATH="$SING_BOX_TMPDIR" "$SING_BOX_BINARY" version >/dev/null 2>&1 ||
+	[ "$(head -c 4 "$SING_BOX_LIBRARY")" = "$(printf '\177ELF')" ] ||
 	{ echo "the sing-box release does not contain a runnable Linux executable" >&2; exit 1; }
+SING_BOX_VERSION=$(LD_LIBRARY_PATH="$SING_BOX_TMPDIR" "$SING_BOX_BINARY" version 2>/dev/null) ||
+	{ echo "the sing-box release does not contain a runnable Linux executable" >&2; exit 1; }
+SING_BOX_VERSION=$(printf '%s\n' "$SING_BOX_VERSION" | head -n 1 | cut -c1-200)
 
 # Downloaded before the registration below, because that step spends a node: the
 # key returns a token and the panel gains a row, while the env file recording it
@@ -424,7 +426,7 @@ RC
 	sleep 3
 	pidof monitor-agent >/dev/null || not_started "$LOG_FILE"
 	rm -f "$BIN.old"
-	echo "sing-box installed at: $SING_BOX_BIN"
+	echo "sing-box $SING_BOX_VERSION ($SING_BOX_ARCH) installed at: $SING_BOX_BIN"
 	echo "monitor-agent installed; follow it with: tail -f $LOG_FILE"
 	exit 0
 fi
@@ -471,5 +473,5 @@ systemctl restart monitor-agent
 sleep 3
 systemctl is-active --quiet monitor-agent || not_started "journalctl -u monitor-agent -n 20"
 rm -f "$BIN.old"
-echo "sing-box installed at: $SING_BOX_BIN"
+echo "sing-box $SING_BOX_VERSION ($SING_BOX_ARCH) installed at: $SING_BOX_BIN"
 echo "monitor-agent installed; follow it with: journalctl -u monitor-agent -f"
