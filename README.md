@@ -2,6 +2,16 @@
 
 文档：[monitor-document.pages.dev](https://monitor-document.pages.dev)，安装、配置、反向代理与主题开发都在这里。
 
+## 安装
+
+在支持的 Linux 服务器上运行以下命令，安装器会从 GitHub 下载最新发布版并配置 systemd 服务：
+
+```sh
+curl -fsSL https://github.com/monitor-probe/monitor/releases/latest/download/install-hub.sh | sudo sh
+```
+
+默认监听端口为 `28080`。交互式终端中可按提示设置端口和站点地址；非交互执行会使用默认配置。更多配置方式见[安装文档](https://monitor-document.pages.dev)。
+
 ## 特性
 
 - 实时监控：秒级实时数据展示
