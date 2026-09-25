@@ -20,7 +20,8 @@ use crate::{App, Shared};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const RESULT_RETENTION: Duration = Duration::from_secs(10 * 60);
-const STATUS_METHOD: &str = "agent.status";
+const AGENT_STATUS_METHOD: &str = "agent.status";
+const SINGBOX_STATUS_METHOD: &str = "singbox.status";
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -181,11 +182,16 @@ pub async fn submit(
     let Ok(Json(request)) = body else {
         return api::answer(StatusCode::BAD_REQUEST, "命令请求格式不正确");
     };
-    if request.method != STATUS_METHOD {
+    if request.method != AGENT_STATUS_METHOD && request.method != SINGBOX_STATUS_METHOD {
         return api::answer(StatusCode::BAD_REQUEST, "未注册的命令方法");
     }
     if request.params != json!({}) {
-        return api::answer(StatusCode::BAD_REQUEST, "agent.status 不接收参数");
+        let message = match request.method.as_str() {
+            AGENT_STATUS_METHOD => "agent.status 不接收参数",
+            SINGBOX_STATUS_METHOD => "singbox.status 不接收参数",
+            _ => unreachable!(),
+        };
+        return api::answer(StatusCode::BAD_REQUEST, message);
     }
     match app.db.node(node_id) {
         Ok(Some(_)) => {}
@@ -198,8 +204,8 @@ pub async fn submit(
         let Some(agent) = agents.get(&node_id) else {
             return api::answer(StatusCode::CONFLICT, "节点当前离线");
         };
-        if !agent.capabilities.contains(STATUS_METHOD) {
-            return api::answer(StatusCode::CONFLICT, "当前 agent 不支持 agent.status");
+        if !agent.capabilities.contains(&request.method) {
+            return api::answer(StatusCode::CONFLICT, "当前 agent 不支持该命令方法");
         }
         (agent.session, agent.tx.clone())
     };
@@ -281,7 +287,7 @@ mod tests {
     #[test]
     fn command_results_are_bound_to_the_node_and_connection_that_requested_them() {
         let registry = Registry::default();
-        registry.insert("id".into(), 7, 11, STATUS_METHOD.into());
+        registry.insert("id".into(), 7, 11, AGENT_STATUS_METHOD.into());
         assert!(!registry.complete("id", 8, 11, Ok(json!({"ok": true}))));
         assert!(!registry.complete("id", 7, 12, Ok(json!({"ok": true}))));
         assert!(registry.complete("id", 7, 11, Ok(json!({"agent_version": "1.0"}))));
@@ -295,7 +301,7 @@ mod tests {
     #[test]
     fn a_disconnected_command_has_an_unknown_outcome() {
         let registry = Registry::default();
-        registry.insert("id".into(), 7, 11, STATUS_METHOD.into());
+        registry.insert("id".into(), 7, 11, AGENT_STATUS_METHOD.into());
         registry.disconnect(7, 11);
         let result = registry.get("id", 7).unwrap();
         assert_eq!(result.status, Status::OutcomeUnknown);
@@ -305,7 +311,7 @@ mod tests {
     #[test]
     fn an_agent_error_is_returned_as_a_failed_command() {
         let registry = Registry::default();
-        registry.insert("id".into(), 7, 11, STATUS_METHOD.into());
+        registry.insert("id".into(), 7, 11, AGENT_STATUS_METHOD.into());
         assert!(registry.complete("id", 7, 11, Err(json!({"code": -32603, "message": "failed"}))));
         let result = registry.get("id", 7).unwrap();
         assert_eq!(result.status, Status::Failed);
@@ -314,10 +320,11 @@ mod tests {
 
     #[test]
     fn requests_use_json_rpc_ids_methods_and_params() {
-        let parsed: Value = serde_json::from_str(&request_message("id", STATUS_METHOD, json!({}))).unwrap();
+        let parsed: Value =
+            serde_json::from_str(&request_message("id", AGENT_STATUS_METHOD, json!({}))).unwrap();
         assert_eq!(parsed["jsonrpc"], "2.0");
         assert_eq!(parsed["id"], "id");
-        assert_eq!(parsed["method"], STATUS_METHOD);
+        assert_eq!(parsed["method"], AGENT_STATUS_METHOD);
         assert_eq!(parsed["params"], json!({}));
     }
 
@@ -326,14 +333,14 @@ mod tests {
         let (app, node_id) = app_node();
         let (tx, mut rx) = mpsc::channel(16);
         let mut agent = Agent::new(11, tx);
-        agent.capabilities.insert(STATUS_METHOD.into());
+        agent.capabilities.insert(AGENT_STATUS_METHOD.into());
         app.agents.write().unwrap().insert(node_id, agent);
 
         let response = submit(
             Admin,
             State(app.clone()),
             Path(node_id),
-            Ok(Json(Request { method: STATUS_METHOD.into(), params: json!({}) })),
+            Ok(Json(Request { method: AGENT_STATUS_METHOD.into(), params: json!({}) })),
         )
         .await;
         assert_eq!(response.status(), StatusCode::ACCEPTED);
@@ -343,7 +350,7 @@ mod tests {
 
         let sent: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
         assert_eq!(sent["id"], id);
-        assert_eq!(sent["method"], STATUS_METHOD);
+        assert_eq!(sent["method"], AGENT_STATUS_METHOD);
         assert_eq!(app.commands.get(id, node_id).unwrap().status, Status::Pending);
 
         assert!(app.commands.complete(id, node_id, 11, Ok(json!({"agent_version": "1.2.3"}))));
@@ -355,10 +362,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn administrator_can_submit_and_poll_singbox_status() {
+        let (app, node_id) = app_node();
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut agent = Agent::new(15, tx);
+        agent.capabilities.insert(SINGBOX_STATUS_METHOD.into());
+        app.agents.write().unwrap().insert(node_id, agent);
+
+        let response = submit(
+            Admin,
+            State(app.clone()),
+            Path(node_id),
+            Ok(Json(Request { method: SINGBOX_STATUS_METHOD.into(), params: json!({}) })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let created = response_json(response).await;
+        let id = created["command_id"].as_str().unwrap();
+        let sent: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        assert_eq!(sent["id"], id);
+        assert_eq!(sent["method"], SINGBOX_STATUS_METHOD);
+        assert_eq!(sent["params"], json!({}));
+
+        let result = json!({
+            "installed": true,
+            "version": "1.12.0",
+            "service_exists": true,
+            "running": true,
+            "config_exists": true,
+            "config_path": "/etc/sing-box/config.json"
+        });
+        assert!(app.commands.complete(id, node_id, 15, Ok(result.clone())));
+        let response = status(Admin, State(app.clone()), Path((node_id, id.to_owned()))).await;
+        let completed = response_json(response).await;
+        assert_eq!(completed["status"], "succeeded");
+        assert_eq!(completed["result"], result);
+    }
+
+    #[tokio::test]
     async fn offline_unsupported_and_unregistered_commands_are_rejected() {
         let (app, node_id) = app_node();
-        let request =
-            || Ok::<_, JsonRejection>(Json(Request { method: STATUS_METHOD.into(), params: json!({}) }));
+        let request = || {
+            Ok::<_, JsonRejection>(Json(Request { method: AGENT_STATUS_METHOD.into(), params: json!({}) }))
+        };
         let offline = submit(Admin, State(app.clone()), Path(node_id), request()).await;
         assert_eq!(offline.status(), StatusCode::CONFLICT);
 
@@ -366,6 +412,24 @@ mod tests {
         app.agents.write().unwrap().insert(node_id, Agent::new(12, tx));
         let unsupported = submit(Admin, State(app.clone()), Path(node_id), request()).await;
         assert_eq!(unsupported.status(), StatusCode::CONFLICT);
+
+        let invalid_singbox_params = submit(
+            Admin,
+            State(app.clone()),
+            Path(node_id),
+            Ok(Json(Request { method: SINGBOX_STATUS_METHOD.into(), params: json!({"unexpected": true}) })),
+        )
+        .await;
+        assert_eq!(invalid_singbox_params.status(), StatusCode::BAD_REQUEST);
+
+        let unsupported_singbox = submit(
+            Admin,
+            State(app.clone()),
+            Path(node_id),
+            Ok(Json(Request { method: SINGBOX_STATUS_METHOD.into(), params: json!({}) })),
+        )
+        .await;
+        assert_eq!(unsupported_singbox.status(), StatusCode::CONFLICT);
 
         let unknown = submit(
             Admin,
@@ -383,13 +447,13 @@ mod tests {
         let (tx, _rx) = mpsc::channel(1);
         tx.try_send("occupied".to_owned()).unwrap();
         let mut agent = Agent::new(14, tx);
-        agent.capabilities.insert(STATUS_METHOD.into());
+        agent.capabilities.insert(AGENT_STATUS_METHOD.into());
         app.agents.write().unwrap().insert(node_id, agent);
         let response = submit(
             Admin,
             State(app.clone()),
             Path(node_id),
-            Ok(Json(Request { method: STATUS_METHOD.into(), params: json!({}) })),
+            Ok(Json(Request { method: AGENT_STATUS_METHOD.into(), params: json!({}) })),
         )
         .await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -401,13 +465,13 @@ mod tests {
         let (app, node_id) = app_node();
         let (tx, mut rx) = mpsc::channel(16);
         let mut agent = Agent::new(13, tx);
-        agent.capabilities.insert(STATUS_METHOD.into());
+        agent.capabilities.insert(AGENT_STATUS_METHOD.into());
         app.agents.write().unwrap().insert(node_id, agent);
         let response = submit(
             Admin,
             State(app.clone()),
             Path(node_id),
-            Ok(Json(Request { method: STATUS_METHOD.into(), params: json!({}) })),
+            Ok(Json(Request { method: AGENT_STATUS_METHOD.into(), params: json!({}) })),
         )
         .await;
         let created = response_json(response).await;
