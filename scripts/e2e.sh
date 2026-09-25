@@ -105,13 +105,45 @@ case "$COMMAND_CODE" in
 	echo "e2e: agent.status round trip: ok"
 ;;
 409)
-	grep -q '不支持 agent.status' "$DIR/command.json" || fail "the command API refused an online node: $(cat "$DIR/command.json")"
+	grep -q '不支持' "$DIR/command.json" || fail "the command API refused an online node: $(cat "$DIR/command.json")"
 ;;
 404)
 	: # 老 hub 尚无管理员 Command API。
 ;;
 *) fail "agent.status submission returned HTTP $COMMAND_CODE: $(cat "$DIR/command.json")" ;;
 esac
+
+# 只有支持 Command 的新 hub 才继续验证 singbox.status；旧端按实际能力跳过。
+if [ "$COMMAND_CODE" = 202 ]; then
+	SINGBOX_CODE=$(curl -sS -o "$DIR/singbox-command.json" -w '%{http_code}' -H "Cookie: $COOKIE" \
+		-H 'content-type: application/json' -d '{"method":"singbox.status","params":{}}' \
+		"$URL/api/nodes/$NODE_ID/commands")
+	case "$SINGBOX_CODE" in
+	202)
+		COMMAND_ID=$(jq -r '.command_id // empty' "$DIR/singbox-command.json")
+		[ -n "$COMMAND_ID" ] || fail "singbox.status returned no command id"
+		wait_for "singbox.status to finish" command_succeeded
+		COMMAND_RESULT=$(curl -fsS -H "Cookie: $COOKIE" "$URL/api/nodes/$NODE_ID/commands/$COMMAND_ID")
+		echo "$COMMAND_RESULT" | jq -e '
+			.status == "succeeded"
+			and (.result.installed | type == "boolean")
+			and ((.result.version | type) == "string" or (.result.version | type) == "null")
+			and (.result.service_exists | type == "boolean")
+			and (.result.running | type == "boolean")
+			and (.result.config_exists | type == "boolean")
+			and .result.config_path == "/etc/sing-box/config.json"
+		' >/dev/null || fail "singbox.status returned an invalid result: $COMMAND_RESULT"
+		echo "e2e: singbox.status round trip: ok"
+	;;
+	409)
+		grep -q '不支持' "$DIR/singbox-command.json" || fail "the singbox.status command was refused: $(cat "$DIR/singbox-command.json")"
+	;;
+	400)
+		grep -q '未注册的命令方法' "$DIR/singbox-command.json" || fail "the singbox.status command was rejected: $(cat "$DIR/singbox-command.json")"
+	;;
+	*) fail "singbox.status submission returned HTTP $SINGBOX_CODE: $(cat "$DIR/singbox-command.json")" ;;
+	esac
+fi
 
 # The public check below would pass on a node that has no private fields at
 # all, so the panel's view must carry them first.

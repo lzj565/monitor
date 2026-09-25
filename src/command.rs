@@ -19,9 +19,29 @@ use crate::auth::random_token;
 use crate::{App, Shared};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+const CONTROL_COMMAND_TIMEOUT: Duration = Duration::from_secs(35);
 const RESULT_RETENTION: Duration = Duration::from_secs(10 * 60);
 const AGENT_STATUS_METHOD: &str = "agent.status";
 const SINGBOX_STATUS_METHOD: &str = "singbox.status";
+const SINGBOX_CONTROL_METHODS: [&str; 4] =
+    ["singbox.start", "singbox.stop", "singbox.restart", "singbox.reload"];
+const REMOTE_TIMEOUT_CODE: i64 = -32001;
+
+fn is_control_method(method: &str) -> bool {
+    SINGBOX_CONTROL_METHODS.contains(&method)
+}
+
+fn is_supported_method(method: &str) -> bool {
+    method == AGENT_STATUS_METHOD || method == SINGBOX_STATUS_METHOD || is_control_method(method)
+}
+
+fn command_timeout(method: &str) -> Duration {
+    if is_control_method(method) {
+        CONTROL_COMMAND_TIMEOUT
+    } else {
+        COMMAND_TIMEOUT
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -100,6 +120,13 @@ impl Registry {
             Ok(result) => {
                 record.status = Status::Succeeded;
                 record.result = Some(result);
+            }
+            Err(error) if error.get("code").and_then(Value::as_i64) == Some(REMOTE_TIMEOUT_CODE) => {
+                record.status = Status::OutcomeUnknown;
+                record.error = Some(json!({
+                    "reason": "timeout",
+                    "message": "Agent 本地执行超时，服务操作可能已生效"
+                }));
             }
             Err(error) => {
                 record.status = Status::Failed;
@@ -182,16 +209,11 @@ pub async fn submit(
     let Ok(Json(request)) = body else {
         return api::answer(StatusCode::BAD_REQUEST, "命令请求格式不正确");
     };
-    if request.method != AGENT_STATUS_METHOD && request.method != SINGBOX_STATUS_METHOD {
+    if !is_supported_method(&request.method) {
         return api::answer(StatusCode::BAD_REQUEST, "未注册的命令方法");
     }
     if request.params != json!({}) {
-        let message = match request.method.as_str() {
-            AGENT_STATUS_METHOD => "agent.status 不接收参数",
-            SINGBOX_STATUS_METHOD => "singbox.status 不接收参数",
-            _ => unreachable!(),
-        };
-        return api::answer(StatusCode::BAD_REQUEST, message);
+        return api::answer(StatusCode::BAD_REQUEST, format!("{} 不接收参数", request.method));
     }
     match app.db.node(node_id) {
         Ok(Some(_)) => {}
@@ -211,6 +233,7 @@ pub async fn submit(
     };
 
     let id = random_token()[..24].to_owned();
+    let timeout = command_timeout(&request.method);
     let method = request.method;
     let message = request_message(&id, &method, request.params);
     app.commands.insert(id.clone(), node_id, session, method.to_owned());
@@ -219,7 +242,7 @@ pub async fn submit(
             let app_for_timeout = app.clone();
             let timeout_id = id.clone();
             tokio::spawn(async move {
-                tokio::time::sleep(COMMAND_TIMEOUT).await;
+                tokio::time::sleep(timeout).await;
                 app_for_timeout.commands.outcome_unknown(&timeout_id, session, "timeout");
             });
             (StatusCode::ACCEPTED, Json(json!({"command_id": id, "status": Status::Pending}))).into_response()
@@ -319,6 +342,22 @@ mod tests {
     }
 
     #[test]
+    fn an_agent_control_timeout_has_an_unknown_outcome() {
+        let registry = Registry::default();
+        registry.insert("id".into(), 7, 11, "singbox.restart".into());
+        assert!(registry.complete(
+            "id",
+            7,
+            11,
+            Err(json!({"code": REMOTE_TIMEOUT_CODE, "message": "结果可能已生效"}))
+        ));
+        let result = registry.get("id", 7).unwrap();
+        assert_eq!(result.status, Status::OutcomeUnknown);
+        assert_eq!(result.error.unwrap()["reason"], "timeout");
+        assert!(!registry.complete("id", 7, 11, Ok(json!({"late": true}))));
+    }
+
+    #[test]
     fn requests_use_json_rpc_ids_methods_and_params() {
         let parsed: Value =
             serde_json::from_str(&request_message("id", AGENT_STATUS_METHOD, json!({}))).unwrap();
@@ -400,6 +439,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn administrator_can_submit_each_fixed_singbox_control_method() {
+        let (app, node_id) = app_node();
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut agent = Agent::new(16, tx);
+        for method in SINGBOX_CONTROL_METHODS {
+            agent.capabilities.insert(method.into());
+        }
+        app.agents.write().unwrap().insert(node_id, agent);
+
+        for method in SINGBOX_CONTROL_METHODS {
+            let response = submit(
+                Admin,
+                State(app.clone()),
+                Path(node_id),
+                Ok(Json(Request { method: method.into(), params: json!({}) })),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+            let created = response_json(response).await;
+            let sent: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+            assert_eq!(sent["id"], created["command_id"]);
+            assert_eq!(sent["method"], method);
+            assert_eq!(sent["params"], json!({}));
+        }
+    }
+
+    #[tokio::test]
     async fn offline_unsupported_and_unregistered_commands_are_rejected() {
         let (app, node_id) = app_node();
         let request = || {
@@ -430,6 +496,24 @@ mod tests {
         )
         .await;
         assert_eq!(unsupported_singbox.status(), StatusCode::CONFLICT);
+
+        let invalid_control_params = submit(
+            Admin,
+            State(app.clone()),
+            Path(node_id),
+            Ok(Json(Request { method: "singbox.restart".into(), params: json!({"force": true}) })),
+        )
+        .await;
+        assert_eq!(invalid_control_params.status(), StatusCode::BAD_REQUEST);
+
+        let unsupported_control = submit(
+            Admin,
+            State(app.clone()),
+            Path(node_id),
+            Ok(Json(Request { method: "singbox.restart".into(), params: json!({}) })),
+        )
+        .await;
+        assert_eq!(unsupported_control.status(), StatusCode::CONFLICT);
 
         let unknown = submit(
             Admin,
@@ -486,5 +570,31 @@ mod tests {
         records.get_mut(&id).unwrap().expires_at = Some(Instant::now() - Duration::from_secs(1));
         drop(records);
         assert!(app.commands.get(&id, node_id).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn control_commands_wait_longer_than_status_queries() {
+        let (app, node_id) = app_node();
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut agent = Agent::new(17, tx);
+        agent.capabilities.insert("singbox.restart".into());
+        app.agents.write().unwrap().insert(node_id, agent);
+        let response = submit(
+            Admin,
+            State(app.clone()),
+            Path(node_id),
+            Ok(Json(Request { method: "singbox.restart".into(), params: json!({}) })),
+        )
+        .await;
+        let created = response_json(response).await;
+        let id = created["command_id"].as_str().unwrap();
+        let _ = rx.recv().await.unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(COMMAND_TIMEOUT).await;
+        tokio::task::yield_now().await;
+        assert_eq!(app.commands.get(id, node_id).unwrap().status, Status::Pending);
+        tokio::time::advance(CONTROL_COMMAND_TIMEOUT - COMMAND_TIMEOUT).await;
+        tokio::task::yield_now().await;
+        assert_eq!(app.commands.get(id, node_id).unwrap().status, Status::OutcomeUnknown);
     }
 }

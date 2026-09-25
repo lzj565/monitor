@@ -449,9 +449,8 @@ ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
-# AF_NETLINK is how getifaddrs(3) obtains this host's own addresses from the
-# kernel; without it the agent reports none.
-RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK
+# AF_UNIX 供 systemctl 连接本机 systemd，AF_NETLINK 供 Agent 读取网卡地址。
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 MemoryMax=64M
 
 [Install]
