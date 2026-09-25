@@ -15,6 +15,12 @@ ROOT="/opt/monitor"
 BIN="$ROOT/monitor-agent"
 SING_BOX_BIN="$ROOT/sing-box"
 SING_BOX_LIB="$ROOT/libcronet.so"
+SING_BOX_CONFIG_DIR="/etc/sing-box"
+SING_BOX_CONFIG="$SING_BOX_CONFIG_DIR/config.json"
+SING_BOX_SYSTEMD_UNIT="/etc/systemd/system/sing-box.service"
+SING_BOX_OPENRC_FILE="/etc/init.d/sing-box"
+SING_BOX_LOG="/var/log/sing-box.log"
+SING_BOX_USER="sing-box"
 ENV_FILE="$ROOT/agent.env"
 UNIT_FILE="/etc/systemd/system/monitor-agent.service"
 RC_FILE="/etc/init.d/monitor-agent"
@@ -53,6 +59,16 @@ done
 
 [ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 1; }
 
+is_managed_sing_box_systemd_unit() {
+	[ -f "$SING_BOX_SYSTEMD_UNIT" ] && [ ! -L "$SING_BOX_SYSTEMD_UNIT" ] &&
+		grep -Fqx '# 由 monitor-agent 安装器管理。' "$SING_BOX_SYSTEMD_UNIT"
+}
+
+is_managed_sing_box_openrc_file() {
+	[ -f "$SING_BOX_OPENRC_FILE" ] && [ ! -L "$SING_BOX_OPENRC_FILE" ] &&
+		grep -Fqx '# 由 monitor-agent 安装器管理。' "$SING_BOX_OPENRC_FILE"
+}
+
 # Removes exactly what an install writes and nothing else, for both init
 # systems: the one present now need not be the one the install found, and
 # systemctl fails outright where systemd is not PID 1 (WSL, containers) although
@@ -63,12 +79,23 @@ if [ -n "$UNINSTALL" ]; then
 	rc-service monitor-agent stop 2>/dev/null || true
 	rc-update del monitor-agent default >/dev/null 2>&1 || true
 	systemctl disable --now monitor-agent 2>/dev/null || true
+	if is_managed_sing_box_systemd_unit; then
+		systemctl disable --now sing-box.service >/dev/null 2>&1 || true
+		rm -f "$SING_BOX_SYSTEMD_UNIT"
+		systemctl daemon-reload >/dev/null 2>&1 || true
+	fi
+	if is_managed_sing_box_openrc_file; then
+		rc-service sing-box stop >/dev/null 2>&1 || true
+		rc-update del sing-box default >/dev/null 2>&1 || true
+		rm -f "$SING_BOX_OPENRC_FILE"
+		rm -f "$SING_BOX_LOG"
+	fi
 	rm -f "$UNIT_FILE" "$RC_FILE" "$LOG_FILE" "$BIN" "$BIN.old" \
 		"$SING_BOX_BIN" "$SING_BOX_BIN.new" "$SING_BOX_LIB" "$SING_BOX_LIB.new" "$ENV_FILE"
 	systemctl daemon-reload 2>/dev/null || true
 	userdel monitor-agent 2>/dev/null || deluser monitor-agent 2>/dev/null || true
 	rmdir "$ROOT" 2>/dev/null || true
-	echo "monitor-agent and sing-box uninstalled"
+	echo "monitor-agent and sing-box uninstalled; configuration preserved at $SING_BOX_CONFIG"
 	exit 0
 fi
 
@@ -201,9 +228,17 @@ http://*)
 	fi
 	;;
 esac
-if command -v systemctl >/dev/null; then
+if [ -d /run/systemd/system ] && command -v systemctl >/dev/null; then
 	INIT=systemd
-elif command -v rc-update >/dev/null; then
+elif [ -e /run/openrc/softlevel ] && command -v rc-update >/dev/null && command -v rc-service >/dev/null; then
+	INIT=openrc
+elif [ -f "$UNIT_FILE" ] && command -v systemctl >/dev/null; then
+	INIT=systemd
+elif [ -f "$RC_FILE" ] && command -v rc-update >/dev/null && command -v rc-service >/dev/null; then
+	INIT=openrc
+elif command -v systemctl >/dev/null; then
+	INIT=systemd
+elif command -v rc-update >/dev/null && command -v rc-service >/dev/null; then
 	INIT=openrc
 else
 	echo "this installer needs systemd or OpenRC" >&2
@@ -231,7 +266,8 @@ SING_BOX_TMPDIR="$(mktemp -d)"
 SING_BOX_ARCHIVE="$SING_BOX_TMPDIR/release.tar.gz"
 SING_BOX_BINARY="$SING_BOX_TMPDIR/sing-box"
 SING_BOX_LIBRARY="$SING_BOX_TMPDIR/libcronet.so"
-trap 'rm -f "$TMP"; rm -rf "$SING_BOX_TMPDIR"' EXIT
+SING_BOX_CONFIG_TMP=""
+trap 'rm -f "$TMP"; rm -rf "$SING_BOX_TMPDIR"; [ -z "$SING_BOX_CONFIG_TMP" ] || rm -f "$SING_BOX_CONFIG_TMP"' EXIT
 
 fetch_asset() {
 	FETCH_URL="$1"
@@ -265,6 +301,43 @@ fetch_asset() {
 		return 1
 	}
 }
+
+check_sing_box_service_conflict() {
+	if [ "$INIT" = systemd ]; then
+		if is_managed_sing_box_openrc_file; then
+			echo "an installer-managed OpenRC sing-box service already exists; refusing to create a second service" >&2
+			return 1
+		fi
+		if [ -e "$SING_BOX_SYSTEMD_UNIT" ] || [ -L "$SING_BOX_SYSTEMD_UNIT" ]; then
+			is_managed_sing_box_systemd_unit || {
+				echo "sing-box.service already exists and is not managed by this installer; leaving it unchanged" >&2
+				return 1
+			}
+		elif systemctl show --property=LoadState sing-box.service 2>/dev/null | grep -Fqx 'LoadState=loaded'; then
+			echo "sing-box.service is provided by another package; leaving it unchanged" >&2
+			return 1
+		fi
+	else
+		if is_managed_sing_box_systemd_unit; then
+			echo "an installer-managed systemd sing-box service already exists; refusing to create a second service" >&2
+			return 1
+		fi
+		for SYSTEMD_UNIT in /etc/systemd/system/sing-box.service /run/systemd/system/sing-box.service /usr/local/lib/systemd/system/sing-box.service /usr/lib/systemd/system/sing-box.service /lib/systemd/system/sing-box.service; do
+			if [ -e "$SYSTEMD_UNIT" ] || [ -L "$SYSTEMD_UNIT" ]; then
+				echo "systemd sing-box unit already exists at $SYSTEMD_UNIT; leaving it unchanged" >&2
+				return 1
+			fi
+		done
+		if [ -e "$SING_BOX_OPENRC_FILE" ] || [ -L "$SING_BOX_OPENRC_FILE" ]; then
+			is_managed_sing_box_openrc_file || {
+				echo "OpenRC sing-box service already exists and is not managed by this installer; leaving it unchanged" >&2
+				return 1
+			}
+		fi
+	fi
+}
+
+check_sing_box_service_conflict
 
 # 批量下载超过中转并发数时会返回 503，等待后重试。
 fetch_asset "$URL" "$TMP" "monitor-agent ($ARCH)"
@@ -320,11 +393,315 @@ fi
 SING_BOX_VERSION=$(printf '%s\n' "$SING_BOX_VERSION" | head -n 1 | cut -c1-200)
 echo "sing-box version check succeeded: $SING_BOX_VERSION"
 
-# Downloaded before the registration below, because that step spends a node: the
-# key returns a token and the panel gains a row, while the env file recording it
-# is only written once the binary is in place. A download that fails after
-# registering therefore leaves an unusable node behind, and the rerun -- the
-# documented way to recover -- registers a second one.
+ensure_sing_box_user() {
+	SING_BOX_NOLOGIN=/sbin/nologin
+	[ -x "$SING_BOX_NOLOGIN" ] || SING_BOX_NOLOGIN=/usr/sbin/nologin
+	[ -x "$SING_BOX_NOLOGIN" ] || SING_BOX_NOLOGIN=/bin/false
+	if id -u "$SING_BOX_USER" >/dev/null 2>&1; then
+		[ "$(id -u "$SING_BOX_USER")" != 0 ] || {
+			echo "the sing-box service account must not be root" >&2
+			return 1
+		}
+	else
+		if command -v useradd >/dev/null 2>&1; then
+			if useradd --help 2>&1 | grep -q BusyBox; then
+				useradd -S -H -h /nonexistent -s "$SING_BOX_NOLOGIN" "$SING_BOX_USER" || return 1
+			else
+				useradd --system --user-group --no-create-home --home-dir /nonexistent --shell "$SING_BOX_NOLOGIN" "$SING_BOX_USER" || return 1
+			fi
+		elif command -v adduser >/dev/null 2>&1 && adduser --help 2>&1 | grep -q BusyBox; then
+			adduser -S -D -H -h /nonexistent -s "$SING_BOX_NOLOGIN" "$SING_BOX_USER" || return 1
+		elif command -v adduser >/dev/null 2>&1; then
+			adduser --system --group --no-create-home --home /nonexistent --shell "$SING_BOX_NOLOGIN" "$SING_BOX_USER" || return 1
+		else
+			echo "cannot create the sing-box service account: useradd/adduser is unavailable" >&2
+			return 1
+		fi
+	fi
+	SING_BOX_GROUP=$(id -gn "$SING_BOX_USER") || return 1
+	[ "$(id -g "$SING_BOX_USER")" != 0 ] || {
+		echo "the sing-box service account must not use the root group" >&2
+		return 1
+	}
+}
+
+check_sing_box_config() {
+	CHECK_CONFIG="$1"
+	CHECK_OUTPUT="$SING_BOX_TMPDIR/config-check.output"
+	if LD_LIBRARY_PATH="$SING_BOX_TMPDIR" "$SING_BOX_BINARY" check -c "$CHECK_CONFIG" >"$CHECK_OUTPUT" 2>&1; then
+		return 0
+	fi
+	echo "sing-box config check failed for $CHECK_CONFIG" >&2
+	if [ "$SING_BOX_CONFIG_CREATED" = yes ]; then
+		[ ! -s "$CHECK_OUTPUT" ] || head -c 1200 "$CHECK_OUTPUT" >&2
+		printf '\n' >&2
+	else
+		echo "details are suppressed because the existing configuration may contain credentials; inspect it with: LD_LIBRARY_PATH=$ROOT $SING_BOX_BIN check -c $CHECK_CONFIG" >&2
+	fi
+	return 1
+}
+
+prepare_sing_box_config() {
+	ensure_sing_box_user || return 1
+	if [ -L "$SING_BOX_CONFIG_DIR" ]; then
+		echo "refusing symlinked sing-box config directory: $SING_BOX_CONFIG_DIR" >&2
+		return 1
+	fi
+	install -d -m 0750 -o root -g "$SING_BOX_GROUP" "$SING_BOX_CONFIG_DIR" || return 1
+	if [ -L "$SING_BOX_CONFIG" ] || { [ -e "$SING_BOX_CONFIG" ] && [ ! -f "$SING_BOX_CONFIG" ]; }; then
+		echo "sing-box config path must be a regular file, not a symlink: $SING_BOX_CONFIG" >&2
+		return 1
+	fi
+	SING_BOX_CONFIG_CREATED=no
+	if [ ! -e "$SING_BOX_CONFIG" ]; then
+		SING_BOX_CONFIG_TMP=$(mktemp "$SING_BOX_CONFIG_DIR/.config.json.XXXXXX") || return 1
+		cat >"$SING_BOX_CONFIG_TMP" <<'CONFIG' || return 1
+{
+  "log": {
+    "level": "warn",
+    "timestamp": true
+  },
+  "inbounds": [],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ]
+}
+CONFIG
+		chown root:"$SING_BOX_GROUP" "$SING_BOX_CONFIG_TMP" || return 1
+		chmod 0640 "$SING_BOX_CONFIG_TMP" || return 1
+		SING_BOX_CONFIG_CREATED=yes
+		check_sing_box_config "$SING_BOX_CONFIG_TMP" || return 1
+		if ln "$SING_BOX_CONFIG_TMP" "$SING_BOX_CONFIG" 2>/dev/null; then
+			rm -f "$SING_BOX_CONFIG_TMP"
+			SING_BOX_CONFIG_TMP=""
+		else
+			if [ -f "$SING_BOX_CONFIG" ] && [ ! -L "$SING_BOX_CONFIG" ]; then
+				rm -f "$SING_BOX_CONFIG_TMP"
+				SING_BOX_CONFIG_TMP=""
+				SING_BOX_CONFIG_CREATED=no
+			else
+				echo "could not atomically create $SING_BOX_CONFIG" >&2
+				return 1
+			fi
+		fi
+	fi
+	check_sing_box_config "$SING_BOX_CONFIG" || return 1
+	chown root:"$SING_BOX_GROUP" "$SING_BOX_CONFIG" || return 1
+	chmod 0640 "$SING_BOX_CONFIG" || return 1
+}
+
+capture_sing_box_state() {
+	SING_BOX_WAS_OWNED=no
+	SING_BOX_WAS_ACTIVE=no
+	SING_BOX_WAS_ENABLED=no
+	if [ "$INIT" = systemd ]; then
+		if is_managed_sing_box_systemd_unit; then
+			SING_BOX_WAS_OWNED=yes
+			systemctl is-active --quiet sing-box.service && SING_BOX_WAS_ACTIVE=yes
+			systemctl is-enabled --quiet sing-box.service && SING_BOX_WAS_ENABLED=yes
+		fi
+	else
+		if is_managed_sing_box_openrc_file; then
+			SING_BOX_WAS_OWNED=yes
+			rc-service sing-box status >/dev/null 2>&1 && SING_BOX_WAS_ACTIVE=yes
+			rc-update show default 2>/dev/null | grep -Eq '(^|[[:space:]])sing-box([[:space:]]|$)' && SING_BOX_WAS_ENABLED=yes
+		fi
+	fi
+}
+
+write_sing_box_service() {
+	if [ "$INIT" = systemd ]; then
+		SING_BOX_UNIT_TMP=$(mktemp /etc/systemd/system/.sing-box.service.XXXXXX) || return 1
+		cat >"$SING_BOX_UNIT_TMP" <<UNIT || { rm -f "$SING_BOX_UNIT_TMP"; return 1; }
+# 由 monitor-agent 安装器管理。
+[Unit]
+Description=sing-box proxy core
+Documentation=https://sing-box.sagernet.org
+After=network-online.target nss-lookup.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$SING_BOX_USER
+Group=$SING_BOX_GROUP
+Environment=LD_LIBRARY_PATH=$ROOT
+ExecStartPre=$SING_BOX_BIN check -c $SING_BOX_CONFIG
+ExecStart=$SING_BOX_BIN run -c $SING_BOX_CONFIG
+ExecReload=/bin/kill -HUP \$MAINPID
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=30s
+TimeoutStopSec=15s
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+		chmod 0644 "$SING_BOX_UNIT_TMP" || { rm -f "$SING_BOX_UNIT_TMP"; return 1; }
+		mv -f "$SING_BOX_UNIT_TMP" "$SING_BOX_SYSTEMD_UNIT" || { rm -f "$SING_BOX_UNIT_TMP"; return 1; }
+		systemctl daemon-reload || return 1
+	else
+		SING_BOX_RC_TMP=$(mktemp /etc/init.d/.sing-box.XXXXXX) || return 1
+		cat >"$SING_BOX_RC_TMP" <<RC || { rm -f "$SING_BOX_RC_TMP"; return 1; }
+#!/sbin/openrc-run
+# 由 monitor-agent 安装器管理。
+description="sing-box proxy core"
+command="$SING_BOX_BIN"
+command_args_foreground="run -c $SING_BOX_CONFIG"
+command_user="$SING_BOX_USER:$SING_BOX_GROUP"
+supervisor="supervise-daemon"
+respawn_delay=5
+output_log="$SING_BOX_LOG"
+error_log="$SING_BOX_LOG"
+export LD_LIBRARY_PATH="$ROOT"
+
+depend() {
+	need net
+}
+
+start_pre() {
+	checkpath --file --owner "$SING_BOX_USER:$SING_BOX_GROUP" --mode 0640 "$SING_BOX_LOG"
+	"$SING_BOX_BIN" check -c "$SING_BOX_CONFIG"
+}
+RC
+		chmod 0755 "$SING_BOX_RC_TMP" || { rm -f "$SING_BOX_RC_TMP"; return 1; }
+		mv -f "$SING_BOX_RC_TMP" "$SING_BOX_OPENRC_FILE" || { rm -f "$SING_BOX_RC_TMP"; return 1; }
+	fi
+}
+
+restore_sing_box_install() {
+	if [ "$INIT" = systemd ]; then
+		systemctl stop sing-box.service >/dev/null 2>&1 || true
+		if [ "$SING_BOX_WAS_OWNED" = yes ]; then
+			cp -p "$SING_BOX_TMPDIR/old-sing-box.service" "$SING_BOX_SYSTEMD_UNIT" || return 1
+		else
+			systemctl disable sing-box.service >/dev/null 2>&1 || true
+			rm -f "$SING_BOX_SYSTEMD_UNIT"
+		fi
+		systemctl daemon-reload >/dev/null 2>&1 || true
+	else
+		rc-service sing-box stop >/dev/null 2>&1 || true
+		if [ "$SING_BOX_WAS_OWNED" = yes ]; then
+			cp -p "$SING_BOX_TMPDIR/old-sing-box.init" "$SING_BOX_OPENRC_FILE" || return 1
+		else
+			rc-update del sing-box default >/dev/null 2>&1 || true
+			rm -f "$SING_BOX_OPENRC_FILE"
+		fi
+	fi
+	if [ "$SING_BOX_OLD_BINARY" = yes ]; then
+		cp -p "$SING_BOX_TMPDIR/old-sing-box" "$SING_BOX_BIN.rollback" && mv -f "$SING_BOX_BIN.rollback" "$SING_BOX_BIN" || return 1
+	else
+		rm -f "$SING_BOX_BIN"
+	fi
+	if [ "$SING_BOX_OLD_LIBRARY" = yes ]; then
+		cp -p "$SING_BOX_TMPDIR/old-libcronet.so" "$SING_BOX_LIB.rollback" && mv -f "$SING_BOX_LIB.rollback" "$SING_BOX_LIB" || return 1
+	else
+		rm -f "$SING_BOX_LIB"
+	fi
+	if [ "$SING_BOX_WAS_OWNED" = yes ]; then
+		if [ "$INIT" = systemd ]; then
+			if [ "$SING_BOX_WAS_ENABLED" = yes ]; then systemctl enable sing-box.service >/dev/null 2>&1 || true; else systemctl disable sing-box.service >/dev/null 2>&1 || true; fi
+			if [ "$SING_BOX_WAS_ACTIVE" = yes ]; then systemctl restart sing-box.service >/dev/null 2>&1 || true; fi
+		else
+			if [ "$SING_BOX_WAS_ENABLED" = yes ]; then rc-update add sing-box default >/dev/null 2>&1 || true; else rc-update del sing-box default >/dev/null 2>&1 || true; fi
+			if [ "$SING_BOX_WAS_ACTIVE" = yes ]; then rc-service sing-box start >/dev/null 2>&1 || true; fi
+		fi
+	fi
+}
+
+install_sing_box() {
+	prepare_sing_box_config || return 1
+	capture_sing_box_state
+	SING_BOX_OLD_BINARY=no
+	SING_BOX_OLD_LIBRARY=no
+	[ ! -f "$SING_BOX_BIN" ] || { cp -p "$SING_BOX_BIN" "$SING_BOX_TMPDIR/old-sing-box" && SING_BOX_OLD_BINARY=yes; } || return 1
+	[ ! -f "$SING_BOX_LIB" ] || { cp -p "$SING_BOX_LIB" "$SING_BOX_TMPDIR/old-libcronet.so" && SING_BOX_OLD_LIBRARY=yes; } || return 1
+	if [ "$SING_BOX_WAS_OWNED" = yes ]; then
+		if [ "$INIT" = systemd ]; then cp -p "$SING_BOX_SYSTEMD_UNIT" "$SING_BOX_TMPDIR/old-sing-box.service" || return 1
+		else cp -p "$SING_BOX_OPENRC_FILE" "$SING_BOX_TMPDIR/old-sing-box.init" || return 1; fi
+	fi
+	install -m 0755 "$SING_BOX_BINARY" "$SING_BOX_BIN.new" &&
+		install -m 0644 "$SING_BOX_LIBRARY" "$SING_BOX_LIB.new" &&
+		mv -f "$SING_BOX_LIB.new" "$SING_BOX_LIB" &&
+		mv -f "$SING_BOX_BIN.new" "$SING_BOX_BIN" || {
+			echo "could not install the sing-box binary and runtime library" >&2
+			restore_sing_box_install || echo "sing-box rollback also failed; inspect the service and binaries" >&2
+			return 1
+		}
+	write_sing_box_service || {
+		echo "could not install the sing-box service definition" >&2
+		restore_sing_box_install || echo "sing-box rollback also failed; inspect the service and binaries" >&2
+		return 1
+	}
+	if [ "$SING_BOX_WAS_OWNED" != yes ]; then
+		if [ "$INIT" = systemd ]; then
+			systemctl enable sing-box.service >/dev/null && systemctl start sing-box.service || {
+				echo "sing-box could not be enabled or started; see: journalctl -u sing-box.service -n 50 --no-pager" >&2
+				restore_sing_box_install || echo "sing-box rollback also failed; inspect the service and binaries" >&2
+				return 1
+			}
+		else
+			rc-update add sing-box default >/dev/null && rc-service sing-box start || {
+				echo "sing-box could not be enabled or started; see: $SING_BOX_LOG" >&2
+				restore_sing_box_install || echo "sing-box rollback also failed; inspect the service and binaries" >&2
+				return 1
+			}
+		fi
+	elif [ "$SING_BOX_WAS_ACTIVE" = yes ]; then
+		if [ "$INIT" = systemd ]; then
+			systemctl restart sing-box.service || {
+				echo "sing-box restart failed; see: journalctl -u sing-box.service -n 50 --no-pager" >&2
+				restore_sing_box_install || echo "sing-box rollback also failed; inspect the service and binaries" >&2
+				return 1
+			}
+		else
+			rc-service sing-box restart || {
+				echo "sing-box restart failed; see: $SING_BOX_LOG" >&2
+				restore_sing_box_install || echo "sing-box rollback also failed; inspect the service and binaries" >&2
+				return 1
+			}
+		fi
+	fi
+	SING_BOX_RUNNING=no
+	SING_BOX_ENABLED=no
+	if [ "$INIT" = systemd ]; then
+		systemctl is-active --quiet sing-box.service && SING_BOX_RUNNING=yes
+		systemctl is-enabled --quiet sing-box.service && SING_BOX_ENABLED=yes
+	else
+		rc-service sing-box status >/dev/null 2>&1 && SING_BOX_RUNNING=yes
+		rc-update show default 2>/dev/null | grep -Eq '(^|[[:space:]])sing-box([[:space:]]|$)' && SING_BOX_ENABLED=yes
+	fi
+	if { [ "$SING_BOX_WAS_OWNED" != yes ] || [ "$SING_BOX_WAS_ACTIVE" = yes ]; } && [ "$SING_BOX_RUNNING" != yes ]; then
+		echo "sing-box service did not become active" >&2
+		restore_sing_box_install || echo "sing-box rollback also failed; inspect the service and binaries" >&2
+		return 1
+	fi
+}
+
+report_sing_box_install() {
+	echo "sing-box $SING_BOX_VERSION ($SING_BOX_ARCH) installed at: $SING_BOX_BIN"
+	echo "sing-box config: $SING_BOX_CONFIG"
+	echo "sing-box service: $INIT (running=$SING_BOX_RUNNING, enabled_at_boot=$SING_BOX_ENABLED)"
+	echo "notice: the initial config has no inbounds, so sing-box is running without proxy listeners"
+	if [ "$INIT" = systemd ]; then
+		echo "sing-box logs: journalctl -u sing-box.service -f"
+	else
+		echo "sing-box logs: tail -f $SING_BOX_LOG"
+	fi
+}
+
+# 在注册前完成两个二进制的下载和校验，避免网络失败先占用节点；注册 token 会在
+# sing-box 服务安装前写入受限环境文件，服务启动失败后重试不会重复注册节点。
 #
 # --register exchanges a key for this node's own token, which is what allows one
 # command to provision a batch of machines. The key is valid only within the
@@ -373,6 +750,21 @@ if [ -z "$TOKEN" ]; then
 	fi
 fi
 
+# 保存在服务环境文件中的 init 类型供 Agent 选择对应的固定服务命令。
+install -d -m 0755 "$ROOT"
+(
+	umask 077
+	cat >"$ENV_FILE" <<ENV
+MONITOR_SERVER=$SERVER
+MONITOR_TOKEN=$TOKEN
+MONITOR_INIT=$INIT
+ENV
+	[ -z "$IFACE" ] || printf 'MONITOR_IFACE=%s\n' "$IFACE" >>"$ENV_FILE"
+)
+
+# sing-box 先完成校验和启动，再停掉现有 Agent，避免其升级因核心启动失败而中断。
+install_sing_box || exit 1
+
 # Stop an agent already running here before replacing its binary. The service
 # name is fixed, so a reinstall could never start a second copy, but without this
 # the new binary lands beneath a live process and only the restart at the end
@@ -384,30 +776,11 @@ if [ "$INIT" = openrc ]; then
 else
 	systemctl stop monitor-agent 2>/dev/null || true
 fi
-install -d -m 0755 "$ROOT"
 # Kept until the new binary has proved it starts; see not_started. Never over
 # an existing copy: a run that died before that check left an unproven binary
 # in $BIN, and the copy is the one that ran before it.
 [ ! -f "$BIN" ] || [ -f "$BIN.old" ] || cp "$BIN" "$BIN.old"
 install -m 0755 "$TMP" "$BIN"
-install -m 0755 "$SING_BOX_BINARY" "$SING_BOX_BIN.new"
-install -m 0644 "$SING_BOX_LIBRARY" "$SING_BOX_LIB.new"
-mv -f "$SING_BOX_LIB.new" "$SING_BOX_LIB"
-mv -f "$SING_BOX_BIN.new" "$SING_BOX_BIN"
-
-# The token lives in a root-only environment file rather than the unit, keeping
-# it out of `systemctl cat` and the world-readable journal. 0600 root is what
-# keeps it private, since $ROOT itself is readable and holds the binaries. Set in
-# a subshell, because the unit file written below is read by anyone debugging
-# with `systemctl cat` and need not be 0600.
-(
-	umask 077
-	cat >"$ENV_FILE" <<ENV
-MONITOR_SERVER=$SERVER
-MONITOR_TOKEN=$TOKEN
-ENV
-	[ -z "$IFACE" ] || printf 'MONITOR_IFACE=%s\n' "$IFACE" >>"$ENV_FILE"
-)
 
 # The new agent is not running. The binary it replaced is put back and started
 # again, so a failed upgrade leaves the machine reporting as before; the unit
@@ -461,7 +834,7 @@ RC
 	sleep 3
 	pidof monitor-agent >/dev/null || not_started "$LOG_FILE"
 	rm -f "$BIN.old"
-	echo "sing-box $SING_BOX_VERSION ($SING_BOX_ARCH) installed at: $SING_BOX_BIN"
+	report_sing_box_install
 	echo "monitor-agent installed; follow it with: tail -f $LOG_FILE"
 	exit 0
 fi
@@ -508,5 +881,5 @@ systemctl restart monitor-agent
 sleep 3
 systemctl is-active --quiet monitor-agent || not_started "journalctl -u monitor-agent -n 20"
 rm -f "$BIN.old"
-echo "sing-box $SING_BOX_VERSION ($SING_BOX_ARCH) installed at: $SING_BOX_BIN"
+report_sing_box_install
 echo "monitor-agent installed; follow it with: journalctl -u monitor-agent -f"
