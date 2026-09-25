@@ -20,11 +20,16 @@ use crate::{App, Shared};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const CONTROL_COMMAND_TIMEOUT: Duration = Duration::from_secs(35);
+const CONFIG_CHECK_TIMEOUT: Duration = Duration::from_secs(25);
+const CONFIG_APPLY_TIMEOUT: Duration = Duration::from_secs(110);
 const RESULT_RETENTION: Duration = Duration::from_secs(10 * 60);
 const CONFIG_RESULT_RETENTION: Duration = Duration::from_secs(60);
+const MAX_CONFIG_BYTES: usize = 32 * 1024;
 const AGENT_STATUS_METHOD: &str = "agent.status";
 const SINGBOX_STATUS_METHOD: &str = "singbox.status";
 const SINGBOX_CONFIG_GET_METHOD: &str = "singbox.config.get";
+const SINGBOX_CONFIG_CHECK_METHOD: &str = "singbox.config.check";
+const SINGBOX_CONFIG_APPLY_METHOD: &str = "singbox.config.apply";
 const SINGBOX_CONTROL_METHODS: [&str; 4] =
     ["singbox.start", "singbox.stop", "singbox.restart", "singbox.reload"];
 const REMOTE_TIMEOUT_CODE: i64 = -32001;
@@ -33,10 +38,16 @@ fn is_control_method(method: &str) -> bool {
     SINGBOX_CONTROL_METHODS.contains(&method)
 }
 
+fn is_config_method(method: &str) -> bool {
+    method == SINGBOX_CONFIG_GET_METHOD
+        || method == SINGBOX_CONFIG_CHECK_METHOD
+        || method == SINGBOX_CONFIG_APPLY_METHOD
+}
+
 fn is_supported_method(method: &str) -> bool {
     method == AGENT_STATUS_METHOD
         || method == SINGBOX_STATUS_METHOD
-        || method == SINGBOX_CONFIG_GET_METHOD
+        || is_config_method(method)
         || is_control_method(method)
 }
 
@@ -49,7 +60,11 @@ fn result_retention(method: &str) -> Duration {
 }
 
 fn command_timeout(method: &str) -> Duration {
-    if is_control_method(method) {
+    if method == SINGBOX_CONFIG_APPLY_METHOD {
+        CONFIG_APPLY_TIMEOUT
+    } else if method == SINGBOX_CONFIG_CHECK_METHOD {
+        CONFIG_CHECK_TIMEOUT
+    } else if is_control_method(method) {
         CONTROL_COMMAND_TIMEOUT
     } else {
         COMMAND_TIMEOUT
@@ -153,7 +168,11 @@ impl Registry {
                 record.status = Status::OutcomeUnknown;
                 record.error = Some(json!({
                     "reason": "timeout",
-                    "message": "Agent 本地执行超时，服务操作可能已生效"
+                    "message": if is_config_content_method(&record.method) {
+                        error.get("message").and_then(Value::as_str).unwrap_or("sing-box 配置应用结果未知")
+                    } else {
+                        "Agent 本地执行超时，服务操作可能已生效"
+                    }
                 }));
             }
             Err(error) => {
@@ -240,7 +259,20 @@ pub async fn submit(
     if !is_supported_method(&request.method) {
         return api::answer(StatusCode::BAD_REQUEST, "未注册的命令方法");
     }
-    if request.params != json!({}) {
+    if is_config_content_method(&request.method) {
+        let Some(values) = request.params.as_object() else {
+            return api::answer(StatusCode::BAD_REQUEST, "配置命令参数必须是对象");
+        };
+        if values.len() != 1 || !values.contains_key("content") {
+            return api::answer(StatusCode::BAD_REQUEST, "配置命令只接受 content 参数");
+        }
+        let Some(content) = values.get("content").and_then(Value::as_str) else {
+            return api::answer(StatusCode::BAD_REQUEST, "配置命令 content 必须是字符串");
+        };
+        if content.len() > MAX_CONFIG_BYTES {
+            return api::answer(StatusCode::PAYLOAD_TOO_LARGE, "sing-box 配置超过 32 KiB 限制");
+        }
+    } else if request.params != json!({}) {
         return api::answer(StatusCode::BAD_REQUEST, format!("{} 不接收参数", request.method));
     }
     match app.db.node(node_id) {
@@ -307,6 +339,10 @@ pub async fn status(
 fn no_store(mut response: Response) -> Response {
     response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
+}
+
+fn is_config_content_method(method: &str) -> bool {
+    method == SINGBOX_CONFIG_CHECK_METHOD || method == SINGBOX_CONFIG_APPLY_METHOD
 }
 
 /// 清理指定连接中仍未收到结果的命令，断连后的执行结果不能再被确认。
@@ -395,6 +431,22 @@ mod tests {
         assert_eq!(result.status, Status::OutcomeUnknown);
         assert_eq!(result.error.unwrap()["reason"], "timeout");
         assert!(!registry.complete("id", 7, 11, Ok(json!({"late": true}))));
+    }
+
+    #[test]
+    fn config_apply_unknown_outcome_keeps_the_rollback_backup_location() {
+        let registry = Registry::default();
+        registry.insert("apply-id".into(), 7, 11, SINGBOX_CONFIG_APPLY_METHOD.into());
+        let message = "旧配置恢复失败；备份保留于 /etc/sing-box/.config.json.backup-1-2";
+        assert!(registry.complete(
+            "apply-id",
+            7,
+            11,
+            Err(json!({"code": REMOTE_TIMEOUT_CODE, "message": message}))
+        ));
+        let result = registry.get("apply-id", 7).unwrap();
+        assert_eq!(result.status, Status::OutcomeUnknown);
+        assert_eq!(result.error.unwrap()["message"], message);
     }
 
     #[test]
@@ -514,6 +566,83 @@ mod tests {
         );
         let remaining = app.commands.lock()[id].expires_at.unwrap().duration_since(Instant::now());
         assert!(remaining <= CONFIG_RESULT_RETENTION && remaining >= Duration::from_secs(55));
+    }
+
+    #[tokio::test]
+    async fn config_check_and_apply_send_only_the_content_parameter() {
+        let (app, node_id) = app_node();
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut agent = Agent::new(19, tx);
+        agent.capabilities.insert(SINGBOX_CONFIG_CHECK_METHOD.into());
+        agent.capabilities.insert(SINGBOX_CONFIG_APPLY_METHOD.into());
+        app.agents.write().unwrap().insert(node_id, agent);
+
+        for (method, result) in [
+            (SINGBOX_CONFIG_CHECK_METHOD, json!({"valid": true, "size_bytes": 2})),
+            (
+                SINGBOX_CONFIG_APPLY_METHOD,
+                json!({"config_path": "/etc/sing-box/config.json", "size_bytes": 2, "running": true}),
+            ),
+        ] {
+            let response = submit(
+                Admin,
+                State(app.clone()),
+                Path(node_id),
+                Ok(Json(Request { method: method.into(), params: json!({"content": "{}"}) })),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            let created = response_json(response).await;
+            let id = created["command_id"].as_str().unwrap();
+            let sent: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+            assert_eq!(sent["id"], id);
+            assert_eq!(sent["method"], method);
+            assert_eq!(sent["params"], json!({"content": "{}"}));
+
+            assert!(app.commands.complete(id, node_id, 19, Ok(result.clone())));
+            let response = status(Admin, State(app.clone()), Path((node_id, id.to_owned()))).await;
+            let completed = response_json(response).await;
+            assert_eq!(completed["status"], "succeeded");
+            assert_eq!(completed["result"], result);
+            assert!(completed["result"].get("content").is_none());
+        }
+        assert_eq!(command_timeout(SINGBOX_CONFIG_CHECK_METHOD), CONFIG_CHECK_TIMEOUT);
+        assert_eq!(command_timeout(SINGBOX_CONFIG_APPLY_METHOD), CONFIG_APPLY_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn config_mutation_rejects_extra_params_and_oversized_content_before_queueing() {
+        let (app, node_id) = app_node();
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut agent = Agent::new(20, tx);
+        agent.capabilities.insert(SINGBOX_CONFIG_CHECK_METHOD.into());
+        app.agents.write().unwrap().insert(node_id, agent);
+
+        let extra = submit(
+            Admin,
+            State(app.clone()),
+            Path(node_id),
+            Ok(Json(Request {
+                method: SINGBOX_CONFIG_CHECK_METHOD.into(),
+                params: json!({"content": "{}", "extra": true}),
+            })),
+        )
+        .await;
+        assert_eq!(extra.status(), StatusCode::BAD_REQUEST);
+
+        let oversized = submit(
+            Admin,
+            State(app),
+            Path(node_id),
+            Ok(Json(Request {
+                method: SINGBOX_CONFIG_CHECK_METHOD.into(),
+                params: json!({"content": "x".repeat(MAX_CONFIG_BYTES + 1)}),
+            })),
+        )
+        .await;
+        assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

@@ -1241,6 +1241,209 @@ type ConfigCommand = {
   error?: { message?: string }
 }
 
+type ProxyConfigResult = {
+  content?: string
+  valid?: boolean
+  config_path?: string
+  size_bytes?: number
+  sha256?: string
+  running?: boolean
+}
+
+type ProxyCommand = {
+  status: "pending" | "succeeded" | "failed" | "outcome_unknown"
+  result?: ProxyConfigResult
+  error?: { message?: string }
+}
+
+function Proxy({ nodes }: { nodes: Node[] }) {
+  const onlineNodes = nodes.filter((node) => node.online)
+  const [nodeId, setNodeId] = useState("")
+  const [content, setContent] = useState("")
+  const [contentNodeId, setContentNodeId] = useState("")
+  const [busy, setBusy] = useState<"load" | "check" | "apply" | null>(null)
+  const [error, setError] = useState("")
+  const [checkedContent, setCheckedContent] = useState<string | null>(null)
+  const [checkedNodeId, setCheckedNodeId] = useState<string | null>(null)
+  const [checkedBytes, setCheckedBytes] = useState<number | null>(null)
+  const [applied, setApplied] = useState(false)
+  const [confirmApply, setConfirmApply] = useState(false)
+  const generation = useRef(0)
+  const contentRef = useRef("")
+  const selectedId = nodes.some((node) => node.id.toString() === nodeId)
+    ? nodeId
+    : onlineNodes[0]?.id.toString() ?? ""
+  const selected = nodes.find((node) => node.id.toString() === selectedId)
+  const visibleContent = contentNodeId === selectedId ? content : ""
+  const contentBytes = new TextEncoder().encode(visibleContent).length
+
+  useEffect(() => () => {
+    generation.current += 1
+    contentRef.current = ""
+  }, [])
+
+  async function runCommand(method: "singbox.config.get" | "singbox.config.check" | "singbox.config.apply") {
+    if (!selected?.online || busy) return
+    const requestGeneration = generation.current
+    const targetNode = selected
+    const sentContent = contentNodeId === targetNode.id.toString() ? content : ""
+    const bytes = new TextEncoder().encode(sentContent).length
+    const action = method.endsWith(".get") ? "load" : method.endsWith(".check") ? "check" : "apply"
+    setBusy(action)
+    setError("")
+    setApplied(false)
+    try {
+      const submitted = await api<{ command_id: string }>(`/nodes/${targetNode.id}/commands`, {
+        method: "POST",
+        body: JSON.stringify({
+          method,
+          params: method.endsWith(".get") ? {} : { content: sentContent },
+        }),
+        cache: "no-store",
+      })
+      const deadline = Date.now() + (method.endsWith(".apply") ? 115_000 : method.endsWith(".check") ? 35_000 : 12_000)
+      while (Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 500))
+        if (generation.current !== requestGeneration) return
+        const command = await api<ProxyCommand>(`/nodes/${targetNode.id}/commands/${submitted.command_id}`, { cache: "no-store" })
+        if (command.status === "pending") continue
+        if (command.status !== "succeeded" || !command.result) {
+          throw new Error(command.error?.message || (command.status === "outcome_unknown" ? "执行结果未知，请先检查节点状态和配置" : "sing-box 操作失败"))
+        }
+        if (method.endsWith(".get")) {
+          const loaded = command.result.content ?? ""
+          contentRef.current = loaded
+          setContentNodeId(targetNode.id.toString())
+          setContent(loaded)
+          setCheckedContent(null)
+          setCheckedNodeId(null)
+          setCheckedBytes(null)
+        } else if (method.endsWith(".check")) {
+          setCheckedContent(sentContent)
+          setCheckedNodeId(targetNode.id.toString())
+          setCheckedBytes(command.result.size_bytes ?? bytes)
+        } else {
+          setApplied(true)
+          setCheckedContent(sentContent)
+          setCheckedNodeId(targetNode.id.toString())
+        }
+        return
+      }
+      if (generation.current === requestGeneration) {
+        throw new Error(method.endsWith(".apply") ? "等待应用结果超时；操作可能仍在执行，请查看节点状态" : "等待 sing-box 命令结果超时")
+      }
+    } catch (cause) {
+      if (generation.current === requestGeneration) setError((cause as Error).message)
+    } finally {
+      if (generation.current === requestGeneration) {
+        setBusy(null)
+        if (method.endsWith(".apply")) setConfirmApply(false)
+      }
+    }
+  }
+
+  function editContent(value: string) {
+    contentRef.current = value
+    setContentNodeId(selectedId)
+    setContent(value)
+    setError("")
+    setCheckedContent(null)
+    setCheckedNodeId(null)
+    setCheckedBytes(null)
+    setApplied(false)
+  }
+
+  function selectNode(value: string) {
+    generation.current += 1
+    contentRef.current = ""
+    setNodeId(value)
+    setContent("")
+    setContentNodeId(value)
+    setError("")
+    setCheckedContent(null)
+    setCheckedNodeId(null)
+    setCheckedBytes(null)
+    setApplied(false)
+    setConfirmApply(false)
+    setBusy(null)
+  }
+
+  return (
+    <div className="space-y-4">
+      <Card className="gap-4 p-5">
+        <div className="space-y-1">
+          <h2 className="text-base font-semibold">sing-box 配置</h2>
+          <p className="text-sm leading-relaxed text-muted-foreground">
+            配置文件位于 /etc/sing-box/config.json，最大 32 KiB。配置可能包含密钥，只在当前页面和命令传输期间使用，不会保存到面板。先校验，再应用；应用会重启 sing-box，失败时自动恢复旧配置。
+          </p>
+        </div>
+        <Field label="节点">
+          <Select value={selectedId} onValueChange={selectNode} disabled={busy !== null}>
+            <SelectTrigger className="w-full sm:max-w-sm"><SelectValue placeholder="选择在线节点" /></SelectTrigger>
+            <SelectContent>
+              {nodes.map((node) => (
+                <SelectItem key={node.id} value={node.id.toString()}>
+                  {node.name}{node.online ? " · 在线" : " · 离线"}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </Field>
+        {!onlineNodes.length && <p className="text-sm text-muted-foreground">当前没有在线节点。</p>}
+        {selected && !selected.online && <p className="text-sm text-destructive">所选节点离线，无法读取或修改配置。</p>}
+        {selected && (
+          <>
+            <div className="flex flex-wrap items-center gap-2">
+              <Button variant="outline" disabled={!selected.online || busy !== null} onClick={() => void runCommand("singbox.config.get")}>
+                {busy === "load" ? "读取中…" : "读取当前配置"}
+              </Button>
+              <Button variant="outline" disabled={!selected.online || !visibleContent || contentBytes > 32 * 1024 || busy !== null} onClick={() => void runCommand("singbox.config.check")}>
+                {busy === "check" ? "校验中…" : "校验配置"}
+              </Button>
+              <Button
+                variant="destructive"
+                disabled={!selected.online || !visibleContent || contentBytes > 32 * 1024 || checkedContent !== visibleContent || checkedNodeId !== selectedId || busy !== null}
+                onClick={() => setConfirmApply(true)}
+              >
+                应用并重启
+              </Button>
+              <span className={`text-xs ${contentBytes > 32 * 1024 ? "text-destructive" : "text-muted-foreground"}`}>
+                {contentBytes.toLocaleString()} / 32,768 字节
+              </span>
+            </div>
+            <textarea
+              spellCheck={false}
+              aria-label="sing-box JSON 配置"
+              value={visibleContent}
+              disabled={busy !== null}
+              onChange={(event) => editContent(event.target.value)}
+              rows={24}
+              className={`${TEXTAREA} min-h-[24rem] resize-y leading-relaxed disabled:opacity-70`}
+            />
+            {checkedContent === visibleContent && checkedNodeId === selectedId && checkedBytes !== null && (
+              <p role="status" className="text-sm text-emerald-600">配置校验通过（{checkedBytes.toLocaleString()} 字节）。</p>
+            )}
+            {applied && <p role="status" className="text-sm text-emerald-600">配置已应用，sing-box 已通过重启后健康检查。</p>}
+          </>
+        )}
+        {error && <p role="alert" className="break-words text-sm text-destructive">{error}</p>}
+      </Card>
+      {confirmApply && selected && (
+        <ConfirmDialog
+          title={`应用「${selected.name}」的 sing-box 配置`}
+          description="此操作会原子替换配置并重启 sing-box。服务未通过健康检查时会恢复旧配置。"
+          confirmLabel={busy === "apply" ? "应用中…" : "应用并重启"}
+          busy={busy !== null}
+          onClose={() => setConfirmApply(false)}
+          onConfirm={() => void runCommand("singbox.config.apply")}
+        >
+          <p className="rounded-md bg-muted p-3 text-sm">节点：<strong>{selected.name}</strong></p>
+        </ConfirmDialog>
+      )}
+    </div>
+  )
+}
+
 function ConfigDialog({ node, onClose }: { node: Node; onClose: () => void }) {
   const [config, setConfig] = useState<ConfigResult | null>(null)
   const [error, setError] = useState("")
@@ -2978,6 +3181,7 @@ function Update({ versions, reload, nodes, site, refusal }: {
 // reload returns to the same section.
 const ADMIN_SECTIONS = [
   { path: "/admin/nodes", label: "节点", icon: Server },
+  { path: "/admin/proxy", label: "代理", icon: SlidersHorizontal },
   { path: "/admin/ping", label: "延迟", icon: Radio },
   { path: "/admin/notify", label: "通知", icon: Bell },
   { path: "/admin/data", label: "数据", icon: Database },
@@ -3033,7 +3237,9 @@ export function Admin({
       </nav>
 
       <div className="min-w-0 flex-1">
-        {path === "/admin/ping" ? (
+        {path === "/admin/proxy" ? (
+          <Proxy nodes={nodes} />
+        ) : path === "/admin/ping" ? (
           <Ping nodes={nodes} />
         ) : path === "/admin/notify" ? (
           <Notify nodes={nodes} refresh={refresh} />
