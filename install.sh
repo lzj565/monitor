@@ -276,6 +276,8 @@ tar -tzf "$SING_BOX_ARCHIVE" | grep -Fqx "$SING_BOX_LIBRARY_MEMBER" ||
 	{ echo "the sing-box archive is missing libcronet.so" >&2; exit 1; }
 tar -xOzf "$SING_BOX_ARCHIVE" "$SING_BOX_MEMBER" >"$SING_BOX_BINARY" ||
 	{ echo "could not extract sing-box from the release archive" >&2; exit 1; }
+chmod 0755 "$SING_BOX_BINARY" ||
+	{ echo "could not make the sing-box binary executable" >&2; exit 1; }
 tar -xOzf "$SING_BOX_ARCHIVE" "$SING_BOX_LIBRARY_MEMBER" >"$SING_BOX_LIBRARY" ||
 	{ echo "could not extract libcronet.so from the release archive" >&2; exit 1; }
 [ "$(head -c 4 "$SING_BOX_BINARY")" = "$(printf '\177ELF')" ] &&

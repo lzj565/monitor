@@ -2148,10 +2148,7 @@ mod tests {
     /// whatever this accepts, the hub will fetch.
     #[test]
     fn only_a_github_repository_url_can_name_a_release_to_download() {
-        assert_eq!(
-            github_repo("https://github.com/lzj565/monitor"),
-            Some(("lzj565", "monitor"))
-        );
+        assert_eq!(github_repo("https://github.com/lzj565/monitor"), Some(("lzj565", "monitor")));
         // A link to the repository, in whatever form the author wrote it.
         assert_eq!(github_repo("https://github.com/a/b.git"), Some(("a", "b")));
         assert_eq!(github_repo("https://github.com/a/b/tree/main"), Some(("a", "b")));
