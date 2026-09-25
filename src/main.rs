@@ -165,7 +165,7 @@ fn forwarded_proto(headers: &HeaderMap) -> Option<&str> {
 /// settings: redirecting either implies a fork, which rebuilds these lines
 /// anyway.
 pub const AGENT_REPO: &str = "monitor-probe/agent";
-pub const HUB_REPO: &str = "monitor-probe/monitor";
+pub const HUB_REPO: &str = "lzj565/monitor";
 const SING_BOX_REPO: &str = "SagerNet/sing-box";
 const SING_BOX_RELEASES_API: &str = "https://api.github.com/repos/SagerNet/sing-box/releases/latest";
 const SING_BOX_RELEASE_TTL: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
