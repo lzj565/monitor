@@ -47,7 +47,7 @@ const LOCKOUT: Duration = Duration::from_secs(900);
 /// Refused rather than queued: a queue admits the same flood, merely later. The
 /// cost is that two simultaneous sign-ins require one to retry.
 const PASSWORD_CHECKS: usize = 1;
-static PASSWORD_GATE: Semaphore = Semaphore::const_new(PASSWORD_CHECKS);
+pub(crate) static PASSWORD_GATE: Semaphore = Semaphore::const_new(PASSWORD_CHECKS);
 
 pub fn sha256(value: &str) -> String {
     hex::encode(Sha256::digest(value.as_bytes()))
@@ -66,7 +66,7 @@ pub fn hash_password(password: &str) -> Result<String> {
         .to_string())
 }
 
-fn verify_password(password: &str, stored: &str) -> bool {
+pub(crate) fn verify_password(password: &str, stored: &str) -> bool {
     PasswordHash::new(stored)
         .map(|parsed| Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok())
         .unwrap_or(false)
@@ -112,7 +112,7 @@ impl Throttle {
     }
 }
 
-fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+pub(crate) fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
         .get(header::COOKIE)?
         .to_str()
@@ -128,7 +128,7 @@ pub fn authed(app: &App, headers: &HeaderMap) -> bool {
     cookie_value(headers, COOKIE).is_some_and(|token| app.db.session_valid(&sha256(&token)))
 }
 
-fn set_cookie(name: &str, value: &str, max_age: i64, secure: bool) -> String {
+pub(crate) fn set_cookie(name: &str, value: &str, max_age: i64, secure: bool) -> String {
     let mut cookie = format!("{name}={value}; HttpOnly; SameSite=Lax; Path=/; Max-Age={max_age}");
     if secure {
         cookie.push_str("; Secure");

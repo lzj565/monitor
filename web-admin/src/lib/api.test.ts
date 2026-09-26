@@ -5,7 +5,7 @@ import { createElement } from "react"
 import { renderToStaticMarkup } from "react-dom/server"
 import { QRCodeSVG } from "qrcode.react"
 import { createProxyNode, createProxyNodeOperationGuard, deleteConfirmation, fetchProxyNodeShare, proxyNodeCreatePayload, regenerateAndDeployProxyNode, regenerateConfirmation, removeProxyNode, updateAndDeployProxyNode, proxyNodeUpdatePayload, type ProxyNodeActionApi, type ProxyNodeUpdatePayload } from "./proxy-node-actions.ts"
-import { createProxyUserOperationGuard, deleteProxyUser, proxyUserDeleteConfirmation, proxyUserRegenerateConfirmation, regenerateProxyUser, resetProxyUserTraffic, saveProxyUser, syncProxyUser, type ProxyUserActionApi } from "./proxy-user-actions.ts"
+import { createProxyUserOperationGuard, deleteProxyUser, proxyUserDeleteConfirmation, proxyUserRegenerateConfirmation, regenerateProxyUser, resetProxyUserTraffic, saveProxyUser, setProxyUserPassword, syncProxyUser, type ProxyUserActionApi } from "./proxy-user-actions.ts"
 import { importProxyNodeInbound, scanProxyNodeImports, type ProxyNodeImportApi, type ProxyNodeImportRequest, type ProxyNodeImportScan } from "./proxy-node-imports.ts"
 import { bytes } from "./format.ts"
 import { expiryDateLabel, formatBytes, limitBytesFromGb, limitGbInput, PROXY_USER_TABLE_COLUMNS, proxyUserCountText, proxyUserListState, proxyUserRowView, trafficPercent } from "./proxy-user-view.ts"
@@ -292,6 +292,8 @@ assert.match(proxyUserManagerSource, /用户 UUID[\s\S]*dialogUser\.uuid[\s\S]*�
 assert.match(proxyUserManagerSource, /resetProxyUserTraffic\(api, target\.user\.id\)/, "只在确认处理分支请求清零 API")
 assert.match(proxyUserManagerSource, /traffic_limit_gb[\s\S]*traffic_reset_day[\s\S]*expire_date/, "编辑表单含额度、重置日与到期日期")
 assert.match(proxyUserManagerSource, /length: 28/, "重置日选项仅包含 1 到 28")
+assert.match(proxyUserManagerSource, /用户中心登录密码/, "新用户必须设置登录密码")
+assert.match(proxyUserManagerSource, /setProxyUserPassword\(api, passwordUser.id, passwordValue\)/, "已有用户使用独立密码 API 修改")
 assert.doesNotMatch(proxyUserManagerSource, /device_limit|subscription|订阅链接/, "未引入设备限制或伪造订阅")
 const proxyUserInput = {
   name: proxyUser.name,
@@ -307,8 +309,10 @@ const proxyUserRequest: ProxyUserActionApi = async <T>(path: string, init?: Requ
   proxyUserCalls.push({ path, init })
   return { user: { ...proxyUser, enabled: false }, failed_servers: [] } as T
 }
-const createdUser = await saveProxyUser(proxyUserRequest, null, { ...proxyUserInput, enabled: true })
+const createPassword = "a-secure-user-password"
+const createdUser = await saveProxyUser(proxyUserRequest, null, { ...proxyUserInput, enabled: true, password: createPassword })
 assert.deepEqual(proxyUserCalls.map(({ path, init }) => [path, init?.method]), [["/proxy/users", "POST"]])
+assert.equal(JSON.parse(proxyUserCalls[0].init?.body as string).password, createPassword, "新建请求只把密码发给后台进行 hash")
 assert.equal(createdUser.user.id, proxyUser.id)
 proxyUserCalls.length = 0
 const updatedUser = await saveProxyUser(proxyUserRequest, proxyUser.id, proxyUserInput)
@@ -339,6 +343,10 @@ assert.deepEqual(proxyUserCalls.map(({ path, init }) => [path, init?.method]), [
 proxyUserCalls.length = 0
 await resetProxyUserTraffic(proxyUserRequest, proxyUser.id)
 assert.deepEqual(proxyUserCalls.map(({ path, init }) => [path, init?.method]), [["/proxy/users/12/traffic/reset", "POST"]])
+proxyUserCalls.length = 0
+await setProxyUserPassword(proxyUserRequest, proxyUser.id, "another-secure-password")
+assert.deepEqual(proxyUserCalls.map(({ path, init }) => [path, init?.method]), [["/proxy/users/12/password", "PUT"]])
+assert.deepEqual(JSON.parse(proxyUserCalls[0].init?.body as string), { password: "another-secure-password" })
 const retainedUser: ProxyUserActionApi = async <T>(path: string, init?: RequestInit): Promise<T> => {
   proxyUserCalls.push({ path, init })
   return { deleted: false, user: { ...proxyUser, enabled: false }, failed_servers: [{ server_id: 3, server_name: "HK", error: "agent offline" }] } as T

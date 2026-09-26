@@ -10,7 +10,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::json;
 
 use crate::api::{self, Admin};
-use crate::db::{ProxyUser, ProxyUserLimits};
+use crate::db::{ProxyUser, ProxyUserCreateSettings, ProxyUserLimits};
 use crate::proxy_deploy;
 use crate::proxy_provision;
 use crate::Shared;
@@ -19,6 +19,7 @@ use crate::Shared;
 #[serde(deny_unknown_fields)]
 pub struct CreateProxyUserRequest {
     pub name: String,
+    pub password: String,
     pub enabled: bool,
     #[serde(default)]
     pub note: String,
@@ -143,6 +144,9 @@ pub async fn create_proxy_user(
     let Ok(Json(request)) = body else {
         return no_store(api::answer(StatusCode::BAD_REQUEST, "用户请求格式不正确"));
     };
+    if !(12..=1024).contains(&request.password.len()) {
+        return no_store(api::answer(StatusCode::BAD_REQUEST, "登录密码长度须为 12 到 1024 字节"));
+    }
     let traffic_limit_bytes = request.traffic_limit_bytes.unwrap_or(0);
     let traffic_reset_day = request.traffic_reset_day.unwrap_or(1);
     let expire_date = request.expire_date.unwrap_or(None);
@@ -153,14 +157,21 @@ pub async fn create_proxy_user(
     if traffic_limit_bytes < 0 || !(1..=28).contains(&traffic_reset_day) {
         return no_store(api::answer(StatusCode::BAD_REQUEST, "流量限额或每月重置日无效"));
     }
+    let password_hash = match crate::auth::hash_password(&request.password) {
+        Ok(hash) => hash,
+        Err(error) => return no_store(api::fail(error)),
+    };
     let uuid = proxy_provision::uuid_v4();
-    match app.db.create_proxy_user_with_limits(
+    match app.db.create_proxy_user_with_password(
         &request.name,
         &uuid,
         request.enabled,
         &request.note,
         &request.proxy_node_ids,
-        ProxyUserLimits { traffic_limit_bytes, traffic_reset_day, expire_at },
+        ProxyUserCreateSettings {
+            limits: ProxyUserLimits { traffic_limit_bytes, traffic_reset_day, expire_at },
+            password_hash: Some(&password_hash),
+        },
     ) {
         Ok((user, server_ids)) => {
             let failures = proxy_deploy::deploy_proxy_user_servers(&app, &server_ids).await;
@@ -176,6 +187,47 @@ pub async fn create_proxy_user(
                     .into_response(),
             )
         }
+        Err(error) => no_store(api::fail(error)),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetProxyUserPasswordRequest {
+    password: String,
+}
+
+/// 管理员单独重设普通代理用户登录密码，不把密码混入通用用户更新请求。
+pub async fn set_proxy_user_password(
+    _: Admin,
+    State(app): State<Shared>,
+    Path(id): Path<i64>,
+    body: Result<Json<SetProxyUserPasswordRequest>, JsonRejection>,
+) -> Response {
+    if id <= 0 {
+        return no_store(api::answer(StatusCode::BAD_REQUEST, "代理用户 ID 无效"));
+    }
+    let Ok(Json(request)) = body else {
+        return no_store(api::answer(StatusCode::BAD_REQUEST, "密码请求格式不正确"));
+    };
+    if !(12..=1024).contains(&request.password.len()) {
+        return no_store(api::answer(StatusCode::BAD_REQUEST, "登录密码长度须为 12 到 1024 字节"));
+    }
+    match app.db.proxy_user(id) {
+        Ok(Some(user)) if user.is_system => {
+            return no_store(api::answer(StatusCode::CONFLICT, "系统用户使用 Monitor 管理员密码登录"));
+        }
+        Ok(Some(_)) => {}
+        Ok(None) => return no_store(api::answer(StatusCode::NOT_FOUND, "代理用户不存在")),
+        Err(error) => return no_store(api::fail(error)),
+    }
+    let password_hash = match crate::auth::hash_password(&request.password) {
+        Ok(hash) => hash,
+        Err(error) => return no_store(api::fail(error)),
+    };
+    match app.db.set_proxy_user_password_hash(id, &password_hash) {
+        Ok(true) => no_store(Json(json!({ "updated": true })).into_response()),
+        Ok(false) => no_store(api::answer(StatusCode::NOT_FOUND, "代理用户不存在")),
         Err(error) => no_store(api::fail(error)),
     }
 }
@@ -364,6 +416,7 @@ mod tests {
             State(app.clone()),
             Ok(Json(CreateProxyUserRequest {
                 name: " Alice ".into(),
+                password: "a-secure-user-password".into(),
                 enabled: true,
                 note: "first note".into(),
                 proxy_node_ids: Vec::new(),
@@ -390,6 +443,8 @@ mod tests {
         assert_eq!(user["expire_at"], serde_json::Value::Null);
         assert_eq!(user["expire_date"], serde_json::Value::Null);
         assert_eq!(user["traffic"]["used_bytes"], 0);
+        assert!(user.get("password_hash").is_none());
+        assert!(user.get("password").is_none());
 
         let updated = update_proxy_user(
             Admin,
@@ -434,6 +489,58 @@ mod tests {
         let deleted = delete_proxy_user(Admin, State(app), Path(id)).await;
         assert_eq!(deleted.status(), StatusCode::OK);
         assert_eq!(response_json(deleted).await["deleted"], true);
+    }
+
+    #[tokio::test]
+    async fn proxy_user_password_is_hash_only_and_reset_revokes_existing_sessions() {
+        let app = app();
+        let created = create_proxy_user(
+            Admin,
+            State(app.clone()),
+            Ok(Json(CreateProxyUserRequest {
+                name: "password-user".into(),
+                password: "initial-user-password".into(),
+                enabled: true,
+                note: String::new(),
+                proxy_node_ids: Vec::new(),
+                traffic_limit_bytes: None,
+                traffic_reset_day: None,
+                expire_date: None,
+            })),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let payload = response_json(created).await;
+        let id = payload["user"]["id"].as_i64().unwrap();
+        assert!(payload["user"].get("password_hash").is_none());
+        let before = app.db.proxy_user_login_credential("password-user").unwrap().unwrap().2.unwrap();
+        assert!(before.starts_with("$argon2"));
+        assert!(crate::auth::verify_password("initial-user-password", &before));
+
+        let now = crate::hub_time::now_timestamp();
+        app.db.create_proxy_user_login_session("before-reset", id, false, &before, now, now + 60).unwrap();
+        let reset = set_proxy_user_password(
+            Admin,
+            State(app.clone()),
+            Path(id),
+            Ok(Json(SetProxyUserPasswordRequest { password: "replacement-password".into() })),
+        )
+        .await;
+        assert_eq!(reset.status(), StatusCode::OK);
+        assert_eq!(app.db.proxy_user_session("before-reset", now).unwrap(), None);
+        let after = app.db.proxy_user_login_credential("password-user").unwrap().unwrap().2.unwrap();
+        assert_ne!(before, after);
+        assert!(crate::auth::verify_password("replacement-password", &after));
+
+        let system_id = app.db.proxy_users().unwrap().into_iter().find(|user| user.is_system).unwrap().id;
+        let refused = set_proxy_user_password(
+            Admin,
+            State(app),
+            Path(system_id),
+            Ok(Json(SetProxyUserPasswordRequest { password: "replacement-password".into() })),
+        )
+        .await;
+        assert_eq!(refused.status(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]
@@ -500,6 +607,7 @@ mod tests {
         let app = app();
         let request = CreateProxyUserRequest {
             name: "metered".into(),
+            password: "a-secure-user-password".into(),
             enabled: true,
             note: String::new(),
             proxy_node_ids: Vec::new(),

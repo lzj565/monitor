@@ -3,7 +3,7 @@ import type { ProxyUser } from "./api.ts"
 export type ProxyUserInput = Omit<Pick<
   ProxyUser,
   "name" | "enabled" | "note" | "proxy_node_ids" | "traffic_limit_bytes" | "traffic_reset_day" | "expire_date"
->, "expire_date"> & { expire_date?: string | null }
+>, "expire_date"> & { expire_date?: string | null; password?: string }
 export type ProxyUserResult = { user: ProxyUser; failed_servers: { server_id: number; server_name: string; error: string }[] }
 export type ProxyUserDeleteResult = { deleted: boolean; user: ProxyUser | null; failed_servers: ProxyUserResult["failed_servers"] }
 export type ProxyUserActionApi = <T = unknown>(path: string, init?: RequestInit) => Promise<T>
@@ -33,6 +33,13 @@ export function syncProxyUser(request: ProxyUserActionApi, id: number): Promise<
 
 export function resetProxyUserTraffic(request: ProxyUserActionApi, id: number): Promise<ProxyUserResult> {
   return request<ProxyUserResult>(`/proxy/users/${id}/traffic/reset`, { method: "POST" })
+}
+
+export function setProxyUserPassword(request: ProxyUserActionApi, id: number, password: string): Promise<{ updated: boolean }> {
+  return request<{ updated: boolean }>(`/proxy/users/${id}/password`, {
+    method: "PUT",
+    body: JSON.stringify({ password }),
+  })
 }
 
 export function proxyUserRegenerateConfirmation(name: string) {

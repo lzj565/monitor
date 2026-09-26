@@ -166,7 +166,7 @@ CREATE TABLE IF NOT EXISTS session (
 /// cannot: `open` runs `SCHEMA` before migrating, and on an older file the
 /// column is not there yet. `an_upgraded_release_matches_a_fresh_database`
 /// holds every migration to these rules, starting from v1.0.0's schema.
-const SCHEMA_VERSION: i64 = 15;
+const SCHEMA_VERSION: i64 = 16;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -446,6 +446,27 @@ fn migrate_to_15(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// 用户中心凭据、独立订阅密钥与代理用户 session。
+fn migrate_to_16(conn: &Connection) -> Result<()> {
+    add_column(conn, "proxy_user", "password_hash TEXT")?;
+    add_column(conn, "proxy_user", "subscription_token TEXT")?;
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS proxy_user_subscription_token
+           ON proxy_user(subscription_token)
+           WHERE subscription_token IS NOT NULL;
+         CREATE TABLE IF NOT EXISTS proxy_user_session (
+           token_hash TEXT PRIMARY KEY,
+           user_id INTEGER NOT NULL REFERENCES proxy_user(id) ON DELETE CASCADE,
+           kind TEXT NOT NULL CHECK (kind IN ('login', 'impersonation')),
+           created_at INTEGER NOT NULL,
+           expires_at INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS proxy_user_session_user
+           ON proxy_user_session(user_id, expires_at);",
+    )?;
+    Ok(())
+}
+
 /// 每次打开数据库时确保唯一的系统 admin 存在，不改变既有代理凭据或授权。
 fn ensure_default_proxy_user(conn: &Connection) -> Result<()> {
     let system_user_exists: bool =
@@ -529,6 +550,9 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     if from < 15 {
         migrate_to_15(&tx)?;
     }
+    if from < 16 {
+        migrate_to_16(&tx)?;
+    }
     ensure_default_proxy_user(&tx)?;
     let now = Utc::now().timestamp();
     tx.execute(
@@ -601,8 +625,8 @@ const V14_TABLES: [&str; 12] = [
     "proxy_node",
     "proxy_user_node",
 ];
-/// 执行当前版本迁移后，备份必须包含的全部表。
-const TABLES: [&str; 14] = [
+/// v15 备份已包含用户流量累计与各服务器 counter baseline。
+const V15_TABLES: [&str; 14] = [
     "setting",
     "node",
     "traffic",
@@ -617,6 +641,24 @@ const TABLES: [&str; 14] = [
     "proxy_user_node",
     "proxy_user_traffic",
     "proxy_user_traffic_source",
+];
+/// 执行当前版本迁移后，备份必须包含的全部表。
+const TABLES: [&str; 15] = [
+    "setting",
+    "node",
+    "traffic",
+    "metric",
+    "ping_task",
+    "ping_node",
+    "ping_record",
+    "session",
+    "proxy_instance",
+    "proxy_user",
+    "proxy_node",
+    "proxy_user_node",
+    "proxy_user_traffic",
+    "proxy_user_traffic_source",
+    "proxy_user_session",
 ];
 
 /// One node's stored configuration and last known facts.
@@ -775,6 +817,12 @@ impl Default for ProxyUserLimits {
     fn default() -> Self {
         Self { traffic_limit_bytes: 0, traffic_reset_day: 1, expire_at: None }
     }
+}
+
+/// 创建代理用户时一次提交的额度与可选密码 hash。
+pub struct ProxyUserCreateSettings<'a> {
+    pub limits: ProxyUserLimits,
+    pub password_hash: Option<&'a str>,
 }
 
 /// 新建节点的默认监听地址；导入节点会保存服务器配置中的实际地址。
@@ -1530,8 +1578,39 @@ impl Db {
         requested_node_ids: &[i64],
         limits: ProxyUserLimits,
     ) -> Result<(ProxyUser, Vec<i64>)> {
+        self.create_proxy_user_with_settings(
+            name,
+            uuid,
+            enabled,
+            note,
+            requested_node_ids,
+            ProxyUserCreateSettings { limits, password_hash: None },
+        )
+    }
+
+    pub fn create_proxy_user_with_password(
+        &self,
+        name: &str,
+        uuid: &str,
+        enabled: bool,
+        note: &str,
+        requested_node_ids: &[i64],
+        settings: ProxyUserCreateSettings<'_>,
+    ) -> Result<(ProxyUser, Vec<i64>)> {
+        self.create_proxy_user_with_settings(name, uuid, enabled, note, requested_node_ids, settings)
+    }
+
+    fn create_proxy_user_with_settings(
+        &self,
+        name: &str,
+        uuid: &str,
+        enabled: bool,
+        note: &str,
+        requested_node_ids: &[i64],
+        settings: ProxyUserCreateSettings<'_>,
+    ) -> Result<(ProxyUser, Vec<i64>)> {
         validate_proxy_user_profile(name, note, uuid)?;
-        validate_proxy_user_limits(limits)?;
+        validate_proxy_user_limits(settings.limits)?;
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         ensure_proxy_user_name_available(&tx, name, None)?;
@@ -1539,8 +1618,8 @@ impl Db {
         let now = crate::hub_time::now_timestamp();
         let initial_state = crate::proxy_access::effective_proxy_access(
             enabled,
-            limits.expire_at,
-            limits.traffic_limit_bytes,
+            settings.limits.expire_at,
+            settings.limits.traffic_limit_bytes,
             0,
             0,
             now,
@@ -1548,18 +1627,19 @@ impl Db {
         tx.execute(
             "INSERT INTO proxy_user
                (username, uuid, enabled, is_system, created_at, note, updated_at,
-                traffic_limit_bytes, traffic_reset_day, expire_at, last_access_state)
-             VALUES (?1, ?2, ?3, 0, ?4, ?5, ?4, ?6, ?7, ?8, ?9)",
+                traffic_limit_bytes, traffic_reset_day, expire_at, last_access_state, password_hash)
+             VALUES (?1, ?2, ?3, 0, ?4, ?5, ?4, ?6, ?7, ?8, ?9, ?10)",
             params![
                 name.trim(),
                 uuid.trim(),
                 enabled,
                 now,
                 note.trim(),
-                limits.traffic_limit_bytes,
-                limits.traffic_reset_day,
-                limits.expire_at,
-                initial_state.as_str()
+                settings.limits.traffic_limit_bytes,
+                settings.limits.traffic_reset_day,
+                settings.limits.expire_at,
+                initial_state.as_str(),
+                settings.password_hash
             ],
         )?;
         let id = tx.last_insert_rowid();
@@ -1581,6 +1661,44 @@ impl Db {
         user.proxy_node_ids = proxy_node_ids;
         tx.commit()?;
         Ok((user, server_ids))
+    }
+
+    /// 读取登录所需的最小凭据字段；hash 不进入 ProxyUser API 模型。
+    pub fn proxy_user_login_credential(&self, username: &str) -> Result<Option<(i64, bool, Option<String>)>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT id, is_system, password_hash FROM proxy_user WHERE username=?1",
+                [username],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_proxy_user_usage_for_test(&self, id: i64, uplink: i64, downlink: i64) -> Result<()> {
+        self.conn().execute(
+            "UPDATE proxy_user_traffic SET uplink_bytes=?2, downlink_bytes=?3 WHERE user_id=?1",
+            params![id, uplink, downlink],
+        )?;
+        Ok(())
+    }
+
+    /// 设置普通代理用户密码并撤销其既有用户中心 session。
+    pub fn set_proxy_user_password_hash(&self, id: i64, password_hash: &str) -> Result<bool> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE proxy_user SET password_hash=?2, updated_at=?3 WHERE id=?1 AND is_system=0",
+            params![id, password_hash, crate::hub_time::now_timestamp()],
+        )?;
+        if changed == 0 {
+            tx.commit()?;
+            return Ok(false);
+        }
+        tx.execute("DELETE FROM proxy_user_session WHERE user_id=?1", [id])?;
+        tx.commit()?;
+        Ok(true)
     }
 
     /// 更新 desired state 与授权，并返回旧、新授权涉及的去重服务器。
@@ -3114,6 +3232,7 @@ impl Db {
             11 => &V11_TABLES,
             12 => &V12_TABLES,
             13 | 14 => &V14_TABLES,
+            15 => &V15_TABLES,
             _ => &TABLES,
         };
         for table in required_tables {
@@ -3141,6 +3260,8 @@ impl Db {
                 "traffic_reset_day",
                 "expire_at",
                 "last_access_state",
+                "password_hash",
+                "subscription_token",
             ]
             .into_iter()
             .filter(|column| !columns.contains(*column))
@@ -3253,6 +3374,63 @@ impl Db {
         Ok(())
     }
 
+    pub fn create_proxy_user_impersonation_session(
+        &self,
+        token_hash: &str,
+        user_id: i64,
+        created_at: i64,
+        expires_at: i64,
+    ) -> Result<bool> {
+        let changed = self.conn().execute(
+            "INSERT INTO proxy_user_session (token_hash, user_id, kind, created_at, expires_at)
+             SELECT ?1, id, 'impersonation', ?3, ?4 FROM proxy_user WHERE id=?2",
+            params![token_hash, user_id, created_at, expires_at],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// 只有验证时的凭据仍然是当前凭据时才签发登录 session，避免改密与登录并发时旧密码漏过。
+    pub fn create_proxy_user_login_session(
+        &self,
+        token_hash: &str,
+        user_id: i64,
+        is_system: bool,
+        expected_password_hash: &str,
+        created_at: i64,
+        expires_at: i64,
+    ) -> Result<bool> {
+        let changed = self.conn().execute(
+            "INSERT INTO proxy_user_session (token_hash, user_id, kind, created_at, expires_at)
+             SELECT ?1, pu.id, 'login', ?4, ?5
+             FROM proxy_user pu
+             WHERE pu.id=?2 AND pu.is_system=?3 AND (
+               (pu.is_system=0 AND pu.password_hash=?6)
+               OR
+               (pu.is_system=1 AND EXISTS (
+                 SELECT 1 FROM setting WHERE key='admin_password_hash' AND value=?6
+               ))
+             )",
+            params![token_hash, user_id, is_system, created_at, expires_at, expected_password_hash],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn proxy_user_session(&self, token_hash: &str, now: i64) -> Result<Option<(i64, String)>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT user_id, kind FROM proxy_user_session WHERE token_hash=?1 AND expires_at>?2",
+                params![token_hash, now],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    pub fn drop_proxy_user_session(&self, token_hash: &str) -> Result<()> {
+        self.conn().execute("DELETE FROM proxy_user_session WHERE token_hash=?1", [token_hash])?;
+        Ok(())
+    }
+
     /// Replaces the admin password hash and signs every session out, both or
     /// neither: a reset that stored the hash and then failed would report failure
     /// while the old password no longer works.
@@ -3265,6 +3443,11 @@ impl Db {
             [hash],
         )?;
         tx.execute("DELETE FROM session", [])?;
+        tx.execute(
+            "DELETE FROM proxy_user_session WHERE user_id IN
+             (SELECT id FROM proxy_user WHERE is_system=1)",
+            [],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -3272,12 +3455,21 @@ impl Db {
     /// Invalidates every login. Used after a restore, which would otherwise
     /// revive every session the backup holds.
     pub fn drop_all_sessions(&self) -> Result<()> {
-        self.conn().execute("DELETE FROM session", [])?;
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM session", [])?;
+        tx.execute("DELETE FROM proxy_user_session", [])?;
+        tx.commit()?;
         Ok(())
     }
 
     pub fn expire_sessions(&self) -> Result<()> {
-        self.conn().execute("DELETE FROM session WHERE expires_at <= ?1", [Utc::now().timestamp()])?;
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let now = Utc::now().timestamp();
+        tx.execute("DELETE FROM session WHERE expires_at <= ?1", [now])?;
+        tx.execute("DELETE FROM proxy_user_session WHERE expires_at <= ?1", [now])?;
+        tx.commit()?;
         Ok(())
     }
 }
@@ -4034,7 +4226,154 @@ mod tests {
                 .unwrap(),
             8192
         );
-        assert_eq!(db.conn().query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 15);
+        assert_eq!(db.conn().query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 16);
+        assert_eq!(
+            db.conn()
+                .query_row(
+                    "SELECT password_hash IS NULL AND subscription_token IS NULL FROM proxy_user WHERE id=?1",
+                    [user_id],
+                    |row| row.get::<_, bool>(0)
+                )
+                .unwrap(),
+            true,
+            "旧账号保留可登录前由管理员设置密码，订阅 token 不用 UUID 冒充"
+        );
+    }
+
+    #[test]
+    fn proxy_user_sessions_are_revoked_on_password_change_and_cascade_on_delete() {
+        let db = db();
+        let id = db
+            .create_proxy_user_with_nodes("auth-user", "a0f81cec-73c5-4eb8-a2e2-cd1544946e8e", true, "", &[])
+            .unwrap()
+            .0
+            .id;
+        let now = crate::hub_time::now_timestamp();
+        assert!(db.set_proxy_user_password_hash(id, "$argon2$old").unwrap());
+        assert!(db
+            .create_proxy_user_login_session("user-session", id, false, "$argon2$old", now, now + 60)
+            .unwrap());
+        assert_eq!(db.proxy_user_session("user-session", now).unwrap(), Some((id, "login".into())));
+
+        assert!(db.set_proxy_user_password_hash(id, "$argon2$new").unwrap());
+        assert_eq!(db.proxy_user_session("user-session", now).unwrap(), None, "改密撤销现有 session");
+        assert!(
+            !db.create_proxy_user_login_session("stale-login", id, false, "$argon2$old", now, now + 60)
+                .unwrap(),
+            "旧密码验证与改密并发时不得签发新 session"
+        );
+
+        db.create_session("admin-session", now + 60).unwrap();
+        db.create_proxy_user_impersonation_session("restore-session", id, now, now + 60).unwrap();
+        db.drop_all_sessions().unwrap();
+        assert!(!db.session_valid("admin-session"), "恢复备份时也撤销管理员 session");
+        assert_eq!(
+            db.proxy_user_session("restore-session", now).unwrap(),
+            None,
+            "恢复备份不能复活用户 session"
+        );
+
+        db.create_proxy_user_impersonation_session("impersonation-session", id, now, now + 60).unwrap();
+        assert_eq!(
+            db.proxy_user_session("impersonation-session", now + 60).unwrap(),
+            None,
+            "到期 session 无效"
+        );
+        assert!(db.delete_proxy_user(id).unwrap());
+        assert_eq!(
+            db.proxy_user_session("impersonation-session", now).unwrap(),
+            None,
+            "删除用户级联删除 session"
+        );
+    }
+
+    #[test]
+    fn v15_backup_migrates_user_auth_fields_before_schema_validation() {
+        let scratch = Scratch::new();
+        let db = Db::open(&scratch.0).unwrap();
+        let user_id = db
+            .create_proxy_user_with_nodes(
+                "backup-user",
+                "a0f81cec-73c5-4eb8-a2e2-cd1544946e8e",
+                true,
+                "",
+                &[],
+            )
+            .unwrap()
+            .0
+            .id;
+        {
+            let candidate = Connection::open(&scratch.0).unwrap();
+            candidate
+                .execute_batch(
+                    "DROP INDEX proxy_user_subscription_token;
+                     DROP TABLE proxy_user_session;
+                     ALTER TABLE proxy_user DROP COLUMN subscription_token;
+                     ALTER TABLE proxy_user DROP COLUMN password_hash;
+                     PRAGMA user_version=15;",
+                )
+                .unwrap();
+        }
+        db.check_backup(&scratch.0).unwrap();
+        let migrated = Connection::open(&scratch.0).unwrap();
+        assert_eq!(migrated.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 16);
+        assert_eq!(
+            migrated
+                .query_row(
+                    "SELECT password_hash IS NULL AND subscription_token IS NULL FROM proxy_user WHERE id=?1",
+                    [user_id],
+                    |row| row.get::<_, bool>(0)
+                )
+                .unwrap(),
+            true
+        );
+        assert_eq!(
+            migrated
+                .query_row("SELECT COUNT(*) FROM proxy_user_session", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn admin_password_change_revokes_admin_and_system_proxy_user_sessions_and_stale_logins() {
+        let db = db();
+        let admin_id = db.proxy_users().unwrap().into_iter().find(|user| user.is_system).unwrap().id;
+        db.set("admin_password_hash", "$argon2$old-admin").unwrap();
+        let now = crate::hub_time::now_timestamp();
+        assert!(db
+            .create_proxy_user_login_session(
+                "admin-user-session",
+                admin_id,
+                true,
+                "$argon2$old-admin",
+                now,
+                now + 60
+            )
+            .unwrap());
+
+        db.replace_password("$argon2$new-admin").unwrap();
+        assert_eq!(db.proxy_user_session("admin-user-session", now).unwrap(), None);
+        assert!(!db
+            .create_proxy_user_login_session(
+                "stale-admin-login",
+                admin_id,
+                true,
+                "$argon2$old-admin",
+                now,
+                now + 60
+            )
+            .unwrap());
+        assert!(db
+            .create_proxy_user_login_session(
+                "new-admin-login",
+                admin_id,
+                true,
+                "$argon2$new-admin",
+                now,
+                now + 60
+            )
+            .unwrap());
     }
 
     #[test]

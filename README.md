@@ -36,3 +36,7 @@ agent (Linux)  ──WebSocket / JSON-RPC 2.0──▶  hub (axum + SQLite)  ─
 Hub 每 10 秒通过 Agent 的 `singbox.stats.users` 只读采集用户 counter，按用户和服务器分别保存 baseline，再将上传与下载增量汇总为当前周期用量。额度以 bytes 保存，`traffic_limit_bytes = 0` 表示不限量；每月重置日为 1 到 28 日，按 Hub 系统时区的本地零点切换周期。到期日期在所选日期全天有效，并于次日 Hub 本地零点过期。
 
 管理员可调用 `POST /api/proxy/users/{id}/traffic/reset` 清空 Hub 的累计量。此操作递增 `reset_generation`，各服务器下一次上报时只重建 baseline；不会调用 sing-box StatsService 的 counter reset。旧 `quota` 字段会在迁移中保留，不会在单位未经确认时转换为新额度。
+
+## 用户中心认证
+
+用户中心使用独立的 `monitor_user_session` cookie 和 `proxy_user_session` 表，不接受管理员 `monitor_session` 作为用户身份。普通 ProxyUser 使用 Argon2 密码登录；系统用户 `admin` 使用现有 Monitor 管理员密码登录，但只签发用户 session。管理员可通过 `PUT /api/proxy/users/{id}/password` 设置普通用户密码，或通过 `POST /api/proxy/users/{id}/impersonate` 签发一小时的用户预览 session。当前版本提供登录、登出、`GET /api/user/me` 和代入 API；用户中心页面及订阅下载尚未实现。

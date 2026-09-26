@@ -41,6 +41,7 @@ mod proxy_share;
 mod proxy_traffic;
 mod proxy_user;
 pub mod subscription_rules;
+mod user_auth;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -84,6 +85,8 @@ pub struct App {
     /// not multiply the query load. See `api::live_snapshot`.
     pub snapshot: Mutex<[(i64, axum::extract::ws::Utf8Bytes); 2]>,
     pub throttle: auth::Throttle,
+    /// 用户中心独立的失败计数，避免用户登录失败锁住管理员登录。
+    pub user_throttle: auth::Throttle,
     /// Failed agent registrations, counted separately from failed sign-ins: the
     /// two have different threat models, and a batch install run with a stale
     /// key must not lock the operator out of the panel.
@@ -125,6 +128,7 @@ impl App {
             readings: Mutex::default(),
             snapshot: Mutex::new([(0, Default::default()), (0, Default::default())]),
             throttle: auth::Throttle::default(),
+            user_throttle: auth::Throttle::default(),
             registrations: auth::Throttle::default(),
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(15))
@@ -545,6 +549,9 @@ async fn main() -> Result<()> {
         .route("/api/auth/logout", post(auth::logout))
         .route("/api/auth/github", get(auth::github_start))
         .route("/api/auth/github/callback", get(auth::github_callback))
+        .route("/api/user/auth/login", post(user_auth::login))
+        .route("/api/user/auth/logout", post(user_auth::logout))
+        .route("/api/user/me", get(user_auth::me))
         // Panel.
         .route("/api/nodes", post(api::create_node))
         .route("/api/register-window", post(api::open_register).delete(api::close_register))
@@ -566,6 +573,8 @@ async fn main() -> Result<()> {
             put(proxy_user::update_proxy_user).delete(proxy_user::delete_proxy_user),
         )
         .route("/api/proxy/users/{id}/regenerate", post(proxy_user::regenerate_proxy_user))
+        .route("/api/proxy/users/{id}/password", put(proxy_user::set_proxy_user_password))
+        .route("/api/proxy/users/{id}/impersonate", post(user_auth::impersonate))
         .route("/api/proxy/users/{id}/sync", post(proxy_user::sync_proxy_user))
         .route("/api/proxy/users/{id}/traffic/reset", post(proxy_user::reset_proxy_user_traffic))
         .route("/api/proxy/servers/{node_id}/deploy", post(proxy_deploy::deploy))

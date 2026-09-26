@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { ChevronDown, Copy, LoaderCircle, Pencil, Plus, RefreshCw, RotateCcw, RotateCw, Trash2 } from "lucide-react"
+import { ChevronDown, Copy, KeyRound, LoaderCircle, Pencil, Plus, RefreshCw, RotateCcw, RotateCw, Trash2 } from "lucide-react"
 import { toast } from "sonner"
 
 import {
@@ -34,6 +34,7 @@ import {
   regenerateProxyUser,
   resetProxyUserTraffic,
   saveProxyUser,
+  setProxyUserPassword,
   syncProxyUser,
   type ProxyUserInput,
   type ProxyUserResult,
@@ -59,6 +60,7 @@ type FormState = {
   traffic_limit_gb: string
   traffic_reset_day: string
   expire_date: string
+  password: string
 }
 
 const NEW_USER: FormState = {
@@ -69,6 +71,7 @@ const NEW_USER: FormState = {
   traffic_limit_gb: "0",
   traffic_reset_day: "1",
   expire_date: "",
+  password: "",
 }
 
 function formFromUser(user: ProxyUser): FormState {
@@ -80,6 +83,7 @@ function formFromUser(user: ProxyUser): FormState {
     traffic_limit_gb: limitGbInput(user.traffic_limit_bytes),
     traffic_reset_day: String(user.traffic_reset_day),
     expire_date: user.expire_date ?? "",
+    password: "",
   }
 }
 
@@ -107,6 +111,9 @@ export function ProxyUserManager({ servers }: { servers: Node[] }) {
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState("")
   const [dialogUser, setDialogUser] = useState<ProxyUser | null | undefined>(undefined)
+  const [passwordUser, setPasswordUser] = useState<ProxyUser | null>(null)
+  const [passwordValue, setPasswordValue] = useState("")
+  const [passwordSaving, setPasswordSaving] = useState(false)
   const [confirm, setConfirm] = useState<Confirmation | null>(null)
   const [form, setForm] = useState<FormState>(NEW_USER)
   const [advancedOpen, setAdvancedOpen] = useState(false)
@@ -164,6 +171,9 @@ export function ProxyUserManager({ servers }: { servers: Node[] }) {
   async function submitForm(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
     if (!form.name.trim()) return toast.error("请填写用户名")
+    const passwordBytes = new TextEncoder().encode(form.password).length
+    if (!dialogUser && passwordBytes < 12) return toast.error("用户登录密码至少 12 字节")
+    if (passwordBytes > 1024) return toast.error("用户登录密码不能超过 1024 字节")
     const unchangedLimit = dialogUser !== null && dialogUser !== undefined
       && form.traffic_limit_gb === limitGbInput(dialogUser.traffic_limit_bytes)
     const limitBytes = unchangedLimit ? dialogUser.traffic_limit_bytes : limitBytesFromGb(form.traffic_limit_gb)
@@ -183,6 +193,7 @@ export function ProxyUserManager({ servers }: { servers: Node[] }) {
           && form.expire_date === (dialogUser.expire_date ?? "")
           ? undefined
           : form.expire_date || null,
+        password: dialogUser ? undefined : form.password,
       }
       const result = await saveProxyUser(api, dialogUser?.id ?? null, input)
       if (dialogUser) {
@@ -200,6 +211,31 @@ export function ProxyUserManager({ servers }: { servers: Node[] }) {
     } finally {
       setSaving(false)
     }
+  }
+
+  async function submitPassword(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (!passwordUser) return
+    const passwordBytes = new TextEncoder().encode(passwordValue).length
+    if (passwordBytes < 12 || passwordBytes > 1024) {
+      return toast.error("密码长度须为 12 到 1024 字节")
+    }
+    setPasswordSaving(true)
+    try {
+      await setProxyUserPassword(api, passwordUser.id, passwordValue)
+      toast.success("用户中心密码已更新，该用户的现有用户中心会话已退出")
+      setPasswordUser(null)
+      setPasswordValue("")
+    } catch (cause) {
+      toast.error(`更新登录密码失败：${(cause as Error).message}`)
+    } finally {
+      setPasswordSaving(false)
+    }
+  }
+
+  function openPassword(user: ProxyUser) {
+    setPasswordValue("")
+    setPasswordUser(user)
   }
 
   async function runUserOperation(user: ProxyUser, action: () => Promise<void>) {
@@ -340,8 +376,8 @@ export function ProxyUserManager({ servers }: { servers: Node[] }) {
               </TableHeader>
               <TableBody>
                 {listState === "loading" ? Array.from({ length: 3 }, (_, index) => (
-                  <TableRow key={`loading-${index}`} className="h-24">
-                    {PROXY_USER_TABLE_COLUMNS.map((column) => <TableCell key={column.key}><Skeleton className="h-4 w-24" /></TableCell>)}
+                  <TableRow key={`loading-${index}`}>
+                    {PROXY_USER_TABLE_COLUMNS.map((column) => <TableCell key={column.key} className="py-3"><Skeleton className="h-4 w-24" /></TableCell>)}
                   </TableRow>
                 )) : listState === "empty" ? (
                   <TableRow><TableCell colSpan={PROXY_USER_TABLE_COLUMNS.length} className="h-28 text-center text-sm text-muted-foreground">暂无用户</TableCell></TableRow>
@@ -360,43 +396,41 @@ export function ProxyUserManager({ servers }: { servers: Node[] }) {
                   }])).values()]
                   const failures = failedByUser[user.id] ?? inferredFailures
                   return (
-                    <TableRow key={user.id} className="h-24">
-                      <TableCell className="font-mono text-sm text-muted-foreground">{row.id}</TableCell>
-                      <TableCell className="font-medium">
+                    <TableRow key={user.id}>
+                      <TableCell className="py-3 font-mono text-sm text-muted-foreground">{row.id}</TableCell>
+                      <TableCell className="py-3 font-medium">
                         {user.name}
                         {row.systemLabel && <Badge variant="secondary" className="ml-2">{row.systemLabel}</Badge>}
                       </TableCell>
-                      <TableCell>
-                        <div className="space-y-1.5">
-                          <div className="flex items-center justify-between gap-2">
-                            <span className="font-medium tabular-nums">{formatBytes(user.traffic.used_bytes)}</span>
+                      <TableCell className="py-3">
+                        <div className="space-y-2">
+                          <div className="flex min-w-0 flex-nowrap items-center gap-1.5">
+                            <span className="shrink-0 whitespace-nowrap font-medium tabular-nums">{formatBytes(user.traffic.used_bytes)}</span>
                             <Tooltip>
                               <TooltipTrigger asChild>
-                                <Button size="sm" variant="ghost" className="h-7 px-2 text-xs text-amber-700 hover:bg-amber-500/10 hover:text-amber-800 dark:text-amber-400" disabled={busy} onClick={() => setConfirm({ kind: "traffic", user })}>
-                                  <RotateCcw className="size-3.5" /> 清空
+                                <Button type="button" size="xs" variant="ghost" className="h-5 px-1.5 text-xs font-normal text-muted-foreground hover:bg-transparent hover:text-foreground" disabled={busy} onClick={() => setConfirm({ kind: "traffic", user })}>
+                                  <RotateCcw className="size-3" /> 清空
                                 </Button>
                               </TooltipTrigger>
                               <TooltipContent>清空 Hub 当前周期累计，并在服务器下次上报时重新建立 baseline</TooltipContent>
                             </Tooltip>
+                            <span className="ml-auto min-w-0 truncate whitespace-nowrap text-right text-xs text-muted-foreground">{user.traffic_limit_bytes === 0 ? "不限量" : `${formatBytes(user.traffic_limit_bytes)} (${Math.floor(percent)}%)`}</span>
                           </div>
-                          <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
-                            <span>{user.traffic_limit_bytes === 0 ? "不限量" : `${formatBytes(user.traffic_limit_bytes)} (${Math.floor(percent)}%)`}</span>
-                            <span>每月 {user.traffic_reset_day} 日重置</span>
-                          </div>
-                          <Progress aria-label={`${user.name} 流量使用比例`} value={percent} indicatorClassName={progressColor} />
+                          <Progress className="h-1.5" aria-label={`${user.name} 流量使用比例`} value={percent} indicatorClassName={progressColor} />
                         </div>
                       </TableCell>
-                      <TableCell className="text-sm">{expiryDateLabel(user.expire_date)}</TableCell>
-                      <TableCell>
+                      <TableCell className="py-3 text-sm">{expiryDateLabel(user.expire_date)}</TableCell>
+                      <TableCell className="py-3">
                         <div className="flex items-center gap-2">
                           <Switch checked={user.enabled} disabled={busy} onCheckedChange={(enabled) => void toggleUser(user, enabled)} aria-label={`${user.enabled ? "停用" : "启用"} ${user.name}`} />
                           <Badge variant="outline" className={accessClass(user)}>{accessLabel(user)}</Badge>
                         </div>
                         {failures.length > 0 && <span className="mt-1 block text-xs text-destructive" title={failures.map((failure) => `${failure.server_name}：${failure.error}`).join("\n")}>服务器配置未同步</span>}
                       </TableCell>
-                      <TableCell>
+                      <TableCell className="py-3">
                         <div className="flex justify-end gap-1">
                           {row.actions.includes("edit") && <Button size="sm" variant="ghost" disabled={busy} onClick={() => openEdit(user)}><Pencil className="size-4" /> 编辑</Button>}
+                          {!user.is_system && <Button size="icon-sm" variant="ghost" disabled={busy} title="设置用户中心密码" aria-label={`设置 ${user.name} 的用户中心密码`} onClick={() => openPassword(user)}><KeyRound className="size-4" /></Button>}
                           {row.actions.includes("delete") && <Button size="icon-sm" variant="ghost" disabled={busy} title="删除用户" onClick={() => setConfirm({ kind: "delete", user })}><Trash2 className="size-4 text-destructive" /></Button>}
                         </div>
                       </TableCell>
@@ -453,6 +487,11 @@ export function ProxyUserManager({ servers }: { servers: Node[] }) {
                     <Switch id="proxy-user-enabled" checked={form.enabled} disabled={saving || editBusy} onCheckedChange={(enabled) => setForm((current) => ({ ...current, enabled }))} />
                   </div>
                 </div>
+                {!dialogUser && <div className="space-y-2">
+                  <Label htmlFor="proxy-user-password">用户中心登录密码</Label>
+                  <Input id="proxy-user-password" type="password" autoComplete="new-password" maxLength={1024} required value={form.password} disabled={saving} onChange={(event) => setForm((current) => ({ ...current, password: event.target.value }))} />
+                  <p className="text-xs text-muted-foreground">至少 12 字节；服务器只保存 Argon2 密码 hash。</p>
+                </div>}
                 {dialogUser ? (
                   <div className="space-y-2">
                     <Label>用户 UUID</Label>
@@ -463,6 +502,10 @@ export function ProxyUserManager({ servers }: { servers: Node[] }) {
                     </div>
                   </div>
                 ) : <p className="rounded-md bg-muted px-3 py-2 text-sm text-muted-foreground">UUID 将在服务器创建时生成。</p>}
+                {dialogUser && !dialogUser.is_system && <div className="flex items-center justify-between gap-3 rounded-md border px-3 py-2.5">
+                  <div><p className="text-sm font-medium">用户中心密码</p><p className="text-xs text-muted-foreground">密码不会回显，重设后会撤销该用户现有会话。</p></div>
+                  <Button type="button" variant="outline" disabled={saving || editBusy} onClick={() => openPassword(dialogUser)}>重置密码</Button>
+                </div>}
 
                 <fieldset className="space-y-2">
                   <legend className="text-sm font-medium">可用代理节点</legend>
@@ -496,6 +539,28 @@ export function ProxyUserManager({ servers }: { servers: Node[] }) {
               <Button type="submit" disabled={saving || editBusy}>
                 {saving && <LoaderCircle className="size-4 animate-spin" />}
                 {dialogUser ? "保存修改" : "创建用户"}
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={passwordUser !== null} onOpenChange={(open) => { if (!open && !passwordSaving) { setPasswordUser(null); setPasswordValue("") } }}>
+        <DialogContent className="sm:max-w-[420px]">
+          <DialogHeader>
+            <DialogTitle>设置「{passwordUser?.name ?? "用户"}」的用户中心密码</DialogTitle>
+            <DialogDescription>密码只保存 Argon2 hash，不会显示在用户资料中。保存后会撤销该用户已有的用户中心 session。</DialogDescription>
+          </DialogHeader>
+          <form onSubmit={(event) => void submitPassword(event)} className="space-y-4">
+            <div className="space-y-2">
+              <Label htmlFor="proxy-user-reset-password">新密码</Label>
+              <Input id="proxy-user-reset-password" type="password" autoComplete="new-password" maxLength={1024} required value={passwordValue} disabled={passwordSaving} onChange={(event) => setPasswordValue(event.target.value)} />
+            </div>
+            <DialogFooter>
+              <Button type="button" variant="outline" disabled={passwordSaving} onClick={() => setPasswordUser(null)}>取消</Button>
+              <Button type="submit" disabled={passwordSaving || !passwordUser}>
+                {passwordSaving && <LoaderCircle className="size-4 animate-spin" />}
+                保存新密码
               </Button>
             </DialogFooter>
           </form>
