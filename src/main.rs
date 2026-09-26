@@ -31,6 +31,7 @@ mod command;
 mod db;
 mod frontend;
 mod notify;
+pub mod proxy_config;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
