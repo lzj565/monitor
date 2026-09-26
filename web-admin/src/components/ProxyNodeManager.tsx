@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react"
-import { Copy, Download, LoaderCircle, Pencil, Plus, QrCode, RotateCw, Trash2 } from "lucide-react"
+import { ChevronDown, Copy, Download, Globe2, LoaderCircle, MapPin, Pencil, PencilLine, Plus, QrCode, RotateCw, Settings2, Trash2, Zap } from "lucide-react"
 import { QRCodeSVG } from "qrcode.react"
 import { toast } from "sonner"
 
@@ -38,15 +38,8 @@ import {
 type AddressMode = "ipv4" | "ipv6" | "custom"
 type SubmitStage = "creating" | "deploying"
 type SingboxStatus = { installed?: boolean; service_exists?: boolean; running?: boolean; service_state_known?: boolean }
-type NewProxyNodeForm = {
+type ProxyNodeFormValues = {
   nodeId: string
-  name: string
-  addressMode: AddressMode
-  customAddress: string
-  realityServerName: string
-  realityDest: string
-}
-type EditProxyNodeForm = {
   name: string
   addressMode: AddressMode
   customAddress: string
@@ -54,17 +47,19 @@ type EditProxyNodeForm = {
   realityServerName: string
   realityDest: string
 }
+type EditProxyNodeForm = ProxyNodeFormValues
 type ImportProxyNodeForm = {
   name: string
   addressMode: AddressMode
   customAddress: string
 }
 
-const EMPTY_FORM: NewProxyNodeForm = {
+const EMPTY_FORM: ProxyNodeFormValues = {
   nodeId: "",
-  name: "",
+  name: "VLESS Reality",
   addressMode: "ipv4",
   customAddress: "",
+  listenPort: "",
   realityServerName: "www.apple.com",
   realityDest: "www.apple.com:443",
 }
@@ -137,7 +132,7 @@ export function ProxyNodeManager({
   const [nodeOperations, setNodeOperations] = useState<Record<number, string>>({})
   const operationGuard = useRef(createProxyNodeOperationGuard())
   const [createOpen, setCreateOpen] = useState(false)
-  const [form, setForm] = useState<NewProxyNodeForm>(EMPTY_FORM)
+  const [form, setForm] = useState<ProxyNodeFormValues>(EMPTY_FORM)
   const [formError, setFormError] = useState("")
   const [submitStage, setSubmitStage] = useState<SubmitStage | null>(null)
   const [editingNode, setEditingNode] = useState<ProxyNode | null>(null)
@@ -293,6 +288,7 @@ export function ProxyNodeManager({
     setEditingNode(node)
     setEditError("")
     setEditForm({
+      nodeId: node.node_id.toString(),
       name: node.name,
       addressMode: node.address_mode as AddressMode,
       customAddress: node.custom_address || "",
@@ -546,6 +542,15 @@ export function ProxyNodeManager({
       setFormError("请填写自定义连接地址")
       return
     }
+    if (form.addressMode !== "custom" && !connectionAddress(form.addressMode, null, selectedServer)) {
+      setFormError(`所选服务器没有可用的 ${form.addressMode === "ipv4" ? "IPv4" : "IPv6"} 地址`)
+      return
+    }
+    const listenPort = form.listenPort.trim() ? Number(form.listenPort) : null
+    if (listenPort !== null && (!Number.isInteger(listenPort) || listenPort < 1 || listenPort > 65535)) {
+      setFormError("端口必须是 1 到 65535 之间的整数，留空则自动分配")
+      return
+    }
 
     setSubmitStage("creating")
     let created: { node: ProxyNode }
@@ -557,7 +562,7 @@ export function ProxyNodeManager({
           name: form.name.trim(),
           address_mode: form.addressMode,
           custom_address: form.addressMode === "custom" ? form.customAddress.trim() : null,
-          listen_port: null,
+          listen_port: listenPort,
           reality_server_name: form.realityServerName.trim(),
           reality_dest: form.realityDest.trim(),
         }),
@@ -897,107 +902,23 @@ export function ProxyNodeManager({
           ) : null}
         </DialogContent>
       </Dialog>
-      <Dialog open={createOpen} onOpenChange={(open) => { if (!submitStage) setCreateOpen(open) }}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>新建代理节点</DialogTitle>
-            <DialogDescription>在 sing-box 正在运行的服务器上创建 VLESS + Reality 代理入口。</DialogDescription>
-          </DialogHeader>
-          <form className="space-y-4" onSubmit={(event) => void createAndDeploy(event)}>
-            <div className="space-y-2">
-              <Label htmlFor="proxy-server">所属服务器 *</Label>
-              <Select value={form.nodeId} disabled={Boolean(submitStage)} onValueChange={(nodeId) => setForm((current) => ({ ...current, nodeId }))}>
-                <SelectTrigger id="proxy-server" className="w-full"><SelectValue placeholder="选择服务器" /></SelectTrigger>
-                <SelectContent>
-                  {nodes.map((server) => {
-                    const readiness = serverReadiness(server, liveStatuses[server.id], rowBusy[server.id])
-                    return (
-                      <SelectItem key={server.id} value={server.id.toString()} disabled={!readiness.ready}>
-                        <span className="flex min-w-0 flex-col">
-                          <span>{server.name}</span>
-                          <span className="text-xs text-muted-foreground">{addressForServer(server) || "无可用 IP"}</span>
-                          <span className="flex gap-3 text-xs">
-                            <span className={server.online ? "text-emerald-600" : "text-muted-foreground"}>● Agent {server.online ? "在线" : "离线"}</span>
-                            <span className={readiness.ready ? "text-emerald-600" : "text-muted-foreground"}>● {readiness.label}</span>
-                          </span>
-                        </span>
-                      </SelectItem>
-                    )
-                  })}
-                </SelectContent>
-              </Select>
-              {selectedServer && !selectedReadiness?.ready && (
-                <p className="text-xs text-destructive">{selectedReadiness?.label}，暂时不能创建代理节点。</p>
-              )}
-              {!nodes.length && <p className="text-xs text-muted-foreground">当前没有可选择的服务器。</p>}
-            </div>
-            <div className="space-y-2">
-              <Label>连接地址</Label>
-              <div className="flex flex-wrap gap-2">
-                {([ ["ipv4", "IPv4"], ["ipv6", "IPv6"], ["custom", "自定义"] ] as const).map(([mode, label]) => (
-                  <Button
-                    key={mode}
-                    type="button"
-                    size="sm"
-                    disabled={Boolean(submitStage)}
-                    variant={form.addressMode === mode ? "default" : "outline"}
-                    onClick={() => setForm((current) => ({ ...current, addressMode: mode }))}
-                  >
-                    {label}
-                  </Button>
-                ))}
-              </div>
-              {form.addressMode === "custom" ? (
-                <Input
-                  aria-label="自定义连接地址"
-                  placeholder="例如 proxy.example.com"
-                  disabled={Boolean(submitStage)}
-                  value={form.customAddress}
-                  onChange={(event) => setForm((current) => ({ ...current, customAddress: event.target.value }))}
-                />
-              ) : (
-                <p className="text-xs text-muted-foreground">
-                  {selectedServer
-                    ? connectionAddress(form.addressMode, null, selectedServer) || "所选服务器没有该地址"
-                    : "使用所属服务器的对应 IP 地址"}
-                </p>
-              )}
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="proxy-name">代理节点名称</Label>
-              <Input id="proxy-name" disabled={Boolean(submitStage)} value={form.name} onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))} placeholder="例如 HK Reality" />
-            </div>
-            <div className="space-y-2">
-              <Label>协议</Label>
-              <div><Badge variant="secondary">VLESS + Reality</Badge></div>
-            </div>
-            <div className="space-y-2">
-              <Label>端口</Label>
-              <Input value="自动分配" readOnly aria-label="端口自动分配" />
-              <p className="text-xs text-muted-foreground">服务器会为此代理节点分配可用端口。</p>
-            </div>
-            <div className="space-y-3 rounded-md border p-3">
-              <p className="text-sm font-medium">Reality 设置</p>
-              <div className="space-y-2">
-                <Label htmlFor="reality-sni">SNI</Label>
-                <Input id="reality-sni" disabled={Boolean(submitStage)} value={form.realityServerName} onChange={(event) => setForm((current) => ({ ...current, realityServerName: event.target.value }))} required />
-              </div>
-              <div className="space-y-2">
-                <Label htmlFor="reality-dest">Dest</Label>
-                <Input id="reality-dest" disabled={Boolean(submitStage)} value={form.realityDest} onChange={(event) => setForm((current) => ({ ...current, realityDest: event.target.value }))} required />
-              </div>
-            </div>
-            {formError && <p role="alert" className="break-words text-sm text-destructive">{formError}</p>}
-            <DialogFooter>
-              <Button type="button" variant="outline" disabled={Boolean(submitStage)} onClick={() => setCreateOpen(false)}>取消</Button>
-              <Button type="submit" disabled={Boolean(submitStage) || !selectedReadiness?.ready}>
-                {submitStage === "creating" ? <><LoaderCircle className="animate-spin" />创建中…</> : submitStage === "deploying" ? <><LoaderCircle className="animate-spin" />部署中…</> : "创建并部署"}
-              </Button>
-            </DialogFooter>
-          </form>
-        </DialogContent>
-      </Dialog>
-      <Dialog
+      <ProxyNodeFormModal
+        mode="create"
+        open={createOpen}
+        onOpenChange={(open) => { if (!submitStage) setCreateOpen(open) }}
+        nodes={nodes}
+        liveStatuses={liveStatuses}
+        rowBusy={rowBusy}
+        value={form}
+        onValueChange={(update) => setForm((current) => ({ ...current, ...update }))}
+        busy={Boolean(submitStage)}
+        submitStage={submitStage}
+        error={formError}
+        onSubmit={(event) => void createAndDeploy(event)}
+        onCancel={() => setCreateOpen(false)}
+      />
+      <ProxyNodeFormModal
+        mode="edit"
         open={Boolean(editingNode && editForm)}
         onOpenChange={(open) => {
           if (open) return
@@ -1005,121 +926,22 @@ export function ProxyNodeManager({
           setEditingNode(null)
           setEditForm(null)
         }}
-      >
-        {editingNode && editForm && (
-          <DialogContent className="sm:max-w-2xl">
-            <DialogHeader>
-              <DialogTitle>编辑「{editingNode.name}」</DialogTitle>
-              <DialogDescription>修改后会保存期望配置并部署到所属服务器。</DialogDescription>
-            </DialogHeader>
-            <form className="space-y-4" onSubmit={(event) => void saveEdit(event)}>
-              <div className="space-y-2">
-                <Label htmlFor="proxy-edit-name">代理节点名称</Label>
-                <Input
-                  id="proxy-edit-name"
-                  value={editForm.name}
-                  disabled={Boolean(nodeOperations[editingNode.id])}
-                  onChange={(event) => setEditForm((current) => current ? { ...current, name: event.target.value } : current)}
-                  required
-                />
-              </div>
-              <div className="space-y-2">
-                <Label>连接地址模式</Label>
-                <Select
-                  value={editForm.addressMode}
-                  disabled={Boolean(nodeOperations[editingNode.id])}
-                  onValueChange={(addressMode: AddressMode) => setEditForm((current) => current ? { ...current, addressMode } : current)}
-                >
-                  <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="ipv4">IPv4</SelectItem>
-                    <SelectItem value="ipv6">IPv6</SelectItem>
-                    <SelectItem value="custom">自定义</SelectItem>
-                  </SelectContent>
-                </Select>
-                {editForm.addressMode === "custom" ? (
-                  <Input
-                    aria-label="自定义连接地址"
-                    placeholder="例如 proxy.example.com"
-                    value={editForm.customAddress}
-                    disabled={Boolean(nodeOperations[editingNode.id])}
-                    onChange={(event) => setEditForm((current) => current ? { ...current, customAddress: event.target.value } : current)}
-                    required
-                  />
-                ) : (
-                  <p className="text-xs text-muted-foreground">
-                    {connectionAddress(editForm.addressMode, null, serversById.get(editingNode.node_id)) || "使用所属服务器的对应 IP 地址"}
-                  </p>
-                )}
-              </div>
-              <div className="space-y-2">
-                <Label htmlFor="proxy-edit-port">端口</Label>
-                <Input
-                  id="proxy-edit-port"
-                  type="number"
-                  min={1}
-                  max={65535}
-                  step={1}
-                  value={editForm.listenPort}
-                  disabled={Boolean(nodeOperations[editingNode.id])}
-                  onChange={(event) => setEditForm((current) => current ? { ...current, listenPort: event.target.value } : current)}
-                  required
-                />
-              </div>
-              <div className="space-y-3 rounded-md border p-3">
-                <p className="text-sm font-medium">Reality 设置</p>
-                <div className="space-y-2">
-                  <Label htmlFor="proxy-edit-sni">SNI</Label>
-                  <Input
-                    id="proxy-edit-sni"
-                    value={editForm.realityServerName}
-                    disabled={Boolean(nodeOperations[editingNode.id])}
-                    onChange={(event) => setEditForm((current) => current ? { ...current, realityServerName: event.target.value } : current)}
-                    required
-                  />
-                </div>
-                <div className="space-y-2">
-                  <Label htmlFor="proxy-edit-dest">Dest</Label>
-                  <Input
-                    id="proxy-edit-dest"
-                    value={editForm.realityDest}
-                    disabled={Boolean(nodeOperations[editingNode.id])}
-                    onChange={(event) => setEditForm((current) => current ? { ...current, realityDest: event.target.value } : current)}
-                    required
-                  />
-                </div>
-              </div>
-              <div className="space-y-3 rounded-md border p-3">
-                <div>
-                  <p className="text-sm font-medium">高级配置</p>
-                  <p className="text-xs text-muted-foreground">凭据只读；重新生成后，使用旧凭据的客户端配置会失效。</p>
-                </div>
-                <CredentialRow label="UUID" value={editingNode.uuid} disabled={Boolean(nodeOperations[editingNode.id])} onRegenerate={() => {
-                  setRegenerateError("")
-                  setRegenerateTarget({ node: editingNode, credential: "uuid" })
-                }} />
-                <CredentialRow label="Reality Public Key" value={editingNode.reality_public_key} disabled={Boolean(nodeOperations[editingNode.id])} onRegenerate={() => {
-                  setRegenerateError("")
-                  setRegenerateTarget({ node: editingNode, credential: "reality_key" })
-                }} regenerateLabel="重新生成 Reality 密钥" />
-                <CredentialRow label="Short ID" value={editingNode.reality_short_id} disabled={Boolean(nodeOperations[editingNode.id])} onRegenerate={() => {
-                  setRegenerateError("")
-                  setRegenerateTarget({ node: editingNode, credential: "short_id" })
-                }} />
-              </div>
-              {editError && <p role="alert" className="break-words text-sm text-destructive">保存失败：{editError}</p>}
-              <DialogFooter>
-                <Button type="button" variant="outline" disabled={Boolean(nodeOperations[editingNode.id])} onClick={() => { setEditingNode(null); setEditForm(null) }}>取消</Button>
-                <Button type="submit" disabled={Boolean(nodeOperations[editingNode.id])}>
-                  {nodeOperations[editingNode.id] === "saving"
-                    ? <><LoaderCircle className="animate-spin" />保存并部署中…</>
-                    : "保存并部署"}
-                </Button>
-              </DialogFooter>
-            </form>
-          </DialogContent>
-        )}
-      </Dialog>
+        nodes={nodes}
+        liveStatuses={liveStatuses}
+        rowBusy={rowBusy}
+        value={editForm ?? EMPTY_FORM}
+        onValueChange={(update) => setEditForm((current) => current ? { ...current, ...update } : current)}
+        proxyNode={editingNode ?? undefined}
+        busy={Boolean(editingNode && nodeOperations[editingNode.id])}
+        error={editError}
+        onSubmit={(event) => void saveEdit(event)}
+        onCancel={() => { setEditingNode(null); setEditForm(null) }}
+        onRegenerate={(credential) => {
+          if (!editingNode) return
+          setRegenerateError("")
+          setRegenerateTarget({ node: editingNode, credential })
+        }}
+      />
       <Dialog
         open={Boolean(deleteTarget)}
         onOpenChange={(open) => {
@@ -1197,5 +1019,316 @@ function CredentialRow({
       </div>
       <Button type="button" variant="outline" size="sm" disabled={disabled} onClick={onRegenerate}>{regenerateLabel}</Button>
     </div>
+  )
+}
+
+function ProxyNodeFormModal({
+  mode,
+  open,
+  onOpenChange,
+  nodes,
+  liveStatuses,
+  rowBusy,
+  value,
+  onValueChange,
+  proxyNode,
+  busy,
+  submitStage,
+  error,
+  onSubmit,
+  onCancel,
+  onRegenerate,
+}: {
+  mode: "create" | "edit"
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  nodes: Node[]
+  liveStatuses: Record<number, SingboxStatus>
+  rowBusy: Record<number, string>
+  value: ProxyNodeFormValues
+  onValueChange: (update: Partial<ProxyNodeFormValues>) => void
+  proxyNode?: ProxyNode
+  busy: boolean
+  submitStage?: SubmitStage | null
+  error: string
+  onSubmit: (event: React.FormEvent<HTMLFormElement>) => void
+  onCancel: () => void
+  onRegenerate?: (credential: ProxyNodeCredential) => void
+}) {
+  const editing = mode === "edit"
+  const server = nodes.find((item) => item.id.toString() === value.nodeId)
+  const readiness = server
+    ? serverReadiness(server, liveStatuses[server.id], rowBusy[server.id])
+    : null
+  const ipv4 = connectionAddress("ipv4", null, server)
+  const ipv6 = connectionAddress("ipv6", null, server)
+  const serverAddress = server ? addressForServer(server) : ""
+  const selectedAddress = connectionAddress(value.addressMode, value.customAddress, server)
+  const inputId = editing ? "proxy-edit" : "proxy-create"
+  const serverStatus = readiness?.ready
+    ? "Sing-box 正常"
+    : !server?.online
+      ? "Agent 离线"
+      : readiness?.label || "等待选择服务器"
+  const statusDot = readiness?.ready
+    ? "bg-emerald-500"
+    : server && !server.online
+      ? "bg-destructive"
+      : "bg-muted-foreground/50"
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="flex max-h-[calc(100dvh-64px)] min-h-0 flex-col gap-0 overflow-hidden p-0 sm:max-w-[880px]">
+        <DialogHeader className="shrink-0 px-6 pt-6 pb-4">
+          <DialogTitle>{editing ? "编辑代理节点" : "新建代理节点"}</DialogTitle>
+          <DialogDescription>
+            {editing
+              ? "修改代理节点配置，保存后将同步到所属服务器。"
+              : "在运行 sing-box 的服务器上创建 VLESS + Reality 代理入口。"}
+          </DialogDescription>
+        </DialogHeader>
+        <form className="flex min-h-0 flex-1 flex-col" onSubmit={onSubmit}>
+          <div className="min-h-0 flex-1 space-y-5 overflow-y-auto px-6 pb-5">
+            <div className="space-y-2">
+              <Label htmlFor={`${inputId}-server`}>所属服务器</Label>
+              {editing ? (
+                <div className="flex min-h-11 items-center justify-between gap-3 rounded-md border bg-muted/20 px-3 py-2">
+                  <div className="min-w-0">
+                    <p className="truncate text-sm font-medium">{server?.name || `服务器 #${proxyNode?.node_id}`}</p>
+                    <p className="truncate text-xs text-muted-foreground">{serverAddress || "无可用 IP"}</p>
+                  </div>
+                  <ServerStatus dot={statusDot} label={serverStatus} />
+                </div>
+              ) : (
+                <>
+                  <Select
+                    value={value.nodeId}
+                    disabled={busy}
+                    onValueChange={(nodeId) => onValueChange({ nodeId })}
+                  >
+                    <SelectTrigger id={`${inputId}-server`} className="h-11 w-full">
+                      <SelectValue placeholder="选择服务器" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {nodes.map((item) => {
+                        const itemReadiness = serverReadiness(item, liveStatuses[item.id], rowBusy[item.id])
+                        const address = addressForServer(item)
+                        return (
+                          <SelectItem key={item.id} value={item.id.toString()} disabled={!itemReadiness.ready}>
+                            {item.name} ({address || "无可用 IP"})
+                          </SelectItem>
+                        )
+                      })}
+                    </SelectContent>
+                  </Select>
+                  {server && (
+                    <div className="flex items-center justify-between gap-3 px-1 text-xs">
+                      <span className="min-w-0 truncate text-muted-foreground">
+                        {ipv6 ? `IPv6：${ipv6}` : "未检测到 IPv6 地址"}
+                      </span>
+                      <ServerStatus dot={statusDot} label={serverStatus} />
+                    </div>
+                  )}
+                  {!server && !nodes.length && <p className="text-xs text-muted-foreground">当前没有可选择的服务器。</p>}
+                  {server && readiness && !readiness.ready && (
+                    <p className="text-xs text-destructive">{readiness.label}，暂时不能创建代理节点。</p>
+                  )}
+                </>
+              )}
+            </div>
+
+            <section className="space-y-3 rounded-xl border bg-muted/20 p-4">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <Label>连接地址</Label>
+                  <p className="mt-1 text-xs text-muted-foreground">客户端将通过此地址连接服务器</p>
+                </div>
+                <MapPin className="size-4 text-muted-foreground" aria-hidden="true" />
+              </div>
+              <div className="grid grid-cols-3 gap-1 rounded-lg bg-muted p-1">
+                {([
+                  ["ipv4", "IPv4", Globe2, !ipv4],
+                  ["ipv6", "IPv6", Zap, !ipv6],
+                  ["custom", "自定义", PencilLine, false],
+                ] as const).map(([addressMode, label, Icon, unavailable]) => (
+                  <Button
+                    key={addressMode}
+                    type="button"
+                    size="sm"
+                    variant={value.addressMode === addressMode ? "default" : "ghost"}
+                    disabled={busy || unavailable}
+                    aria-pressed={value.addressMode === addressMode}
+                    onClick={() => onValueChange({ addressMode })}
+                  >
+                    <Icon />{label}
+                  </Button>
+                ))}
+              </div>
+              {value.addressMode === "custom" ? (
+                <Input
+                  aria-label="自定义连接地址"
+                  placeholder="例如 proxy.example.com"
+                  className="h-11 bg-background"
+                  value={value.customAddress}
+                  disabled={busy}
+                  onChange={(event) => onValueChange({ customAddress: event.target.value })}
+                  required
+                />
+              ) : (
+                <div className="flex min-h-9 min-w-0 items-center justify-between gap-3">
+                  <p className="min-w-0 break-all text-lg font-semibold tracking-tight">
+                    {selectedAddress || (server ? "所选服务器没有该地址" : "先选择所属服务器")}
+                  </p>
+                  <span className="shrink-0 rounded-md border bg-background px-2 py-1 text-xs text-muted-foreground">
+                    {value.addressMode === "ipv4" ? "IPv4" : "IPv6"}
+                  </span>
+                </div>
+              )}
+              <div className="space-y-1 text-xs text-muted-foreground">
+                <p>
+                  {value.addressMode === "custom"
+                    ? "已选用自定义连接地址"
+                    : `已选用 ${value.addressMode === "ipv4" ? "IPv4" : "IPv6"} 连接地址`}
+                </p>
+                {value.addressMode !== "ipv6" && ipv6 && <p className="break-all">IPv6：{ipv6}</p>}
+              </div>
+            </section>
+
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div className="space-y-2">
+                <Label htmlFor={`${inputId}-name`}>代理节点名称</Label>
+                <Input
+                  id={`${inputId}-name`}
+                  className="h-11"
+                  value={value.name}
+                  disabled={busy}
+                  onChange={(event) => onValueChange({ name: event.target.value })}
+                  placeholder="例如 HK Reality"
+                  required
+                />
+              </div>
+              <div className="space-y-2">
+                <Label>协议类型</Label>
+                <div className="flex h-11 items-center justify-between rounded-md border bg-muted/20 px-3">
+                  <span className="text-sm font-medium">VLESS + Reality</span>
+                  <span className="text-xs text-muted-foreground">固定协议</span>
+                </div>
+              </div>
+            </div>
+
+            <div className="max-w-md space-y-2">
+              <div className="flex items-center justify-between gap-3">
+                <Label htmlFor={`${inputId}-port`}>端口</Label>
+                {!editing && <span className="text-xs text-muted-foreground">随机空闲</span>}
+              </div>
+              <Input
+                id={`${inputId}-port`}
+                type="number"
+                min={1}
+                max={65535}
+                step={1}
+                className="h-11"
+                value={value.listenPort}
+                disabled={busy}
+                onChange={(event) => onValueChange({ listenPort: event.target.value })}
+                placeholder="自动分配"
+                required={editing}
+              />
+              <p className="text-xs text-muted-foreground">
+                {editing ? "修改端口后，服务器会同步更新监听配置。" : "留空时由服务器自动选择可用的代理端口。"}
+              </p>
+            </div>
+
+            <details key={`${mode}-${open}`} className="group rounded-xl border bg-muted/10">
+              <summary className="flex cursor-pointer list-none items-center justify-between gap-3 p-4 [&::-webkit-details-marker]:hidden">
+                <span className="flex min-w-0 items-start gap-3">
+                  <Settings2 className="mt-0.5 size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
+                  <span className="min-w-0">
+                    <span className="block text-sm font-medium">高级配置</span>
+                    <span className="mt-1 block text-xs text-muted-foreground">SNI / Dest · 身份凭据</span>
+                  </span>
+                </span>
+                <ChevronDown className="size-4 shrink-0 text-muted-foreground transition-transform group-open:rotate-180" aria-hidden="true" />
+              </summary>
+              <div className="space-y-4 border-t px-4 pt-4 pb-4">
+                <div className="space-y-3 rounded-lg border bg-background p-3">
+                  <div>
+                    <p className="text-sm font-medium">Reality 伪装</p>
+                    <p className="mt-1 text-xs text-muted-foreground">握手目标必须与 SNI 域名相匹配。</p>
+                  </div>
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <div className="space-y-2">
+                      <Label htmlFor={`${inputId}-sni`}>SNI 伪装域名</Label>
+                      <Input
+                        id={`${inputId}-sni`}
+                        className="h-11"
+                        value={value.realityServerName}
+                        disabled={busy}
+                        onChange={(event) => onValueChange({ realityServerName: event.target.value })}
+                        required
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <Label htmlFor={`${inputId}-dest`}>Dest 目标</Label>
+                      <Input
+                        id={`${inputId}-dest`}
+                        className="h-11"
+                        value={value.realityDest}
+                        disabled={busy}
+                        onChange={(event) => onValueChange({ realityDest: event.target.value })}
+                        required
+                      />
+                    </div>
+                  </div>
+                </div>
+                {editing && proxyNode ? (
+                  <div className="space-y-3 rounded-lg border bg-background p-3">
+                    <div>
+                      <p className="text-sm font-medium">身份凭据</p>
+                      <p className="mt-1 text-xs text-muted-foreground">凭据只读。重新生成后，旧客户端配置将失效。</p>
+                    </div>
+                    <CredentialRow label="Reality Public Key" value={proxyNode.reality_public_key} disabled={busy} onRegenerate={() => onRegenerate?.("reality_key")} regenerateLabel="重新生成 Reality 密钥" />
+                    <CredentialRow label="UUID" value={proxyNode.uuid} disabled={busy} onRegenerate={() => onRegenerate?.("uuid")} />
+                    <CredentialRow label="Short ID" value={proxyNode.reality_short_id} disabled={busy} onRegenerate={() => onRegenerate?.("short_id")} />
+                  </div>
+                ) : (
+                  <div className="space-y-2 rounded-lg border bg-muted/30 p-3">
+                    <p className="text-sm font-medium">身份凭据</p>
+                    {(["UUID", "Reality 密钥", "Short ID"]).map((label) => (
+                      <div key={label} className="flex items-center justify-between gap-3 text-sm">
+                        <span className="text-muted-foreground">{label}</span>
+                        <span className="text-xs text-muted-foreground">创建时自动生成</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </details>
+            {error && <p role="alert" className="break-words text-sm text-destructive">{editing ? "保存失败：" : "创建失败："}{error}</p>}
+          </div>
+          <DialogFooter className="shrink-0 border-t bg-background px-6 py-4">
+            <Button type="button" variant="outline" disabled={busy} onClick={onCancel}>取消</Button>
+            <Button type="submit" disabled={busy || (!editing && !readiness?.ready)}>
+              {editing
+                ? busy ? <><LoaderCircle className="animate-spin" />保存并部署中…</> : "保存并部署"
+                : submitStage === "creating"
+                  ? <><LoaderCircle className="animate-spin" />创建中…</>
+                  : submitStage === "deploying"
+                    ? <><LoaderCircle className="animate-spin" />部署中…</>
+                    : "创建并部署"}
+            </Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+function ServerStatus({ dot, label }: { dot: string; label: string }) {
+  return (
+    <span className="flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground">
+      <span className={`size-2 rounded-full ${dot}`} aria-hidden="true" />
+      {label}
+    </span>
   )
 }
