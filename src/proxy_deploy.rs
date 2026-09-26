@@ -1064,7 +1064,7 @@ mod tests {
         let check = next_request(&mut rx, SINGBOX_CONFIG_CHECK_METHOD).await;
         let checked = check["params"]["content"].as_str().unwrap().to_owned();
         let candidate: Value = serde_json::from_str(&checked).unwrap();
-        assert_eq!(candidate["inbounds"][0]["users"].as_array().unwrap().len(), 1);
+        assert!(candidate["inbounds"][0]["users"].as_array().unwrap().is_empty());
         assert!(app.db.proxy_user(user_id).unwrap().is_some(), "数据库记录必须等 apply 成功后才删除");
         reply(&app, node_id, SESSION, &check, Ok(json!({ "valid": true })));
         let apply = next_request(&mut rx, SINGBOX_CONFIG_APPLY_METHOD).await;
@@ -1193,7 +1193,7 @@ mod tests {
         let check = next_request(&mut rx, SINGBOX_CONFIG_CHECK_METHOD).await;
         let candidate = check["params"]["content"].as_str().unwrap().to_owned();
         let desired: Value = serde_json::from_str(&candidate).unwrap();
-        assert_eq!(desired["inbounds"][0]["users"].as_array().unwrap().len(), 1);
+        assert!(desired["inbounds"][0]["users"].as_array().unwrap().is_empty());
         reply(&app, second_server, SESSION, &check, Ok(json!({ "valid": true })));
         let apply = next_request(&mut rx, SINGBOX_CONFIG_APPLY_METHOD).await;
         assert_eq!(apply["params"]["content"], candidate);
@@ -1227,8 +1227,9 @@ mod tests {
         reply(&app, node_id, SESSION, &get, get_result(&current));
         let check = next_request(&mut rx, SINGBOX_CONFIG_CHECK_METHOD).await;
         let candidate = check["params"]["content"].as_str().unwrap().to_owned();
+        assert!(!candidate.contains(&old_uuid), "重新生成后旧 UUID 不得留在受管配置中");
         let config: Value = serde_json::from_str(&candidate).unwrap();
-        let user_credential = &config["inbounds"][0]["users"][1];
+        let user_credential = &config["inbounds"][0]["users"][0];
         let new_uuid = user_credential["uuid"].as_str().unwrap();
         assert_ne!(new_uuid, old_uuid);
         assert_eq!(app.db.proxy_user(user_id).unwrap().unwrap().uuid, new_uuid);

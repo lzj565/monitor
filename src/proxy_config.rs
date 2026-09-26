@@ -151,9 +151,6 @@ fn generate_inbound(node: &ProxyNode, users: &[ProxyUser]) -> Result<Value, Prox
     if node.protocol != "vless_reality" {
         return Err(ProxyConfigError::UnsupportedProtocol);
     }
-    if !is_uuid(&node.uuid) {
-        return Err(ProxyConfigError::InvalidUuid);
-    }
     if !is_reality_short_id(&node.reality_short_id) {
         return Err(ProxyConfigError::InvalidShortId);
     }
@@ -168,12 +165,9 @@ fn generate_inbound(node: &ProxyNode, users: &[ProxyUser]) -> Result<Value, Prox
     }
 
     let (server, server_port) = parse_reality_dest(&node.reality_dest)?;
-    let mut inbound_users = vec![json!({
-        "uuid": node.uuid,
-        "flow": "xtls-rprx-vision"
-    })];
+    let mut inbound_users = Vec::new();
     let mut seen_user_ids = BTreeSet::new();
-    let mut seen_user_uuids = BTreeSet::from([node.uuid.to_ascii_lowercase()]);
+    let mut seen_user_uuids = BTreeSet::new();
     let mut assigned_users = users
         .iter()
         .filter(|user| user.enabled && user.proxy_node_ids.contains(&node.id))
@@ -329,11 +323,9 @@ mod tests {
     fn proxy_user(id: i64, uuid: &str, enabled: bool, proxy_node_ids: &[i64]) -> ProxyUser {
         ProxyUser {
             id,
-            username: format!("user-{id}"),
+            name: format!("user-{id}"),
             uuid: uuid.into(),
             enabled,
-            quota: 0,
-            expire_at: None,
             created_at: 1,
             note: String::new(),
             updated_at: 1,
@@ -346,8 +338,17 @@ mod tests {
     }
 
     #[test]
-    fn generates_one_vless_reality_inbound_with_server_fields_only() {
-        let generated = generate_singbox_config(1, empty_config(), &[proxy_node(12, 1, true)]).unwrap();
+    fn generates_one_vless_reality_inbound_with_only_proxy_user_identity() {
+        let mut node = proxy_node(12, 1, true);
+        node.uuid = "legacy-node-uuid-is-not-an-identity".into();
+        let generated = generate_singbox_config_excluding_users(
+            1,
+            empty_config(),
+            &[node],
+            &[proxy_user(7, "a0f81cec-73c5-4eb8-a2e2-cd1544946e8e", true, &[12])],
+            &[],
+        )
+        .unwrap();
         let inbound = &generated["inbounds"][0];
         assert_eq!(
             inbound,
@@ -357,7 +358,8 @@ mod tests {
                 "listen": "::",
                 "listen_port": 10012,
                 "users": [{
-                    "uuid": "bf000d23-0752-40b4-affe-68f7707a9661",
+                    "name": "monitor-user-7",
+                    "uuid": "a0f81cec-73c5-4eb8-a2e2-cd1544946e8e",
                     "flow": "xtls-rprx-vision"
                 }],
                 "tls": {
@@ -375,14 +377,32 @@ mod tests {
         assert!(inbound.get("public_key").is_none());
         assert!(inbound["tls"]["reality"].get("public_key").is_none());
         assert_eq!(inbound["listen"], "::", "custom client address must not become a bind address");
+        assert!(!inbound["users"].to_string().contains("legacy-node-uuid-is-not-an-identity"));
     }
 
     #[test]
-    fn generates_legacy_and_authorized_enabled_user_credentials() {
+    fn keeps_managed_inbound_with_no_users_when_none_are_enabled_and_authorized() {
+        let generated = generate_singbox_config_excluding_users(
+            1,
+            empty_config(),
+            &[proxy_node(12, 1, true)],
+            &[
+                proxy_user(2, "a0f81cec-73c5-4eb8-a2e2-cd1544946e8e", false, &[12]),
+                proxy_user(3, "aa8c947a-1dbd-4905-bcb1-71728c58effb", true, &[18]),
+            ],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(generated["inbounds"][0]["users"], json!([]));
+    }
+
+    #[test]
+    fn generates_only_enabled_users_authorized_for_each_node() {
         let node = proxy_node(12, 1, true);
+        let node_uuid = node.uuid.clone();
         let second_node = proxy_node(18, 1, true);
         let mut first_user = proxy_user(2, "a0f81cec-73c5-4eb8-a2e2-cd1544946e8e", true, &[12, 18]);
-        first_user.username = "Sensitive Display Name".into();
+        first_user.name = "Sensitive Display Name".into();
         let generated = generate_singbox_config_excluding_users(
             1,
             empty_config(),
@@ -392,6 +412,7 @@ mod tests {
                 proxy_user(3, "aa8c947a-1dbd-4905-bcb1-71728c58effb", true, &[12]),
                 proxy_user(4, "e2b4b1d8-0af6-40f8-910b-cabfb913a7bc", false, &[12]),
                 proxy_user(5, "e91f28f5-5837-4b92-a281-224d155f01f6", true, &[18]),
+                proxy_user(6, "f3a9c7de-bc1a-4239-8c56-05e7a0984e41", true, &[999]),
             ],
             &[],
         )
@@ -399,10 +420,6 @@ mod tests {
         assert_eq!(
             generated["inbounds"][0]["users"],
             json!([
-                {
-                    "uuid": "bf000d23-0752-40b4-affe-68f7707a9661",
-                    "flow": "xtls-rprx-vision"
-                },
                 {
                     "name": "monitor-user-2",
                     "uuid": "a0f81cec-73c5-4eb8-a2e2-cd1544946e8e",
@@ -418,11 +435,14 @@ mod tests {
         let credential_users = generated["inbounds"][0]["users"].to_string();
         assert!(credential_users.contains("monitor-user-2"));
         assert!(!credential_users.contains("Sensitive Display Name"));
+        assert!(!credential_users.contains(&node_uuid));
+        assert!(!credential_users.contains("e2b4b1d8-0af6-40f8-910b-cabfb913a7bc"));
+        assert!(!credential_users.contains("f3a9c7de-bc1a-4239-8c56-05e7a0984e41"));
         assert_eq!(
-            generated["inbounds"][1]["users"][1]["uuid"], "a0f81cec-73c5-4eb8-a2e2-cd1544946e8e",
+            generated["inbounds"][1]["users"][0]["uuid"], "a0f81cec-73c5-4eb8-a2e2-cd1544946e8e",
             "同一用户授权多个代理节点时使用同一个 UUID"
         );
-        assert_eq!(generated["inbounds"][1]["users"].as_array().unwrap().len(), 3);
+        assert_eq!(generated["inbounds"][1]["users"].as_array().unwrap().len(), 2);
     }
 
     #[test]
@@ -531,9 +551,24 @@ mod tests {
             Err(ProxyConfigError::InvalidRealityDest)
         );
         node = proxy_node(1, 1, true);
-        node.uuid = "not-a-uuid".into();
+        node.uuid = "legacy-node-uuid-is-not-an-identity".into();
+        let generated = generate_singbox_config_excluding_users(
+            1,
+            empty_config(),
+            &[node.clone()],
+            &[proxy_user(2, "a0f81cec-73c5-4eb8-a2e2-cd1544946e8e", true, &[1])],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(generated["inbounds"][0]["users"][0]["uuid"], "a0f81cec-73c5-4eb8-a2e2-cd1544946e8e");
         assert_eq!(
-            generate_singbox_config(1, empty_config(), &[node.clone()]),
+            generate_singbox_config_excluding_users(
+                1,
+                empty_config(),
+                &[node.clone()],
+                &[proxy_user(2, "not-a-uuid", true, &[1])],
+                &[],
+            ),
             Err(ProxyConfigError::InvalidUuid)
         );
         node = proxy_node(1, 1, true);

@@ -144,10 +144,8 @@ const shareRequest: ProxyNodeActionApi = async <T>(path: string, init?: RequestI
 const share = await fetchProxyNodeShare(shareRequest, proxyNode.id)
 assert.deepEqual(calls.map((call) => [call.path, call.init?.cache]), [["/proxy/nodes/7/share", "no-store"]])
 assert.equal(share.uri, shareUri, "二维码和复制操作读取后端给出的同一条 URI")
-assert.equal(proxyNodeShareDisabledReason(proxyNode, "198.51.100.20"), null)
-assert.match(proxyNodeShareDisabledReason({ ...proxyNode, enabled: false }, "198.51.100.20") || "", /已停用/)
-assert.match(proxyNodeShareDisabledReason({ ...proxyNode, deploy_status: "failed" }, "198.51.100.20") || "", /部署失败/)
-assert.match(proxyNodeShareDisabledReason(proxyNode, "") || "", /连接地址/)
+assert.match(proxyNodeShareDisabledReason(), /分享链接已停用/)
+assert.match(proxyNodeShareDisabledReason(), /代理用户/)
 const shareApiFailure: ProxyNodeActionApi = async () => { throw new Error("代理节点部署失败") }
 await assert.rejects(fetchProxyNodeShare(shareApiFailure, proxyNode.id), /代理节点部署失败/)
 const shareLoading: boolean[] = []

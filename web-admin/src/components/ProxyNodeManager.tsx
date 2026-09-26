@@ -615,10 +615,7 @@ export function ProxyNodeManager({
             {proxyNodes.map((proxyNode) => {
               const server = serversById.get(proxyNode.node_id)
               const nodeBusy = Boolean(nodeOperations[proxyNode.id])
-              const shareDisabledReason = proxyNodeShareDisabledReason(
-                proxyNode,
-                connectionAddress(proxyNode.address_mode, proxyNode.custom_address, server),
-              )
+              const shareDisabledReason = proxyNodeShareDisabledReason()
               const shareDisabledMessage = shareDisabledReason || (nodeBusy ? "代理节点操作中，暂不可分享" : null)
               const shareDisabled = nodeBusy || Boolean(shareDisabledReason) || Boolean(sharingNodes[proxyNode.id])
               return (

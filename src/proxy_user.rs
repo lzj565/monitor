@@ -52,7 +52,7 @@ impl From<ProxyUser> for ProxyUserResponse {
     fn from(user: ProxyUser) -> Self {
         Self {
             id: user.id,
-            name: user.username,
+            name: user.name,
             uuid: user.uuid,
             enabled: user.enabled,
             note: user.note,
@@ -192,7 +192,7 @@ pub async fn delete_proxy_user(_: Admin, State(app): State<Shared>, Path(id): Pa
     };
     let Some((disabled, server_ids)) = (match app.db.update_proxy_user_profile(
         id,
-        &current.username,
+        &current.name,
         false,
         &current.note,
         &current.proxy_node_ids,

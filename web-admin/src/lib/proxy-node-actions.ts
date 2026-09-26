@@ -22,21 +22,8 @@ export async function fetchProxyNodeShare(
   }
 }
 
-export function proxyNodeShareDisabledReason(
-  node: Pick<ProxyNode, "enabled" | "deploy_status" | "uuid" | "reality_public_key" | "reality_short_id" | "reality_server_name">,
-  address: string,
-): string | null {
-  if (!node.enabled) return "代理节点已停用"
-  if (node.deploy_status !== "deployed") {
-    if (node.deploy_status === "deploying") return "代理节点正在部署"
-    if (node.deploy_status === "failed") return "代理节点部署失败，重新部署成功后可分享"
-    return "代理节点尚未成功部署"
-  }
-  if (!address.trim()) return "缺少可用连接地址"
-  if (![node.uuid, node.reality_public_key, node.reality_short_id, node.reality_server_name].every((value) => value.trim())) {
-    return "代理节点分享凭据不完整"
-  }
-  return null
+export function proxyNodeShareDisabledReason(): string {
+  return "节点分享链接已停用，请在用户管理中创建代理用户并授权节点"
 }
 
 export function proxyNodeUpdatePayload(

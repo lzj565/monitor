@@ -245,7 +245,6 @@ export function ProxyUserManager({ servers }: { servers: Node[] }) {
                 <TableHead>状态</TableHead>
                 <TableHead>代理节点</TableHead>
                 <TableHead>备注</TableHead>
-                <TableHead>创建时间</TableHead>
                 <TableHead className="text-right">操作</TableHead>
               </TableRow>
             </TableHeader>
@@ -289,7 +288,6 @@ export function ProxyUserManager({ servers }: { servers: Node[] }) {
                       </div>
                     </TableCell>
                     <TableCell className="max-w-48 truncate text-sm text-muted-foreground" title={user.note}>{user.note || "-"}</TableCell>
-                    <TableCell className="whitespace-nowrap text-sm text-muted-foreground">{new Date(user.created_at * 1000).toLocaleDateString()}</TableCell>
                     <TableCell>
                       <div className="flex justify-end gap-1">
                         <Button size="sm" variant="ghost" disabled={busy} onClick={() => openEdit(user)}><Pencil className="size-4" />编辑</Button>

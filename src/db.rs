@@ -616,11 +616,9 @@ pub struct ProxyInstance {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ProxyUser {
     pub id: i64,
-    pub username: String,
+    pub name: String,
     pub uuid: String,
     pub enabled: bool,
-    pub quota: i64,
-    pub expire_at: Option<i64>,
     pub created_at: i64,
     pub note: String,
     pub updated_at: i64,
@@ -1307,33 +1305,11 @@ impl Db {
         Ok(())
     }
 
-    pub fn create_proxy_user(
-        &self,
-        username: &str,
-        uuid: &str,
-        enabled: bool,
-        quota: i64,
-        expire_at: Option<i64>,
-    ) -> Result<i64> {
-        if username.trim().is_empty() || uuid.trim().is_empty() || quota < 0 {
-            anyhow::bail!("invalid proxy user");
-        }
-        let conn = self.conn();
-        let now = Utc::now().timestamp();
-        conn.execute(
-            "INSERT INTO proxy_user
-               (username, uuid, enabled, quota, expire_at, created_at, note, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, '', ?6)",
-            params![username, uuid, enabled, quota, expire_at, now],
-        )?;
-        Ok(conn.last_insert_rowid())
-    }
-
     pub fn proxy_user(&self, id: i64) -> Result<Option<ProxyUser>> {
         let conn = self.conn();
         let mut user = conn
             .query_row(
-                "SELECT id, username, uuid, enabled, quota, expire_at, created_at, note, updated_at
+                "SELECT id, username AS name, uuid, enabled, created_at, note, updated_at
                  FROM proxy_user WHERE id = ?1",
                 [id],
                 row_to_proxy_user,
@@ -1348,7 +1324,7 @@ impl Db {
     pub fn proxy_users(&self) -> Result<Vec<ProxyUser>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT id, username, uuid, enabled, quota, expire_at, created_at, note, updated_at
+            "SELECT id, username AS name, uuid, enabled, created_at, note, updated_at
              FROM proxy_user ORDER BY created_at, id",
         )?;
         let rows = stmt.query_map([], row_to_proxy_user)?;
@@ -1360,47 +1336,26 @@ impl Db {
         Ok(users)
     }
 
-    pub fn update_proxy_user(&self, user: &ProxyUser) -> Result<bool> {
-        if user.username.trim().is_empty() || user.uuid.trim().is_empty() || user.quota < 0 {
-            anyhow::bail!("invalid proxy user");
-        }
-        Ok(self.conn().execute(
-            "UPDATE proxy_user SET username=?2, uuid=?3, enabled=?4, quota=?5, expire_at=?6,
-                    note=?7, updated_at=?8
-             WHERE id=?1",
-            params![
-                user.id,
-                user.username,
-                user.uuid,
-                user.enabled,
-                user.quota,
-                user.expire_at,
-                user.note,
-                Utc::now().timestamp()
-            ],
-        )? > 0)
-    }
-
     /// 创建用户及其节点授权；授权关系和用户记录必须同时提交。
     pub fn create_proxy_user_with_nodes(
         &self,
-        username: &str,
+        name: &str,
         uuid: &str,
         enabled: bool,
         note: &str,
         requested_node_ids: &[i64],
     ) -> Result<(ProxyUser, Vec<i64>)> {
-        validate_proxy_user_profile(username, note, uuid)?;
+        validate_proxy_user_profile(name, note, uuid)?;
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        ensure_proxy_user_name_available(&tx, username, None)?;
+        ensure_proxy_user_name_available(&tx, name, None)?;
         let proxy_node_ids = validated_proxy_node_ids(&tx, requested_node_ids)?;
         let now = Utc::now().timestamp();
         tx.execute(
             "INSERT INTO proxy_user
-               (username, uuid, enabled, quota, expire_at, created_at, note, updated_at)
-             VALUES (?1, ?2, ?3, 0, NULL, ?4, ?5, ?4)",
-            params![username.trim(), uuid.trim(), enabled, now, note.trim()],
+               (username, uuid, enabled, created_at, note, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?4)",
+            params![name.trim(), uuid.trim(), enabled, now, note.trim()],
         )?;
         let id = tx.last_insert_rowid();
         for proxy_node_id in &proxy_node_ids {
@@ -1421,12 +1376,12 @@ impl Db {
     pub fn update_proxy_user_profile(
         &self,
         id: i64,
-        username: &str,
+        name: &str,
         enabled: bool,
         note: &str,
         requested_node_ids: &[i64],
     ) -> Result<Option<(ProxyUser, Vec<i64>)>> {
-        validate_proxy_user_name_note(username, note)?;
+        validate_proxy_user_name_note(name, note)?;
         if id <= 0 {
             refuse!("代理用户 ID 无效");
         }
@@ -1435,7 +1390,7 @@ impl Db {
         let Some(mut user) = query_proxy_user(&tx, id)? else {
             return Ok(None);
         };
-        ensure_proxy_user_name_available(&tx, username, Some(id))?;
+        ensure_proxy_user_name_available(&tx, name, Some(id))?;
         let old_proxy_node_ids = proxy_user_node_ids(&tx, id)?;
         let proxy_node_ids = validated_proxy_node_ids(&tx, requested_node_ids)?;
         let mut server_ids = proxy_server_ids_for_nodes(&tx, &old_proxy_node_ids)?;
@@ -1446,7 +1401,7 @@ impl Db {
         let now = Utc::now().timestamp();
         tx.execute(
             "UPDATE proxy_user SET username=?2, enabled=?3, note=?4, updated_at=?5 WHERE id=?1",
-            params![id, username.trim(), enabled, note.trim(), now],
+            params![id, name.trim(), enabled, note.trim(), now],
         )?;
         tx.execute("DELETE FROM proxy_user_node WHERE user_id=?1", [id])?;
         for proxy_node_id in &proxy_node_ids {
@@ -1455,7 +1410,7 @@ impl Db {
                 params![id, proxy_node_id],
             )?;
         }
-        user.username = username.trim().to_owned();
+        user.name = name.trim().to_owned();
         user.enabled = enabled;
         user.note = note.trim().to_owned();
         user.updated_at = now;
@@ -1505,7 +1460,7 @@ impl Db {
     pub fn proxy_users_for_node(&self, node_id: i64) -> Result<Vec<ProxyUser>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT pu.id, pu.username, pu.uuid, pu.enabled, pu.quota, pu.expire_at,
+            "SELECT pu.id, pu.username AS name, pu.uuid, pu.enabled,
                     pu.created_at, pu.note, pu.updated_at, pun.proxy_node_id
              FROM proxy_user pu
              JOIN proxy_user_node pun ON pun.user_id=pu.id
@@ -1516,11 +1471,9 @@ impl Db {
             Ok((
                 ProxyUser {
                     id: row.get("id")?,
-                    username: row.get("username")?,
+                    name: row.get("name")?,
                     uuid: row.get("uuid")?,
                     enabled: row.get("enabled")?,
-                    quota: row.get("quota")?,
-                    expire_at: row.get("expire_at")?,
                     created_at: row.get("created_at")?,
                     note: row.get("note")?,
                     updated_at: row.get("updated_at")?,
@@ -2837,11 +2790,9 @@ fn row_to_proxy_instance(r: &rusqlite::Row<'_>) -> rusqlite::Result<ProxyInstanc
 fn row_to_proxy_user(r: &rusqlite::Row<'_>) -> rusqlite::Result<ProxyUser> {
     Ok(ProxyUser {
         id: r.get("id")?,
-        username: r.get("username")?,
+        name: r.get("name")?,
         uuid: r.get("uuid")?,
         enabled: r.get("enabled")?,
-        quota: r.get("quota")?,
-        expire_at: r.get("expire_at")?,
         created_at: r.get("created_at")?,
         note: r.get("note")?,
         updated_at: r.get("updated_at")?,
@@ -2852,7 +2803,7 @@ fn row_to_proxy_user(r: &rusqlite::Row<'_>) -> rusqlite::Result<ProxyUser> {
 fn query_proxy_user(conn: &Connection, id: i64) -> Result<Option<ProxyUser>> {
     Ok(conn
         .query_row(
-            "SELECT id, username, uuid, enabled, quota, expire_at, created_at, note, updated_at
+            "SELECT id, username AS name, uuid, enabled, created_at, note, updated_at
              FROM proxy_user WHERE id=?1",
             [id],
             row_to_proxy_user,
@@ -2898,11 +2849,11 @@ fn proxy_server_ids_for_nodes(conn: &Connection, proxy_node_ids: &[i64]) -> Resu
     Ok(server_ids.into_iter().collect())
 }
 
-fn validate_proxy_user_name_note(username: &str, note: &str) -> Result<()> {
-    if username.trim().is_empty() {
+fn validate_proxy_user_name_note(name: &str, note: &str) -> Result<()> {
+    if name.trim().is_empty() {
         refuse!("用户名称不能为空");
     }
-    if username.trim().chars().count() > 120 {
+    if name.trim().chars().count() > 120 {
         refuse!("用户名称不能超过 120 个字符");
     }
     if note.chars().count() > 2_000 {
@@ -2911,18 +2862,18 @@ fn validate_proxy_user_name_note(username: &str, note: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_proxy_user_profile(username: &str, note: &str, uuid: &str) -> Result<()> {
-    validate_proxy_user_name_note(username, note)?;
+fn validate_proxy_user_profile(name: &str, note: &str, uuid: &str) -> Result<()> {
+    validate_proxy_user_name_note(name, note)?;
     if !crate::proxy_config::is_uuid(uuid) {
         refuse!("代理用户 UUID 格式无效");
     }
     Ok(())
 }
 
-fn ensure_proxy_user_name_available(conn: &Connection, username: &str, except_id: Option<i64>) -> Result<()> {
+fn ensure_proxy_user_name_available(conn: &Connection, name: &str, except_id: Option<i64>) -> Result<()> {
     let exists = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM proxy_user WHERE username=?1 AND (?2 IS NULL OR id!=?2))",
-        params![username.trim(), except_id],
+        params![name.trim(), except_id],
         |row| row.get::<_, bool>(0),
     )?;
     if exists {
@@ -3038,24 +2989,23 @@ mod tests {
     #[test]
     fn proxy_users_have_unique_identity_and_complete_db_crud() {
         let db = db();
-        let id = db.create_proxy_user("alice", "uuid-a", true, 0, None).unwrap();
-        assert_eq!(db.proxy_user(id).unwrap().unwrap().username, "alice");
-        assert!(db.create_proxy_user("alice", "uuid-b", true, 0, None).is_err());
-        assert!(db.create_proxy_user("bob", "uuid-a", true, 0, None).is_err());
-        assert!(db.create_proxy_user(" ", "uuid-c", true, 0, None).is_err());
-        assert!(db.create_proxy_user("bob", "uuid-c", true, -1, None).is_err());
+        let uuid = "a0f81cec-73c5-4eb8-a2e2-cd1544946e8e";
+        let (created, _) = db.create_proxy_user_with_nodes("alice", uuid, true, "", &[]).unwrap();
+        let id = created.id;
+        assert_eq!(db.proxy_user(id).unwrap().unwrap().name, "alice");
+        assert!(db
+            .create_proxy_user_with_nodes("alice", "aa8c947a-1dbd-4905-bcb1-71728c58effb", true, "", &[],)
+            .is_err());
+        assert!(db.create_proxy_user_with_nodes("bob", uuid, true, "", &[]).is_err());
+        assert!(db
+            .create_proxy_user_with_nodes(" ", "e2b4b1d8-0af6-40f8-910b-cabfb913a7bc", true, "", &[])
+            .is_err());
 
-        let mut user = db.proxy_user(id).unwrap().unwrap();
-        user.username = "alice-2".into();
-        user.enabled = false;
-        user.quota = 4096;
-        user.expire_at = Some(1234);
-        assert!(db.update_proxy_user(&user).unwrap());
+        let (updated, _) = db.update_proxy_user_profile(id, "alice-2", false, "", &[]).unwrap().unwrap();
         let loaded = db.proxy_users().unwrap().remove(0);
-        assert_eq!(loaded.username, "alice-2");
+        assert_eq!(loaded.name, "alice-2");
         assert!(!loaded.enabled);
-        assert_eq!(loaded.quota, 4096);
-        assert_eq!(loaded.expire_at, Some(1234));
+        assert_eq!(updated.uuid, uuid, "普通资料编辑不允许改变 UUID");
         assert!(db.delete_proxy_user(id).unwrap());
         assert!(db.proxy_user(id).unwrap().is_none());
     }
@@ -3544,7 +3494,11 @@ mod tests {
         let db = Db::open(&scratch.0).unwrap();
         let server =
             db.create_node(&Node { name: "v12-server".into(), ..Default::default() }, "v12-token").unwrap();
-        let user_id = db.create_proxy_user("v12-user", "v12-user-uuid", true, 4096, Some(1234)).unwrap();
+        let (user, _) = db
+            .create_proxy_user_with_nodes("v12-user", "f3a9c7de-bc1a-4239-8c56-05e7a0984e41", true, "", &[])
+            .unwrap();
+        let user_id = user.id;
+        db.conn().execute("UPDATE proxy_user SET quota=4096, expire_at=1234 WHERE id=?1", [user_id]).unwrap();
         db.create_proxy_node(&proxy_node_config(server, 33333)).unwrap();
         db.backup_into(&copy).unwrap();
 
