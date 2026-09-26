@@ -40,6 +40,7 @@ mod proxy_provision;
 mod proxy_share;
 mod proxy_traffic;
 mod proxy_user;
+pub mod subscription_rules;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
