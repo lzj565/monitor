@@ -25,6 +25,16 @@ ENV_FILE="$ROOT/agent.env"
 UNIT_FILE="/etc/systemd/system/monitor-agent.service"
 RC_FILE="/etc/init.d/monitor-agent"
 LOG_FILE="/var/log/monitor-agent.log"
+
+if [ -t 1 ] && [ -z "${NO_COLOR-}" ]; then
+	B="$(printf '\033[1m')" D="$(printf '\033[2m')" N="$(printf '\033[0m')"
+else
+	B="" D="" N=""
+fi
+
+rule() { printf '  %s────────────────────────────────────────────%s\n' "$D" "$N"; }
+field() { printf '  %s%s%s    %s\n' "$D" "$1" "$N" "$2"; }
+
 SERVER=""
 TOKEN=""
 REGISTER=""
@@ -245,7 +255,8 @@ else
 	exit 1
 fi
 
-case "$(uname -m)" in
+HOST_ARCH=$(uname -m)
+case "$HOST_ARCH" in
 x86_64 | amd64) ARCH=x86_64 ;;
 aarch64 | arm64) ARCH=aarch64 ;;
 *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
@@ -273,7 +284,8 @@ fetch_asset() {
 	FETCH_URL="$1"
 	FETCH_FILE="$2"
 	FETCH_NAME="$3"
-	echo "downloading $FETCH_NAME from $FETCH_URL"
+	FETCH_DIAGNOSTICS=""
+	echo "downloading $FETCH_NAME"
 	TRIES=0
 	while :; do
 		if CURL_INFO=$(curl -sSL --max-time 300 \
@@ -286,8 +298,9 @@ fetch_asset() {
 		CODE=$(printf '%s\n' "$CURL_INFO" | sed -n 's/.*http_code=\([0-9][0-9][0-9]\).*/\1/p')
 		[ -n "$CODE" ] || CODE=000
 		FILE_BYTES=$(wc -c <"$FETCH_FILE" | tr -d ' ')
-		echo "curl $FETCH_NAME: exit=$CURL_EXIT $CURL_INFO file_bytes=$FILE_BYTES"
+		FETCH_DIAGNOSTICS="exit=$CURL_EXIT $CURL_INFO file_bytes=$FILE_BYTES"
 		if [ "$CURL_EXIT" -ne 0 ]; then
+			printf 'download diagnostics (%s): url=%s %s\n' "$FETCH_NAME" "$FETCH_URL" "$FETCH_DIAGNOSTICS" >&2
 			echo "curl failed while downloading $FETCH_NAME (exit $CURL_EXIT)" >&2
 			return 1
 		fi
@@ -296,10 +309,26 @@ fetch_asset() {
 		echo "the hub is busy relaying to other machines; retrying in 5 seconds"
 		sleep 5
 	done
-	[ "$CODE" = 200 ] || {
+	if [ "$CODE" != 200 ]; then
+		printf 'download diagnostics (%s): url=%s %s\n' "$FETCH_NAME" "$FETCH_URL" "$FETCH_DIAGNOSTICS" >&2
 		printf 'download failed (HTTP %s): %s\n' "$CODE" "$(head -n 1 "$FETCH_FILE" | cut -c1-500)" >&2
 		return 1
-	}
+	fi
+}
+
+sing_box_archive_diagnostics() {
+	printf 'sing-box diagnostics: host_arch=%s mapped_arch=%s url=%s archive=%s\n' \
+		"$HOST_ARCH" "$SING_BOX_ARCH" "$SING_BOX_URL" "$SING_BOX_ARCHIVE" >&2
+	printf 'sing-box download: %s\n' "$SING_BOX_FETCH_DIAGNOSTICS" >&2
+	echo "sing-box archive members:" >&2
+	tar -tzf "$SING_BOX_ARCHIVE" 2>&1 | sed -n '1,40p' >&2 || true
+}
+
+sing_box_file_diagnostics() {
+	printf 'sing-box extracted files:\n' >&2
+	ls -ln "$SING_BOX_BINARY" "$SING_BOX_LIBRARY" >&2 || true
+	printf 'sing-box binary sha256: %s\n' \
+		"$(sha256sum "$SING_BOX_BINARY" 2>/dev/null | awk '{print $1}' || true)" >&2
 }
 
 check_sing_box_service_conflict() {
@@ -341,18 +370,26 @@ check_sing_box_service_conflict
 
 # 批量下载超过中转并发数时会返回 503，等待后重试。
 fetch_asset "$URL" "$TMP" "monitor-agent ($ARCH)"
+AGENT_FETCH_DIAGNOSTICS=$FETCH_DIAGNOSTICS
 # A relay can answer 200 with something other than the program, such as a
 # mirror's error page. Checked before the running agent is stopped, so a batch
 # run through such a relay leaves each machine on the agent it had, rather than
 # on bytes that cannot start while this script reports success.
 [ "$(head -c 4 "$TMP")" = "$(printf '\177ELF')" ] ||
-	{ echo "the download is not a Linux executable: $(head -n 1 "$TMP" | tr -cd '[:print:]' | cut -c1-200)" >&2; exit 1; }
+	{
+		printf 'monitor-agent download diagnostics: arch=%s url=%s %s\n' \
+			"$ARCH" "$URL" "$AGENT_FETCH_DIAGNOSTICS" >&2
+		echo "the download is not a Linux executable: $(head -n 1 "$TMP" | tr -cd '[:print:]' | cut -c1-200)" >&2
+		exit 1
+	}
+chmod 0755 "$TMP" || { echo "could not make the monitor-agent download executable" >&2; exit 1; }
+AGENT_HELP=$("$TMP" --help 2>&1 || true)
+AGENT_VERSION=$(printf '%s\n' "$AGENT_HELP" | sed -n '1{s/^monitor-agent //;p;}' | cut -c1-120)
+[ -n "$AGENT_VERSION" ] || AGENT_VERSION=unknown
 
 # 仅从符合架构的归档路径提取 sing-box 和运行库，避免解开其他归档成员。
 fetch_asset "$SING_BOX_URL" "$SING_BOX_ARCHIVE" "sing-box ($SING_BOX_ARCH)"
-echo "sing-box diagnostics: host_arch=$(uname -m) mapped_arch=$SING_BOX_ARCH archive=$SING_BOX_ARCHIVE"
-echo "sing-box archive members:"
-tar -tzf "$SING_BOX_ARCHIVE" | sed -n '1,40p'
+SING_BOX_FETCH_DIAGNOSTICS=$FETCH_DIAGNOSTICS
 SING_BOX_MEMBER=$(tar -tzf "$SING_BOX_ARCHIVE" | awk -v arch="$SING_BOX_ARCH" '
 	$0 ~ ("^sing-box-[^/]+-linux-" arch "/sing-box$") {
 		if (member != "") bad = 1
@@ -360,38 +397,62 @@ SING_BOX_MEMBER=$(tar -tzf "$SING_BOX_ARCHIVE" | awk -v arch="$SING_BOX_ARCH" '
 	}
 	END { if (member != "" && !bad) print member }
 ')
-[ -n "$SING_BOX_MEMBER" ] || { echo "download is not a supported sing-box archive" >&2; exit 1; }
+[ -n "$SING_BOX_MEMBER" ] || {
+	echo "download is not a supported sing-box archive" >&2
+	sing_box_archive_diagnostics
+	exit 1
+}
 SING_BOX_LIBRARY_MEMBER="${SING_BOX_MEMBER%/sing-box}/libcronet.so"
-echo "sing-box executable member: $SING_BOX_MEMBER"
-echo "sing-box runtime library member: $SING_BOX_LIBRARY_MEMBER"
 tar -tzf "$SING_BOX_ARCHIVE" | grep -Fqx "$SING_BOX_LIBRARY_MEMBER" ||
-	{ echo "the sing-box archive is missing libcronet.so" >&2; exit 1; }
+	{
+		echo "the sing-box archive is missing libcronet.so" >&2
+		sing_box_archive_diagnostics
+		exit 1
+	}
 tar -xOzf "$SING_BOX_ARCHIVE" "$SING_BOX_MEMBER" >"$SING_BOX_BINARY" ||
-	{ echo "could not extract sing-box from the release archive" >&2; exit 1; }
+	{
+		echo "could not extract sing-box from the release archive" >&2
+		sing_box_archive_diagnostics
+		sing_box_file_diagnostics
+		exit 1
+	}
 chmod 0755 "$SING_BOX_BINARY" ||
-	{ echo "could not make the sing-box binary executable" >&2; exit 1; }
+	{
+		echo "could not make the sing-box binary executable" >&2
+		sing_box_archive_diagnostics
+		sing_box_file_diagnostics
+		exit 1
+	}
 tar -xOzf "$SING_BOX_ARCHIVE" "$SING_BOX_LIBRARY_MEMBER" >"$SING_BOX_LIBRARY" ||
-	{ echo "could not extract libcronet.so from the release archive" >&2; exit 1; }
+	{
+		echo "could not extract libcronet.so from the release archive" >&2
+		sing_box_archive_diagnostics
+		sing_box_file_diagnostics
+		exit 1
+	}
 [ "$(head -c 4 "$SING_BOX_BINARY")" = "$(printf '\177ELF')" ] &&
 	[ "$(head -c 4 "$SING_BOX_LIBRARY")" = "$(printf '\177ELF')" ] ||
-	{ echo "sing-box ELF check failed: binary=$(od -An -tx1 -N4 "$SING_BOX_BINARY" | tr -d ' \n') library=$(od -An -tx1 -N4 "$SING_BOX_LIBRARY" | tr -d ' \n')" >&2; exit 1; }
-echo "sing-box extracted files:"
-ls -ln "$SING_BOX_BINARY" "$SING_BOX_LIBRARY"
-echo "sing-box binary sha256: $(sha256sum "$SING_BOX_BINARY" 2>/dev/null | awk '{print $1}' || true)"
+	{
+		echo "sing-box ELF check failed: binary=$(od -An -tx1 -N4 "$SING_BOX_BINARY" | tr -d ' \n') library=$(od -An -tx1 -N4 "$SING_BOX_LIBRARY" | tr -d ' \n')" >&2
+		sing_box_archive_diagnostics
+		sing_box_file_diagnostics
+		exit 1
+	}
 SING_BOX_VERSION_LOG="$SING_BOX_TMPDIR/version.stderr"
 if SING_BOX_VERSION=$(LD_LIBRARY_PATH="$SING_BOX_TMPDIR" "$SING_BOX_BINARY" version 2>"$SING_BOX_VERSION_LOG"); then
 	:
 else
 	VERSION_EXIT=$?
 	echo "sing-box version check failed: exit=$VERSION_EXIT binary=$SING_BOX_BINARY LD_LIBRARY_PATH=$SING_BOX_TMPDIR" >&2
+	sing_box_archive_diagnostics
+	sing_box_file_diagnostics
 	echo "sing-box version stderr:" >&2
 	[ ! -s "$SING_BOX_VERSION_LOG" ] || head -c 2000 "$SING_BOX_VERSION_LOG" >&2
 	echo >&2
 	command -v ldd >/dev/null 2>&1 && ldd "$SING_BOX_BINARY" 2>&1 | head -n 40 >&2 || true
 	exit 1
 fi
-SING_BOX_VERSION=$(printf '%s\n' "$SING_BOX_VERSION" | head -n 1 | cut -c1-200)
-echo "sing-box version check succeeded: $SING_BOX_VERSION"
+SING_BOX_VERSION=$(printf '%s\n' "$SING_BOX_VERSION" | head -n 1 | sed 's/^sing-box version //' | cut -c1-200)
 
 ensure_sing_box_user() {
 	SING_BOX_NOLOGIN=/sbin/nologin
@@ -688,15 +749,39 @@ install_sing_box() {
 	fi
 }
 
-report_sing_box_install() {
-	echo "sing-box $SING_BOX_VERSION ($SING_BOX_ARCH) installed at: $SING_BOX_BIN"
-	echo "sing-box config: $SING_BOX_CONFIG"
-	echo "sing-box service: $INIT (running=$SING_BOX_RUNNING, enabled_at_boot=$SING_BOX_ENABLED)"
-	echo "notice: the initial config has no inbounds, so sing-box is running without proxy listeners"
+report_install() {
 	if [ "$INIT" = systemd ]; then
-		echo "sing-box logs: journalctl -u sing-box.service -f"
+		AGENT_SERVICE_FILE=$UNIT_FILE
+		SING_BOX_SERVICE_FILE=$SING_BOX_SYSTEMD_UNIT
+		AGENT_LOG_COMMAND="journalctl -u monitor-agent -f"
+		SING_BOX_LOG_COMMAND="journalctl -u sing-box.service -f"
 	else
-		echo "sing-box logs: tail -f $SING_BOX_LOG"
+		AGENT_SERVICE_FILE=$RC_FILE
+		SING_BOX_SERVICE_FILE=$SING_BOX_OPENRC_FILE
+		AGENT_LOG_COMMAND="tail -f $LOG_FILE"
+		SING_BOX_LOG_COMMAND="tail -f $SING_BOX_LOG"
+	fi
+	if [ "$SING_BOX_RUNNING" = yes ]; then SING_BOX_RUNNING_TEXT=运行中; else SING_BOX_RUNNING_TEXT=已停止; fi
+	if [ "$SING_BOX_ENABLED" = yes ]; then SING_BOX_ENABLED_TEXT=已启用; else SING_BOX_ENABLED_TEXT=未启用; fi
+	printf '\n  %smonitor-agent 安装完成%s\n' "$B" "$N"
+	rule
+	field "架构" "$HOST_ARCH → Agent $ARCH / sing-box $SING_BOX_ARCH"
+	field "Agent 版本" "$AGENT_VERSION"
+	field "sing-box 版本" "$SING_BOX_VERSION"
+	rule
+	field "Agent 文件" "$BIN"
+	field "Agent 服务" "$AGENT_SERVICE_FILE"
+	field "sing-box 文件" "$SING_BOX_BIN"
+	field "运行库" "$SING_BOX_LIB"
+	field "配置文件" "$SING_BOX_CONFIG"
+	field "sing-box 服务" "$SING_BOX_SERVICE_FILE"
+	field "Agent 状态" "运行中；开机自启已启用"
+	field "sing-box 状态" "$SING_BOX_RUNNING_TEXT；开机自启$SING_BOX_ENABLED_TEXT"
+	rule
+	field "Agent 日志" "$AGENT_LOG_COMMAND"
+	field "sing-box 日志" "$SING_BOX_LOG_COMMAND"
+	if [ "$SING_BOX_CONFIG_CREATED" = yes ]; then
+		field "提示" "初始配置没有入站，目前尚无代理监听"
 	fi
 }
 
@@ -834,8 +919,7 @@ RC
 	sleep 3
 	pidof monitor-agent >/dev/null || not_started "$LOG_FILE"
 	rm -f "$BIN.old"
-	report_sing_box_install
-	echo "monitor-agent installed; follow it with: tail -f $LOG_FILE"
+	report_install
 	exit 0
 fi
 
@@ -881,5 +965,4 @@ systemctl restart monitor-agent
 sleep 3
 systemctl is-active --quiet monitor-agent || not_started "journalctl -u monitor-agent -n 20"
 rm -f "$BIN.old"
-report_sing_box_install
-echo "monitor-agent installed; follow it with: journalctl -u monitor-agent -f"
+report_install
