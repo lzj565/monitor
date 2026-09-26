@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react"
-import { ChevronDown, Copy, Download, Globe2, LoaderCircle, MapPin, Pencil, PencilLine, Plus, QrCode, RotateCw, Settings2, Trash2, Zap } from "lucide-react"
+import { ChevronDown, Copy, Download, Globe2, LoaderCircle, MapPin, Pencil, PencilLine, Plus, QrCode, Settings2, Trash2, Zap } from "lucide-react"
 import { QRCodeSVG } from "qrcode.react"
 import { toast } from "sonner"
 
@@ -128,7 +128,6 @@ export function ProxyNodeManager({
   const [proxyNodes, setProxyNodes] = useState<ProxyNode[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState("")
-  const [deploying, setDeploying] = useState<Record<number, boolean>>({})
   const [nodeOperations, setNodeOperations] = useState<Record<number, string>>({})
   const operationGuard = useRef(createProxyNodeOperationGuard())
   const [createOpen, setCreateOpen] = useState(false)
@@ -312,32 +311,6 @@ export function ProxyNodeManager({
     })
     return () => { active = false }
   }, [])
-
-  async function redeploy(proxyNode: ProxyNode) {
-    const { id, node_id: nodeId } = proxyNode
-    if (deploying[nodeId] || !beginNodeOperation(id, "deploying")) return
-    setDeploying((current) => ({ ...current, [nodeId]: true }))
-    setServerDeployment(nodeId, "deploying")
-    let deployed = false
-    try {
-      await api(`/proxy/servers/${nodeId}/deploy`, { method: "POST" })
-      deployed = true
-      setServerDeployment(nodeId, "deployed")
-      toast.success("代理节点已重新部署")
-    } catch (cause) {
-      setServerDeployment(nodeId, "failed", (cause as Error).message)
-      toast.error(`代理节点重新部署失败：${(cause as Error).message}`)
-    } finally {
-      const refreshed = await refresh()
-      if (!refreshed && deployed) toast.error("部署成功，但代理节点列表刷新失败")
-      setDeploying((current) => {
-        const next = { ...current }
-        delete next[nodeId]
-        return next
-      })
-      finishNodeOperation(id)
-    }
-  }
 
   async function applyNodeUpdate(
     node: ProxyNode,
@@ -626,9 +599,9 @@ export function ProxyNodeManager({
         <Table>
           <TableHeader>
             <TableRow>
-              <TableHead>启用</TableHead>
-              <TableHead>所属服务器</TableHead>
-              <TableHead>代理节点名称</TableHead>
+              <TableHead>状态</TableHead>
+              <TableHead>服务器</TableHead>
+              <TableHead>名称</TableHead>
               <TableHead>协议</TableHead>
               <TableHead>连接地址</TableHead>
               <TableHead>端口</TableHead>
@@ -641,7 +614,6 @@ export function ProxyNodeManager({
           <TableBody>
             {proxyNodes.map((proxyNode) => {
               const server = serversById.get(proxyNode.node_id)
-              const serverBusy = Boolean(deploying[proxyNode.node_id])
               const nodeBusy = Boolean(nodeOperations[proxyNode.id])
               const shareDisabledReason = proxyNodeShareDisabledReason(
                 proxyNode,
@@ -669,51 +641,47 @@ export function ProxyNodeManager({
                   <TableCell>{proxyNode.reality_server_name || "—"}</TableCell>
                   <TableCell><DesiredStateBadge enabled={proxyNode.enabled} /></TableCell>
                   <TableCell><DeploymentBadge proxyNode={proxyNode} /></TableCell>
-                  <TableCell className="min-w-96">
-                    <div className="flex flex-wrap gap-2">
+                  <TableCell className="whitespace-nowrap">
+                    <div className="flex gap-1">
                       <Button
-                        variant="outline"
-                        size="sm"
+                        variant="ghost"
+                        size="icon"
                         disabled={shareDisabled}
-                        title={shareDisabledMessage || undefined}
+                        title={shareDisabledMessage || "复制链接"}
+                        aria-label={`复制 ${proxyNode.name} 的链接`}
                         onClick={() => void copyShare(proxyNode)}
                       >
-                        {sharingNodes[proxyNode.id] ? <LoaderCircle className="animate-spin" /> : <Copy />}
-                        复制链接
+                        {sharingNodes[proxyNode.id] ? <LoaderCircle className="size-4 animate-spin" /> : <Copy className="size-4" />}
                       </Button>
                       <Button
-                        variant="outline"
-                        size="sm"
+                        variant="ghost"
+                        size="icon"
                         disabled={shareDisabled}
-                        title={shareDisabledMessage || undefined}
+                        title={shareDisabledMessage || "二维码"}
+                        aria-label={`显示 ${proxyNode.name} 的二维码`}
                         onClick={() => void openShareQr(proxyNode)}
                       >
-                        <QrCode />二维码
+                        <QrCode className="size-4" />
                       </Button>
                       <Button
-                        variant="outline"
-                        size="sm"
+                        variant="ghost"
+                        size="icon"
                         disabled={nodeBusy}
+                        title="编辑"
+                        aria-label={`编辑 ${proxyNode.name}`}
                         onClick={() => openEdit(proxyNode)}
                       >
-                        <Pencil />编辑
+                        <Pencil className="size-4" />
                       </Button>
                       <Button
-                        variant="outline"
-                        size="sm"
-                        disabled={serverBusy || nodeBusy}
-                        onClick={() => void redeploy(proxyNode)}
-                      >
-                        <RotateCw className={serverBusy ? "animate-spin" : undefined} />
-                        {serverBusy ? "部署中…" : "重新部署"}
-                      </Button>
-                      <Button
-                        variant="destructive"
-                        size="sm"
+                        variant="ghost"
+                        size="icon"
                         disabled={nodeBusy}
+                        title="删除"
+                        aria-label={`删除 ${proxyNode.name}`}
                         onClick={() => { setDeleteError(""); setDeleteTarget(proxyNode) }}
                       >
-                        <Trash2 />删除
+                        <Trash2 className="size-4 text-destructive" />
                       </Button>
                     </div>
                     {shareDisabledMessage && <p className="mt-1 text-xs text-muted-foreground">{shareDisabledMessage}</p>}
