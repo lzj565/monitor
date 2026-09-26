@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react"
-import { LoaderCircle, Pencil, Plus, RotateCw, Trash2 } from "lucide-react"
+import { Copy, LoaderCircle, Pencil, Plus, QrCode, RotateCw, Trash2 } from "lucide-react"
+import { QRCodeSVG } from "qrcode.react"
 import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
@@ -16,12 +17,15 @@ import { api, type Node, type ProxyNode } from "@/lib/api"
 import {
   createProxyNodeOperationGuard,
   deleteConfirmation,
+  fetchProxyNodeShare,
   regenerateAndDeployProxyNode,
   regenerateConfirmation,
   removeProxyNode,
+  proxyNodeShareDisabledReason,
   updateAndDeployProxyNode,
   proxyNodeUpdatePayload,
   type ProxyNodeCredential,
+  type ProxyNodeShare,
   type ProxyNodeUpdatePayload,
 } from "@/lib/proxy-node-actions"
 
@@ -132,6 +136,9 @@ export function ProxyNodeManager({
   const [deleteError, setDeleteError] = useState("")
   const [regenerateTarget, setRegenerateTarget] = useState<{ node: ProxyNode; credential: ProxyNodeCredential } | null>(null)
   const [regenerateError, setRegenerateError] = useState("")
+  const [sharingNodes, setSharingNodes] = useState<Record<number, boolean>>({})
+  const [shareTarget, setShareTarget] = useState<{ node: ProxyNode; share: ProxyNodeShare | null } | null>(null)
+  const shareRequestId = useRef(0)
   const serversById = new Map(nodes.map((server) => [server.id, server]))
   const selectedServer = nodes.find((server) => server.id.toString() === form.nodeId)
   const selectedReadiness = selectedServer
@@ -308,6 +315,63 @@ export function ProxyNodeManager({
     )
   }
 
+  function setShareBusy(id: number, busy: boolean) {
+    setSharingNodes((current) => {
+      const next = { ...current }
+      if (busy) next[id] = true
+      else delete next[id]
+      return next
+    })
+  }
+
+  async function copyShareUri(uri: string, nodeId: number) {
+    setShareBusy(nodeId, true)
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error("当前浏览器不支持剪贴板访问")
+      await navigator.clipboard.writeText(uri)
+      toast.success("代理链接已复制")
+    } catch {
+      toast.error("复制失败")
+    } finally {
+      setShareBusy(nodeId, false)
+    }
+  }
+
+  async function copyShare(proxyNode: ProxyNode) {
+    setShareBusy(proxyNode.id, true)
+    let share: ProxyNodeShare
+    try {
+      share = await fetchProxyNodeShare(api, proxyNode.id)
+    } catch (cause) {
+      toast.error(`获取代理链接失败：${(cause as Error).message}`)
+      setShareBusy(proxyNode.id, false)
+      return
+    }
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error("当前浏览器不支持剪贴板访问")
+      await navigator.clipboard.writeText(share.uri)
+      toast.success("代理链接已复制")
+    } catch {
+      toast.error("复制失败")
+    } finally {
+      setShareBusy(proxyNode.id, false)
+    }
+  }
+
+  async function openShareQr(proxyNode: ProxyNode) {
+    const requestId = ++shareRequestId.current
+    setShareTarget({ node: proxyNode, share: null })
+    try {
+      const share = await fetchProxyNodeShare(api, proxyNode.id, (busy) => setShareBusy(proxyNode.id, busy))
+      if (shareRequestId.current === requestId) setShareTarget({ node: proxyNode, share })
+    } catch (cause) {
+      if (shareRequestId.current === requestId) {
+        setShareTarget(null)
+        toast.error(`获取代理链接失败：${(cause as Error).message}`)
+      }
+    }
+  }
+
   async function confirmDelete() {
     if (!deleteTarget || !beginNodeOperation(deleteTarget.id, "deleting")) return
     const node = deleteTarget
@@ -471,6 +535,12 @@ export function ProxyNodeManager({
               const server = serversById.get(proxyNode.node_id)
               const serverBusy = Boolean(deploying[proxyNode.node_id])
               const nodeBusy = Boolean(nodeOperations[proxyNode.id])
+              const shareDisabledReason = proxyNodeShareDisabledReason(
+                proxyNode,
+                connectionAddress(proxyNode.address_mode, proxyNode.custom_address, server),
+              )
+              const shareDisabledMessage = shareDisabledReason || (nodeBusy ? "代理节点操作中，暂不可分享" : null)
+              const shareDisabled = nodeBusy || Boolean(shareDisabledReason) || Boolean(sharingNodes[proxyNode.id])
               return (
                 <TableRow key={proxyNode.id}>
                   <TableCell>
@@ -491,8 +561,27 @@ export function ProxyNodeManager({
                   <TableCell>{proxyNode.reality_server_name || "—"}</TableCell>
                   <TableCell><DesiredStateBadge enabled={proxyNode.enabled} /></TableCell>
                   <TableCell><DeploymentBadge proxyNode={proxyNode} /></TableCell>
-                  <TableCell className="min-w-64">
+                  <TableCell className="min-w-96">
                     <div className="flex flex-wrap gap-2">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        disabled={shareDisabled}
+                        title={shareDisabledMessage || undefined}
+                        onClick={() => void copyShare(proxyNode)}
+                      >
+                        {sharingNodes[proxyNode.id] ? <LoaderCircle className="animate-spin" /> : <Copy />}
+                        复制链接
+                      </Button>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        disabled={shareDisabled}
+                        title={shareDisabledMessage || undefined}
+                        onClick={() => void openShareQr(proxyNode)}
+                      >
+                        <QrCode />二维码
+                      </Button>
                       <Button
                         variant="outline"
                         size="sm"
@@ -519,13 +608,57 @@ export function ProxyNodeManager({
                         <Trash2 />删除
                       </Button>
                     </div>
+                    {shareDisabledMessage && <p className="mt-1 text-xs text-muted-foreground">{shareDisabledMessage}</p>}
                   </TableCell>
                 </TableRow>
               )
             })}
           </TableBody>
-        </Table>
+      </Table>
       ) : null}
+      <Dialog
+        open={Boolean(shareTarget)}
+        onOpenChange={(open) => {
+          if (!open) {
+            shareRequestId.current += 1
+            setShareTarget(null)
+          }
+        }}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>{shareTarget?.node.name || "代理节点二维码"}</DialogTitle>
+            <DialogDescription>扫描二维码导入 VLESS + Reality 节点</DialogDescription>
+          </DialogHeader>
+          {shareTarget && !shareTarget.share ? (
+            <div className="flex flex-col items-center gap-3 py-8" aria-label="正在生成二维码">
+              <LoaderCircle className="size-8 animate-spin text-muted-foreground" />
+              <p className="text-sm text-muted-foreground">正在加载分享链接…</p>
+            </div>
+          ) : shareTarget?.share ? (
+            <div className="flex flex-col items-center gap-4">
+              <div className="rounded-lg bg-white p-3">
+                <QRCodeSVG value={shareTarget.share.uri} size={224} level="M" title={`${shareTarget.share.name} VLESS Reality 二维码`} />
+              </div>
+              <div className="space-y-1 text-center">
+                <p className="text-sm font-medium">VLESS + Reality</p>
+                <p className="text-sm text-muted-foreground">{shareTarget.share.address}</p>
+              </div>
+              <Button
+                className="w-full"
+                disabled={Boolean(sharingNodes[shareTarget.node.id])}
+                onClick={() => void copyShareUri(shareTarget.share?.uri || "", shareTarget.node.id)}
+              >
+                <Copy />复制链接
+              </Button>
+              <details className="w-full text-sm">
+                <summary className="cursor-pointer text-muted-foreground">显示完整链接</summary>
+                <code className="mt-2 block max-h-28 overflow-auto break-all rounded-md bg-muted p-3 text-xs">{shareTarget.share.uri}</code>
+              </details>
+            </div>
+          ) : null}
+        </DialogContent>
+      </Dialog>
       <Dialog open={createOpen} onOpenChange={(open) => { if (!submitStage) setCreateOpen(open) }}>
         <DialogContent>
           <DialogHeader>

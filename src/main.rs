@@ -34,6 +34,7 @@ mod notify;
 pub mod proxy_config;
 mod proxy_deploy;
 mod proxy_provision;
+mod proxy_share;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -615,6 +616,7 @@ async fn main() -> Result<()> {
         .route("/api/proxy/instances", get(api::proxy_instances))
         .route("/api/proxy/nodes", get(api::proxy_nodes).post(api::create_proxy_node))
         .route("/api/proxy/nodes/{id}", put(api::update_proxy_node).delete(proxy_deploy::remove_proxy_node))
+        .route("/api/proxy/nodes/{id}/share", get(proxy_share::share_proxy_node))
         .route("/api/proxy/nodes/{id}/regenerate", post(api::regenerate_proxy_node))
         .route("/api/proxy/servers/{node_id}/deploy", post(proxy_deploy::deploy))
         .route("/api/ping-tasks", get(api::ping_tasks).post(api::save_ping_task))

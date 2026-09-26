@@ -145,7 +145,7 @@ pub(crate) const PUBLIC_METRICS: [&str; 18] = [
 /// Private addresses appear only when nothing public is known, as where hub and
 /// node share a network and they are all there is. `ip` alone is the fallback
 /// for an agent reporting no interface.
-fn addresses<'a>(
+pub(crate) fn addresses<'a>(
     ip: &'a str,
     (ipv4, ipv6): (&'a str, &'a str),
     (pin4, pin6): (&'a str, &'a str),
@@ -2116,6 +2116,51 @@ mod tests {
                 crate::command::complete(&app, id, node_id, session, Ok(status.clone()));
             }
         });
+    }
+
+    #[tokio::test]
+    async fn proxy_share_endpoint_requires_successful_deployment_and_returns_no_store_uri() {
+        let app = std::sync::Arc::new(app());
+        let node_id = app
+            .db
+            .create_node(&Node { name: "share-server".into(), ..Default::default() }, "share-token")
+            .unwrap();
+        let proxy_node = crate::proxy_provision::create_proxy_node(
+            &app.db,
+            &ProxyNodeProvisionRequest {
+                node_id,
+                name: "HK 分享 [A] #1".into(),
+                address_mode: "custom".into(),
+                custom_address: Some("edge.example.net".into()),
+                listen_port: Some(24443),
+                reality_server_name: "www.apple.com".into(),
+                reality_dest: "www.apple.com:443".into(),
+            },
+        )
+        .unwrap();
+
+        let unavailable =
+            crate::proxy_share::share_proxy_node(Admin, State(app.clone()), Path(proxy_node.id)).await;
+        assert_eq!(unavailable.status(), StatusCode::CONFLICT);
+        assert_eq!(unavailable.headers()[header::CACHE_CONTROL], "no-store");
+        assert!(app.db.proxy_node(proxy_node.id).unwrap().is_some());
+
+        app.db.set_proxy_nodes_deploy_status(node_id, "deployed", None).unwrap();
+        let response =
+            crate::proxy_share::share_proxy_node(Admin, State(app.clone()), Path(proxy_node.id)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let serialized = String::from_utf8(body.to_vec()).unwrap();
+        let share: Value = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(share["node_id"], json!(proxy_node.id));
+        assert_eq!(share["name"], "HK 分享 [A] #1");
+        assert_eq!(share["address"], "edge.example.net:24443");
+        assert!(share["uri"].as_str().unwrap().starts_with("vless://"));
+        assert!(share["uri"].as_str().unwrap().contains("pbk="));
+        assert!(share["uri"].as_str().unwrap().contains("%23"));
+        assert!(!serialized.contains(&proxy_node.reality_private_key));
+        assert!(!serialized.contains("reality_private_key"));
     }
 
     #[tokio::test]

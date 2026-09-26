@@ -7,6 +7,37 @@ export type ProxyNodeUpdatePayload = Pick<
 
 export type ProxyNodeCredential = "uuid" | "reality_key" | "short_id"
 export type ProxyNodeActionApi = <T = unknown>(path: string, init?: RequestInit) => Promise<T>
+export type ProxyNodeShare = { node_id: number; name: string; address: string; uri: string }
+
+export async function fetchProxyNodeShare(
+  request: ProxyNodeActionApi,
+  id: number,
+  onLoading?: (loading: boolean) => void,
+): Promise<ProxyNodeShare> {
+  onLoading?.(true)
+  try {
+    return await request<ProxyNodeShare>(`/proxy/nodes/${id}/share`, { cache: "no-store" })
+  } finally {
+    onLoading?.(false)
+  }
+}
+
+export function proxyNodeShareDisabledReason(
+  node: Pick<ProxyNode, "enabled" | "deploy_status" | "uuid" | "reality_public_key" | "reality_short_id" | "reality_server_name">,
+  address: string,
+): string | null {
+  if (!node.enabled) return "代理节点已停用"
+  if (node.deploy_status !== "deployed") {
+    if (node.deploy_status === "deploying") return "代理节点正在部署"
+    if (node.deploy_status === "failed") return "代理节点部署失败，重新部署成功后可分享"
+    return "代理节点尚未成功部署"
+  }
+  if (!address.trim()) return "缺少可用连接地址"
+  if (![node.uuid, node.reality_public_key, node.reality_short_id, node.reality_server_name].every((value) => value.trim())) {
+    return "代理节点分享凭据不完整"
+  }
+  return null
+}
 
 export function proxyNodeUpdatePayload(
   node: ProxyNodeUpdatePayload,

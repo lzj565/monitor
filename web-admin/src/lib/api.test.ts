@@ -1,6 +1,9 @@
 /// <reference types="node" />
 import assert from "node:assert/strict"
-import { createProxyNodeOperationGuard, deleteConfirmation, regenerateAndDeployProxyNode, regenerateConfirmation, removeProxyNode, updateAndDeployProxyNode, proxyNodeUpdatePayload, type ProxyNodeActionApi, type ProxyNodeUpdatePayload } from "./proxy-node-actions.ts"
+import { createElement } from "react"
+import { renderToStaticMarkup } from "react-dom/server"
+import { QRCodeSVG } from "qrcode.react"
+import { createProxyNodeOperationGuard, deleteConfirmation, fetchProxyNodeShare, regenerateAndDeployProxyNode, regenerateConfirmation, removeProxyNode, updateAndDeployProxyNode, proxyNodeShareDisabledReason, proxyNodeUpdatePayload, type ProxyNodeActionApi, type ProxyNodeUpdatePayload } from "./proxy-node-actions.ts"
 import { badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, loopbackOrigin, outdatedAgents, provisioningSite, provisionRefusal, trafficCorrection } from "./api.ts"
 
 assert.deepEqual(changes({ public: true, price: 5 }, { price: 20 }), { price: 20 })
@@ -129,6 +132,36 @@ const deletePrompt = deleteConfirmation("HK Reality")
 assert.match(deletePrompt.title, /HK Reality/)
 assert.match(deletePrompt.description, /sing-box 配置/)
 assert.match(deletePrompt.description, /客户端连接将立即失效/)
+
+calls.length = 0
+const shareUri = "vless://01234567-89ab-cdef-0123-456789abcdef@198.51.100.20:24443?security=reality#HK"
+const shareRequest: ProxyNodeActionApi = async <T>(path: string, init?: RequestInit): Promise<T> => {
+  calls.push({ path, init })
+  return { node_id: proxyNode.id, name: proxyNode.name, address: "198.51.100.20:24443", uri: shareUri } as T
+}
+const share = await fetchProxyNodeShare(shareRequest, proxyNode.id)
+assert.deepEqual(calls.map((call) => [call.path, call.init?.cache]), [["/proxy/nodes/7/share", "no-store"]])
+assert.equal(share.uri, shareUri, "二维码和复制操作读取后端给出的同一条 URI")
+assert.equal(proxyNodeShareDisabledReason(proxyNode, "198.51.100.20"), null)
+assert.match(proxyNodeShareDisabledReason({ ...proxyNode, enabled: false }, "198.51.100.20") || "", /已停用/)
+assert.match(proxyNodeShareDisabledReason({ ...proxyNode, deploy_status: "failed" }, "198.51.100.20") || "", /部署失败/)
+assert.match(proxyNodeShareDisabledReason(proxyNode, "") || "", /连接地址/)
+const shareApiFailure: ProxyNodeActionApi = async () => { throw new Error("代理节点部署失败") }
+await assert.rejects(fetchProxyNodeShare(shareApiFailure, proxyNode.id), /代理节点部署失败/)
+const shareLoading: boolean[] = []
+let resolveShare: (() => void) | undefined
+const pendingShareRequest: ProxyNodeActionApi = async <T>() => new Promise<T>((resolve) => {
+  resolveShare = () => resolve({ node_id: proxyNode.id, name: proxyNode.name, address: "198.51.100.20:24443", uri: shareUri } as T)
+})
+const pendingShare = fetchProxyNodeShare(pendingShareRequest, proxyNode.id, (busy) => shareLoading.push(busy))
+assert.deepEqual(shareLoading, [true], "二维码请求完成前处于 loading")
+resolveShare?.()
+await pendingShare
+assert.deepEqual(shareLoading, [true, false], "二维码请求结束后退出 loading")
+const qrMarkup = renderToStaticMarkup(createElement(QRCodeSVG, { value: share.uri, title: "HK Reality VLESS Reality 二维码" }))
+assert.match(qrMarkup, /^<svg\b/)
+assert.match(qrMarkup, /<title>HK Reality VLESS Reality 二维码<\/title>/)
+
 calls.length = 0
 await removeProxyNode(request, proxyNode.id)
 assert.deepEqual(calls.map((call) => [call.path, call.init?.method]), [["/proxy/nodes/7", "DELETE"]])
