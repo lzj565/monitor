@@ -119,6 +119,17 @@ export type ProxyNode = {
   last_error: string | null
 }
 
+export type ProxyUser = {
+  id: number
+  name: string
+  uuid: string
+  enabled: boolean
+  note: string
+  proxy_node_ids: number[]
+  created_at: number
+  updated_at: number
+}
+
 /** Every group in use, in the order of the first node carrying it: the node order decides the group order. */
 export function groupsOf(nodes: Pick<Node, "group">[]): string[] {
   return [...new Set(nodes.map((n) => n.group ?? "").filter(Boolean))]

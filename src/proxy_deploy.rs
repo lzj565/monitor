@@ -4,12 +4,13 @@ use axum::extract::{Path, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::api::{self, Admin};
 use crate::command::{self, ConfigCommandError};
 use crate::db::{Node, ProxyNode, ProxyNodeConfig};
-use crate::proxy_config::{generate_singbox_config_excluding, ProxyConfigError};
+use crate::proxy_config::{generate_singbox_config_excluding_users, ProxyConfigError};
 use crate::proxy_import::{self, ProxyImportCandidate, ProxyImportRequest};
 #[cfg(test)]
 use crate::App;
@@ -19,6 +20,13 @@ use crate::Shared;
 struct DeployResult {
     changed: bool,
     deployed_nodes: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct ServerDeployFailure {
+    pub server_id: i64,
+    pub server_name: String,
+    pub error: String,
 }
 
 #[derive(Debug)]
@@ -111,6 +119,29 @@ impl DeployError {
             error => api::answer(error.http_status(), error.public_message()),
         }
     }
+}
+
+/// 对用户授权、状态或 UUID 变更涉及的服务器逐台复用现有配置部署服务。
+pub(crate) async fn deploy_proxy_user_servers(app: &Shared, server_ids: &[i64]) -> Vec<ServerDeployFailure> {
+    let ids = server_ids.iter().copied().filter(|id| *id > 0).collect::<std::collections::BTreeSet<_>>();
+    let mut failures = Vec::new();
+    for server_id in ids {
+        if let Err(error) = deploy_server_proxy_config(app, server_id).await {
+            let server_name = match app.db.node(server_id) {
+                Ok(Some(node)) => node.name,
+                Ok(None) => format!("服务器 {server_id}"),
+                Err(database_error) => {
+                    tracing::warn!(
+                        server_id,
+                        "could not read server name for deployment result: {database_error:#}"
+                    );
+                    format!("服务器 {server_id}")
+                }
+            };
+            failures.push(ServerDeployFailure { server_id, server_name, error: error.public_message() });
+        }
+    }
+    failures
 }
 
 fn map_command_error(error: ConfigCommandError, phase: CommandPhase) -> DeployError {
@@ -503,9 +534,15 @@ async fn deploy_configuration_from_current(
     current_config: &Value,
     additionally_excluded_tags: &[String],
 ) -> Result<bool, DeployError> {
-    let desired_config =
-        generate_singbox_config_excluding(node_id, current_config.clone(), nodes, additionally_excluded_tags)
-            .map_err(DeployError::Generator)?;
+    let users = app.db.proxy_users_for_node(node_id).map_err(DeployError::Database)?;
+    let desired_config = generate_singbox_config_excluding_users(
+        node_id,
+        current_config.clone(),
+        nodes,
+        &users,
+        additionally_excluded_tags,
+    )
+    .map_err(DeployError::Generator)?;
     if desired_config == *current_config {
         return Ok(false);
     }
@@ -600,6 +637,34 @@ mod tests {
 
     fn create_proxy_node(app: &App, node_id: i64, port: u16, enabled: bool, dest: &str) -> i64 {
         app.db.create_proxy_node(&proxy_node_config(node_id, port, enabled, dest)).unwrap().id
+    }
+
+    fn create_proxy_user(app: &App, proxy_node_id: i64) -> i64 {
+        app.db
+            .create_proxy_user_with_nodes(
+                "Alice",
+                "a0f81cec-73c5-4eb8-a2e2-cd1544946e8e",
+                true,
+                "",
+                &[proxy_node_id],
+            )
+            .unwrap()
+            .0
+            .id
+    }
+
+    fn current_config_with_user(app: &App, node_id: i64) -> String {
+        let nodes = app.db.proxy_nodes_for_node(node_id).unwrap();
+        let users = app.db.proxy_users_for_node(node_id).unwrap();
+        crate::proxy_config::generate_singbox_config_excluding_users(
+            node_id,
+            current_config(),
+            &nodes,
+            &users,
+            &[],
+        )
+        .unwrap()
+        .to_string()
     }
 
     fn add_agent(app: &App, node_id: i64, session: u64) -> mpsc::Receiver<String> {
@@ -980,6 +1045,203 @@ mod tests {
         let saved = status(&app, proxy_id);
         assert_eq!(saved.deploy_status, "failed");
         assert_eq!(saved.last_error.as_deref(), Some("agent offline"));
+    }
+
+    #[tokio::test]
+    async fn deploy_aware_user_delete_removes_credentials_before_deleting_database_user() {
+        let (app, node_id) = app_node();
+        let proxy_id = create_proxy_node(&app, node_id, 443, true, "www.apple.com:443");
+        let user_id = create_proxy_user(&app, proxy_id);
+        let current = current_config_with_user(&app, node_id);
+        let mut rx = add_agent(&app, node_id, SESSION);
+        let delete_app = app.clone();
+        let deletion = tokio::spawn(async move {
+            crate::proxy_user::delete_proxy_user(Admin, State(delete_app), Path(user_id)).await
+        });
+
+        let get = next_request(&mut rx, SINGBOX_CONFIG_GET_METHOD).await;
+        reply(&app, node_id, SESSION, &get, get_result(&current));
+        let check = next_request(&mut rx, SINGBOX_CONFIG_CHECK_METHOD).await;
+        let checked = check["params"]["content"].as_str().unwrap().to_owned();
+        let candidate: Value = serde_json::from_str(&checked).unwrap();
+        assert_eq!(candidate["inbounds"][0]["users"].as_array().unwrap().len(), 1);
+        assert!(app.db.proxy_user(user_id).unwrap().is_some(), "数据库记录必须等 apply 成功后才删除");
+        reply(&app, node_id, SESSION, &check, Ok(json!({ "valid": true })));
+        let apply = next_request(&mut rx, SINGBOX_CONFIG_APPLY_METHOD).await;
+        assert_eq!(apply["params"]["content"], checked);
+        assert!(app.db.proxy_user(user_id).unwrap().is_some());
+        reply(&app, node_id, SESSION, &apply, Ok(json!({ "running": true })));
+
+        let response = deletion.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_json(response).await["deleted"], true);
+        assert!(app.db.proxy_user(user_id).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn user_delete_keeps_disabled_user_when_config_check_fails() {
+        let (app, node_id) = app_node();
+        let proxy_id = create_proxy_node(&app, node_id, 443, true, "www.apple.com:443");
+        let user_id = create_proxy_user(&app, proxy_id);
+        let current = current_config_with_user(&app, node_id);
+        let mut rx = add_agent(&app, node_id, SESSION);
+        let delete_app = app.clone();
+        let deletion = tokio::spawn(async move {
+            crate::proxy_user::delete_proxy_user(Admin, State(delete_app), Path(user_id)).await
+        });
+        let get = next_request(&mut rx, SINGBOX_CONFIG_GET_METHOD).await;
+        reply(&app, node_id, SESSION, &get, get_result(&current));
+        let check = next_request(&mut rx, SINGBOX_CONFIG_CHECK_METHOD).await;
+        reply(&app, node_id, SESSION, &check, Err(json!({ "code": -32000, "message": PRIVATE_SENTINEL })));
+
+        let response = deletion.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["deleted"], false);
+        assert_eq!(body["user"]["enabled"], false);
+        assert_eq!(body["failed_servers"][0]["server_id"], node_id);
+        let saved = app.db.proxy_user(user_id).unwrap().unwrap();
+        assert!(!saved.enabled);
+        assert_eq!(saved.proxy_node_ids, [proxy_id]);
+        assert!(rx.try_recv().is_err(), "config.check 失败不能继续 apply 或删除数据库记录");
+    }
+
+    #[tokio::test]
+    async fn user_delete_keeps_disabled_user_when_config_apply_fails() {
+        let (app, node_id) = app_node();
+        let proxy_id = create_proxy_node(&app, node_id, 443, true, "www.apple.com:443");
+        let user_id = create_proxy_user(&app, proxy_id);
+        let current = current_config_with_user(&app, node_id);
+        let mut rx = add_agent(&app, node_id, SESSION);
+        let delete_app = app.clone();
+        let deletion = tokio::spawn(async move {
+            crate::proxy_user::delete_proxy_user(Admin, State(delete_app), Path(user_id)).await
+        });
+        let get = next_request(&mut rx, SINGBOX_CONFIG_GET_METHOD).await;
+        reply(&app, node_id, SESSION, &get, get_result(&current));
+        let check = next_request(&mut rx, SINGBOX_CONFIG_CHECK_METHOD).await;
+        reply(&app, node_id, SESSION, &check, Ok(json!({ "valid": true })));
+        let apply = next_request(&mut rx, SINGBOX_CONFIG_APPLY_METHOD).await;
+        reply(&app, node_id, SESSION, &apply, Err(json!({ "code": -32000, "message": PRIVATE_SENTINEL })));
+
+        let response = deletion.await.unwrap();
+        let body = response_json(response).await;
+        assert_eq!(body["deleted"], false);
+        assert_eq!(body["user"]["enabled"], false);
+        assert_eq!(app.db.proxy_user(user_id).unwrap().unwrap().proxy_node_ids, [proxy_id]);
+    }
+
+    #[tokio::test]
+    async fn user_delete_keeps_disabled_user_when_agent_is_offline() {
+        let (app, node_id) = app_node();
+        let proxy_id = create_proxy_node(&app, node_id, 443, true, "www.apple.com:443");
+        let user_id = create_proxy_user(&app, proxy_id);
+        let response = crate::proxy_user::delete_proxy_user(Admin, State(app.clone()), Path(user_id)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["deleted"], false);
+        assert_eq!(body["user"]["enabled"], false);
+        assert_eq!(body["failed_servers"][0]["error"], "服务器当前离线");
+        assert_eq!(app.db.proxy_user(user_id).unwrap().unwrap().proxy_node_ids, [proxy_id]);
+    }
+
+    #[tokio::test]
+    async fn user_update_deploys_every_server_and_keeps_desired_state_on_partial_failure() {
+        let app = Arc::new(App::for_test(Db::open(":memory:").unwrap()));
+        let first_server = app
+            .db
+            .create_node(&Node { name: "offline-server".into(), ..Default::default() }, "offline-token")
+            .unwrap();
+        let second_server = app
+            .db
+            .create_node(&Node { name: "online-server".into(), ..Default::default() }, "online-token")
+            .unwrap();
+        let first_proxy = create_proxy_node(&app, first_server, 24443, true, "www.apple.com:443");
+        let second_proxy = create_proxy_node(&app, second_server, 24444, true, "www.apple.com:443");
+        let user_id = app
+            .db
+            .create_proxy_user_with_nodes(
+                "Alice",
+                "a0f81cec-73c5-4eb8-a2e2-cd1544946e8e",
+                true,
+                "",
+                &[first_proxy, second_proxy],
+            )
+            .unwrap()
+            .0
+            .id;
+        let second_current = current_config_with_user(&app, second_server);
+        let mut rx = add_agent(&app, second_server, SESSION);
+        let update_app = app.clone();
+        let update = tokio::spawn(async move {
+            crate::proxy_user::update_proxy_user(
+                Admin,
+                State(update_app),
+                Path(user_id),
+                Ok(Json(crate::proxy_user::UpdateProxyUserRequest {
+                    name: "Alice".into(),
+                    enabled: false,
+                    note: "disabled".into(),
+                    proxy_node_ids: vec![first_proxy, second_proxy],
+                })),
+            )
+            .await
+        });
+
+        let get = next_request(&mut rx, SINGBOX_CONFIG_GET_METHOD).await;
+        reply(&app, second_server, SESSION, &get, get_result(&second_current));
+        let check = next_request(&mut rx, SINGBOX_CONFIG_CHECK_METHOD).await;
+        let candidate = check["params"]["content"].as_str().unwrap().to_owned();
+        let desired: Value = serde_json::from_str(&candidate).unwrap();
+        assert_eq!(desired["inbounds"][0]["users"].as_array().unwrap().len(), 1);
+        reply(&app, second_server, SESSION, &check, Ok(json!({ "valid": true })));
+        let apply = next_request(&mut rx, SINGBOX_CONFIG_APPLY_METHOD).await;
+        assert_eq!(apply["params"]["content"], candidate);
+        reply(&app, second_server, SESSION, &apply, Ok(json!({ "running": true })));
+
+        let response = update.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["user"]["enabled"], false);
+        assert_eq!(body["failed_servers"][0]["server_id"], first_server);
+        assert_eq!(body["failed_servers"][0]["error"], "服务器当前离线");
+        assert!(!app.db.proxy_user(user_id).unwrap().unwrap().enabled);
+        assert_eq!(status(&app, first_proxy).deploy_status, "failed");
+        assert_eq!(status(&app, second_proxy).deploy_status, "deployed");
+    }
+
+    #[tokio::test]
+    async fn regenerate_user_uuid_deploys_the_new_credential() {
+        let (app, node_id) = app_node();
+        let proxy_id = create_proxy_node(&app, node_id, 443, true, "www.apple.com:443");
+        let user_id = create_proxy_user(&app, proxy_id);
+        let old_uuid = app.db.proxy_user(user_id).unwrap().unwrap().uuid;
+        let current = current_config_with_user(&app, node_id);
+        let mut rx = add_agent(&app, node_id, SESSION);
+        let regenerate_app = app.clone();
+        let regeneration = tokio::spawn(async move {
+            crate::proxy_user::regenerate_proxy_user(Admin, State(regenerate_app), Path(user_id)).await
+        });
+
+        let get = next_request(&mut rx, SINGBOX_CONFIG_GET_METHOD).await;
+        reply(&app, node_id, SESSION, &get, get_result(&current));
+        let check = next_request(&mut rx, SINGBOX_CONFIG_CHECK_METHOD).await;
+        let candidate = check["params"]["content"].as_str().unwrap().to_owned();
+        let config: Value = serde_json::from_str(&candidate).unwrap();
+        let user_credential = &config["inbounds"][0]["users"][1];
+        let new_uuid = user_credential["uuid"].as_str().unwrap();
+        assert_ne!(new_uuid, old_uuid);
+        assert_eq!(app.db.proxy_user(user_id).unwrap().unwrap().uuid, new_uuid);
+        reply(&app, node_id, SESSION, &check, Ok(json!({ "valid": true })));
+        let apply = next_request(&mut rx, SINGBOX_CONFIG_APPLY_METHOD).await;
+        assert_eq!(apply["params"]["content"], candidate);
+        reply(&app, node_id, SESSION, &apply, Ok(json!({ "running": true })));
+
+        let response = regeneration.await.unwrap();
+        let body = response_json(response).await;
+        assert_eq!(body["user"]["uuid"], new_uuid);
+        assert!(body["failed_servers"].as_array().unwrap().is_empty());
+        assert_eq!(status(&app, proxy_id).deploy_status, "deployed");
     }
 
     #[tokio::test]

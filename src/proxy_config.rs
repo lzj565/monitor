@@ -6,7 +6,7 @@ use std::net::IpAddr;
 
 use serde_json::{json, Value};
 
-use crate::db::ProxyNode;
+use crate::db::{ProxyNode, ProxyUser};
 
 /// Monitor 管理 inbound 使用的 tag 前缀；用户配置应避开此命名空间。
 pub const MANAGED_INBOUND_TAG_PREFIX: &str = "monitor-proxy-node-";
@@ -18,6 +18,8 @@ pub enum ProxyConfigError {
     InvalidCurrentConfig,
     InvalidProxyNodeId,
     DuplicateProxyNodeId,
+    InvalidProxyUserId,
+    DuplicateProxyUserId,
     InvalidPort,
     DuplicateListenPort,
     UnsupportedProtocol,
@@ -38,6 +40,8 @@ impl fmt::Display for ProxyConfigError {
             }
             Self::InvalidProxyNodeId => "代理节点 ID 无效",
             Self::DuplicateProxyNodeId => "代理节点 ID 重复",
+            Self::InvalidProxyUserId => "代理用户 ID 无效",
+            Self::DuplicateProxyUserId => "代理用户 ID 重复",
             Self::InvalidPort => "代理节点监听端口无效",
             Self::DuplicateListenPort => "同一服务器上的代理节点监听端口重复",
             Self::UnsupportedProtocol => "代理节点协议不受支持",
@@ -62,14 +66,25 @@ pub fn generate_singbox_config(
     current_config: Value,
     nodes: &[ProxyNode],
 ) -> Result<Value, ProxyConfigError> {
-    generate_singbox_config_excluding(node_id, current_config, nodes, &[])
+    generate_singbox_config_excluding_users(node_id, current_config, nodes, &[], &[])
 }
 
 /// 导入和删除可以额外声明本次部署应移除的原始 inbound tag。
 pub fn generate_singbox_config_excluding(
     node_id: i64,
+    current_config: Value,
+    nodes: &[ProxyNode],
+    additionally_excluded_tags: &[String],
+) -> Result<Value, ProxyConfigError> {
+    generate_singbox_config_excluding_users(node_id, current_config, nodes, &[], additionally_excluded_tags)
+}
+
+/// 使用当前服务器上被授权且启用的 ProxyUser 重建托管 inbound。
+pub fn generate_singbox_config_excluding_users(
+    node_id: i64,
     mut current_config: Value,
     nodes: &[ProxyNode],
+    users: &[ProxyUser],
     additionally_excluded_tags: &[String],
 ) -> Result<Value, ProxyConfigError> {
     if node_id <= 0 {
@@ -103,7 +118,7 @@ pub fn generate_singbox_config_excluding(
         if !seen_ports.insert(node.listen_port) {
             return Err(ProxyConfigError::DuplicateListenPort);
         }
-        generated.push(generate_inbound(node)?);
+        generated.push(generate_inbound(node, users)?);
     }
 
     let Some(config) = current_config.as_object_mut() else {
@@ -132,7 +147,7 @@ pub fn generate_singbox_config_excluding(
     Ok(current_config)
 }
 
-fn generate_inbound(node: &ProxyNode) -> Result<Value, ProxyConfigError> {
+fn generate_inbound(node: &ProxyNode, users: &[ProxyUser]) -> Result<Value, ProxyConfigError> {
     if node.protocol != "vless_reality" {
         return Err(ProxyConfigError::UnsupportedProtocol);
     }
@@ -153,15 +168,41 @@ fn generate_inbound(node: &ProxyNode) -> Result<Value, ProxyConfigError> {
     }
 
     let (server, server_port) = parse_reality_dest(&node.reality_dest)?;
+    let mut inbound_users = vec![json!({
+        "uuid": node.uuid,
+        "flow": "xtls-rprx-vision"
+    })];
+    let mut seen_user_ids = BTreeSet::new();
+    let mut seen_user_uuids = BTreeSet::from([node.uuid.to_ascii_lowercase()]);
+    let mut assigned_users = users
+        .iter()
+        .filter(|user| user.enabled && user.proxy_node_ids.contains(&node.id))
+        .collect::<Vec<_>>();
+    assigned_users.sort_unstable_by_key(|user| user.id);
+    for user in assigned_users {
+        if user.id <= 0 {
+            return Err(ProxyConfigError::InvalidProxyUserId);
+        }
+        if !seen_user_ids.insert(user.id) {
+            return Err(ProxyConfigError::DuplicateProxyUserId);
+        }
+        if !is_uuid(&user.uuid) {
+            return Err(ProxyConfigError::InvalidUuid);
+        }
+        if seen_user_uuids.insert(user.uuid.to_ascii_lowercase()) {
+            inbound_users.push(json!({
+                "name": format!("monitor-user-{}", user.id),
+                "uuid": user.uuid,
+                "flow": "xtls-rprx-vision"
+            }));
+        }
+    }
     Ok(json!({
         "type": "vless",
         "tag": format!("{MANAGED_INBOUND_TAG_PREFIX}{}", node.id),
         "listen": node.listen_address,
         "listen_port": node.listen_port,
-        "users": [{
-            "uuid": node.uuid,
-            "flow": "xtls-rprx-vision"
-        }],
+        "users": inbound_users,
         "tls": {
             "enabled": true,
             "server_name": node.reality_server_name,
@@ -285,6 +326,21 @@ mod tests {
         }
     }
 
+    fn proxy_user(id: i64, uuid: &str, enabled: bool, proxy_node_ids: &[i64]) -> ProxyUser {
+        ProxyUser {
+            id,
+            username: format!("user-{id}"),
+            uuid: uuid.into(),
+            enabled,
+            quota: 0,
+            expire_at: None,
+            created_at: 1,
+            note: String::new(),
+            updated_at: 1,
+            proxy_node_ids: proxy_node_ids.to_vec(),
+        }
+    }
+
     fn empty_config() -> Value {
         json!({"inbounds": []})
     }
@@ -319,6 +375,54 @@ mod tests {
         assert!(inbound.get("public_key").is_none());
         assert!(inbound["tls"]["reality"].get("public_key").is_none());
         assert_eq!(inbound["listen"], "::", "custom client address must not become a bind address");
+    }
+
+    #[test]
+    fn generates_legacy_and_authorized_enabled_user_credentials() {
+        let node = proxy_node(12, 1, true);
+        let second_node = proxy_node(18, 1, true);
+        let mut first_user = proxy_user(2, "a0f81cec-73c5-4eb8-a2e2-cd1544946e8e", true, &[12, 18]);
+        first_user.username = "Sensitive Display Name".into();
+        let generated = generate_singbox_config_excluding_users(
+            1,
+            empty_config(),
+            &[node, second_node],
+            &[
+                first_user,
+                proxy_user(3, "aa8c947a-1dbd-4905-bcb1-71728c58effb", true, &[12]),
+                proxy_user(4, "e2b4b1d8-0af6-40f8-910b-cabfb913a7bc", false, &[12]),
+                proxy_user(5, "e91f28f5-5837-4b92-a281-224d155f01f6", true, &[18]),
+            ],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            generated["inbounds"][0]["users"],
+            json!([
+                {
+                    "uuid": "bf000d23-0752-40b4-affe-68f7707a9661",
+                    "flow": "xtls-rprx-vision"
+                },
+                {
+                    "name": "monitor-user-2",
+                    "uuid": "a0f81cec-73c5-4eb8-a2e2-cd1544946e8e",
+                    "flow": "xtls-rprx-vision"
+                },
+                {
+                    "name": "monitor-user-3",
+                    "uuid": "aa8c947a-1dbd-4905-bcb1-71728c58effb",
+                    "flow": "xtls-rprx-vision"
+                }
+            ])
+        );
+        let credential_users = generated["inbounds"][0]["users"].to_string();
+        assert!(credential_users.contains("monitor-user-2"));
+        assert!(!credential_users.contains("Sensitive Display Name"));
+        assert_eq!(
+            generated["inbounds"][1]["users"][1]["uuid"], "a0f81cec-73c5-4eb8-a2e2-cd1544946e8e",
+            "同一用户授权多个代理节点时使用同一个 UUID"
+        );
+        assert_eq!(generated["inbounds"][1]["users"].as_array().unwrap().len(), 3);
     }
 
     #[test]

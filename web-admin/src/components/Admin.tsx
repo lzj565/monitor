@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useId, useRef, useState } from "react"
 import { flushSync } from "react-dom"
-import { ArrowUpCircle, Bell, CalendarClock, Check, ChevronDown, ChevronRight, Copy, Database, Download, FileText, GripVertical, Layers, Palette, Pencil, Plus, Radio, RefreshCw, Search, Send, Server, Settings, Shield, SlidersHorizontal, Trash2, Upload } from "lucide-react"
+import { ArrowUpCircle, Bell, CalendarClock, Check, ChevronDown, ChevronRight, Copy, Database, Download, FileText, GripVertical, Layers, Palette, Pencil, Plus, Radio, RefreshCw, Search, Send, Server, Settings, Shield, SlidersHorizontal, Trash2, Upload, Users } from "lucide-react"
 import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
@@ -14,6 +14,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { ProxyNodeManager } from "@/components/ProxyNodeManager"
+import { ProxyUserManager } from "@/components/ProxyUserManager"
 import { api, badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, outdatedAgents, provisioningSite, trafficCorrection, upload, type ConfigField, type IfaceChoice, type Node, type PingTask, type ProxyInstance, type Source } from "@/lib/api"
 import { bytes, CYCLES, FOREVER, money, uptime } from "@/lib/format"
 
@@ -3483,6 +3484,7 @@ function Update({ versions, reload, nodes, site, refusal }: {
 const ADMIN_SECTIONS = [
   { path: "/admin/nodes", label: "服务器", icon: Server },
   { path: "/admin/proxy", label: "代理", icon: SlidersHorizontal },
+  { path: "/admin/proxy/users", label: "用户", icon: Users },
   { path: "/admin/ping", label: "延迟", icon: Radio },
   { path: "/admin/notify", label: "通知", icon: Bell },
   { path: "/admin/data", label: "数据", icon: Database },
@@ -3540,6 +3542,8 @@ export function Admin({
       <div className="min-w-0 flex-1">
         {path === "/admin/proxy" ? (
           <Proxy nodes={nodes} />
+        ) : path === "/admin/proxy/users" ? (
+          <ProxyUserManager servers={nodes} />
         ) : path === "/admin/ping" ? (
           <Ping nodes={nodes} />
         ) : path === "/admin/notify" ? (

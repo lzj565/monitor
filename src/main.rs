@@ -36,6 +36,7 @@ mod proxy_deploy;
 mod proxy_import;
 mod proxy_provision;
 mod proxy_share;
+mod proxy_user;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -68,6 +69,8 @@ pub struct App {
     pub commands: command::Registry,
     /// 每个服务器一个部署锁；Hub 是单进程服务，不需要跨进程锁。
     pub proxy_deploy_locks: Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>,
+    /// 串行化单个代理用户的编辑、删除、UUID 重生成与同步操作。
+    pub proxy_user_locks: Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>,
     /// Each node's newest traffic reading, booked about once a minute rather
     /// than with every report. Per node rather than per connection; see
     /// `agent_ws::file`.
@@ -116,6 +119,7 @@ impl App {
             agents: RwLock::default(),
             commands: command::Registry::default(),
             proxy_deploy_locks: Mutex::default(),
+            proxy_user_locks: Mutex::default(),
             readings: Mutex::default(),
             snapshot: Mutex::new([(0, Default::default()), (0, Default::default())]),
             throttle: auth::Throttle::default(),
@@ -146,6 +150,11 @@ impl App {
     pub fn proxy_deploy_lock(&self, node_id: i64) -> Arc<tokio::sync::Mutex<()>> {
         let mut locks = self.proxy_deploy_locks.lock().unwrap_or_else(|error| error.into_inner());
         locks.entry(node_id).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
+    }
+
+    pub fn proxy_user_lock(&self, user_id: i64) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.proxy_user_locks.lock().unwrap_or_else(|error| error.into_inner());
+        locks.entry(user_id).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
     }
 
     /// Whether a session cookie may be marked Secure. With `--site` this follows
@@ -619,6 +628,13 @@ async fn main() -> Result<()> {
         .route("/api/proxy/nodes/{id}", put(api::update_proxy_node).delete(proxy_deploy::remove_proxy_node))
         .route("/api/proxy/nodes/{id}/share", get(proxy_share::share_proxy_node))
         .route("/api/proxy/nodes/{id}/regenerate", post(api::regenerate_proxy_node))
+        .route("/api/proxy/users", get(proxy_user::list_proxy_users).post(proxy_user::create_proxy_user))
+        .route(
+            "/api/proxy/users/{id}",
+            put(proxy_user::update_proxy_user).delete(proxy_user::delete_proxy_user),
+        )
+        .route("/api/proxy/users/{id}/regenerate", post(proxy_user::regenerate_proxy_user))
+        .route("/api/proxy/users/{id}/sync", post(proxy_user::sync_proxy_user))
         .route("/api/proxy/servers/{node_id}/deploy", post(proxy_deploy::deploy))
         .route(
             "/api/proxy/servers/{node_id}/imports",

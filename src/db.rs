@@ -3,7 +3,7 @@
 // ponytail: single global connection; move to a read pool if the dashboard ever
 // blocks behind ingest.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Mutex;
 
 use anyhow::{Context, Result};
@@ -166,7 +166,7 @@ CREATE TABLE IF NOT EXISTS session (
 /// cannot: `open` runs `SCHEMA` before migrating, and on an older file the
 /// column is not there yet. `an_upgraded_release_matches_a_fresh_database`
 /// holds every migration to these rules, starting from v1.0.0's schema.
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -372,6 +372,21 @@ fn migrate_to_12(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// 为代理用户增加备注与更新时间，并建立到 ProxyNode 的授权关系。
+fn migrate_to_13(conn: &Connection) -> Result<()> {
+    add_column(conn, "proxy_user", "note TEXT NOT NULL DEFAULT ''")?;
+    add_column(conn, "proxy_user", "updated_at INTEGER NOT NULL DEFAULT 0")?;
+    conn.execute("UPDATE proxy_user SET updated_at=created_at WHERE updated_at=0", [])?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS proxy_user_node (
+           user_id INTEGER NOT NULL REFERENCES proxy_user(id) ON DELETE CASCADE,
+           proxy_node_id INTEGER NOT NULL REFERENCES proxy_node(id) ON DELETE CASCADE,
+           PRIMARY KEY (user_id, proxy_node_id)
+         );",
+    )?;
+    Ok(())
+}
+
 /// Brings a database already in service up to `SCHEMA_VERSION` and stamps it.
 /// `from` is its current version. A fresh file runs the additive migration
 /// history inside one transaction as well.
@@ -421,6 +436,9 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     if from < 12 {
         migrate_to_12(&tx)?;
     }
+    if from < 13 {
+        migrate_to_13(&tx)?;
+    }
     tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     tx.commit()?;
     Ok(())
@@ -456,8 +474,8 @@ const V11_TABLES: [&str; 11] = [
     "proxy_user",
     "proxy_node",
 ];
-/// 执行当前版本迁移后，备份必须包含的全部表。
-const TABLES: [&str; 11] = [
+/// v12 备份中还没有代理用户与 ProxyNode 的授权关系表。
+const V12_TABLES: [&str; 11] = [
     "setting",
     "node",
     "traffic",
@@ -469,6 +487,21 @@ const TABLES: [&str; 11] = [
     "proxy_instance",
     "proxy_user",
     "proxy_node",
+];
+/// 执行当前版本迁移后，备份必须包含的全部表。
+const TABLES: [&str; 12] = [
+    "setting",
+    "node",
+    "traffic",
+    "metric",
+    "ping_task",
+    "ping_node",
+    "ping_record",
+    "session",
+    "proxy_instance",
+    "proxy_user",
+    "proxy_node",
+    "proxy_user_node",
 ];
 
 /// One node's stored configuration and last known facts.
@@ -589,6 +622,9 @@ pub struct ProxyUser {
     pub quota: i64,
     pub expire_at: Option<i64>,
     pub created_at: i64,
+    pub note: String,
+    pub updated_at: i64,
+    pub proxy_node_ids: Vec<i64>,
 }
 
 /// 新建节点的默认监听地址；导入节点会保存服务器配置中的实际地址。
@@ -1283,34 +1319,45 @@ impl Db {
             anyhow::bail!("invalid proxy user");
         }
         let conn = self.conn();
+        let now = Utc::now().timestamp();
         conn.execute(
-            "INSERT INTO proxy_user (username, uuid, enabled, quota, expire_at, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![username, uuid, enabled, quota, expire_at, Utc::now().timestamp()],
+            "INSERT INTO proxy_user
+               (username, uuid, enabled, quota, expire_at, created_at, note, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, '', ?6)",
+            params![username, uuid, enabled, quota, expire_at, now],
         )?;
         Ok(conn.last_insert_rowid())
     }
 
     pub fn proxy_user(&self, id: i64) -> Result<Option<ProxyUser>> {
-        Ok(self
-            .conn()
+        let conn = self.conn();
+        let mut user = conn
             .query_row(
-                "SELECT id, username, uuid, enabled, quota, expire_at, created_at
+                "SELECT id, username, uuid, enabled, quota, expire_at, created_at, note, updated_at
                  FROM proxy_user WHERE id = ?1",
                 [id],
                 row_to_proxy_user,
             )
-            .optional()?)
+            .optional()?;
+        if let Some(user) = &mut user {
+            user.proxy_node_ids = proxy_user_node_ids(&conn, id)?;
+        }
+        Ok(user)
     }
 
     pub fn proxy_users(&self) -> Result<Vec<ProxyUser>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT id, username, uuid, enabled, quota, expire_at, created_at
+            "SELECT id, username, uuid, enabled, quota, expire_at, created_at, note, updated_at
              FROM proxy_user ORDER BY created_at, id",
         )?;
         let rows = stmt.query_map([], row_to_proxy_user)?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        let mut users = rows.collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+        for user in &mut users {
+            user.proxy_node_ids = proxy_user_node_ids(&conn, user.id)?;
+        }
+        Ok(users)
     }
 
     pub fn update_proxy_user(&self, user: &ProxyUser) -> Result<bool> {
@@ -1318,10 +1365,176 @@ impl Db {
             anyhow::bail!("invalid proxy user");
         }
         Ok(self.conn().execute(
-            "UPDATE proxy_user SET username=?2, uuid=?3, enabled=?4, quota=?5, expire_at=?6
+            "UPDATE proxy_user SET username=?2, uuid=?3, enabled=?4, quota=?5, expire_at=?6,
+                    note=?7, updated_at=?8
              WHERE id=?1",
-            params![user.id, user.username, user.uuid, user.enabled, user.quota, user.expire_at],
+            params![
+                user.id,
+                user.username,
+                user.uuid,
+                user.enabled,
+                user.quota,
+                user.expire_at,
+                user.note,
+                Utc::now().timestamp()
+            ],
         )? > 0)
+    }
+
+    /// 创建用户及其节点授权；授权关系和用户记录必须同时提交。
+    pub fn create_proxy_user_with_nodes(
+        &self,
+        username: &str,
+        uuid: &str,
+        enabled: bool,
+        note: &str,
+        requested_node_ids: &[i64],
+    ) -> Result<(ProxyUser, Vec<i64>)> {
+        validate_proxy_user_profile(username, note, uuid)?;
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_proxy_user_name_available(&tx, username, None)?;
+        let proxy_node_ids = validated_proxy_node_ids(&tx, requested_node_ids)?;
+        let now = Utc::now().timestamp();
+        tx.execute(
+            "INSERT INTO proxy_user
+               (username, uuid, enabled, quota, expire_at, created_at, note, updated_at)
+             VALUES (?1, ?2, ?3, 0, NULL, ?4, ?5, ?4)",
+            params![username.trim(), uuid.trim(), enabled, now, note.trim()],
+        )?;
+        let id = tx.last_insert_rowid();
+        for proxy_node_id in &proxy_node_ids {
+            tx.execute(
+                "INSERT INTO proxy_user_node (user_id, proxy_node_id) VALUES (?1, ?2)",
+                params![id, proxy_node_id],
+            )?;
+        }
+        let server_ids = proxy_server_ids_for_nodes(&tx, &proxy_node_ids)?;
+        let mut user =
+            query_proxy_user(&tx, id)?.ok_or_else(|| anyhow::anyhow!("created proxy user missing"))?;
+        user.proxy_node_ids = proxy_node_ids;
+        tx.commit()?;
+        Ok((user, server_ids))
+    }
+
+    /// 更新 desired state 与授权，并返回旧、新授权涉及的去重服务器。
+    pub fn update_proxy_user_profile(
+        &self,
+        id: i64,
+        username: &str,
+        enabled: bool,
+        note: &str,
+        requested_node_ids: &[i64],
+    ) -> Result<Option<(ProxyUser, Vec<i64>)>> {
+        validate_proxy_user_name_note(username, note)?;
+        if id <= 0 {
+            refuse!("代理用户 ID 无效");
+        }
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(mut user) = query_proxy_user(&tx, id)? else {
+            return Ok(None);
+        };
+        ensure_proxy_user_name_available(&tx, username, Some(id))?;
+        let old_proxy_node_ids = proxy_user_node_ids(&tx, id)?;
+        let proxy_node_ids = validated_proxy_node_ids(&tx, requested_node_ids)?;
+        let mut server_ids = proxy_server_ids_for_nodes(&tx, &old_proxy_node_ids)?;
+        server_ids.extend(proxy_server_ids_for_nodes(&tx, &proxy_node_ids)?);
+        server_ids.sort_unstable();
+        server_ids.dedup();
+
+        let now = Utc::now().timestamp();
+        tx.execute(
+            "UPDATE proxy_user SET username=?2, enabled=?3, note=?4, updated_at=?5 WHERE id=?1",
+            params![id, username.trim(), enabled, note.trim(), now],
+        )?;
+        tx.execute("DELETE FROM proxy_user_node WHERE user_id=?1", [id])?;
+        for proxy_node_id in &proxy_node_ids {
+            tx.execute(
+                "INSERT INTO proxy_user_node (user_id, proxy_node_id) VALUES (?1, ?2)",
+                params![id, proxy_node_id],
+            )?;
+        }
+        user.username = username.trim().to_owned();
+        user.enabled = enabled;
+        user.note = note.trim().to_owned();
+        user.updated_at = now;
+        user.proxy_node_ids = proxy_node_ids;
+        tx.commit()?;
+        Ok(Some((user, server_ids)))
+    }
+
+    /// 更新 UUID 后返回该用户当前授权涉及的服务器，供调用方同步 desired state。
+    pub fn regenerate_proxy_user_uuid(&self, id: i64, uuid: &str) -> Result<Option<(ProxyUser, Vec<i64>)>> {
+        if id <= 0 || !crate::proxy_config::is_uuid(uuid) {
+            refuse!("代理用户 UUID 无效");
+        }
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(mut user) = query_proxy_user(&tx, id)? else {
+            return Ok(None);
+        };
+        let proxy_node_ids = proxy_user_node_ids(&tx, id)?;
+        let server_ids = proxy_server_ids_for_nodes(&tx, &proxy_node_ids)?;
+        let now = Utc::now().timestamp();
+        tx.execute("UPDATE proxy_user SET uuid=?2, updated_at=?3 WHERE id=?1", params![id, uuid, now])?;
+        user.uuid = uuid.to_owned();
+        user.updated_at = now;
+        user.proxy_node_ids = proxy_node_ids;
+        tx.commit()?;
+        Ok(Some((user, server_ids)))
+    }
+
+    pub fn proxy_user_server_ids(&self, id: i64) -> Result<Vec<i64>> {
+        let conn = self.conn();
+        let proxy_node_ids = proxy_user_node_ids(&conn, id)?;
+        let mut server_ids = proxy_server_ids_for_nodes(&conn, &proxy_node_ids)?;
+        // 授权被移除后，失败服务器不再能从当前关系表反查；ProxyNode 的部署状态是服务器级快照，重试时一并纳入。
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT node_id FROM proxy_node
+             WHERE deploy_status IN ('failed', 'deploying') ORDER BY node_id",
+        )?;
+        let pending_ids = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+        server_ids.extend(pending_ids.collect::<Result<Vec<_>, _>>()?);
+        server_ids.sort_unstable();
+        server_ids.dedup();
+        Ok(server_ids)
+    }
+
+    /// 返回这个服务器上至少授权了一个 ProxyNode 的用户，包含停用用户供生成器明确过滤。
+    pub fn proxy_users_for_node(&self, node_id: i64) -> Result<Vec<ProxyUser>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT pu.id, pu.username, pu.uuid, pu.enabled, pu.quota, pu.expire_at,
+                    pu.created_at, pu.note, pu.updated_at, pun.proxy_node_id
+             FROM proxy_user pu
+             JOIN proxy_user_node pun ON pun.user_id=pu.id
+             JOIN proxy_node pn ON pn.id=pun.proxy_node_id
+             WHERE pn.node_id=?1 ORDER BY pu.id, pun.proxy_node_id",
+        )?;
+        let rows = stmt.query_map([node_id], |row| {
+            Ok((
+                ProxyUser {
+                    id: row.get("id")?,
+                    username: row.get("username")?,
+                    uuid: row.get("uuid")?,
+                    enabled: row.get("enabled")?,
+                    quota: row.get("quota")?,
+                    expire_at: row.get("expire_at")?,
+                    created_at: row.get("created_at")?,
+                    note: row.get("note")?,
+                    updated_at: row.get("updated_at")?,
+                    proxy_node_ids: Vec::new(),
+                },
+                row.get::<_, i64>("proxy_node_id")?,
+            ))
+        })?;
+        let mut users = BTreeMap::new();
+        for row in rows {
+            let (user, proxy_node_id) = row?;
+            users.entry(user.id).or_insert(user).proxy_node_ids.push(proxy_node_id);
+        }
+        Ok(users.into_values().collect())
     }
 
     pub fn delete_proxy_user(&self, id: i64) -> Result<bool> {
@@ -2388,6 +2601,7 @@ impl Db {
             v if v < 10 => &LEGACY_TABLES,
             10 => &V10_TABLES,
             11 => &V11_TABLES,
+            12 => &V12_TABLES,
             _ => &TABLES,
         };
         for table in required_tables {
@@ -2629,7 +2843,92 @@ fn row_to_proxy_user(r: &rusqlite::Row<'_>) -> rusqlite::Result<ProxyUser> {
         quota: r.get("quota")?,
         expire_at: r.get("expire_at")?,
         created_at: r.get("created_at")?,
+        note: r.get("note")?,
+        updated_at: r.get("updated_at")?,
+        proxy_node_ids: Vec::new(),
     })
+}
+
+fn query_proxy_user(conn: &Connection, id: i64) -> Result<Option<ProxyUser>> {
+    Ok(conn
+        .query_row(
+            "SELECT id, username, uuid, enabled, quota, expire_at, created_at, note, updated_at
+             FROM proxy_user WHERE id=?1",
+            [id],
+            row_to_proxy_user,
+        )
+        .optional()?)
+}
+
+fn proxy_user_node_ids(conn: &Connection, user_id: i64) -> Result<Vec<i64>> {
+    let mut stmt =
+        conn.prepare("SELECT proxy_node_id FROM proxy_user_node WHERE user_id=?1 ORDER BY proxy_node_id")?;
+    let ids = stmt.query_map([user_id], |row| row.get::<_, i64>(0))?;
+    Ok(ids.collect::<Result<_, _>>()?)
+}
+
+fn validated_proxy_node_ids(conn: &Connection, requested: &[i64]) -> Result<Vec<i64>> {
+    let ids = requested.iter().copied().collect::<std::collections::BTreeSet<_>>();
+    if ids.iter().any(|id| *id <= 0) {
+        refuse!("代理节点 ID 无效");
+    }
+    for id in &ids {
+        let exists = conn.query_row("SELECT EXISTS(SELECT 1 FROM proxy_node WHERE id=?1)", [id], |row| {
+            row.get::<_, bool>(0)
+        })?;
+        if !exists {
+            refuse!("所选代理节点不存在");
+        }
+    }
+    Ok(ids.into_iter().collect())
+}
+
+fn proxy_server_ids_for_nodes(conn: &Connection, proxy_node_ids: &[i64]) -> Result<Vec<i64>> {
+    let mut server_ids = std::collections::BTreeSet::new();
+    for proxy_node_id in proxy_node_ids {
+        if let Some(node_id) = conn
+            .query_row("SELECT node_id FROM proxy_node WHERE id=?1", [proxy_node_id], |row| {
+                row.get::<_, i64>(0)
+            })
+            .optional()?
+        {
+            server_ids.insert(node_id);
+        }
+    }
+    Ok(server_ids.into_iter().collect())
+}
+
+fn validate_proxy_user_name_note(username: &str, note: &str) -> Result<()> {
+    if username.trim().is_empty() {
+        refuse!("用户名称不能为空");
+    }
+    if username.trim().chars().count() > 120 {
+        refuse!("用户名称不能超过 120 个字符");
+    }
+    if note.chars().count() > 2_000 {
+        refuse!("备注不能超过 2000 个字符");
+    }
+    Ok(())
+}
+
+fn validate_proxy_user_profile(username: &str, note: &str, uuid: &str) -> Result<()> {
+    validate_proxy_user_name_note(username, note)?;
+    if !crate::proxy_config::is_uuid(uuid) {
+        refuse!("代理用户 UUID 格式无效");
+    }
+    Ok(())
+}
+
+fn ensure_proxy_user_name_available(conn: &Connection, username: &str, except_id: Option<i64>) -> Result<()> {
+    let exists = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM proxy_user WHERE username=?1 AND (?2 IS NULL OR id!=?2))",
+        params![username.trim(), except_id],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if exists {
+        refuse!("代理用户名已存在");
+    }
+    Ok(())
 }
 
 fn row_to_proxy_node(r: &rusqlite::Row<'_>) -> rusqlite::Result<ProxyNode> {
@@ -2759,6 +3058,103 @@ mod tests {
         assert_eq!(loaded.expire_at, Some(1234));
         assert!(db.delete_proxy_user(id).unwrap());
         assert!(db.proxy_user(id).unwrap().is_none());
+    }
+
+    #[test]
+    fn proxy_user_node_assignments_are_transactional_and_cascade() {
+        let db = db();
+        let servers = ["u-server-a", "u-server-b", "u-server-c"]
+            .map(|token| db.create_node(&Node { name: token.into(), ..Default::default() }, token).unwrap());
+        let proxy_nodes = servers
+            .iter()
+            .enumerate()
+            .map(|(index, server_id)| {
+                db.create_proxy_node(&proxy_node_config(*server_id, 24_000 + index as u16)).unwrap().id
+            })
+            .collect::<Vec<_>>();
+        let uuid = "f15aec0b-10d2-4794-b07a-64c817f6cabe";
+        let (created, created_servers) = db
+            .create_proxy_user_with_nodes(
+                "Alice",
+                uuid,
+                true,
+                "owner",
+                &[proxy_nodes[1], proxy_nodes[0], proxy_nodes[1]],
+            )
+            .unwrap();
+        assert_eq!(created.proxy_node_ids, proxy_nodes[..2]);
+        assert_eq!(created.note, "owner");
+        assert_eq!(created_servers, servers[..2]);
+        assert_eq!(db.proxy_users_for_node(servers[0]).unwrap()[0].id, created.id);
+        assert!(db.create_proxy_user_with_nodes("Bob", uuid, true, "", &[]).is_err());
+        assert!(db
+            .create_proxy_user_with_nodes(
+                "Invalid target",
+                "a0f81cec-73c5-4eb8-a2e2-cd1544946e8e",
+                true,
+                "",
+                &[i64::MAX],
+            )
+            .is_err());
+        assert_eq!(db.proxy_users().unwrap().len(), 1, "无效授权不会留下孤立用户");
+
+        let (updated, affected_servers) = db
+            .update_proxy_user_profile(
+                created.id,
+                "Alice 2",
+                false,
+                "paused",
+                &[proxy_nodes[1], proxy_nodes[2]],
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.proxy_node_ids, proxy_nodes[1..]);
+        assert!(!updated.enabled);
+        assert_eq!(updated.note, "paused");
+        assert_eq!(affected_servers, servers, "旧、新授权服务器合并去重");
+
+        assert!(db.delete_proxy_node(proxy_nodes[1]).unwrap());
+        assert_eq!(db.proxy_user(created.id).unwrap().unwrap().proxy_node_ids, [proxy_nodes[2]]);
+        assert!(db.delete_proxy_user(created.id).unwrap());
+        assert_eq!(
+            db.conn()
+                .query_row("SELECT COUNT(*) FROM proxy_user_node", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "删除用户级联清理授权关系"
+        );
+    }
+
+    #[test]
+    fn proxy_user_resync_includes_failed_servers_after_an_assignment_was_removed() {
+        let db = db();
+        let first_server =
+            db.create_node(&Node { name: "old-server".into(), ..Default::default() }, "old").unwrap();
+        let current_server =
+            db.create_node(&Node { name: "current-server".into(), ..Default::default() }, "current").unwrap();
+        let old_proxy = db.create_proxy_node(&proxy_node_config(first_server, 24_111)).unwrap();
+        let current_proxy = db.create_proxy_node(&proxy_node_config(current_server, 24_112)).unwrap();
+        let user = db
+            .create_proxy_user_with_nodes(
+                "Alice",
+                "f15aec0b-10d2-4794-b07a-64c817f6cabe",
+                true,
+                "",
+                &[current_proxy.id],
+            )
+            .unwrap()
+            .0;
+
+        db.set_proxy_nodes_deploy_status(first_server, "failed", Some("Agent 离线")).unwrap();
+        assert_eq!(
+            db.proxy_user_server_ids(user.id).unwrap(),
+            [first_server, current_server],
+            "重试必须包含已取消授权但仍未同步的旧服务器"
+        );
+
+        db.set_proxy_nodes_deploy_status(first_server, "deployed", None).unwrap();
+        assert_eq!(db.proxy_user_server_ids(user.id).unwrap(), [current_server]);
+        assert_eq!(db.proxy_node(old_proxy.id).unwrap().unwrap().node_id, first_server);
     }
 
     #[test]
@@ -3139,6 +3535,62 @@ mod tests {
             .unwrap();
         assert_eq!(listen, DEFAULT_PROXY_LISTEN_ADDRESS);
         assert_eq!(source, None);
+    }
+
+    #[test]
+    fn a_v12_backup_gains_proxy_user_fields_and_assignment_table_before_validation() {
+        let scratch = Scratch::new();
+        let copy = format!("{}.copy", scratch.0);
+        let db = Db::open(&scratch.0).unwrap();
+        let server =
+            db.create_node(&Node { name: "v12-server".into(), ..Default::default() }, "v12-token").unwrap();
+        let user_id = db.create_proxy_user("v12-user", "v12-user-uuid", true, 4096, Some(1234)).unwrap();
+        db.create_proxy_node(&proxy_node_config(server, 33333)).unwrap();
+        db.backup_into(&copy).unwrap();
+
+        let old = Connection::open(&copy).unwrap();
+        old.execute_batch(
+            "DROP TABLE proxy_user_node;
+             ALTER TABLE proxy_user DROP COLUMN updated_at;
+             ALTER TABLE proxy_user DROP COLUMN note;
+             PRAGMA user_version = 12;",
+        )
+        .unwrap();
+        drop(old);
+
+        db.check_backup(&copy).unwrap();
+        let migrated = Connection::open(&copy).unwrap();
+        let version = migrated.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let (username, quota, expiry, note, updated_at, created_at): (
+            String,
+            i64,
+            Option<i64>,
+            String,
+            i64,
+            i64,
+        ) = migrated
+            .query_row(
+                "SELECT username, quota, expire_at, note, updated_at, created_at FROM proxy_user WHERE id=?1",
+                [user_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+            )
+            .unwrap();
+        assert_eq!(username, "v12-user");
+        assert_eq!(quota, 4096);
+        assert_eq!(expiry, Some(1234));
+        assert_eq!(note, "");
+        assert_eq!(updated_at, created_at);
+        assert_eq!(
+            migrated
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='proxy_user_node'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
     }
 
     /// `oldest` is what the data page compares against the retention window, so it

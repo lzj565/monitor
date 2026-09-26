@@ -4,6 +4,7 @@ import { createElement } from "react"
 import { renderToStaticMarkup } from "react-dom/server"
 import { QRCodeSVG } from "qrcode.react"
 import { createProxyNodeOperationGuard, deleteConfirmation, fetchProxyNodeShare, regenerateAndDeployProxyNode, regenerateConfirmation, removeProxyNode, updateAndDeployProxyNode, proxyNodeShareDisabledReason, proxyNodeUpdatePayload, type ProxyNodeActionApi, type ProxyNodeUpdatePayload } from "./proxy-node-actions.ts"
+import { createProxyUserOperationGuard, deleteProxyUser, proxyUserDeleteConfirmation, proxyUserRegenerateConfirmation, regenerateProxyUser, saveProxyUser, syncProxyUser, type ProxyUserActionApi } from "./proxy-user-actions.ts"
 import { importProxyNodeInbound, scanProxyNodeImports, type ProxyNodeImportApi, type ProxyNodeImportRequest, type ProxyNodeImportScan } from "./proxy-node-imports.ts"
 import { badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, loopbackOrigin, outdatedAgents, provisioningSite, provisionRefusal, trafficCorrection } from "./api.ts"
 
@@ -179,6 +180,71 @@ operationGuard.finish(proxyNode.id)
 assert.equal(operationGuard.tryStart(proxyNode.id), true)
 operationGuard.finish(proxyNode.id)
 console.log("proxy node edit, deploy, toggle, regenerate and delete workflows passed")
+
+const proxyUser = {
+  id: 12,
+  name: "Alice",
+  uuid: "f15aec0b-10d2-4794-b07a-64c817f6cabe",
+  enabled: true,
+  note: "test account",
+  proxy_node_ids: [7, 8],
+  created_at: 1_800_000_000,
+  updated_at: 1_800_000_000,
+}
+const proxyUserInput = {
+  name: proxyUser.name,
+  enabled: false,
+  note: proxyUser.note,
+  proxy_node_ids: proxyUser.proxy_node_ids,
+}
+const proxyUserCalls: { path: string; init?: RequestInit }[] = []
+const proxyUserRequest: ProxyUserActionApi = async <T>(path: string, init?: RequestInit): Promise<T> => {
+  proxyUserCalls.push({ path, init })
+  return { user: { ...proxyUser, enabled: false }, failed_servers: [] } as T
+}
+const createdUser = await saveProxyUser(proxyUserRequest, null, { ...proxyUserInput, enabled: true })
+assert.deepEqual(proxyUserCalls.map(({ path, init }) => [path, init?.method]), [["/proxy/users", "POST"]])
+assert.equal(createdUser.user.id, proxyUser.id)
+proxyUserCalls.length = 0
+const updatedUser = await saveProxyUser(proxyUserRequest, proxyUser.id, proxyUserInput)
+assert.deepEqual(proxyUserCalls.map(({ path, init }) => [path, init?.method]), [["/proxy/users/12", "PUT"]])
+assert.deepEqual(JSON.parse(proxyUserCalls[0].init?.body as string), proxyUserInput)
+assert.equal("uuid" in JSON.parse(proxyUserCalls[0].init?.body as string), false, "普通编辑不能提交 UUID")
+assert.equal(updatedUser.user.enabled, false)
+const partialUserSync: ProxyUserActionApi = async <T>() => ({
+  user: { ...proxyUser, enabled: false },
+  failed_servers: [{ server_id: 3, server_name: "HK", error: "agent offline" }],
+}) as T
+const partialUpdate = await saveProxyUser(partialUserSync, proxyUser.id, proxyUserInput)
+assert.equal(partialUpdate.user.enabled, false, "部分同步失败时保留服务端返回的 disabled desired state")
+assert.equal(partialUpdate.failed_servers[0].server_name, "HK")
+
+proxyUserCalls.length = 0
+await regenerateProxyUser(proxyUserRequest, proxyUser.id)
+assert.deepEqual(proxyUserCalls.map(({ path, init }) => [path, init?.method]), [["/proxy/users/12/regenerate", "POST"]])
+assert.match(proxyUserRegenerateConfirmation("Alice").description, /现有客户端配置将失效/)
+assert.match(proxyUserDeleteConfirmation("Alice").description, /全部服务器同步成功后才会删除/)
+
+proxyUserCalls.length = 0
+await syncProxyUser(proxyUserRequest, proxyUser.id)
+assert.deepEqual(proxyUserCalls.map(({ path, init }) => [path, init?.method]), [["/proxy/users/12/sync", "POST"]])
+const retainedUser: ProxyUserActionApi = async <T>(path: string, init?: RequestInit): Promise<T> => {
+  proxyUserCalls.push({ path, init })
+  return { deleted: false, user: { ...proxyUser, enabled: false }, failed_servers: [{ server_id: 3, server_name: "HK", error: "agent offline" }] } as T
+}
+const deleteResponse = await deleteProxyUser(retainedUser, proxyUser.id)
+assert.equal(deleteResponse.deleted, false)
+assert.equal(deleteResponse.user?.enabled, false, "部署失败时保留用户并保留禁用 desired state")
+assert.equal(deleteResponse.failed_servers.length, 1)
+assert.deepEqual(proxyUserDeleteConfirmation("Alice").action, "删除用户")
+
+const userOperationGuard = createProxyUserOperationGuard()
+assert.equal(userOperationGuard.tryStart(proxyUser.id), true)
+assert.equal(userOperationGuard.tryStart(proxyUser.id), false, "同一代理用户操作期间不可重复提交")
+userOperationGuard.finish(proxyUser.id)
+assert.equal(userOperationGuard.tryStart(proxyUser.id), true)
+userOperationGuard.finish(proxyUser.id)
+console.log("proxy user CRUD, sync, regenerate and deploy-aware delete workflows passed")
 
 const importScan: ProxyNodeImportScan = {
   config_fingerprint: "a".repeat(64),

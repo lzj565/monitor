@@ -173,7 +173,7 @@ pub(crate) fn reality_public_key_from_private(private_key: &str) -> Result<Strin
     Ok(URL_SAFE_NO_PAD.encode(public.to_bytes()))
 }
 
-fn uuid_v4() -> String {
+pub(crate) fn uuid_v4() -> String {
     let mut bytes = rand::random::<[u8; 16]>();
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
