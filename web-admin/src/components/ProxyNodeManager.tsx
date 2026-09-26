@@ -21,7 +21,6 @@ import {
   regenerateAndDeployProxyNode,
   regenerateConfirmation,
   removeProxyNode,
-  proxyNodeShareDisabledReason,
   updateAndDeployProxyNode,
   proxyNodeUpdatePayload,
   type ProxyNodeCredential,
@@ -615,9 +614,7 @@ export function ProxyNodeManager({
             {proxyNodes.map((proxyNode) => {
               const server = serversById.get(proxyNode.node_id)
               const nodeBusy = Boolean(nodeOperations[proxyNode.id])
-              const shareDisabledReason = proxyNodeShareDisabledReason()
-              const shareDisabledMessage = shareDisabledReason || (nodeBusy ? "代理节点操作中，暂不可分享" : null)
-              const shareDisabled = nodeBusy || Boolean(shareDisabledReason) || Boolean(sharingNodes[proxyNode.id])
+              const shareDisabled = true
               return (
                 <TableRow key={proxyNode.id}>
                   <TableCell>
@@ -644,7 +641,6 @@ export function ProxyNodeManager({
                         variant="ghost"
                         size="icon"
                         disabled={shareDisabled}
-                        title={shareDisabledMessage || "复制链接"}
                         aria-label={`复制 ${proxyNode.name} 的链接`}
                         onClick={() => void copyShare(proxyNode)}
                       >
@@ -654,7 +650,6 @@ export function ProxyNodeManager({
                         variant="ghost"
                         size="icon"
                         disabled={shareDisabled}
-                        title={shareDisabledMessage || "二维码"}
                         aria-label={`显示 ${proxyNode.name} 的二维码`}
                         onClick={() => void openShareQr(proxyNode)}
                       >
@@ -681,7 +676,6 @@ export function ProxyNodeManager({
                         <Trash2 className="size-4 text-destructive" />
                       </Button>
                     </div>
-                    {shareDisabledMessage && <p className="mt-1 text-xs text-muted-foreground">{shareDisabledMessage}</p>}
                   </TableCell>
                 </TableRow>
               )

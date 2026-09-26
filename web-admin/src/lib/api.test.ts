@@ -3,7 +3,7 @@ import assert from "node:assert/strict"
 import { createElement } from "react"
 import { renderToStaticMarkup } from "react-dom/server"
 import { QRCodeSVG } from "qrcode.react"
-import { createProxyNodeOperationGuard, deleteConfirmation, fetchProxyNodeShare, regenerateAndDeployProxyNode, regenerateConfirmation, removeProxyNode, updateAndDeployProxyNode, proxyNodeShareDisabledReason, proxyNodeUpdatePayload, type ProxyNodeActionApi, type ProxyNodeUpdatePayload } from "./proxy-node-actions.ts"
+import { createProxyNodeOperationGuard, deleteConfirmation, fetchProxyNodeShare, regenerateAndDeployProxyNode, regenerateConfirmation, removeProxyNode, updateAndDeployProxyNode, proxyNodeUpdatePayload, type ProxyNodeActionApi, type ProxyNodeUpdatePayload } from "./proxy-node-actions.ts"
 import { createProxyUserOperationGuard, deleteProxyUser, proxyUserDeleteConfirmation, proxyUserRegenerateConfirmation, regenerateProxyUser, saveProxyUser, syncProxyUser, type ProxyUserActionApi } from "./proxy-user-actions.ts"
 import { importProxyNodeInbound, scanProxyNodeImports, type ProxyNodeImportApi, type ProxyNodeImportRequest, type ProxyNodeImportScan } from "./proxy-node-imports.ts"
 import { badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, loopbackOrigin, outdatedAgents, provisioningSite, provisionRefusal, trafficCorrection } from "./api.ts"
@@ -144,8 +144,6 @@ const shareRequest: ProxyNodeActionApi = async <T>(path: string, init?: RequestI
 const share = await fetchProxyNodeShare(shareRequest, proxyNode.id)
 assert.deepEqual(calls.map((call) => [call.path, call.init?.cache]), [["/proxy/nodes/7/share", "no-store"]])
 assert.equal(share.uri, shareUri, "二维码和复制操作读取后端给出的同一条 URI")
-assert.match(proxyNodeShareDisabledReason(), /分享链接已停用/)
-assert.match(proxyNodeShareDisabledReason(), /代理用户/)
 const shareApiFailure: ProxyNodeActionApi = async () => { throw new Error("代理节点部署失败") }
 await assert.rejects(fetchProxyNodeShare(shareApiFailure, proxyNode.id), /代理节点部署失败/)
 const shareLoading: boolean[] = []

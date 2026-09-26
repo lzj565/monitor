@@ -22,10 +22,6 @@ export async function fetchProxyNodeShare(
   }
 }
 
-export function proxyNodeShareDisabledReason(): string {
-  return "节点分享链接已停用，请在用户管理中创建代理用户并授权节点"
-}
-
 export function proxyNodeUpdatePayload(
   node: ProxyNodeUpdatePayload,
   changes: Partial<ProxyNodeUpdatePayload> = {},
