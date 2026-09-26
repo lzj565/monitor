@@ -15,6 +15,7 @@ import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { api, type Node, type ProxyNode } from "@/lib/api"
 import {
+  createProxyNode,
   createProxyNodeOperationGuard,
   deleteConfirmation,
   fetchProxyNodeShare,
@@ -22,6 +23,7 @@ import {
   regenerateConfirmation,
   removeProxyNode,
   updateAndDeployProxyNode,
+  proxyNodeCreatePayload,
   proxyNodeUpdatePayload,
   type ProxyNodeCredential,
   type ProxyNodeShare,
@@ -527,18 +529,18 @@ export function ProxyNodeManager({
     setSubmitStage("creating")
     let created: { node: ProxyNode }
     try {
-      created = await api<{ node: ProxyNode }>("/proxy/nodes", {
-        method: "POST",
-        body: JSON.stringify({
-          node_id: selectedServer.id,
-          name: form.name.trim(),
-          address_mode: form.addressMode,
-          custom_address: form.addressMode === "custom" ? form.customAddress.trim() : null,
-          listen_port: listenPort,
-          reality_server_name: form.realityServerName.trim(),
-          reality_dest: form.realityDest.trim(),
+      created = await createProxyNode(
+        api,
+        proxyNodeCreatePayload({
+          nodeId: selectedServer.id,
+          name: form.name,
+          addressMode: form.addressMode,
+          customAddress: form.customAddress,
+          listenPort,
+          realityServerName: form.realityServerName,
+          realityDest: form.realityDest,
         }),
-      })
+      )
     } catch (cause) {
       setFormError((cause as Error).message)
       setSubmitStage(null)
@@ -1037,18 +1039,18 @@ function ProxyNodeFormModal({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="flex max-h-[calc(100dvh-64px)] min-h-0 flex-col gap-0 overflow-hidden p-0 sm:max-w-[880px]">
-        <DialogHeader className="shrink-0 px-6 pt-6 pb-4">
+      <DialogContent className="flex w-[calc(100vw-32px)] max-h-[85dvh] min-h-0 flex-col gap-0 overflow-hidden p-0 max-w-[660px] sm:max-w-[660px]">
+        <DialogHeader className="shrink-0 px-5 pt-5 pb-3">
           <DialogTitle>{editing ? "编辑代理节点" : "新建代理节点"}</DialogTitle>
           <DialogDescription>
             {editing
               ? "修改代理节点配置，保存后将同步到所属服务器。"
-              : "在运行 sing-box 的服务器上创建 VLESS + Reality 代理入口。"}
+              : "选择连接地址并配置 VLESS + Reality 代理入口。"}
           </DialogDescription>
         </DialogHeader>
         <form className="flex min-h-0 flex-1 flex-col" onSubmit={onSubmit}>
-          <div className="min-h-0 flex-1 space-y-5 overflow-y-auto px-6 pb-5">
-            <div className="space-y-2">
+          <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-5 pb-4">
+            <div className="space-y-1.5">
               <Label htmlFor={`${inputId}-server`}>所属服务器</Label>
               {editing ? (
                 <div className="flex min-h-11 items-center justify-between gap-3 rounded-md border bg-muted/20 px-3 py-2">
@@ -1065,7 +1067,7 @@ function ProxyNodeFormModal({
                     disabled={busy}
                     onValueChange={(nodeId) => onValueChange({ nodeId })}
                   >
-                    <SelectTrigger id={`${inputId}-server`} className="h-11 w-full">
+                    <SelectTrigger id={`${inputId}-server`} className="h-9 w-full">
                       <SelectValue placeholder="选择服务器" />
                     </SelectTrigger>
                     <SelectContent>
@@ -1096,7 +1098,7 @@ function ProxyNodeFormModal({
               )}
             </div>
 
-            <section className="space-y-3 rounded-xl border bg-muted/20 p-4">
+            <section className="space-y-2 rounded-xl border bg-muted/20 p-3">
               <div className="flex items-center justify-between gap-3">
                 <div>
                   <Label>连接地址</Label>
@@ -1114,6 +1116,7 @@ function ProxyNodeFormModal({
                     key={addressMode}
                     type="button"
                     size="sm"
+                    className="h-9"
                     variant={value.addressMode === addressMode ? "default" : "ghost"}
                     disabled={busy || unavailable}
                     aria-pressed={value.addressMode === addressMode}
@@ -1127,7 +1130,7 @@ function ProxyNodeFormModal({
                 <Input
                   aria-label="自定义连接地址"
                   placeholder="例如 proxy.example.com"
-                  className="h-11 bg-background"
+                  className="h-9 bg-background"
                   value={value.customAddress}
                   disabled={busy}
                   onChange={(event) => onValueChange({ customAddress: event.target.value })}
@@ -1135,7 +1138,7 @@ function ProxyNodeFormModal({
                 />
               ) : (
                 <div className="flex min-h-9 min-w-0 items-center justify-between gap-3">
-                  <p className="min-w-0 break-all text-lg font-semibold tracking-tight">
+                  <p className="min-w-0 break-all text-base font-semibold tracking-tight">
                     {selectedAddress || (server ? "所选服务器没有该地址" : "先选择所属服务器")}
                   </p>
                   <span className="shrink-0 rounded-md border bg-background px-2 py-1 text-xs text-muted-foreground">
@@ -1153,12 +1156,12 @@ function ProxyNodeFormModal({
               </div>
             </section>
 
-            <div className="grid gap-4 sm:grid-cols-2">
-              <div className="space-y-2">
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div className="space-y-1.5">
                 <Label htmlFor={`${inputId}-name`}>代理节点名称</Label>
                 <Input
                   id={`${inputId}-name`}
-                  className="h-11"
+                  className="h-9"
                   value={value.name}
                   disabled={busy}
                   onChange={(event) => onValueChange({ name: event.target.value })}
@@ -1166,19 +1169,18 @@ function ProxyNodeFormModal({
                   required
                 />
               </div>
-              <div className="space-y-2">
+              <div className="space-y-1.5">
                 <Label>协议类型</Label>
-                <div className="flex h-11 items-center justify-between rounded-md border bg-muted/20 px-3">
+                <div className="flex h-9 items-center justify-between rounded-md border bg-muted/20 px-3">
                   <span className="text-sm font-medium">VLESS + Reality</span>
                   <span className="text-xs text-muted-foreground">固定协议</span>
                 </div>
               </div>
             </div>
 
-            <div className="max-w-md space-y-2">
+            <div className="max-w-sm space-y-1.5">
               <div className="flex items-center justify-between gap-3">
                 <Label htmlFor={`${inputId}-port`}>端口</Label>
-                {!editing && <span className="text-xs text-muted-foreground">随机空闲</span>}
               </div>
               <Input
                 id={`${inputId}-port`}
@@ -1186,7 +1188,7 @@ function ProxyNodeFormModal({
                 min={1}
                 max={65535}
                 step={1}
-                className="h-11"
+                className="h-9"
                 value={value.listenPort}
                 disabled={busy}
                 onChange={(event) => onValueChange({ listenPort: event.target.value })}
@@ -1194,44 +1196,45 @@ function ProxyNodeFormModal({
                 required={editing}
               />
               <p className="text-xs text-muted-foreground">
-                {editing ? "修改端口后，服务器会同步更新监听配置。" : "留空时由服务器自动选择可用的代理端口。"}
+                {editing ? "修改端口后，服务器会同步更新监听配置。" : "留空时服务器自动选择可用端口。"}
               </p>
             </div>
 
-            <details key={`${mode}-${open}`} className="group rounded-xl border bg-muted/10">
-              <summary className="flex cursor-pointer list-none items-center justify-between gap-3 p-4 [&::-webkit-details-marker]:hidden">
+            <details key={`${mode}-${open}`} className="group rounded-lg border bg-muted/10">
+              <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-3 py-2.5 [&::-webkit-details-marker]:hidden">
                 <span className="flex min-w-0 items-start gap-3">
                   <Settings2 className="mt-0.5 size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
-                  <span className="min-w-0">
-                    <span className="block text-sm font-medium">高级配置</span>
-                    <span className="mt-1 block text-xs text-muted-foreground">SNI / Dest · Reality 参数</span>
-                  </span>
+                  <span className="text-sm font-medium">高级配置（SNI / Dest）</span>
                 </span>
-                <ChevronDown className="size-4 shrink-0 text-muted-foreground transition-transform group-open:rotate-180" aria-hidden="true" />
+                <span className="flex shrink-0 items-center gap-2 text-xs text-muted-foreground">
+                  <span className="group-open:hidden">展开</span>
+                  <span className="hidden group-open:inline">收起</span>
+                  <ChevronDown className="size-4 transition-transform group-open:rotate-180" aria-hidden="true" />
+                </span>
               </summary>
-              <div className="space-y-4 border-t px-4 pt-4 pb-4">
-                <div className="space-y-3 rounded-lg border bg-background p-3">
-                  <div>
+              <div className="space-y-4 border-t px-3 py-3">
+                <div className="space-y-2">
+                  <div className="space-y-1">
                     <p className="text-sm font-medium">Reality 伪装</p>
                     <p className="mt-1 text-xs text-muted-foreground">握手目标必须与 SNI 域名相匹配。</p>
                   </div>
                   <div className="grid gap-3 sm:grid-cols-2">
-                    <div className="space-y-2">
+                    <div className="space-y-1.5">
                       <Label htmlFor={`${inputId}-sni`}>SNI 伪装域名</Label>
                       <Input
                         id={`${inputId}-sni`}
-                        className="h-11"
+                        className="h-9"
                         value={value.realityServerName}
                         disabled={busy}
                         onChange={(event) => onValueChange({ realityServerName: event.target.value })}
                         required
                       />
                     </div>
-                    <div className="space-y-2">
+                    <div className="space-y-1.5">
                       <Label htmlFor={`${inputId}-dest`}>Dest 目标</Label>
                       <Input
                         id={`${inputId}-dest`}
-                        className="h-11"
+                        className="h-9"
                         value={value.realityDest}
                         disabled={busy}
                         onChange={(event) => onValueChange({ realityDest: event.target.value })}
@@ -1240,7 +1243,7 @@ function ProxyNodeFormModal({
                     </div>
                   </div>
                 </div>
-                {editing && proxyNode ? (
+                {editing && proxyNode && (
                   <div className="space-y-3 rounded-lg border bg-background p-3">
                     <div>
                       <p className="text-sm font-medium">Reality 参数</p>
@@ -1249,22 +1252,12 @@ function ProxyNodeFormModal({
                     <CredentialRow label="Reality Public Key" value={proxyNode.reality_public_key} disabled={busy} onRegenerate={() => onRegenerate?.("reality_key")} regenerateLabel="重新生成 Reality 密钥" />
                     <CredentialRow label="Short ID" value={proxyNode.reality_short_id} disabled={busy} onRegenerate={() => onRegenerate?.("short_id")} />
                   </div>
-                ) : (
-                  <div className="space-y-2 rounded-lg border bg-muted/30 p-3">
-                    <p className="text-sm font-medium">Reality 参数</p>
-                    {["Reality Public Key", "Short ID"].map((label) => (
-                      <div key={label} className="flex items-center justify-between gap-3 text-sm">
-                        <span className="text-muted-foreground">{label}</span>
-                        <span className="text-xs text-muted-foreground">创建时自动生成</span>
-                      </div>
-                    ))}
-                  </div>
                 )}
               </div>
             </details>
             {error && <p role="alert" className="break-words text-sm text-destructive">{editing ? "保存失败：" : "创建失败："}{error}</p>}
           </div>
-          <DialogFooter className="shrink-0 border-t bg-background px-6 py-4">
+          <DialogFooter className="shrink-0 border-t bg-background px-5 py-3">
             <Button type="button" variant="outline" disabled={busy} onClick={onCancel}>取消</Button>
             <Button type="submit" disabled={busy || (!editing && !readiness?.ready)}>
               {editing

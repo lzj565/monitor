@@ -1,11 +1,14 @@
 /// <reference types="node" />
 import assert from "node:assert/strict"
+import { readFileSync } from "node:fs"
 import { createElement } from "react"
 import { renderToStaticMarkup } from "react-dom/server"
 import { QRCodeSVG } from "qrcode.react"
-import { createProxyNodeOperationGuard, deleteConfirmation, fetchProxyNodeShare, regenerateAndDeployProxyNode, regenerateConfirmation, removeProxyNode, updateAndDeployProxyNode, proxyNodeUpdatePayload, type ProxyNodeActionApi, type ProxyNodeUpdatePayload } from "./proxy-node-actions.ts"
+import { createProxyNode, createProxyNodeOperationGuard, deleteConfirmation, fetchProxyNodeShare, proxyNodeCreatePayload, regenerateAndDeployProxyNode, regenerateConfirmation, removeProxyNode, updateAndDeployProxyNode, proxyNodeUpdatePayload, type ProxyNodeActionApi, type ProxyNodeUpdatePayload } from "./proxy-node-actions.ts"
 import { createProxyUserOperationGuard, deleteProxyUser, proxyUserDeleteConfirmation, proxyUserRegenerateConfirmation, regenerateProxyUser, saveProxyUser, syncProxyUser, type ProxyUserActionApi } from "./proxy-user-actions.ts"
 import { importProxyNodeInbound, scanProxyNodeImports, type ProxyNodeImportApi, type ProxyNodeImportRequest, type ProxyNodeImportScan } from "./proxy-node-imports.ts"
+import { bytes } from "./format.ts"
+import { PROXY_USER_TABLE_COLUMNS, proxyUserCountText, proxyUserListState, proxyUserRowView } from "./proxy-user-view.ts"
 import { badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, loopbackOrigin, outdatedAgents, provisioningSite, provisionRefusal, trafficCorrection } from "./api.ts"
 
 assert.deepEqual(changes({ public: true, price: 5 }, { price: 20 }), { price: 20 })
@@ -77,6 +80,56 @@ const proxyNode = {
   deploy_status: "deployed",
   last_error: null,
 }
+const createPayload = proxyNodeCreatePayload({
+  nodeId: proxyNode.node_id,
+  name: "  HK Reality  ",
+  addressMode: "custom",
+  customAddress: " edge.example.net ",
+  listenPort: null,
+  realityServerName: " www.apple.com ",
+  realityDest: " www.apple.com:443 ",
+})
+assert.deepEqual(createPayload, {
+  node_id: proxyNode.node_id,
+  name: "HK Reality",
+  address_mode: "custom",
+  custom_address: "edge.example.net",
+  listen_port: null,
+  reality_server_name: "www.apple.com",
+  reality_dest: "www.apple.com:443",
+})
+assert.deepEqual(Object.keys(createPayload).sort(), [
+  "address_mode", "custom_address", "listen_port", "name", "node_id", "reality_dest", "reality_server_name",
+].sort(), "创建请求不包含后端生成的 UUID 或 Reality 凭据")
+
+const createCalls: { path: string; init?: RequestInit }[] = []
+const createRequest: ProxyNodeActionApi = async <T>(path: string, init?: RequestInit): Promise<T> => {
+  createCalls.push({ path, init })
+  return { node: proxyNode } as T
+}
+const createResult = await createProxyNode(createRequest, createPayload)
+assert.deepEqual(createCalls.map((call) => [call.path, call.init?.method]), [["/proxy/nodes", "POST"]])
+assert.deepEqual(JSON.parse(createCalls[0].init?.body as string), createPayload)
+assert.equal(createResult.node.reality_public_key, proxyNode.reality_public_key, "创建后使用服务端返回的公钥")
+assert.equal(createResult.node.reality_short_id, proxyNode.reality_short_id, "创建后使用服务端返回的 Short ID")
+assert.equal(createResult.node.uuid, proxyNode.uuid, "创建后保留服务端返回的 UUID")
+
+const managerSource = readFileSync(new URL("../components/ProxyNodeManager.tsx", import.meta.url), "utf8")
+const modalSource = managerSource.slice(managerSource.indexOf("function ProxyNodeFormModal("))
+const advancedSource = modalSource.match(/<details\b[\s\S]*?<\/details>/)?.[0] || ""
+assert.match(managerSource, /onClick={openCreate}><Plus \/>新建代理节点<\/Button>/, "新建按钮打开创建表单")
+assert.match(managerSource, /mode="create"\s+open={createOpen}/, "创建表单受 Dialog open 状态控制")
+assert.match(modalSource, /sm:max-w-\[660px\]/, "创建和编辑 Dialog 使用紧凑宽度")
+assert.match(modalSource, /max-h-\[85dvh\]/, "Dialog 高度随内容变化并限制在视口内")
+assert.ok(advancedSource, "高级配置使用原生可折叠区域")
+assert.doesNotMatch(advancedSource, /\bopen(?:=|\s|>)/, "高级配置默认折叠")
+assert.match(advancedSource, /<summary[\s\S]*?高级配置（SNI \/ Dest）/, "高级配置由可点击标题展开")
+assert.match(advancedSource, /SNI 伪装域名[\s\S]*Dest 目标/, "高级配置包含 SNI 和 Dest")
+assert.match(advancedSource, /\{editing && proxyNode && \([\s\S]*CredentialRow label="Reality Public Key"[\s\S]*CredentialRow label="Short ID"/, "Reality 凭据只在编辑现有节点时展示")
+assert.doesNotMatch(managerSource, /创建时自动生成/, "创建页不再展示自动生成提示")
+assert.match(modalSource, /\["ipv4", "IPv4"[\s\S]*\["ipv6", "IPv6"[\s\S]*\["custom", "自定义"/, "连接地址保留 IPv4、IPv6、自定义选项")
+assert.match(modalSource, /placeholder="自动分配"[\s\S]*留空时服务器自动选择可用端口/, "端口留空时交由服务器自动分配")
+
 const editable = proxyNodeUpdatePayload(proxyNode, { name: "HK edge", address_mode: "custom", custom_address: "edge.example.net" })
 assert.deepEqual(Object.keys(editable).sort(), ["address_mode", "custom_address", "enabled", "listen_port", "name", "reality_dest", "reality_server_name"].sort())
 assert.equal((editable as ProxyNodeUpdatePayload).enabled, true)
@@ -187,6 +240,29 @@ const proxyUser = {
   created_at: 1_800_000_000,
   updated_at: 1_800_000_000,
 }
+assert.deepEqual(PROXY_USER_TABLE_COLUMNS.map(({ label }) => label), ["ID", "用户名", "流量使用情况", "账户状态", "专属订阅链接", "操作"])
+assert.equal(PROXY_USER_TABLE_COLUMNS.some(({ label }) => /UUID|设备限制|到期时间/.test(label)), false)
+const adminView = proxyUserRowView({ id: 1, is_system: true })
+assert.equal(adminView.systemLabel, "系统")
+assert.deepEqual(adminView.actions, ["edit"], "系统用户不能显示删除操作")
+const ordinaryView = proxyUserRowView({ id: proxyUser.id, is_system: false })
+assert.deepEqual(ordinaryView.actions, ["edit", "delete"])
+assert.equal(ordinaryView.traffic, "--", "Hub 暂无用户累计流量 API 时不显示伪造数据")
+assert.equal(ordinaryView.trafficClearDisabled, true)
+assert.equal(ordinaryView.trafficTooltip, "流量统计接入后可用")
+assert.ok(PROXY_USER_TABLE_COLUMNS.find(({ key }) => key === "traffic"), "清空入口归属流量列")
+assert.equal(ordinaryView.subscription, "尚未支持")
+assert.equal(ordinaryView.subscriptionActionsDisabled, true)
+assert.equal("uuid" in ordinaryView, false, "主表展示模型不暴露 UUID")
+assert.equal(proxyUserCountText(2, false), "当前用户：2 户")
+assert.equal(proxyUserCountText(0, true), "正在加载用户…")
+assert.equal(proxyUserListState(0, true), "loading")
+assert.equal(proxyUserListState(0, false), "empty")
+assert.equal(proxyUserListState(2, true), "ready", "刷新期间保留已加载行")
+assert.equal(bytes(0), "0 B")
+assert.equal(bytes(1024), "1 KB")
+assert.equal(bytes(1_048_576), "1 MB")
+assert.equal(bytes(1_073_741_824), "1 GB")
 const proxyUserInput = {
   name: proxyUser.name,
   enabled: false,
@@ -207,6 +283,9 @@ assert.deepEqual(proxyUserCalls.map(({ path, init }) => [path, init?.method]), [
 assert.deepEqual(JSON.parse(proxyUserCalls[0].init?.body as string), proxyUserInput)
 assert.equal("uuid" in JSON.parse(proxyUserCalls[0].init?.body as string), false, "普通编辑不能提交 UUID")
 assert.equal(updatedUser.user.enabled, false)
+proxyUserCalls.length = 0
+await saveProxyUser(proxyUserRequest, proxyUser.id, { ...proxyUserInput, enabled: true })
+assert.equal(JSON.parse(proxyUserCalls[0].init?.body as string).enabled, true, "账户状态继续使用现有 enabled API")
 const partialUserSync: ProxyUserActionApi = async <T>() => ({
   user: { ...proxyUser, enabled: false },
   failed_servers: [{ server_id: 3, server_name: "HK", error: "agent offline" }],

@@ -5,9 +5,49 @@ export type ProxyNodeUpdatePayload = Pick<
   "name" | "enabled" | "address_mode" | "custom_address" | "listen_port" | "reality_server_name" | "reality_dest"
 >
 
+export type ProxyNodeCreatePayload = {
+  node_id: number
+  name: string
+  address_mode: "ipv4" | "ipv6" | "custom"
+  custom_address: string | null
+  listen_port: number | null
+  reality_server_name: string
+  reality_dest: string
+}
+
 export type ProxyNodeCredential = "reality_key" | "short_id"
 export type ProxyNodeActionApi = <T = unknown>(path: string, init?: RequestInit) => Promise<T>
 export type ProxyNodeShare = { node_id: number; name: string; address: string; uri: string }
+
+export function proxyNodeCreatePayload(input: {
+  nodeId: number
+  name: string
+  addressMode: ProxyNodeCreatePayload["address_mode"]
+  customAddress: string
+  listenPort: number | null
+  realityServerName: string
+  realityDest: string
+}): ProxyNodeCreatePayload {
+  return {
+    node_id: input.nodeId,
+    name: input.name.trim(),
+    address_mode: input.addressMode,
+    custom_address: input.addressMode === "custom" ? input.customAddress.trim() : null,
+    listen_port: input.listenPort,
+    reality_server_name: input.realityServerName.trim(),
+    reality_dest: input.realityDest.trim(),
+  }
+}
+
+export async function createProxyNode(
+  request: ProxyNodeActionApi,
+  payload: ProxyNodeCreatePayload,
+): Promise<{ node: ProxyNode }> {
+  return await request<{ node: ProxyNode }>("/proxy/nodes", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  })
+}
 
 export async function fetchProxyNodeShare(
   request: ProxyNodeActionApi,
