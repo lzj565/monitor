@@ -9,6 +9,20 @@ export const PROXY_USER_TABLE_COLUMNS = [
   { key: "actions", label: "操作", className: "w-[200px] text-right" },
 ] as const
 
+export type ProxyUserStatusFilter = "all" | "enabled" | "disabled"
+
+export function filterProxyUsers<T extends Pick<ProxyUser, "name" | "enabled">>(
+  users: readonly T[],
+  query: string,
+  status: ProxyUserStatusFilter,
+): T[] {
+  const normalizedQuery = query.trim().toLowerCase()
+  return users.filter((user) =>
+    (!normalizedQuery || user.name.toLowerCase().includes(normalizedQuery))
+    && (status === "all" || user.enabled === (status === "enabled")),
+  )
+}
+
 export type ProxyUserRowAction = "edit" | "delete"
 
 export function proxyUserRowView(user: Pick<ProxyUser, "id" | "is_system">) {

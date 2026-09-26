@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { ChevronDown, Copy, ExternalLink, KeyRound, LoaderCircle, Pencil, Plus, RefreshCw, RotateCcw, RotateCw, Trash2 } from "lucide-react"
+import { ChevronDown, Copy, ExternalLink, KeyRound, LoaderCircle, Pencil, Plus, RefreshCw, RotateCcw, RotateCw, Search, Trash2 } from "lucide-react"
 import { toast } from "sonner"
 
 import {
@@ -41,6 +41,7 @@ import {
 } from "@/lib/proxy-user-actions"
 import {
   expiryDateLabel,
+  filterProxyUsers,
   formatBytes,
   limitBytesFromGb,
   limitGbInput,
@@ -49,6 +50,7 @@ import {
   proxyUserRowView,
   PROXY_USER_TABLE_COLUMNS,
   trafficPercent,
+  type ProxyUserStatusFilter,
 } from "@/lib/proxy-user-view"
 
 type Confirmation = { kind: "regenerate" | "delete" | "traffic"; user: ProxyUser }
@@ -110,6 +112,8 @@ export function ProxyUserManager({ servers }: { servers: Node[] }) {
   const [proxyNodes, setProxyNodes] = useState<ProxyNode[]>([])
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState("")
+  const [query, setQuery] = useState("")
+  const [statusFilter, setStatusFilter] = useState<ProxyUserStatusFilter>("all")
   const [dialogUser, setDialogUser] = useState<ProxyUser | null | undefined>(undefined)
   const [passwordUser, setPasswordUser] = useState<ProxyUser | null>(null)
   const [passwordValue, setPasswordValue] = useState("")
@@ -342,105 +346,109 @@ export function ProxyUserManager({ servers }: { servers: Node[] }) {
   }, [proxyNodes, serverById])
   const editBusy = dialogUser != null && busyIds.includes(dialogUser.id)
   const listState = proxyUserListState(users.length, loading)
+  const filteredUsers = filterProxyUsers(users, query, statusFilter)
 
   return (
     <div className="space-y-4">
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div className="space-y-1">
-          <h1 className="text-lg font-semibold">用户与流量管理</h1>
-          <p className="text-sm text-muted-foreground">管理代理用户、流量额度、重置周期与有效期。</p>
+      <div className="flex flex-wrap items-center justify-end gap-2">
+        <div className="mr-auto flex w-full items-center gap-2 sm:w-auto">
+          <div className="relative min-w-0 flex-1 sm:w-64 sm:flex-none">
+            <Search className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
+            <Input className="pl-8" placeholder="搜索用户名" aria-label="按用户名搜索" value={query} onChange={(event) => setQuery(event.target.value)} />
+          </div>
+          <Select value={statusFilter} onValueChange={(value) => setStatusFilter(value as ProxyUserStatusFilter)}>
+            <SelectTrigger className="w-32" aria-label="按状态筛选"><SelectValue /></SelectTrigger>
+            <SelectContent position="popper">
+              <SelectItem value="all">全部状态</SelectItem>
+              <SelectItem value="enabled">启用</SelectItem>
+              <SelectItem value="disabled">停用</SelectItem>
+            </SelectContent>
+          </Select>
+          <span className="hidden whitespace-nowrap text-xs text-muted-foreground sm:inline">{proxyUserCountText(users.length, listState === "loading")}</span>
         </div>
-        <div className="flex gap-2">
-          <Button size="sm" variant="outline" onClick={() => { setLoading(true); void load() }} disabled={loading}>
-            <RefreshCw className={`size-4 ${loading ? "animate-spin" : ""}`} /> 刷新
-          </Button>
-          <Button size="sm" onClick={openCreate}><Plus className="size-4" /> 新建用户</Button>
-        </div>
+        <Button variant="outline" onClick={() => { setLoading(true); void load() }} disabled={loading}>
+          <RefreshCw className={loading ? "animate-spin" : ""} /> 刷新
+        </Button>
+        <Button onClick={openCreate}><Plus /> 新建用户</Button>
       </div>
 
       {loadError && <p role="alert" className="text-sm text-destructive">{loadError}</p>}
       <TooltipProvider delayDuration={250}>
-        <Card className="overflow-hidden rounded-xl p-0 shadow-sm">
-          <div className="border-b bg-muted/30 px-5 py-3">
-            <div className="flex items-center gap-3 text-sm">
-              <Badge variant="secondary">代理用户</Badge>
-              <span className="text-muted-foreground">{proxyUserCountText(users.length, listState === "loading")}</span>
-            </div>
-          </div>
-          <div className="overflow-x-auto">
-            <Table className="min-w-[1120px]">
-              <TableHeader className="bg-muted/40">
-                <TableRow className="h-11 hover:bg-muted/40">
-                  {PROXY_USER_TABLE_COLUMNS.map((column) => <TableHead key={column.key} className={column.className}>{column.label}</TableHead>)}
+        <Card className="overflow-x-auto p-0">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                {PROXY_USER_TABLE_COLUMNS.map((column) => <TableHead key={column.key} className={column.className}>{column.label}</TableHead>)}
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {listState === "loading" ? Array.from({ length: 3 }, (_, index) => (
+                <TableRow key={`loading-${index}`}>
+                  {PROXY_USER_TABLE_COLUMNS.map((column) => <TableCell key={column.key}><Skeleton className="h-4 w-24" /></TableCell>)}
                 </TableRow>
-              </TableHeader>
-              <TableBody>
-                {listState === "loading" ? Array.from({ length: 3 }, (_, index) => (
-                  <TableRow key={`loading-${index}`}>
-                    {PROXY_USER_TABLE_COLUMNS.map((column) => <TableCell key={column.key} className="py-3"><Skeleton className="h-4 w-24" /></TableCell>)}
+              )) : listState === "empty" ? (
+                <TableRow><TableCell colSpan={PROXY_USER_TABLE_COLUMNS.length} className="h-28 text-center text-sm text-muted-foreground">暂无用户</TableCell></TableRow>
+              ) : filteredUsers.length === 0 ? (
+                <TableRow><TableCell colSpan={PROXY_USER_TABLE_COLUMNS.length} className="h-28 text-center text-sm text-muted-foreground">没有匹配的用户</TableCell></TableRow>
+              ) : filteredUsers.map((user) => {
+                const busy = busyIds.includes(user.id)
+                const row = proxyUserRowView(user)
+                const percent = trafficPercent(user.traffic.used_bytes, user.traffic_limit_bytes)
+                const progressColor = percent >= 100 ? "bg-destructive" : percent >= 80 ? "bg-amber-500" : "bg-primary"
+                const nodeIssues = user.proxy_node_ids
+                  .map((id) => proxyNodes.find((node) => node.id === id))
+                  .filter((node): node is ProxyNode => !!node && node.deploy_status !== "deployed")
+                const inferredFailures = [...new Map(nodeIssues.map((node) => [node.node_id, {
+                  server_id: node.node_id,
+                  server_name: serverById.get(node.node_id)?.name ?? `服务器 ${node.node_id}`,
+                  error: node.last_error || (node.deploy_status === "deploying" ? "配置正在部署" : "代理节点尚未成功部署"),
+                }])).values()]
+                const failures = failedByUser[user.id] ?? inferredFailures
+                return (
+                  <TableRow key={user.id}>
+                    <TableCell className="font-mono text-sm text-muted-foreground">{row.id}</TableCell>
+                    <TableCell className="font-medium">
+                      {user.name}
+                      {row.systemLabel && <Badge variant="secondary" className="ml-2">{row.systemLabel}</Badge>}
+                    </TableCell>
+                    <TableCell>
+                      <div className="space-y-2">
+                        <div className="flex min-w-0 flex-nowrap items-center gap-1.5">
+                          <span className="shrink-0 whitespace-nowrap font-medium tabular-nums">{formatBytes(user.traffic.used_bytes)}</span>
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Button type="button" size="xs" variant="ghost" className="h-5 px-1.5 text-xs font-normal text-muted-foreground hover:bg-transparent hover:text-foreground" disabled={busy} onClick={() => setConfirm({ kind: "traffic", user })}>
+                                <RotateCcw className="size-3" /> 清空
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent>清空 Hub 当前周期累计，并在服务器下次上报时重新建立 baseline</TooltipContent>
+                          </Tooltip>
+                          <span className="ml-auto min-w-0 truncate whitespace-nowrap text-right text-xs text-muted-foreground">{user.traffic_limit_bytes === 0 ? "不限量" : `${formatBytes(user.traffic_limit_bytes)} (${Math.floor(percent)}%)`}</span>
+                        </div>
+                        <Progress className="h-1.5" aria-label={`${user.name} 流量使用比例`} value={percent} indicatorClassName={progressColor} />
+                      </div>
+                    </TableCell>
+                    <TableCell className="text-sm">{expiryDateLabel(user.expire_date)}</TableCell>
+                    <TableCell>
+                      <div className="flex items-center gap-2">
+                        <Switch checked={user.enabled} disabled={busy} onCheckedChange={(enabled) => void toggleUser(user, enabled)} aria-label={`${user.enabled ? "停用" : "启用"} ${user.name}`} />
+                        <Badge variant="outline" className={accessClass(user)}>{accessLabel(user)}</Badge>
+                      </div>
+                      {failures.length > 0 && <span className="mt-1 block text-xs text-destructive" title={failures.map((failure) => `${failure.server_name}：${failure.error}`).join("\n")}>服务器配置未同步</span>}
+                    </TableCell>
+                    <TableCell>
+                      <div className="flex justify-end gap-1">
+                        <Button type="button" size="icon-sm" variant="ghost" disabled={busy} title="以用户身份查看" aria-label={`以用户身份查看 ${user.name}`} onClick={() => { window.open("/user?preview=1", "_blank", "noopener,noreferrer") }}><ExternalLink className="size-4" /></Button>
+                        {row.actions.includes("edit") && <Button size="sm" variant="ghost" disabled={busy} onClick={() => openEdit(user)}><Pencil className="size-4" /> 编辑</Button>}
+                        {!user.is_system && <Button size="icon-sm" variant="ghost" disabled={busy} title="设置用户中心密码" aria-label={`设置 ${user.name} 的用户中心密码`} onClick={() => openPassword(user)}><KeyRound className="size-4" /></Button>}
+                        {row.actions.includes("delete") && <Button size="icon-sm" variant="ghost" disabled={busy} title="删除用户" onClick={() => setConfirm({ kind: "delete", user })}><Trash2 className="size-4 text-destructive" /></Button>}
+                      </div>
+                    </TableCell>
                   </TableRow>
-                )) : listState === "empty" ? (
-                  <TableRow><TableCell colSpan={PROXY_USER_TABLE_COLUMNS.length} className="h-28 text-center text-sm text-muted-foreground">暂无用户</TableCell></TableRow>
-                ) : users.map((user) => {
-                  const busy = busyIds.includes(user.id)
-                  const row = proxyUserRowView(user)
-                  const percent = trafficPercent(user.traffic.used_bytes, user.traffic_limit_bytes)
-                  const progressColor = percent >= 100 ? "bg-destructive" : percent >= 80 ? "bg-amber-500" : "bg-primary"
-                  const nodeIssues = user.proxy_node_ids
-                    .map((id) => proxyNodes.find((node) => node.id === id))
-                    .filter((node): node is ProxyNode => !!node && node.deploy_status !== "deployed")
-                  const inferredFailures = [...new Map(nodeIssues.map((node) => [node.node_id, {
-                    server_id: node.node_id,
-                    server_name: serverById.get(node.node_id)?.name ?? `服务器 ${node.node_id}`,
-                    error: node.last_error || (node.deploy_status === "deploying" ? "配置正在部署" : "代理节点尚未成功部署"),
-                  }])).values()]
-                  const failures = failedByUser[user.id] ?? inferredFailures
-                  return (
-                    <TableRow key={user.id}>
-                      <TableCell className="py-3 font-mono text-sm text-muted-foreground">{row.id}</TableCell>
-                      <TableCell className="py-3 font-medium">
-                        {user.name}
-                        {row.systemLabel && <Badge variant="secondary" className="ml-2">{row.systemLabel}</Badge>}
-                      </TableCell>
-                      <TableCell className="py-3">
-                        <div className="space-y-2">
-                          <div className="flex min-w-0 flex-nowrap items-center gap-1.5">
-                            <span className="shrink-0 whitespace-nowrap font-medium tabular-nums">{formatBytes(user.traffic.used_bytes)}</span>
-                            <Tooltip>
-                              <TooltipTrigger asChild>
-                                <Button type="button" size="xs" variant="ghost" className="h-5 px-1.5 text-xs font-normal text-muted-foreground hover:bg-transparent hover:text-foreground" disabled={busy} onClick={() => setConfirm({ kind: "traffic", user })}>
-                                  <RotateCcw className="size-3" /> 清空
-                                </Button>
-                              </TooltipTrigger>
-                              <TooltipContent>清空 Hub 当前周期累计，并在服务器下次上报时重新建立 baseline</TooltipContent>
-                            </Tooltip>
-                            <span className="ml-auto min-w-0 truncate whitespace-nowrap text-right text-xs text-muted-foreground">{user.traffic_limit_bytes === 0 ? "不限量" : `${formatBytes(user.traffic_limit_bytes)} (${Math.floor(percent)}%)`}</span>
-                          </div>
-                          <Progress className="h-1.5" aria-label={`${user.name} 流量使用比例`} value={percent} indicatorClassName={progressColor} />
-                        </div>
-                      </TableCell>
-                      <TableCell className="py-3 text-sm">{expiryDateLabel(user.expire_date)}</TableCell>
-                      <TableCell className="py-3">
-                        <div className="flex items-center gap-2">
-                          <Switch checked={user.enabled} disabled={busy} onCheckedChange={(enabled) => void toggleUser(user, enabled)} aria-label={`${user.enabled ? "停用" : "启用"} ${user.name}`} />
-                          <Badge variant="outline" className={accessClass(user)}>{accessLabel(user)}</Badge>
-                        </div>
-                        {failures.length > 0 && <span className="mt-1 block text-xs text-destructive" title={failures.map((failure) => `${failure.server_name}：${failure.error}`).join("\n")}>服务器配置未同步</span>}
-                      </TableCell>
-                      <TableCell className="py-3">
-                        <div className="flex justify-end gap-1">
-                          <Button type="button" size="icon-sm" variant="ghost" disabled={busy} title="以用户身份查看" aria-label={`以用户身份查看 ${user.name}`} onClick={() => { window.open("/user?preview=1", "_blank", "noopener,noreferrer") }}><ExternalLink className="size-4" /></Button>
-                          {row.actions.includes("edit") && <Button size="sm" variant="ghost" disabled={busy} onClick={() => openEdit(user)}><Pencil className="size-4" /> 编辑</Button>}
-                          {!user.is_system && <Button size="icon-sm" variant="ghost" disabled={busy} title="设置用户中心密码" aria-label={`设置 ${user.name} 的用户中心密码`} onClick={() => openPassword(user)}><KeyRound className="size-4" /></Button>}
-                          {row.actions.includes("delete") && <Button size="icon-sm" variant="ghost" disabled={busy} title="删除用户" onClick={() => setConfirm({ kind: "delete", user })}><Trash2 className="size-4 text-destructive" /></Button>}
-                        </div>
-                      </TableCell>
-                    </TableRow>
-                  )
-                })}
-              </TableBody>
-            </Table>
-          </div>
+                )
+              })}
+            </TableBody>
+          </Table>
         </Card>
       </TooltipProvider>
 

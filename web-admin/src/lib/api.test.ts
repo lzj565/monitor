@@ -8,7 +8,7 @@ import { createProxyNode, createProxyNodeOperationGuard, deleteConfirmation, fet
 import { createProxyUserOperationGuard, deleteProxyUser, proxyUserDeleteConfirmation, proxyUserRegenerateConfirmation, regenerateProxyUser, resetProxyUserTraffic, saveProxyUser, setProxyUserPassword, syncProxyUser, type ProxyUserActionApi } from "./proxy-user-actions.ts"
 import { importProxyNodeInbound, scanProxyNodeImports, type ProxyNodeImportApi, type ProxyNodeImportRequest, type ProxyNodeImportScan } from "./proxy-node-imports.ts"
 import { bytes } from "./format.ts"
-import { expiryDateLabel, formatBytes, limitBytesFromGb, limitGbInput, PROXY_USER_TABLE_COLUMNS, proxyUserCountText, proxyUserListState, proxyUserRowView, trafficPercent } from "./proxy-user-view.ts"
+import { expiryDateLabel, filterProxyUsers, formatBytes, limitBytesFromGb, limitGbInput, PROXY_USER_TABLE_COLUMNS, proxyUserCountText, proxyUserListState, proxyUserRowView, trafficPercent } from "./proxy-user-view.ts"
 import { getUserCenterMock } from "./user-center-mock.ts"
 import { badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, loopbackOrigin, outdatedAgents, provisioningSite, provisionRefusal, trafficCorrection } from "./api.ts"
 
@@ -259,6 +259,9 @@ assert.ok(PROXY_USER_TABLE_COLUMNS.find(({ key }) => key === "traffic"), "清空
 assert.equal("uuid" in ordinaryView, false, "主表展示模型不暴露 UUID")
 assert.equal(proxyUserCountText(2, false), "当前用户：2 户")
 assert.equal(proxyUserCountText(0, true), "正在加载用户…")
+assert.deepEqual(filterProxyUsers([{ name: "Alice", enabled: true }, { name: "Bob", enabled: false }], " ali ", "all"), [{ name: "Alice", enabled: true }])
+assert.deepEqual(filterProxyUsers([{ name: "Alice", enabled: true }, { name: "Bob", enabled: false }], "", "enabled"), [{ name: "Alice", enabled: true }])
+assert.deepEqual(filterProxyUsers([{ name: "Alice", enabled: true }, { name: "Bob", enabled: false }], "", "disabled"), [{ name: "Bob", enabled: false }])
 assert.equal(proxyUserListState(0, true), "loading")
 assert.equal(proxyUserListState(0, false), "empty")
 assert.equal(proxyUserListState(2, true), "ready", "刷新期间保留已加载行")
@@ -300,6 +303,9 @@ assert.match(trafficCell, /<Button\b[^>]*onClick=\{\(\) => setConfirm\(\{ kind: 
 assert.match(proxyUserManagerSource, /<AlertDialogCancel[^>]*>取消<\/AlertDialogCancel>/, "取消操作不绑定流量 API")
 assert.match(proxyUserManagerSource, /<Skeleton/, "加载时显示表格骨架")
 assert.match(proxyUserManagerSource, /暂无用户/, "空列表有空状态")
+assert.match(proxyUserManagerSource, /placeholder="搜索用户名"[\s\S]*按状态筛选[\s\S]*全部状态[\s\S]*停用/, "用户列表提供用户名搜索和状态筛选")
+assert.doesNotMatch(proxyUserManagerSource, /用户与流量管理|<Badge variant="secondary">代理用户<\/Badge>/, "用户列表不重复渲染页面标题或卡片标签")
+assert.match(proxyUserManagerSource, /<Card className="overflow-x-auto p-0">[\s\S]*<Table>[\s\S]*<TableHeader>[\s\S]*<TableRow>/, "用户表格复用服务器列表的单层表格卡片")
 assert.match(proxyUserManagerSource, /用户 UUID[\s\S]*dialogUser\.uuid[\s\S]*重新生成/, "UUID 复制与重生成仍在编辑弹窗")
 assert.match(proxyUserManagerSource, /if \(target\.kind === "traffic"\) \{\s*const result = await resetProxyUserTraffic\(api, target\.user\.id\)/, "确认清零时调用流量 API")
 assert.match(proxyUserManagerSource, /traffic_limit_gb[\s\S]*traffic_reset_day[\s\S]*expire_date/, "编辑表单含额度、重置日与到期日期")
