@@ -8,11 +8,14 @@ use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, Local, NaiveDate, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
 pub struct Db(Mutex<Connection>);
+
+const AUTO_PROXY_PORT_MIN: u16 = 24_000;
+const AUTO_PROXY_PORT_MAX: u16 = 29_999;
 
 const SCHEMA: &str = r#"
 PRAGMA journal_mode = WAL;
@@ -604,7 +607,7 @@ pub struct ProxyNodeConfig {
 
 fn validate_proxy_node(config: &ProxyNodeConfig) -> Result<()> {
     if config.node_id <= 0 {
-        refuse!("请选择服务器节点");
+        refuse!("请选择服务器");
     }
     if config.name.trim().is_empty() {
         refuse!("请填写代理节点名称");
@@ -639,6 +642,44 @@ fn validate_proxy_node(config: &ProxyNodeConfig) -> Result<()> {
         refuse!("只有 custom 地址模式可以填写 custom_address");
     }
     Ok(())
+}
+
+fn insert_proxy_node(conn: &Connection, config: &ProxyNodeConfig) -> Result<ProxyNode> {
+    validate_proxy_node(config)?;
+    let now = Utc::now().timestamp();
+    let custom_address = config.custom_address.as_deref().map(str::trim).filter(|value| !value.is_empty());
+    conn.execute(
+        "INSERT INTO proxy_node
+           (node_id, name, enabled, protocol, address_mode, custom_address, listen_port,
+            uuid, reality_private_key, reality_public_key, reality_short_id,
+            reality_server_name, reality_dest, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)",
+        params![
+            config.node_id,
+            config.name.trim(),
+            config.enabled,
+            config.protocol,
+            config.address_mode,
+            custom_address,
+            config.listen_port,
+            config.uuid.trim(),
+            config.reality_private_key.trim(),
+            config.reality_public_key.trim(),
+            config.reality_short_id.trim(),
+            config.reality_server_name.trim(),
+            config.reality_dest.trim(),
+            now,
+        ],
+    )?;
+    let id = conn.last_insert_rowid();
+    Ok(conn.query_row(
+        "SELECT id, node_id, name, enabled, protocol, address_mode, custom_address, listen_port,
+                uuid, reality_private_key, reality_public_key, reality_short_id,
+                reality_server_name, reality_dest, deploy_status, last_error, created_at, updated_at
+         FROM proxy_node WHERE id = ?1",
+        [id],
+        row_to_proxy_node,
+    )?)
 }
 
 fn yes() -> bool {
@@ -924,43 +965,44 @@ impl Db {
     }
 
     pub fn create_proxy_node(&self, config: &ProxyNodeConfig) -> Result<ProxyNode> {
-        validate_proxy_node(config)?;
-        let now = Utc::now().timestamp();
-        let custom_address =
-            config.custom_address.as_deref().map(str::trim).filter(|value| !value.is_empty());
         let conn = self.conn();
-        conn.execute(
-            "INSERT INTO proxy_node
-               (node_id, name, enabled, protocol, address_mode, custom_address, listen_port,
-                uuid, reality_private_key, reality_public_key, reality_short_id,
-                reality_server_name, reality_dest, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)",
-            params![
-                config.node_id,
-                config.name.trim(),
-                config.enabled,
-                config.protocol,
-                config.address_mode,
-                custom_address,
-                config.listen_port,
-                config.uuid.trim(),
-                config.reality_private_key.trim(),
-                config.reality_public_key.trim(),
-                config.reality_short_id.trim(),
-                config.reality_server_name.trim(),
-                config.reality_dest.trim(),
-                now,
-            ],
-        )?;
-        let id = conn.last_insert_rowid();
-        Ok(conn.query_row(
-            "SELECT id, node_id, name, enabled, protocol, address_mode, custom_address, listen_port,
-                    uuid, reality_private_key, reality_public_key, reality_short_id,
-                    reality_server_name, reality_dest, deploy_status, last_error, created_at, updated_at
-             FROM proxy_node WHERE id = ?1",
-            [id],
-            row_to_proxy_node,
-        )?)
+        insert_proxy_node(&conn, config)
+    }
+
+    /// 在事务中分配端口并创建记录，避免并发请求选中同一端口。
+    pub fn create_proxy_node_auto_port(
+        &self,
+        config: &ProxyNodeConfig,
+        preferred_port: u16,
+    ) -> Result<ProxyNode> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let used = {
+            let mut stmt = tx.prepare("SELECT listen_port FROM proxy_node WHERE node_id=?1")?;
+            let ports = stmt
+                .query_map([config.node_id], |row| row.get::<_, u16>(0))?
+                .collect::<rusqlite::Result<HashSet<_>>>()?;
+            ports
+        };
+        let port_count = u32::from(AUTO_PROXY_PORT_MAX - AUTO_PROXY_PORT_MIN) + 1;
+        let start = if (AUTO_PROXY_PORT_MIN..=AUTO_PROXY_PORT_MAX).contains(&preferred_port) {
+            preferred_port
+        } else {
+            AUTO_PROXY_PORT_MIN
+        };
+        let listen_port = (0..port_count)
+            .map(|offset| {
+                AUTO_PROXY_PORT_MIN + ((u32::from(start - AUTO_PROXY_PORT_MIN) + offset) % port_count) as u16
+            })
+            .find(|port| !used.contains(port));
+        let Some(listen_port) = listen_port else {
+            refuse!("该服务器没有可自动分配的监听端口");
+        };
+        let mut allocated = config.clone();
+        allocated.listen_port = listen_port;
+        let created = insert_proxy_node(&tx, &allocated)?;
+        tx.commit()?;
+        Ok(created)
     }
 
     pub fn update_proxy_node(&self, id: i64, config: &ProxyNodeConfig) -> Result<bool> {
@@ -1782,9 +1824,8 @@ impl Db {
                 params![id, node],
             )
             .map_err(|e| match e.sqlite_error_code() {
-                Some(rusqlite::ErrorCode::ConstraintViolation) => {
-                    anyhow::Error::from(e).context(crate::Shown(format!("节点 {node} 不存在，可能已被删除")))
-                }
+                Some(rusqlite::ErrorCode::ConstraintViolation) => anyhow::Error::from(e)
+                    .context(crate::Shown(format!("服务器 {node} 不存在，可能已被删除"))),
                 _ => e.into(),
             })?;
         }
@@ -1804,7 +1845,7 @@ impl Db {
             .optional()?;
         if let Some(node) = crowded {
             refuse!(
-                "节点「{node}」会被分配超过 {} 个探测任务，agent 最多只跑这么多，多出来的会被静默丢掉",
+                "服务器「{node}」会被分配超过 {} 个探测任务，agent 最多只跑这么多，多出来的会被静默丢掉",
                 Self::MAX_PROBES_PER_NODE
             );
         }
@@ -1812,7 +1853,10 @@ impl Db {
         let joining: i64 =
             tx.query_row("SELECT COUNT(*) FROM ping_task WHERE auto_join", [], |r| r.get(0))?;
         if joining > Self::MAX_PROBES_PER_NODE {
-            refuse!("新节点会自动加入 {joining} 个探测任务，agent 最多只跑 {} 个", Self::MAX_PROBES_PER_NODE);
+            refuse!(
+                "新服务器会自动加入 {joining} 个探测任务，agent 最多只跑 {} 个",
+                Self::MAX_PROBES_PER_NODE
+            );
         }
         tx.commit()?;
         Ok(id)
@@ -2595,6 +2639,27 @@ mod tests {
         assert!(db.proxy_nodes().unwrap().is_empty());
     }
 
+    #[test]
+    fn automatic_proxy_ports_are_unique_per_server_and_reused_across_servers() {
+        let db = db();
+        let server = db
+            .create_node(&Node { name: "server-a".into(), ..Default::default() }, "server-a-token")
+            .unwrap();
+        let other_server = db
+            .create_node(&Node { name: "server-b".into(), ..Default::default() }, "server-b-token")
+            .unwrap();
+        let config = proxy_node_config(server, 1);
+
+        let first = db.create_proxy_node_auto_port(&config, AUTO_PROXY_PORT_MIN).unwrap();
+        let second = db.create_proxy_node_auto_port(&config, AUTO_PROXY_PORT_MIN).unwrap();
+        let on_other_server =
+            db.create_proxy_node_auto_port(&proxy_node_config(other_server, 1), AUTO_PROXY_PORT_MIN).unwrap();
+
+        assert_eq!(first.listen_port, AUTO_PROXY_PORT_MIN);
+        assert_eq!(second.listen_port, AUTO_PROXY_PORT_MIN + 1);
+        assert_eq!(on_other_server.listen_port, AUTO_PROXY_PORT_MIN);
+    }
+
     /// PRAGMA settings are per connection, so a value read through any other
     /// handle proves nothing about the one the hub writes through.
     #[test]
@@ -3162,7 +3227,7 @@ mod tests {
         assert!(!db.all_traffic().contains_key(&id));
         // Ticked in an editor opened before the delete: named, not a 500.
         let gone = db.save_ping_task(&probe(vec![id])).unwrap_err();
-        let expected = format!("节点 {id} 不存在，可能已被删除");
+        let expected = format!("服务器 {id} 不存在，可能已被删除");
         assert_eq!(
             gone.downcast_ref::<crate::Shown>().map(|s| s.0.as_str()),
             Some(expected.as_str()),

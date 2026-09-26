@@ -19,6 +19,7 @@ use crate::auth::{
     authed, client_ip, current_session, hash_password, issue_session, issued_at, random_token, with_cookies,
 };
 use crate::db::{Db, Node, NodePatch, PingTask, ProxyNodeConfig, Traffic, TrafficPatch};
+use crate::proxy_provision::{self, ProxyNodeProvisionRequest};
 use crate::{agent_ws, App, Shared};
 
 /// Present only on requests carrying a valid session. Handlers taking it cannot
@@ -74,7 +75,7 @@ fn bad(message: &str) -> Response {
 }
 
 fn no_such_node() -> Response {
-    answer(StatusCode::NOT_FOUND, "节点不存在，可能已被删除")
+    answer(StatusCode::NOT_FOUND, "服务器不存在，可能已被删除")
 }
 
 /// The last step of every response. An error the hub composed passes as it is;
@@ -339,7 +340,7 @@ fn proxy_node_write_failure(error: anyhow::Error) -> Response {
                 return answer(StatusCode::CONFLICT, "该服务器的监听端口已被占用");
             }
             rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY => {
-                return answer(StatusCode::NOT_FOUND, "服务器节点不存在，可能已被删除");
+                return answer(StatusCode::NOT_FOUND, "服务器不存在，可能已被删除");
             }
             _ => {}
         }
@@ -357,10 +358,25 @@ pub async fn proxy_nodes(_: Admin, State(app): State<Shared>) -> Response {
 pub async fn create_proxy_node(
     _: Admin,
     State(app): State<Shared>,
-    body: Result<Json<ProxyNodeConfig>, JsonRejection>,
+    body: Result<Json<ProxyNodeProvisionRequest>, JsonRejection>,
 ) -> Response {
-    let Ok(Json(config)) = body else { return bad("代理节点数据格式不对") };
-    match app.db.create_proxy_node(&config) {
+    let Ok(Json(request)) = body else { return bad("代理节点数据格式不对") };
+    if let Err(error) = request.validate() {
+        return fail(error);
+    }
+    match app.db.node(request.node_id) {
+        Ok(Some(_)) => {}
+        Ok(None) => return answer(StatusCode::NOT_FOUND, "所属服务器不存在，可能已被删除"),
+        Err(error) => return fail(error),
+    }
+    let status = match crate::command::singbox_status(&app, request.node_id).await {
+        Ok(status) => status,
+        Err(error) => return no_store(crate::command::command_error_response(error)),
+    };
+    if let Err(message) = proxy_provision::validate_singbox_status(&status) {
+        return no_store(answer(StatusCode::CONFLICT, message));
+    }
+    match proxy_provision::create_proxy_node(&app.db, &request) {
         Ok(node) => no_store((StatusCode::CREATED, Json(json!({"node": node}))).into_response()),
         Err(error) => proxy_node_write_failure(error),
     }
@@ -641,8 +657,8 @@ async fn stream_live(app: Shared, mut socket: WebSocket, session: Option<String>
 /// otherwise valid https domain entry, and a tunnelled panel is refused until
 /// one is given. `main` warns about the first at startup; this is for whoever
 /// reads the panel rather than the journal.
-const PROVISIONING_DENIED: &str = "请通过 HTTPS 域名访问面板后添加或安装节点；\
-     从隧道或回环地址进面板时，给 hub 加 --site 指定节点可达的域名；\
+const PROVISIONING_DENIED: &str = "请通过 HTTPS 域名访问面板后添加或安装服务器；\
+     从隧道或回环地址进面板时，给 hub 加 --site 指定服务器可达的域名；\
      --site 必须是 https:// 加域名，不能是 IP、不能带路径";
 
 /// Every browser sends `Origin` with these writes, so its absence points at a
@@ -759,7 +775,7 @@ fn patch_error(node: &mut NodePatch) -> Option<&'static str> {
     if let Some(name) = &mut node.name {
         *name = name.trim().to_owned();
         if name.is_empty() {
-            return Some("请填写节点名称");
+            return Some("请填写服务器名称");
         }
     }
     if let Some(group) = &mut node.group {
@@ -827,9 +843,9 @@ pub async fn create_node(
     if let Err(refusal) = provisioning_allowed(&app, &headers) {
         return answer(StatusCode::FORBIDDEN, refusal);
     }
-    let Ok(Json(mut node)) = body else { return bad("节点数据格式不对") };
+    let Ok(Json(mut node)) = body else { return bad("服务器数据格式不对") };
     if node.name.trim().is_empty() {
-        return bad("请填写节点名称");
+        return bad("请填写服务器名称");
     }
     if let Some(message) =
         node_limits(Some(node.traffic_reset_day), Some(node.price), Some(node.traffic_limit))
@@ -1009,7 +1025,7 @@ pub async fn update_node(
     Path(id): Path<i64>,
     body: Result<Json<NodePatch>, JsonRejection>,
 ) -> Response {
-    let Ok(Json(mut node)) = body else { return bad("节点数据格式不对") };
+    let Ok(Json(mut node)) = body else { return bad("服务器数据格式不对") };
     if let Some(message) = patch_error(&mut node) {
         return bad(message);
     }
@@ -1052,7 +1068,7 @@ pub async fn update_nodes(
     ids.sort_unstable();
     ids.dedup();
     if ids.is_empty() {
-        return bad("没有选中节点");
+        return bad("没有选中服务器");
     }
     let mut patch = NodePatch { group: patch.group, notify: patch.notify, ..Default::default() };
     if let Some(message) = patch_error(&mut patch) {
@@ -1063,7 +1079,7 @@ pub async fn update_nodes(
             invalidate_snapshot(&app);
             Json(json!({"updated": ids.len()})).into_response()
         }
-        Ok(false) => answer(StatusCode::NOT_FOUND, "有节点已被删除，没有做任何修改；刷新后重新选择"),
+        Ok(false) => answer(StatusCode::NOT_FOUND, "有服务器已被删除，没有做任何修改；刷新后重新选择"),
         Err(e) => fail(e),
     }
 }
@@ -1972,7 +1988,7 @@ fn setting_error(app: &App, key: &str, value: &Value) -> Option<String> {
         // chooses that binary, while the node still sees a valid TLS connection to
         // the hub.
         "github_proxy" if !(value.is_empty() || value.starts_with("https://")) => {
-            Some("GitHub 代理必须以 https:// 开头：agent 程序经它下载，再安装到每个节点".into())
+            Some("GitHub 代理必须以 https:// 开头：agent 程序经它下载，再安装到每台服务器".into())
         }
         "admin_password" if value.len() < 12 => Some("密码至少 12 位".into()),
         "admin_password" => None,
@@ -2037,7 +2053,19 @@ mod tests {
         App::for_test(Db::open(":memory:").unwrap())
     }
 
-    fn proxy_node_body(node_id: i64, listen_port: u16) -> Value {
+    fn proxy_node_body(node_id: i64) -> Value {
+        json!({
+            "node_id": node_id,
+            "name": "Reality node",
+            "address_mode": "ipv4",
+            "custom_address": null,
+            "listen_port": null,
+            "reality_server_name": "example.com",
+            "reality_dest": "example.com:443"
+        })
+    }
+
+    fn proxy_node_update_body(node_id: i64, listen_port: u16) -> Value {
         json!({
             "node_id": node_id,
             "name": "Reality node",
@@ -2055,6 +2083,21 @@ mod tests {
         })
     }
 
+    fn add_singbox_status_agent(app: Shared, node_id: i64, status: Value) {
+        let session = 17;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut agent = Agent::new(session, tx);
+        agent.capabilities.insert("singbox.status".into());
+        app.agents.write().unwrap().insert(node_id, agent);
+        tokio::spawn(async move {
+            while let Some(message) = rx.recv().await {
+                let Ok(request) = serde_json::from_str::<Value>(&message) else { continue };
+                let Some(id) = request.get("id").and_then(Value::as_str) else { continue };
+                crate::command::complete(&app, id, node_id, session, Ok(status.clone()));
+            }
+        });
+    }
+
     #[tokio::test]
     async fn proxy_node_crud_is_admin_only_and_keeps_responses_out_of_caches() {
         let app = std::sync::Arc::new(app());
@@ -2062,6 +2105,16 @@ mod tests {
             .db
             .create_node(&Node { name: "server".into(), ..Default::default() }, "server-token")
             .unwrap();
+        add_singbox_status_agent(
+            app.clone(),
+            node_id,
+            json!({
+                "installed": true,
+                "service_exists": true,
+                "running": true,
+                "service_state_known": true
+            }),
+        );
 
         let (mut parts, _) = axum::http::Request::new(()).into_parts();
         assert_eq!(
@@ -2072,7 +2125,7 @@ mod tests {
         let created = create_proxy_node(
             Admin,
             State(app.clone()),
-            Ok(Json(serde_json::from_value(proxy_node_body(node_id, 443)).unwrap())),
+            Ok(Json(serde_json::from_value(proxy_node_body(node_id)).unwrap())),
         )
         .await;
         assert_eq!(created.status(), StatusCode::CREATED);
@@ -2083,7 +2136,8 @@ mod tests {
         let id = created["node"]["id"].as_i64().unwrap();
         assert_eq!(created["node"]["protocol"], "vless_reality");
         assert_eq!(created["node"]["deploy_status"], "not_deployed");
-        assert_eq!(created["node"]["reality_private_key"], "private-test-secret");
+        assert_eq!(created["node"]["reality_private_key"].as_str().unwrap().len(), 43);
+        assert!((24_000..=29_999).contains(&created["node"]["listen_port"].as_u64().unwrap()));
 
         let listed = proxy_nodes(Admin, State(app.clone())).await;
         assert_eq!(listed.status(), StatusCode::OK);
@@ -2093,8 +2147,8 @@ mod tests {
                 .unwrap();
         assert_eq!(listed["nodes"].as_array().unwrap().len(), 1);
 
-        let mut duplicate = proxy_node_body(node_id, 443);
-        duplicate["reality_private_key"] = json!("another-private-secret");
+        let mut duplicate = proxy_node_body(node_id);
+        duplicate["listen_port"] = created["node"]["listen_port"].clone();
         let conflict = create_proxy_node(
             Admin,
             State(app.clone()),
@@ -2105,9 +2159,9 @@ mod tests {
         let conflict_text =
             String::from_utf8(axum::body::to_bytes(conflict.into_body(), usize::MAX).await.unwrap().to_vec())
                 .unwrap();
-        assert!(!conflict_text.contains("another-private-secret"));
+        assert!(!conflict_text.contains(created["node"]["reality_private_key"].as_str().unwrap()));
 
-        let mut update = proxy_node_body(node_id, 8443);
+        let mut update = proxy_node_update_body(node_id, 8443);
         update["name"] = json!("updated Reality node");
         update["address_mode"] = json!("custom");
         update["custom_address"] = json!("edge.example.net");
@@ -2135,29 +2189,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn proxy_node_api_refuses_unsupported_protocol_without_returning_secrets() {
+    async fn proxy_node_provision_requires_an_available_singbox_service() {
         let app = std::sync::Arc::new(app());
         let node_id = app
             .db
             .create_node(&Node { name: "server".into(), ..Default::default() }, "server-token")
             .unwrap();
-        let mut body = proxy_node_body(node_id, 443);
-        body["protocol"] = json!("xray");
+        let body = proxy_node_body(node_id);
         let response =
             create_proxy_node(Admin, State(app.clone()), Ok(Json(serde_json::from_value(body).unwrap())))
                 .await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), StatusCode::CONFLICT);
         let text =
             String::from_utf8(axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap().to_vec())
                 .unwrap();
-        assert!(text.contains("VLESS + Reality"));
-        assert!(!text.contains("private-test-secret"));
+        assert!(text.contains("离线"));
+        assert!(app.db.proxy_nodes().unwrap().is_empty());
+
+        add_singbox_status_agent(app.clone(), node_id, json!({"installed": false}));
+        let response = create_proxy_node(
+            Admin,
+            State(app.clone()),
+            Ok(Json(serde_json::from_value(proxy_node_body(node_id)).unwrap())),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let text =
+            String::from_utf8(axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap().to_vec())
+                .unwrap();
+        assert!(text.contains("sing-box 未安装"));
         assert!(app.db.proxy_nodes().unwrap().is_empty());
 
         let missing_server = create_proxy_node(
             Admin,
             State(app.clone()),
-            Ok(Json(serde_json::from_value(proxy_node_body(999_999, 443)).unwrap())),
+            Ok(Json(serde_json::from_value(proxy_node_body(999_999)).unwrap())),
         )
         .await;
         assert_eq!(missing_server.status(), StatusCode::NOT_FOUND);
@@ -3650,6 +3716,6 @@ mod tests {
             (StatusCode::UNPROCESSABLE_ENTITY, "Failed to deserialize the JSON body").into_response();
         assert_eq!(read(rejection).await, "请求格式不对");
         assert_eq!(read(StatusCode::UNAUTHORIZED.into_response()).await, "登录已失效，请重新登录");
-        assert_eq!(read(bad("请填写节点名称")).await, "请填写节点名称");
+        assert_eq!(read(bad("请填写服务器名称")).await, "请填写服务器名称");
     }
 }

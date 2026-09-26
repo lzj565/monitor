@@ -13,6 +13,7 @@ import { Popover, PopoverAnchor, PopoverContent } from "@/components/ui/popover"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
+import { ProxyNodeManager } from "@/components/ProxyNodeManager"
 import { api, badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, outdatedAgents, provisioningSite, trafficCorrection, upload, type ConfigField, type IfaceChoice, type Node, type PingTask, type ProxyInstance, type Source } from "@/lib/api"
 import { bytes, CYCLES, FOREVER, money, uptime } from "@/lib/format"
 
@@ -194,7 +195,7 @@ function copy(text: string) {
 const SOURCES: Record<Source, string> = {
   manual: "手动填写",
   interface: "网卡地址",
-  exit: "hub 看到的出口，不在节点网卡上（NAT 或代理）",
+  exit: "hub 看到的出口，不在服务器网卡上（NAT 或代理）",
   connection: "hub 看到的连接地址",
 }
 
@@ -269,7 +270,7 @@ function NodeSearch({ value, onChange, className = "" }: { value: string; onChan
   return (
     <div className={`relative ${className}`}>
       <Search className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
-      <Input className="pl-8" placeholder="名称/地址/地区/分组" aria-label="搜索节点" value={value} onChange={(e) => onChange(e.target.value)} />
+      <Input className="pl-8" placeholder="名称/地址/地区/分组" aria-label="搜索服务器" value={value} onChange={(e) => onChange(e.target.value)} />
     </div>
   )
 }
@@ -314,7 +315,7 @@ function NodePicker({ nodes, chosen, onPick, disabled = false }: {
           </label>
         ))}
         {!visible.length && (
-          <p className="col-span-full p-2 text-xs text-muted-foreground">{nodes.length ? "没有匹配的节点" : "先添加节点"}</p>
+          <p className="col-span-full p-2 text-xs text-muted-foreground">{nodes.length ? "没有匹配的服务器" : "先添加服务器"}</p>
         )}
       </div>
     </div>
@@ -541,7 +542,7 @@ function GroupDialog({ nodes, onClose, onSaved }: { nodes: Node[]; onClose: () =
         <DialogHeader>
           <DialogTitle>设置分组</DialogTitle>
           <DialogDescription className="leading-relaxed">
-            勾选节点，设为同一个分组。改名或解散：先筛选出这个分组、全选，再填新名字或清空。
+            勾选服务器，设为同一个分组。改名或解散：先筛选出这个分组、全选，再填新名字或清空。
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-4">
@@ -597,14 +598,14 @@ function CreateNode({ onClose, onSaved }: {
 
   async function save(e: React.FormEvent) {
     e.preventDefault()
-    if (!name.trim()) return toast.error("请填写节点名称")
+    if (!name.trim()) return toast.error("请填写服务器名称")
     setSaving(true)
     try {
       await api("/nodes", {
         method: "POST",
         body: JSON.stringify({ name: name.trim() }),
       })
-      toast.success("节点已添加")
+      toast.success("服务器已添加")
       onClose()
       onSaved()
     } catch (e) {
@@ -618,7 +619,7 @@ function CreateNode({ onClose, onSaved }: {
     <Dialog open onOpenChange={(open) => !open && onClose()}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
-          <DialogTitle>添加节点</DialogTitle>
+          <DialogTitle>添加服务器</DialogTitle>
         </DialogHeader>
         <form className="space-y-4" onSubmit={save}>
           <Field label="名称">
@@ -655,7 +656,7 @@ function NodeForm({ node, nodes, onClose, onSaved }: {
   const automatic = (v6: boolean) => (v6 ? node.ipv6_auto : node.ipv4_auto) || "无"
 
   async function save() {
-    if (!form.name.trim()) return toast.error("请填写节点名称")
+    if (!form.name.trim()) return toast.error("请填写服务器名称")
     const patch = changes(node, {
       name: form.name.trim(),
       public: form.public,
@@ -686,7 +687,7 @@ function NodeForm({ node, nodes, onClose, onSaved }: {
           body: JSON.stringify(correction),
         })
       }
-      toast.success("节点设置已保存")
+      toast.success("服务器设置已保存")
       onClose()
       onSaved()
     } catch (e) {
@@ -1022,7 +1023,7 @@ function RegisterDialog({ site, reg, onClose }: {
               </Command>
               {/* Per machine, so it cannot be part of the one command. */}
               <p className="text-xs leading-relaxed text-muted-foreground">
-                要给某台单独起名，在它执行的命令末尾加 <code>--name 名字</code>，只对新建的节点生效。
+                要给某台单独起名，在它执行的命令末尾加 <code>--name 名字</code>，只对新建的服务器生效。
                 <a
                   className="ml-1 underline underline-offset-2 hover:text-foreground"
                   href="https://monitor-document.pages.dev/install/batch"
@@ -1290,12 +1291,12 @@ async function runProxyCommand(nodeId: number, method: ProxyMethod, params: Reco
     const command = await api<ProxyCommand>("/nodes/" + nodeId + "/commands/" + submitted.command_id, { cache: "no-store" })
     if (command.status === "pending") continue
     if (command.status !== "succeeded" || !command.result) {
-      throw new Error(command.error?.message || (command.status === "outcome_unknown" ? "执行结果未知，请先检查节点状态和配置" : "sing-box 操作失败"))
+      throw new Error(command.error?.message || (command.status === "outcome_unknown" ? "执行结果未知，请先检查服务器状态和配置" : "sing-box 操作失败"))
     }
     return command.result
   }
   throw new Error(method === "singbox.config.apply"
-    ? "等待应用结果超时；操作可能仍在执行，请查看节点状态"
+    ? "等待应用结果超时；操作可能仍在执行，请查看服务器状态"
     : "等待 sing-box 命令结果超时")
 }
 
@@ -1324,7 +1325,7 @@ function singboxStatusLabel(status: ProxyInstance["status"]) {
   }
 }
 
-function Proxy({ nodes }: { nodes: Node[] }) {
+function ProxyAdvanced({ nodes }: { nodes: Node[] }) {
   const onlineNodes = nodes.filter((node) => node.online)
   const nodesKey = nodes.map((node) => node.id + ":" + Number(node.online)).join("|")
   const nodesRef = useRef(nodes)
@@ -1374,6 +1375,7 @@ function Proxy({ nodes }: { nodes: Node[] }) {
     let active = true
     void (async () => {
       setInstancesLoading(true)
+      setLiveStatuses({})
       try {
         const cached = await loadProxyInstances()
         if (active) {
@@ -1391,7 +1393,14 @@ function Proxy({ nodes }: { nodes: Node[] }) {
           const status = await runProxyCommand(node.id, "singbox.status")
           if (active) setLiveStatuses((current) => ({ ...current, [node.id]: status }))
         } catch (cause) {
-          if (active) setRowErrors((current) => ({ ...current, [node.id]: (cause as Error).message }))
+          if (active) {
+            setLiveStatuses((current) => {
+              const next = { ...current }
+              delete next[node.id]
+              return next
+            })
+            setRowErrors((current) => ({ ...current, [node.id]: (cause as Error).message }))
+          }
         } finally {
           if (active) {
             setRowBusy((current) => {
@@ -1429,6 +1438,11 @@ function Proxy({ nodes }: { nodes: Node[] }) {
       setLiveStatuses((current) => ({ ...current, [node.id]: status }))
       await refreshInstances()
     } catch (cause) {
+      setLiveStatuses((current) => {
+        const next = { ...current }
+        delete next[node.id]
+        return next
+      })
       setRowErrors((current) => ({ ...current, [node.id]: (cause as Error).message }))
     } finally {
       setRowBusy((current) => {
@@ -1465,7 +1479,7 @@ function Proxy({ nodes }: { nodes: Node[] }) {
         const command = await api<ProxyCommand>(`/nodes/${targetNode.id}/commands/${submitted.command_id}`, { cache: "no-store" })
         if (command.status === "pending") continue
         if (command.status !== "succeeded" || !command.result) {
-          throw new Error(command.error?.message || (command.status === "outcome_unknown" ? "执行结果未知，请先检查节点状态和配置" : "sing-box 操作失败"))
+          throw new Error(command.error?.message || (command.status === "outcome_unknown" ? "执行结果未知，请先检查服务器状态和配置" : "sing-box 操作失败"))
         }
         if (method.endsWith(".get")) {
           const loaded = command.result.content ?? ""
@@ -1495,6 +1509,11 @@ function Proxy({ nodes }: { nodes: Node[] }) {
             await refreshInstances()
           } catch (cause) {
             if (generation.current === requestGeneration) {
+              setLiveStatuses((current) => {
+                const next = { ...current }
+                delete next[targetNode.id]
+                return next
+              })
               setError("配置已应用，但状态摘要刷新失败：" + (cause as Error).message)
             }
           }
@@ -1502,7 +1521,7 @@ function Proxy({ nodes }: { nodes: Node[] }) {
         return
       }
       if (generation.current === requestGeneration) {
-        throw new Error(method.endsWith(".apply") ? "等待应用结果超时；操作可能仍在执行，请查看节点状态" : "等待 sing-box 命令结果超时")
+        throw new Error(method.endsWith(".apply") ? "等待应用结果超时；操作可能仍在执行，请查看服务器状态" : "等待 sing-box 命令结果超时")
       }
     } catch (cause) {
       if (generation.current === requestGeneration) setError((cause as Error).message)
@@ -1542,19 +1561,21 @@ function Proxy({ nodes }: { nodes: Node[] }) {
 
   return (
     <div className="space-y-4">
+      <ProxyNodeManager nodes={nodes} liveStatuses={liveStatuses} rowBusy={rowBusy} />
+      <h2 className="text-base font-semibold">高级管理</h2>
       <Card className="gap-4 p-5">
         <div className="space-y-1">
-          <h2 className="text-base font-semibold">代理节点</h2>
-          <p className="text-sm text-muted-foreground">状态来自 Agent 命令；离线节点显示最近一次成功查询的记录。</p>
+          <h2 className="text-base font-semibold">sing-box 实例</h2>
+          <p className="text-sm text-muted-foreground">状态来自 Agent 命令；离线服务器显示最近一次成功查询的记录。</p>
         </div>
         {instancesError && <p role="alert" className="text-sm text-destructive">{instancesError}</p>}
         {!nodes.length ? (
-          <p className="text-sm text-muted-foreground">当前没有 Monitor 节点。</p>
+          <p className="text-sm text-muted-foreground">当前没有服务器。</p>
         ) : (
           <Table>
             <TableHeader>
               <TableRow>
-                <TableHead>节点</TableHead>
+                <TableHead>服务器</TableHead>
                 <TableHead>Agent</TableHead>
                 <TableHead>sing-box</TableHead>
                 <TableHead>版本</TableHead>
@@ -1638,9 +1659,9 @@ function Proxy({ nodes }: { nodes: Node[] }) {
             配置文件位于 /etc/sing-box/config.json，最大 32 KiB。配置可能包含密钥，只在当前页面和命令传输期间使用，不会保存到面板。先校验，再应用；应用会重启 sing-box，失败时自动恢复旧配置。
           </p>
         </div>
-        <Field label="节点">
+        <Field label="服务器">
           <Select value={selectedId} onValueChange={selectNode} disabled={busy !== null}>
-            <SelectTrigger className="w-full sm:max-w-sm"><SelectValue placeholder="选择在线节点" /></SelectTrigger>
+            <SelectTrigger className="w-full sm:max-w-sm"><SelectValue placeholder="选择在线服务器" /></SelectTrigger>
             <SelectContent>
               {nodes.map((node) => (
                 <SelectItem key={node.id} value={node.id.toString()}>
@@ -1650,8 +1671,8 @@ function Proxy({ nodes }: { nodes: Node[] }) {
             </SelectContent>
           </Select>
         </Field>
-        {!onlineNodes.length && <p className="text-sm text-muted-foreground">当前没有在线节点。</p>}
-        {selected && !selected.online && <p className="text-sm text-destructive">所选节点离线，无法读取或修改配置。</p>}
+        {!onlineNodes.length && <p className="text-sm text-muted-foreground">当前没有在线服务器。</p>}
+        {selected && !selected.online && <p className="text-sm text-destructive">所选服务器离线，无法读取或修改配置。</p>}
         {selected && (
           <>
             <div className="flex flex-wrap items-center gap-2">
@@ -1698,7 +1719,7 @@ function Proxy({ nodes }: { nodes: Node[] }) {
           onClose={() => setConfirmApply(false)}
           onConfirm={() => void runCommand("singbox.config.apply")}
         >
-          <p className="rounded-md bg-muted p-3 text-sm">节点：<strong>{selected.name}</strong></p>
+          <p className="rounded-md bg-muted p-3 text-sm">服务器：<strong>{selected.name}</strong></p>
         </ConfirmDialog>
       )}
       {viewingConfig && (
@@ -1708,6 +1729,17 @@ function Proxy({ nodes }: { nodes: Node[] }) {
           onLoaded={onConfigLoaded}
         />
       )}
+    </div>
+  )
+}
+
+function Proxy({ nodes }: { nodes: Node[] }) {
+  return (
+    <div className="space-y-6">
+      <div>
+        <h1 className="text-lg font-semibold">代理</h1>
+      </div>
+      <ProxyAdvanced nodes={nodes} />
     </div>
   )
 }
@@ -1825,7 +1857,7 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
           <Server /> 批量添加{reg.left > 0 && ` · ${Math.ceil(reg.left / 60)} 分`}
         </Button>
         <Button disabled={!!refusal} onClick={() => setCreating(true)}>
-          <Plus /> 添加节点
+          <Plus /> 添加服务器
         </Button>
       </div>
 
@@ -1906,13 +1938,13 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
                   <Button variant="ghost" size="icon" disabled={!!refusal} onClick={() => setInstalling(n)} title="安装 Agent" aria-label="安装 Agent">
                     <Download />
                   </Button>
-                  <Button variant="ghost" size="icon" onClick={() => setEditing(n)} title="编辑节点" aria-label="编辑节点">
+                  <Button variant="ghost" size="icon" onClick={() => setEditing(n)} title="编辑服务器" aria-label="编辑服务器">
                     <Pencil />
                   </Button>
                   <Button variant="ghost" size="icon" onClick={() => setBilling(n)} title="续费设置" aria-label="续费设置">
                     <CalendarClock />
                   </Button>
-                  <Button variant="ghost" size="icon" onClick={() => setDeleting(n)} title="删除节点" aria-label="删除节点">
+                  <Button variant="ghost" size="icon" onClick={() => setDeleting(n)} title="删除服务器" aria-label="删除服务器">
                     <Trash2 className="text-destructive" />
                   </Button>
                 </TableCell>
@@ -1921,14 +1953,14 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
             {nodes.length === 0 && (
               <TableRow>
                 <TableCell colSpan={7} className="py-10 text-center text-sm text-muted-foreground">
-                  还没有节点，右上角添加
+                  还没有服务器，右上角添加
                 </TableCell>
               </TableRow>
             )}
             {searching && nodes.length > 0 && !visible.length && (
               <TableRow>
                 <TableCell colSpan={7} className="py-10 text-center text-sm text-muted-foreground">
-                  没有匹配的节点
+                  没有匹配的服务器
                 </TableCell>
               </TableRow>
             )}
@@ -1967,9 +1999,9 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
       {viewingConfig && <ConfigDialog node={viewingConfig} onClose={() => setViewingConfig(null)} />}
       {deleting && (
         <ConfirmDialog
-          title={`删除节点「${deleting.name}」？`}
+          title={`删除服务器「${deleting.name}」？`}
           description="历史指标、流量记录和凭证一并删除，不可恢复。"
-          confirmLabel="删除节点"
+          confirmLabel="删除服务器"
           busy={removing}
           onClose={() => setDeleting(null)}
           onConfirm={remove}
@@ -2063,7 +2095,7 @@ function PingForm({ task, nodes, onClose, onSaved }: {
                   editing an existing one starts with nothing selected. */}
               <Input autoFocus={!task.id} value={form.name ?? ""} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="Cloudflare" />
             </Field>
-            <Field label="目标地址" hint="host:port，每个节点各自 TCP 连接">
+            <Field label="目标地址" hint="host:port，每台服务器各自 TCP 连接">
               <Input value={form.target ?? ""} onChange={(e) => setForm({ ...form, target: e.target.value })} placeholder="1.1.1.1:443" />
             </Field>
             <Field label="间隔（秒）" hint="5–3600">
@@ -2074,11 +2106,11 @@ function PingForm({ task, nodes, onClose, onSaved }: {
           </section>
           <section className="space-y-3 border-t pt-5">
             <div className="flex items-baseline justify-between gap-2">
-              <h3 className="text-sm font-medium">运行节点</h3>
+              <h3 className="text-sm font-medium">运行服务器</h3>
               <span className="tnum text-xs text-muted-foreground">已选 {chosenCount} / {nodes.length}</span>
             </div>
             <NodePicker nodes={nodes} chosen={chosen} onPick={pick} />
-            <OptionRow title="新节点自动加入" hint="以后添加的节点自动运行此监控" toggle>
+            <OptionRow title="新服务器自动加入" hint="以后添加的服务器自动运行此监控" toggle>
               <Switch checked={!!form.auto_join} onCheckedChange={(v) => setForm({ ...form, auto_join: v })} />
             </OptionRow>
           </section>
@@ -2135,7 +2167,7 @@ function Ping({ nodes }: { nodes: Node[] }) {
               <TableHead className="w-[22%]">名称</TableHead>
               <TableHead className="w-[34%]">目标</TableHead>
               <TableHead className="w-[10%]">间隔</TableHead>
-              <TableHead className="w-[22%]">节点</TableHead>
+              <TableHead className="w-[22%]">服务器</TableHead>
               <TableHead className="text-right">操作</TableHead>
             </TableRow>
           </TableHeader>
@@ -2165,7 +2197,7 @@ function Ping({ nodes }: { nodes: Node[] }) {
             {tasks.length === 0 && (
               <TableRow>
                 <TableCell colSpan={5} className="py-10 text-center text-sm text-muted-foreground">
-                  还没有延迟监控。每个节点独立 TCP 连接目标端口并上报耗时。
+                  还没有延迟监控。每台服务器独立 TCP 连接目标端口并上报耗时。
                 </TableCell>
               </TableRow>
             )}
@@ -2651,7 +2683,7 @@ function SettingsTab() {
           </Field>
           <Field
             label="GitHub 代理"
-            hint="留空直连。仅在 hub 自己拉不到 GitHub Release 时填。这个地址返回的字节会被安装到每一台节点上，只填信得过的镜像"
+            hint="留空直连。仅在 hub 自己拉不到 GitHub Release 时填。这个地址返回的字节会被安装到每一台服务器上，只填信得过的镜像"
           >
             <Input
               value={String(s.github_proxy ?? "")}
@@ -2802,7 +2834,7 @@ function OfflineNodes({ nodes, refresh }: { nodes: Node[]; refresh: () => void }
       <div>
         <h3 className="text-sm font-medium">离线通知</h3>
         <p className="mt-1 text-xs text-muted-foreground">
-          按节点打开，默认关。已打开 {nodes.filter((n) => n.notify).length} / {nodes.length} 台
+          按服务器打开，默认关。已打开 {nodes.filter((n) => n.notify).length} / {nodes.length} 台
           {pending.length > 0 && <span className="text-foreground">，待保存：{pending.join("、")}</span>}
         </p>
       </div>
@@ -2845,7 +2877,7 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
           <div className="min-w-0 flex-1">
             <h3 className="text-sm font-medium">通知渠道</h3>
             <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-              Telegram 和 Webhook 配了哪个就发哪个，也可以同时用。离线通知在下方按节点打开；流量和到期提醒对填了额度、到期日的节点生效。
+              Telegram 和 Webhook 配了哪个就发哪个，也可以同时用。离线通知在下方按服务器打开；流量和到期提醒对填了额度、到期日的服务器生效。
             </p>
           </div>
           <Button size="sm" variant="secondary" disabled={testing} onClick={test}>
@@ -2948,7 +2980,7 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
           <Field label="流量提醒（%）" hint="本期用量达到该比例和 100% 时各提醒一次，0 关闭">
             <Input type="number" min={0} max={100} value={text("notify_traffic")} onChange={(e) => set("notify_traffic", e.target.value)} />
           </Field>
-          <Field label="到期提醒（天）" hint="每天 9 点汇总这么多天内到期的节点，自动续期时也提醒，0 关闭">
+          <Field label="到期提醒（天）" hint="每天 9 点汇总这么多天内到期的服务器，自动续期时也提醒，0 关闭">
             <Input type="number" min={0} max={365} value={text("notify_expiry")} onChange={(e) => set("notify_expiry", e.target.value)} />
           </Field>
         </div>
@@ -3220,8 +3252,8 @@ function Data() {
         <div>
           <h3 className="text-sm font-medium">备份</h3>
           <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-            导出的是整个数据库，含节点凭证与登录密码哈希，请当作密钥保管。恢复会用备份文件整体覆盖当前数据，
-            当前节点、设置、历史全部作废，所有设备需要重新登录。
+            导出的是整个数据库，含服务器凭证与登录密码哈希，请当作密钥保管。恢复会用备份文件整体覆盖当前数据，
+            当前服务器、设置、历史全部作废，所有设备需要重新登录。
             <br />
             请用这里导出的文件恢复：直接复制 <code>monitor.db</code> 会丢掉预写日志里还没落盘的那部分。
           </p>
@@ -3263,7 +3295,7 @@ function Data() {
       {pending && (
         <ConfirmDialog
           title="用备份覆盖当前数据？"
-          description={`将用 ${pending.name}（${bytes(pending.size)}）整体替换当前数据库。当前的节点、设置和历史全部丢失，且无法撤销。`}
+          description={`将用 ${pending.name}（${bytes(pending.size)}）整体替换当前数据库。当前的服务器、设置和历史全部丢失，且无法撤销。`}
           confirmLabel={busy === "restore" ? `已上传 ${bytes(sent)} / ${bytes(pending.size)}` : "确认恢复"}
           busy={!!busy}
           onClose={() => { abort.current?.abort(); setPending(null) }}
@@ -3373,7 +3405,7 @@ function Update({ versions, reload, nodes, site, refusal }: {
         {(outdated.length > 0 || !versions.agent_latest) && (
           <>
             <p className="text-xs leading-relaxed text-muted-foreground">
-              以 root 在每台机器上执行一次。不含凭证，沿用机器上已有的设置，不会新建节点。
+              以 root 在每台机器上执行一次。不含凭证，沿用机器上已有的设置，不会新建服务器。
             </p>
             {upgrade ? (
               <>
@@ -3406,7 +3438,7 @@ function Update({ versions, reload, nodes, site, refusal }: {
                 <summary className="flex cursor-pointer list-none items-center justify-between gap-3 rounded-md text-xs text-muted-foreground outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 [&::-webkit-details-marker]:hidden">
                   <span className="flex items-center gap-1.5">
                     <ChevronRight className="size-4 transition-transform group-open:rotate-90" />
-                    待升级的节点
+                    待升级的服务器
                   </span>
                   {offline > 0 && <span>其中 {offline} 台离线</span>}
                 </summary>
@@ -3449,7 +3481,7 @@ function Update({ versions, reload, nodes, site, refusal }: {
 // Each area is its own route rather than a tab, so a page can be linked to and a
 // reload returns to the same section.
 const ADMIN_SECTIONS = [
-  { path: "/admin/nodes", label: "节点", icon: Server },
+  { path: "/admin/nodes", label: "服务器", icon: Server },
   { path: "/admin/proxy", label: "代理", icon: SlidersHorizontal },
   { path: "/admin/ping", label: "延迟", icon: Radio },
   { path: "/admin/notify", label: "通知", icon: Bell },

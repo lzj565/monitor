@@ -487,7 +487,7 @@ fn batch(event: &'static str, mark: &str, what: &str, items: Vec<(&str, String)>
             if items.len() > LISTED {
                 lines.push(format!("……另外 {} 台", items.len() - LISTED));
             }
-            (format!("{mark} {} 台节点{what}", items.len()), lines.join("\n"))
+            (format!("{mark} {} 台服务器{what}", items.len()), lines.join("\n"))
         }
     };
     let node = items.iter().map(|(name, _)| *name).collect::<Vec<_>>().join(", ");
@@ -721,7 +721,7 @@ mod tests {
         let names: Vec<String> = (0..60).map(|i| format!("n{i}")).collect();
         let note =
             batch("offline", "🔴", "离线", names.iter().map(|n| (n.as_str(), "d".into())).collect()).unwrap();
-        assert_eq!(note.title, "🔴 60 台节点离线");
+        assert_eq!(note.title, "🔴 60 台服务器离线");
         assert_eq!(note.message.lines().count(), LISTED + 1);
         assert!(note.message.ends_with("……另外 40 台"));
         assert_eq!(note.node.split(", ").count(), 60);
@@ -745,7 +745,7 @@ mod tests {
         connect(&app, brief);
         let notes = sweep(&app, &mut watch, now + 210).unwrap();
         assert_eq!(notes.len(), 1, "two nodes down in one sweep are one alert");
-        assert_eq!(notes[0].title, "🔴 2 台节点离线");
+        assert_eq!(notes[0].title, "🔴 2 台服务器离线");
         assert_eq!(notes[0].node, "a, b", "not the opted-out node, nor one back within the grace period");
         assert!(sweep(&app, &mut watch, now + 240).unwrap().is_empty(), "announced once");
 
@@ -929,7 +929,7 @@ mod tests {
         assert!(expiry_digest(&app, at(9)).unwrap().is_none(), "no channel, and the day is not spent");
         with_channel(&app);
         let note = expiry_digest(&app, at(9)).unwrap().unwrap();
-        assert_eq!(note.title, "⏳ 2 台节点即将到期");
+        assert_eq!(note.title, "⏳ 2 台服务器即将到期");
         assert_eq!(note.message, "today · 2026-09-15 今天到期\nsoon · 2026-09-20 还剩 5 天");
         assert!(expiry_digest(&app, at(10)).unwrap().is_none(), "once per day");
     }

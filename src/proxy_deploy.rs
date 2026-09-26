@@ -80,11 +80,11 @@ impl DeployError {
     fn public_message(&self) -> String {
         match self {
             Self::Database(_) => api::INTERNAL.into(),
-            Self::ServerNotFound => "服务器节点不存在".into(),
-            Self::AgentOffline => "节点当前离线".into(),
+            Self::ServerNotFound => "服务器不存在".into(),
+            Self::AgentOffline => "服务器当前离线".into(),
             Self::AgentUnsupported => "当前 agent 不支持 sing-box 配置命令".into(),
-            Self::AgentQueueFull => "节点命令队列已满".into(),
-            Self::AgentDisconnected => "节点连接已断开".into(),
+            Self::AgentQueueFull => "服务器命令队列已满".into(),
+            Self::AgentDisconnected => "服务器连接已断开".into(),
             Self::Timeout => "部署等待 Agent 响应超时".into(),
             Self::OutcomeUnknown => "Agent 连接中断，部署结果未知".into(),
             Self::ConfigTooLarge => "生成的 sing-box 配置超过 32 KiB 限制".into(),

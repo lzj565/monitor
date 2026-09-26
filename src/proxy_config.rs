@@ -34,7 +34,7 @@ pub enum ProxyConfigError {
 impl fmt::Display for ProxyConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let message = match self {
-            Self::InvalidNodeId => "服务器节点 ID 无效",
+            Self::InvalidNodeId => "服务器 ID 无效",
             Self::InvalidCurrentConfig => {
                 "现有 sing-box 配置必须是 JSON 对象，且 inbounds（如存在）必须是数组"
             }
@@ -203,6 +203,13 @@ fn parse_reality_dest(value: &str) -> Result<(String, u16), ProxyConfigError> {
         return Err(ProxyConfigError::InvalidRealityDest);
     }
     Ok((host.to_owned(), port))
+}
+
+/// 校验部署前的 Reality SNI 和握手目标，避免先创建无法生成配置的代理节点。
+pub fn validate_reality_settings(server_name: &str, dest: &str) -> Result<(), ProxyConfigError> {
+    validate_host(server_name.trim()).map_err(|_| ProxyConfigError::InvalidRealityServerName)?;
+    parse_reality_dest(dest)?;
+    Ok(())
 }
 
 fn validate_host(host: &str) -> Result<(), ProxyConfigError> {

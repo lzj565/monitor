@@ -374,21 +374,21 @@ fn enqueue_command(
     }
 }
 
-fn command_error_response(error: ConfigCommandError) -> Response {
+pub(crate) fn command_error_response(error: ConfigCommandError) -> Response {
     match error {
         ConfigCommandError::UnsupportedMethod => api::answer(StatusCode::BAD_REQUEST, "未注册的命令方法"),
         ConfigCommandError::InvalidParams => api::answer(StatusCode::BAD_REQUEST, "命令参数格式不正确"),
         ConfigCommandError::PayloadTooLarge => {
             api::answer(StatusCode::PAYLOAD_TOO_LARGE, "sing-box 配置超过 32 KiB 限制")
         }
-        ConfigCommandError::NodeNotFound => api::answer(StatusCode::NOT_FOUND, "节点不存在，可能已被删除"),
+        ConfigCommandError::NodeNotFound => api::answer(StatusCode::NOT_FOUND, "服务器不存在，可能已被删除"),
         ConfigCommandError::Database(error) => api::fail(error),
-        ConfigCommandError::AgentOffline => api::answer(StatusCode::CONFLICT, "节点当前离线"),
+        ConfigCommandError::AgentOffline => api::answer(StatusCode::CONFLICT, "服务器当前离线"),
         ConfigCommandError::AgentUnsupported => {
             api::answer(StatusCode::CONFLICT, "当前 agent 不支持该命令方法")
         }
-        ConfigCommandError::QueueFull => api::answer(StatusCode::SERVICE_UNAVAILABLE, "节点命令队列已满"),
-        ConfigCommandError::Disconnected => api::answer(StatusCode::CONFLICT, "节点连接已断开"),
+        ConfigCommandError::QueueFull => api::answer(StatusCode::SERVICE_UNAVAILABLE, "服务器命令队列已满"),
+        ConfigCommandError::Disconnected => api::answer(StatusCode::CONFLICT, "服务器连接已断开"),
         ConfigCommandError::Timeout => api::answer(StatusCode::GATEWAY_TIMEOUT, "等待 Agent 命令结果超时"),
         ConfigCommandError::OutcomeUnknown => {
             api::answer(StatusCode::GATEWAY_TIMEOUT, "Agent 连接中断，命令执行结果未知")
@@ -441,6 +441,10 @@ async fn execute_config_command(
 
 pub async fn singbox_config_get(app: &Shared, node_id: i64) -> Result<Value, ConfigCommandError> {
     execute_config_command(app, node_id, SINGBOX_CONFIG_GET_METHOD, json!({})).await
+}
+
+pub async fn singbox_status(app: &Shared, node_id: i64) -> Result<Value, ConfigCommandError> {
+    execute_config_command(app, node_id, SINGBOX_STATUS_METHOD, json!({})).await
 }
 
 pub async fn singbox_config_check(

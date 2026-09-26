@@ -33,6 +33,7 @@ mod frontend;
 mod notify;
 pub mod proxy_config;
 mod proxy_deploy;
+mod proxy_provision;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};

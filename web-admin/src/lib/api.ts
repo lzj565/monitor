@@ -100,6 +100,20 @@ export type ProxyInstance = {
   updated_at: number
 }
 
+/** 代理节点列表只消费展示所需字段；密钥等服务端字段不会用于 UI。 */
+export type ProxyNode = {
+  id: number
+  node_id: number
+  name: string
+  protocol: string
+  address_mode: string
+  custom_address: string | null
+  listen_port: number
+  reality_server_name: string
+  deploy_status: string
+  last_error: string | null
+}
+
 /** Every group in use, in the order of the first node carrying it: the node order decides the group order. */
 export function groupsOf(nodes: Pick<Node, "group">[]): string[] {
   return [...new Set(nodes.map((n) => n.group ?? "").filter(Boolean))]
@@ -289,11 +303,11 @@ export function loopbackOrigin(origin: string): boolean {
  * same rule, and a GET carries no `Origin` for it to answer this in advance.
  */
 export function provisionRefusal(origin: string, site: string): string {
-  if (site && !provisioningSite(site)) return "hub 的 --site 不是 https 域名，改正后才能添加或安装节点。"
+  if (site && !provisioningSite(site)) return "hub 的 --site 不是 https 域名，改正后才能添加或安装服务器。"
   if (provisioningSite(origin) || (loopbackOrigin(origin) && site)) return ""
   return loopbackOrigin(origin)
-    ? "从隧道或回环地址进面板时，要给 hub 加 --site 指定节点可达的 https 域名。"
-    : "请通过 HTTPS 域名访问面板后添加或安装节点。"
+    ? "从隧道或回环地址进面板时，要给 hub 加 --site 指定服务器可达的 https 域名。"
+    : "请通过 HTTPS 域名访问面板后添加或安装服务器。"
 }
 
 /** `1.2.3` as numbers, or null for anything else. */
