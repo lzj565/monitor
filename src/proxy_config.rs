@@ -2,9 +2,9 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use crate::db::{ProxyNode, ProxyUser};
 
@@ -29,6 +29,8 @@ pub enum ProxyConfigError {
     InvalidRealityPrivateKey,
     InvalidRealityServerName,
     InvalidListenAddress,
+    InvalidV2rayApiConfig,
+    InvalidV2rayApiListen,
 }
 
 impl fmt::Display for ProxyConfigError {
@@ -51,6 +53,8 @@ impl fmt::Display for ProxyConfigError {
             Self::InvalidRealityPrivateKey => "Reality 私钥不能为空",
             Self::InvalidRealityServerName => "Reality Server Name 不能为空",
             Self::InvalidListenAddress => "sing-box inbound 监听地址必须是 IPv4 或 IPv6 地址",
+            Self::InvalidV2rayApiConfig => "现有 sing-box V2Ray API 配置格式无效",
+            Self::InvalidV2rayApiListen => "sing-box V2Ray API 监听必须使用 loopback 地址",
         };
         f.write_str(message)
     }
@@ -143,8 +147,78 @@ pub fn generate_singbox_config_excluding_users(
     }
     merged.extend(generated);
     *inbounds = merged;
+    merge_v2ray_api(config, node_id, nodes, users)?;
 
     Ok(current_config)
+}
+
+fn merge_v2ray_api(
+    config: &mut Map<String, Value>,
+    node_id: i64,
+    nodes: &[ProxyNode],
+    users: &[ProxyUser],
+) -> Result<(), ProxyConfigError> {
+    let experimental = config.entry("experimental").or_insert_with(|| json!({}));
+    let Some(experimental) = experimental.as_object_mut() else {
+        return Err(ProxyConfigError::InvalidV2rayApiConfig);
+    };
+    let api = experimental.entry("v2ray_api").or_insert_with(|| json!({}));
+    let Some(api) = api.as_object_mut() else {
+        return Err(ProxyConfigError::InvalidV2rayApiConfig);
+    };
+
+    let listen = match api.get("listen") {
+        None => "127.0.0.1:10085".to_owned(),
+        Some(Value::String(listen)) => {
+            let Ok(address) = listen.parse::<SocketAddr>() else {
+                return Err(ProxyConfigError::InvalidV2rayApiListen);
+            };
+            if !address.ip().is_loopback() || address.port() == 0 {
+                return Err(ProxyConfigError::InvalidV2rayApiListen);
+            }
+            listen.clone()
+        }
+        Some(_) => return Err(ProxyConfigError::InvalidV2rayApiListen),
+    };
+    api.insert("listen".into(), Value::String(listen));
+
+    let stats = api.entry("stats").or_insert_with(|| json!({}));
+    let Some(stats) = stats.as_object_mut() else {
+        return Err(ProxyConfigError::InvalidV2rayApiConfig);
+    };
+    stats.insert("enabled".into(), Value::Bool(true));
+
+    let users_value = stats.entry("users").or_insert_with(|| json!([]));
+    let Some(existing_users) = users_value.as_array_mut() else {
+        return Err(ProxyConfigError::InvalidV2rayApiConfig);
+    };
+    let mut merged_users = Vec::with_capacity(existing_users.len() + users.len());
+    for user in existing_users.iter() {
+        let Some(name) = user.as_str() else {
+            return Err(ProxyConfigError::InvalidV2rayApiConfig);
+        };
+        if !name.starts_with("monitor-user-") {
+            merged_users.push(user.clone());
+        }
+    }
+
+    let enabled_node_ids = nodes
+        .iter()
+        .filter(|node| node.node_id == node_id && node.enabled)
+        .map(|node| node.id)
+        .collect::<BTreeSet<_>>();
+    let mut monitor_user_ids = BTreeSet::new();
+    for user in users.iter().filter(|user| {
+        user.enabled && user.proxy_node_ids.iter().any(|node_id| enabled_node_ids.contains(node_id))
+    }) {
+        if user.id <= 0 {
+            return Err(ProxyConfigError::InvalidProxyUserId);
+        }
+        monitor_user_ids.insert(user.id);
+    }
+    merged_users.extend(monitor_user_ids.into_iter().map(|id| Value::String(format!("monitor-user-{id}"))));
+    *existing_users = merged_users;
+    Ok(())
 }
 
 fn generate_inbound(node: &ProxyNode, users: &[ProxyUser]) -> Result<Value, ProxyConfigError> {
@@ -375,6 +449,10 @@ mod tests {
                 }
             })
         );
+        assert_eq!(
+            generated["experimental"]["v2ray_api"],
+            json!({"listen": "127.0.0.1:10085", "stats": {"enabled": true, "users": ["monitor-user-7"]}})
+        );
         assert!(inbound.get("public_key").is_none());
         assert!(inbound["tls"]["reality"].get("public_key").is_none());
         assert_eq!(inbound["listen"], "::", "custom client address must not become a bind address");
@@ -477,6 +555,84 @@ mod tests {
             "同一用户授权多个代理节点时使用同一个 UUID"
         );
         assert_eq!(generated["inbounds"][1]["users"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            generated["experimental"]["v2ray_api"]["stats"]["users"],
+            json!(["monitor-user-2", "monitor-user-3", "monitor-user-5"])
+        );
+    }
+
+    #[test]
+    fn stats_identity_survives_proxy_user_name_and_uuid_changes() {
+        let node = proxy_node(12, 1, true);
+        let mut user = proxy_user(2, "a0f81cec-73c5-4eb8-a2e2-cd1544946e8e", true, &[12]);
+        let before =
+            generate_singbox_config_excluding_users(1, empty_config(), &[node.clone()], &[user.clone()], &[])
+                .unwrap();
+        user.name = "renamed user".into();
+        user.uuid = "aa8c947a-1dbd-4905-bcb1-71728c58effb".into();
+        let after =
+            generate_singbox_config_excluding_users(1, empty_config(), &[node], &[user], &[]).unwrap();
+
+        assert_eq!(before["experimental"]["v2ray_api"]["stats"]["users"], json!(["monitor-user-2"]));
+        assert_eq!(
+            after["experimental"]["v2ray_api"]["stats"]["users"],
+            before["experimental"]["v2ray_api"]["stats"]["users"]
+        );
+        assert_eq!(after["inbounds"][0]["users"][0]["uuid"], "aa8c947a-1dbd-4905-bcb1-71728c58effb");
+    }
+
+    #[test]
+    fn v2ray_api_is_enabled_without_users_and_merges_managed_user_namespace() {
+        let empty = generate_singbox_config(1, empty_config(), &[]).unwrap();
+        assert_eq!(
+            empty["experimental"]["v2ray_api"],
+            json!({"listen": "127.0.0.1:10085", "stats": {"enabled": true, "users": []}})
+        );
+
+        let current = json!({
+            "inbounds": [],
+            "experimental": {
+                "cache_file": {"enabled": true},
+                "clash_api": {"external_controller": "127.0.0.1:9090"},
+                "v2ray_api": {
+                    "listen": "[::1]:30123",
+                    "stats": {"enabled": false, "users": ["manual-user", "monitor-user-999"]}
+                }
+            }
+        });
+        let generated = generate_singbox_config_excluding_users(
+            1,
+            current,
+            &[proxy_node(12, 1, true)],
+            &[proxy_user(2, "a0f81cec-73c5-4eb8-a2e2-cd1544946e8e", true, &[12])],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(generated["experimental"]["cache_file"]["enabled"], true);
+        assert_eq!(generated["experimental"]["clash_api"]["external_controller"], "127.0.0.1:9090");
+        assert_eq!(generated["experimental"]["v2ray_api"]["listen"], "[::1]:30123");
+        assert_eq!(
+            generated["experimental"]["v2ray_api"]["stats"],
+            json!({"enabled": true, "users": ["manual-user", "monitor-user-2"]})
+        );
+    }
+
+    #[test]
+    fn v2ray_api_rejects_non_loopback_listeners_and_keeps_loopback_ports() {
+        for listen in ["0.0.0.0:10085", "[::]:10085", "203.0.113.5:10085", "not-an-address"] {
+            let config = json!({"inbounds": [], "experimental": {"v2ray_api": {"listen": listen}}});
+            assert_eq!(
+                generate_singbox_config(1, config, &[]),
+                Err(ProxyConfigError::InvalidV2rayApiListen),
+                "{listen}"
+            );
+        }
+
+        for listen in ["127.0.0.1:20085", "[::1]:20086"] {
+            let config = json!({"inbounds": [], "experimental": {"v2ray_api": {"listen": listen}}});
+            let generated = generate_singbox_config(1, config, &[]).unwrap();
+            assert_eq!(generated["experimental"]["v2ray_api"]["listen"], listen);
+        }
     }
 
     #[test]
@@ -535,9 +691,11 @@ mod tests {
             "inbounds": [{"type": "socks", "tag": "user"}]
         });
         let generated = generate_singbox_config(1, config.clone(), &[proxy_node(1, 1, true)]).unwrap();
-        for key in ["log", "dns", "outbounds", "route", "experimental", "endpoints"] {
+        for key in ["log", "dns", "outbounds", "route", "endpoints"] {
             assert_eq!(generated[key], config[key], "top-level field {key} changed");
         }
+        assert_eq!(generated["experimental"]["cache_file"], config["experimental"]["cache_file"]);
+        assert_eq!(generated["experimental"]["v2ray_api"]["stats"], json!({"enabled": true, "users": []}));
         assert_eq!(generated["inbounds"][0]["tag"], "user");
     }
 

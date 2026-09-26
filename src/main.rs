@@ -99,8 +99,6 @@ pub struct App {
     /// asks rather than on a timer, so a hub nobody opens makes no outbound
     /// request; see `api::versions`.
     pub releases: Mutex<Releases>,
-    sing_box_release: Mutex<Option<(std::time::Instant, Option<String>)>>,
-    sing_box_release_lookup: tokio::sync::Mutex<()>,
 }
 
 #[derive(Default, Clone)]
@@ -132,8 +130,6 @@ impl App {
             themes,
             notes,
             releases: Mutex::default(),
-            sing_box_release: Mutex::default(),
-            sing_box_release_lookup: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -188,10 +184,8 @@ fn forwarded_proto(headers: &HeaderMap) -> Option<&str> {
 /// anyway.
 pub const AGENT_REPO: &str = "lzj565/agent";
 pub const HUB_REPO: &str = "lzj565/monitor";
-const SING_BOX_REPO: &str = "SagerNet/sing-box";
-const SING_BOX_RELEASES_API: &str = "https://api.github.com/repos/SagerNet/sing-box/releases/latest";
-const SING_BOX_RELEASE_TTL: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
-const SING_BOX_RELEASE_RETRY: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+/// Monitor 发布包使用的 sing-box 官方源码版本。
+const SING_BOX_VERSION: &str = "1.14.2";
 
 /// The one-line installer pasted onto a new VPS.
 async fn install_script() -> Response {
@@ -215,83 +209,19 @@ fn release_url(app: &App, arch: &str) -> String {
     )
 }
 
-fn valid_release_tag(tag: &str) -> bool {
-    !tag.is_empty()
-        && tag != "."
-        && tag != ".."
-        && tag.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'))
-}
-
-fn sing_box_release_url(app: &App, tag: &str, arch: &str) -> Option<String> {
+fn sing_box_release_url(app: &App, arch: &str) -> Option<String> {
     let arch = match arch {
         "x86_64" => "amd64",
         "aarch64" => "arm64",
         _ => return None,
     };
-    if !valid_release_tag(tag) {
-        return None;
-    }
-    let version = tag.strip_prefix('v').unwrap_or(tag);
     Some(proxied(
         app,
         format!(
-            "https://github.com/{SING_BOX_REPO}/releases/download/{tag}/sing-box-{version}-linux-{arch}.tar.gz"
+            "https://github.com/{HUB_REPO}/releases/download/v{}/monitor-sing-box-{SING_BOX_VERSION}-linux-{arch}.tar.gz",
+            env!("CARGO_PKG_VERSION")
         ),
     ))
-}
-
-fn sing_box_release_cache_fresh(
-    cached: &Option<(std::time::Instant, Option<String>)>,
-    now: std::time::Instant,
-) -> bool {
-    let Some((checked_at, tag)) = cached else { return false };
-    let ttl = if tag.is_some() { SING_BOX_RELEASE_TTL } else { SING_BOX_RELEASE_RETRY };
-    now.duration_since(*checked_at) < ttl
-}
-
-async fn latest_sing_box_tag(app: &App) -> std::result::Result<String, &'static str> {
-    // 单独串行刷新并缓存成功与失败结果，避免批量安装时打满 GitHub API 限额。
-    let _lookup = app.sing_box_release_lookup.lock().await;
-    let now = std::time::Instant::now();
-    let cached = app.sing_box_release.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    if sing_box_release_cache_fresh(&cached, now) {
-        return cached.and_then(|(_, tag)| tag).ok_or("the hub could not read the latest sing-box release");
-    }
-
-    let fetched = async {
-        let response = app
-            .http
-            .get(SING_BOX_RELEASES_API)
-            .header(header::USER_AGENT, "monitor-hub")
-            .send()
-            .await
-            .map_err(|e| {
-                warn!("reading the latest sing-box release failed: {e:#}");
-                "the hub could not read the latest sing-box release"
-            })?
-            .error_for_status()
-            .map_err(|e| {
-                warn!("reading the latest sing-box release failed: {e:#}");
-                "the hub could not read the latest sing-box release"
-            })?
-            .json::<serde_json::Value>()
-            .await
-            .map_err(|e| {
-                warn!("reading the latest sing-box release failed: {e:#}");
-                "the hub could not read the latest sing-box release"
-            })?;
-        let tag = response
-            .get("tag_name")
-            .and_then(serde_json::Value::as_str)
-            .filter(|tag| valid_release_tag(tag))
-            .ok_or("the hub received an invalid sing-box release tag")?;
-        Ok(tag.to_owned())
-    }
-    .await;
-
-    let mut cache = app.sing_box_release.lock().unwrap_or_else(|e| e.into_inner());
-    *cache = Some((std::time::Instant::now(), fetched.as_ref().ok().cloned()));
-    fetched
 }
 
 /// 面板里配置的 GitHub proxy 用于 agent、sing-box 发布包和主题更新下载。
@@ -409,16 +339,12 @@ async fn agent_binary(State(app): State<Shared>, Path(arch): Path<String>) -> Re
     }
 }
 
-/// 经 hub 中转 sing-box 官方稳定版归档，节点无需直接访问 GitHub。
+/// 经 hub 中转与当前 Monitor release 对应的定制归档，节点无需直接访问 GitHub。
 async fn sing_box_binary(State(app): State<Shared>, Path(arch): Path<String>) -> Response {
     if !matches!(arch.as_str(), "x86_64" | "aarch64") {
         return api::answer(StatusCode::NOT_FOUND, "unknown architecture");
     }
-    let tag = match latest_sing_box_tag(&app).await {
-        Ok(tag) => tag,
-        Err(message) => return api::answer(StatusCode::BAD_GATEWAY, message),
-    };
-    let Some(url) = sing_box_release_url(&app, &tag, &arch) else {
+    let Some(url) = sing_box_release_url(&app, &arch) else {
         return api::answer(StatusCode::NOT_FOUND, "unknown architecture");
     };
     let Ok(Ok(permit)) = tokio::time::timeout(RELAY_WAIT, RELAY_GATE.acquire()).await else {
@@ -1136,40 +1062,30 @@ mod tests {
     }
 
     #[test]
-    fn sing_box_release_urls_map_supported_arches_and_use_the_github_proxy() {
+    fn sing_box_release_urls_use_the_matching_monitor_release_and_github_proxy() {
         let app = app("");
+        let version = env!("CARGO_PKG_VERSION");
         assert_eq!(
-            sing_box_release_url(&app, "v1.14.2", "x86_64").as_deref(),
-            Some("https://github.com/SagerNet/sing-box/releases/download/v1.14.2/sing-box-1.14.2-linux-amd64.tar.gz")
+            sing_box_release_url(&app, "x86_64").as_deref(),
+            Some(format!(
+                "https://github.com/lzj565/monitor/releases/download/v{version}/monitor-sing-box-{SING_BOX_VERSION}-linux-amd64.tar.gz"
+            ).as_str())
         );
         assert_eq!(
-            sing_box_release_url(&app, "v1.14.2", "aarch64").as_deref(),
-            Some("https://github.com/SagerNet/sing-box/releases/download/v1.14.2/sing-box-1.14.2-linux-arm64.tar.gz")
+            sing_box_release_url(&app, "aarch64").as_deref(),
+            Some(format!(
+                "https://github.com/lzj565/monitor/releases/download/v{version}/monitor-sing-box-{SING_BOX_VERSION}-linux-arm64.tar.gz"
+            ).as_str())
         );
-        assert!(sing_box_release_url(&app, "v1.14.2", "armv7").is_none());
-        assert!(sing_box_release_url(&app, "../latest", "x86_64").is_none());
+        assert!(sing_box_release_url(&app, "armv7").is_none());
 
         app.db.set("github_proxy", "https://ghfast.top/").unwrap();
         assert_eq!(
-            sing_box_release_url(&app, "v1.14.2", "x86_64").as_deref(),
-            Some("https://ghfast.top/https://github.com/SagerNet/sing-box/releases/download/v1.14.2/sing-box-1.14.2-linux-amd64.tar.gz")
+            sing_box_release_url(&app, "x86_64").as_deref(),
+            Some(format!(
+                "https://ghfast.top/https://github.com/lzj565/monitor/releases/download/v{version}/monitor-sing-box-{SING_BOX_VERSION}-linux-amd64.tar.gz"
+            ).as_str())
         );
-    }
-
-    #[test]
-    fn sing_box_release_cache_has_short_success_and_failure_windows() {
-        let now = std::time::Instant::now();
-        let success =
-            Some((now - SING_BOX_RELEASE_TTL + std::time::Duration::from_secs(1), Some("v1.2.3".into())));
-        let failed = Some((now - SING_BOX_RELEASE_RETRY + std::time::Duration::from_secs(1), None));
-        assert!(sing_box_release_cache_fresh(&success, now));
-        assert!(sing_box_release_cache_fresh(&failed, now));
-        assert!(!sing_box_release_cache_fresh(
-            &Some((now - SING_BOX_RELEASE_TTL, Some("v1.2.3".into()))),
-            now
-        ));
-        assert!(!sing_box_release_cache_fresh(&Some((now - SING_BOX_RELEASE_RETRY, None)), now));
-        assert!(!sing_box_release_cache_fresh(&None, now));
     }
 
     #[tokio::test]

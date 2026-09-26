@@ -54,8 +54,95 @@ jobs:
           name: ${{ matrix.target }}
           path: monitor-hub-${{ matrix.target }}
 
+  build-sing-box:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Read pinned sing-box version
+        run: |
+          set -euo pipefail
+          SING_BOX_VERSION=$(sed -n 's/^const SING_BOX_VERSION: &str = "\([0-9.]*\)";$/\1/p' src/main.rs)
+          [ -n "$SING_BOX_VERSION" ] || { echo "::error::SING_BOX_VERSION is missing or invalid"; exit 1; }
+          echo "SING_BOX_VERSION=$SING_BOX_VERSION" >> "$GITHUB_ENV"
+
+      - name: Checkout official sing-box source tag
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "v$SING_BOX_VERSION" https://github.com/SagerNet/sing-box.git upstream
+          test "$(git -C upstream describe --exact-match --tags)" = "v$SING_BOX_VERSION"
+          echo "Building SagerNet/sing-box $(git -C upstream rev-parse HEAD) from v$SING_BOX_VERSION"
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: upstream/go.mod
+
+      - name: Build V2Ray API enabled binary and validate it
+        run: |
+          set -euo pipefail
+          cd upstream
+          DEFAULT_TAGS=$(cat release/DEFAULT_BUILD_TAGS)
+          TAGS=$DEFAULT_TAGS
+          for required_tag in with_v2ray_api with_purego; do
+            if ! printf '%s' ",$TAGS," | grep -Fq ",$required_tag,"; then
+              TAGS="$TAGS,$required_tag"
+            fi
+          done
+          LDFLAGS=$(cat release/LDFLAGS)
+          echo "Official DEFAULT_BUILD_TAGS: $DEFAULT_TAGS"
+          echo "Final build tags: $TAGS"
+          echo "Official LDFLAGS: $LDFLAGS"
+          GOOS=linux GOARCH=${{ matrix.arch }} CGO_ENABLED=0 go build -v -trimpath \
+            -tags "$TAGS" \
+            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=$SING_BOX_VERSION' $LDFLAGS -s -w -buildid=" \
+            -o "$RUNNER_TEMP/sing-box" ./cmd/sing-box
+
+          "$RUNNER_TEMP/sing-box" version | tee "$RUNNER_TEMP/sing-box-version.txt"
+          grep -Eq "^sing-box version $SING_BOX_VERSION([[:space:]]|$)" "$RUNNER_TEMP/sing-box-version.txt"
+          grep -Eq '(^|[[:space:],])with_v2ray_api([[:space:],]|$)' "$RUNNER_TEMP/sing-box-version.txt"
+
+          cat > "$RUNNER_TEMP/config.json" <<'CONFIG'
+          {
+            "log": {"level": "warn"},
+            "inbounds": [],
+            "outbounds": [{"type": "direct", "tag": "direct"}],
+            "experimental": {
+              "v2ray_api": {
+                "listen": "127.0.0.1:10085",
+                "stats": {"enabled": true, "users": []}
+              }
+            }
+          }
+          CONFIG
+          "$RUNNER_TEMP/sing-box" check -c "$RUNNER_TEMP/config.json"
+
+      - name: Package custom binary with official libcronet
+        run: |
+          set -euo pipefail
+          ARCHIVE_DIR="sing-box-$SING_BOX_VERSION-linux-${{ matrix.arch }}"
+          OFFICIAL_ARCHIVE="$RUNNER_TEMP/$ARCHIVE_DIR.tar.gz"
+          PACKAGE_ROOT="$RUNNER_TEMP/package"
+          curl --fail --location --retry 5 \
+            "https://github.com/SagerNet/sing-box/releases/download/v$SING_BOX_VERSION/$ARCHIVE_DIR.tar.gz" \
+            --output "$OFFICIAL_ARCHIVE"
+          tar -tzf "$OFFICIAL_ARCHIVE" | grep -Fqx "$ARCHIVE_DIR/sing-box"
+          tar -tzf "$OFFICIAL_ARCHIVE" | grep -Fqx "$ARCHIVE_DIR/libcronet.so"
+          mkdir -p "$PACKAGE_ROOT"
+          tar -xzf "$OFFICIAL_ARCHIVE" -C "$PACKAGE_ROOT"
+          install -m 0755 "$RUNNER_TEMP/sing-box" "$PACKAGE_ROOT/$ARCHIVE_DIR/sing-box"
+          tar -czf "$RUNNER_TEMP/monitor-sing-box-$SING_BOX_VERSION-linux-${{ matrix.arch }}.tar.gz" \
+            -C "$PACKAGE_ROOT" "$ARCHIVE_DIR"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: monitor-sing-box-${{ matrix.arch }}
+          path: ${{ runner.temp }}/monitor-sing-box-*.tar.gz
+
   release:
-    needs: build
+    needs: [build, build-sing-box]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -83,8 +170,8 @@ jobs:
       - if: startsWith(github.ref, 'refs/tags/')
         run: |
           cp install-hub.sh bin/
-          (cd bin && sha256sum monitor-hub-* install-hub.sh > sha256sums.txt)
-          gh release create "$GITHUB_REF_NAME" bin/monitor-hub-* bin/install-hub.sh bin/sha256sums.txt \
+          (cd bin && sha256sum monitor-hub-* monitor-sing-box-*.tar.gz install-hub.sh > sha256sums.txt)
+          gh release create "$GITHUB_REF_NAME" bin/monitor-hub-* bin/monitor-sing-box-*.tar.gz bin/install-hub.sh bin/sha256sums.txt \
             --generate-notes --repo "$GITHUB_REPOSITORY"
         env:
           GH_TOKEN: ${{ github.token }}

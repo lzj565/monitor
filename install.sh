@@ -458,6 +458,10 @@ else
 	command -v ldd >/dev/null 2>&1 && ldd "$SING_BOX_BINARY" 2>&1 | head -n 40 >&2 || true
 	exit 1
 fi
+if ! printf '%s\n' "$SING_BOX_VERSION" | grep -Eq '(^|[[:space:],])with_v2ray_api([[:space:],]|$)'; then
+	echo "installed sing-box does not include with_v2ray_api" >&2
+	exit 1
+fi
 SING_BOX_VERSION=$(printf '%s\n' "$SING_BOX_VERSION" | head -n 1 | sed 's/^sing-box version //' | cut -c1-200)
 
 ensure_sing_box_user() {
