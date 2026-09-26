@@ -163,7 +163,7 @@ CREATE TABLE IF NOT EXISTS session (
 /// cannot: `open` runs `SCHEMA` before migrating, and on an older file the
 /// column is not there yet. `an_upgraded_release_matches_a_fresh_database`
 /// holds every migration to these rules, starting from v1.0.0's schema.
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -325,6 +325,38 @@ fn migrate_to_10(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// VLESS + Reality 节点与服务器及 sing-box 实例分别建模。
+fn migrate_to_11(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS proxy_node (
+           id INTEGER PRIMARY KEY,
+           node_id INTEGER NOT NULL REFERENCES node(id) ON DELETE CASCADE,
+           name TEXT NOT NULL CHECK (length(trim(name)) > 0),
+           enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+           protocol TEXT NOT NULL CHECK (protocol = 'vless_reality'),
+           address_mode TEXT NOT NULL CHECK (address_mode IN ('ipv4', 'ipv6', 'custom')),
+           custom_address TEXT,
+           listen_port INTEGER NOT NULL CHECK (listen_port BETWEEN 1 AND 65535),
+           uuid TEXT NOT NULL CHECK (length(trim(uuid)) > 0),
+           reality_private_key TEXT NOT NULL CHECK (length(trim(reality_private_key)) > 0),
+           reality_public_key TEXT NOT NULL CHECK (length(trim(reality_public_key)) > 0),
+           reality_short_id TEXT NOT NULL CHECK (length(trim(reality_short_id)) > 0),
+           reality_server_name TEXT NOT NULL CHECK (length(trim(reality_server_name)) > 0),
+           reality_dest TEXT NOT NULL CHECK (length(trim(reality_dest)) > 0),
+           deploy_status TEXT NOT NULL DEFAULT 'not_deployed',
+           last_error TEXT,
+           created_at INTEGER NOT NULL,
+           updated_at INTEGER NOT NULL,
+           UNIQUE (node_id, listen_port),
+           CHECK (
+             (address_mode = 'custom' AND custom_address IS NOT NULL AND length(trim(custom_address)) > 0)
+             OR (address_mode IN ('ipv4', 'ipv6') AND (custom_address IS NULL OR length(trim(custom_address)) = 0))
+           )
+         );",
+    )?;
+    Ok(())
+}
+
 /// Brings a database already in service up to `SCHEMA_VERSION` and stamps it.
 /// `from` is its current version. A fresh file runs the additive migration
 /// history inside one transaction as well.
@@ -368,16 +400,19 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     if from < 10 {
         migrate_to_10(&tx)?;
     }
+    if from < 11 {
+        migrate_to_11(&tx)?;
+    }
     tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     tx.commit()?;
     Ok(())
 }
 
-/// 代理模型迁移前已有的表；旧备份中没有新增的两张表。
+/// v1 到 v9 的备份中还没有代理实例和用户表。
 const LEGACY_TABLES: [&str; 8] =
     ["setting", "node", "traffic", "metric", "ping_task", "ping_node", "ping_record", "session"];
-/// 执行对应版本迁移后，备份必须包含的全部表。
-const TABLES: [&str; 10] = [
+/// v10 的备份中还没有代理节点表。
+const V10_TABLES: [&str; 10] = [
     "setting",
     "node",
     "traffic",
@@ -388,6 +423,20 @@ const TABLES: [&str; 10] = [
     "session",
     "proxy_instance",
     "proxy_user",
+];
+/// 执行当前版本迁移后，备份必须包含的全部表。
+const TABLES: [&str; 11] = [
+    "setting",
+    "node",
+    "traffic",
+    "metric",
+    "ping_task",
+    "ping_node",
+    "ping_record",
+    "session",
+    "proxy_instance",
+    "proxy_user",
+    "proxy_node",
 ];
 
 /// One node's stored configuration and last known facts.
@@ -508,6 +557,88 @@ pub struct ProxyUser {
     pub quota: i64,
     pub expire_at: Option<i64>,
     pub created_at: i64,
+}
+
+/// VLESS + Reality 业务节点包含私钥，因此不实现 `Debug`，避免意外打印到日志。
+#[derive(Serialize, Clone)]
+pub struct ProxyNode {
+    pub id: i64,
+    pub node_id: i64,
+    pub name: String,
+    pub enabled: bool,
+    pub protocol: String,
+    pub address_mode: String,
+    pub custom_address: Option<String>,
+    pub listen_port: u16,
+    pub uuid: String,
+    pub reality_private_key: String,
+    pub reality_public_key: String,
+    pub reality_short_id: String,
+    pub reality_server_name: String,
+    pub reality_dest: String,
+    pub deploy_status: String,
+    pub last_error: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// 创建或替换代理节点期望值的请求字段，不接收部署状态和时间戳。
+#[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyNodeConfig {
+    pub node_id: i64,
+    pub name: String,
+    pub enabled: bool,
+    pub protocol: String,
+    pub address_mode: String,
+    #[serde(default)]
+    pub custom_address: Option<String>,
+    pub listen_port: u16,
+    pub uuid: String,
+    pub reality_private_key: String,
+    pub reality_public_key: String,
+    pub reality_short_id: String,
+    pub reality_server_name: String,
+    pub reality_dest: String,
+}
+
+fn validate_proxy_node(config: &ProxyNodeConfig) -> Result<()> {
+    if config.node_id <= 0 {
+        refuse!("请选择服务器节点");
+    }
+    if config.name.trim().is_empty() {
+        refuse!("请填写代理节点名称");
+    }
+    if config.protocol != "vless_reality" {
+        refuse!("当前仅支持 VLESS + Reality 协议");
+    }
+    if !matches!(config.address_mode.as_str(), "ipv4" | "ipv6" | "custom") {
+        refuse!("地址模式只支持 ipv4、ipv6 或 custom");
+    }
+    if config.listen_port == 0 {
+        refuse!("监听端口必须在 1 到 65535 之间");
+    }
+    for (value, label) in [
+        (config.uuid.as_str(), "UUID"),
+        (config.reality_private_key.as_str(), "Reality 私钥"),
+        (config.reality_public_key.as_str(), "Reality 公钥"),
+        (config.reality_short_id.as_str(), "Reality Short ID"),
+        (config.reality_server_name.as_str(), "Reality Server Name"),
+        (config.reality_dest.as_str(), "Reality Dest"),
+    ] {
+        if value.trim().is_empty() {
+            refuse!("{label}不能为空");
+        }
+    }
+    let custom_address_set =
+        config.custom_address.as_deref().is_some_and(|address| !address.trim().is_empty());
+    if config.address_mode == "custom" && !custom_address_set {
+        refuse!("自定义地址模式必须填写 custom_address");
+    }
+    if config.address_mode != "custom" && custom_address_set {
+        refuse!("只有 custom 地址模式可以填写 custom_address");
+    }
+    Ok(())
 }
 
 fn yes() -> bool {
@@ -732,6 +863,107 @@ impl Db {
         )?;
         let rows = stmt.query_map([], row_to_proxy_instance)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn proxy_nodes(&self) -> Result<Vec<ProxyNode>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, node_id, name, enabled, protocol, address_mode, custom_address, listen_port,
+                    uuid, reality_private_key, reality_public_key, reality_short_id,
+                    reality_server_name, reality_dest, deploy_status, last_error, created_at, updated_at
+             FROM proxy_node ORDER BY node_id, listen_port, id",
+        )?;
+        let rows = stmt.query_map([], row_to_proxy_node)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn proxy_node(&self, id: i64) -> Result<Option<ProxyNode>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT id, node_id, name, enabled, protocol, address_mode, custom_address, listen_port,
+                        uuid, reality_private_key, reality_public_key, reality_short_id,
+                        reality_server_name, reality_dest, deploy_status, last_error, created_at, updated_at
+                 FROM proxy_node WHERE id = ?1",
+                [id],
+                row_to_proxy_node,
+            )
+            .optional()?)
+    }
+
+    pub fn create_proxy_node(&self, config: &ProxyNodeConfig) -> Result<ProxyNode> {
+        validate_proxy_node(config)?;
+        let now = Utc::now().timestamp();
+        let custom_address =
+            config.custom_address.as_deref().map(str::trim).filter(|value| !value.is_empty());
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO proxy_node
+               (node_id, name, enabled, protocol, address_mode, custom_address, listen_port,
+                uuid, reality_private_key, reality_public_key, reality_short_id,
+                reality_server_name, reality_dest, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)",
+            params![
+                config.node_id,
+                config.name.trim(),
+                config.enabled,
+                config.protocol,
+                config.address_mode,
+                custom_address,
+                config.listen_port,
+                config.uuid.trim(),
+                config.reality_private_key.trim(),
+                config.reality_public_key.trim(),
+                config.reality_short_id.trim(),
+                config.reality_server_name.trim(),
+                config.reality_dest.trim(),
+                now,
+            ],
+        )?;
+        let id = conn.last_insert_rowid();
+        Ok(conn.query_row(
+            "SELECT id, node_id, name, enabled, protocol, address_mode, custom_address, listen_port,
+                    uuid, reality_private_key, reality_public_key, reality_short_id,
+                    reality_server_name, reality_dest, deploy_status, last_error, created_at, updated_at
+             FROM proxy_node WHERE id = ?1",
+            [id],
+            row_to_proxy_node,
+        )?)
+    }
+
+    pub fn update_proxy_node(&self, id: i64, config: &ProxyNodeConfig) -> Result<bool> {
+        validate_proxy_node(config)?;
+        let now = Utc::now().timestamp();
+        let custom_address =
+            config.custom_address.as_deref().map(str::trim).filter(|value| !value.is_empty());
+        Ok(self.conn().execute(
+            "UPDATE proxy_node SET node_id=?2, name=?3, enabled=?4, protocol=?5, address_mode=?6,
+                    custom_address=?7, listen_port=?8, uuid=?9, reality_private_key=?10,
+                    reality_public_key=?11, reality_short_id=?12, reality_server_name=?13,
+                    reality_dest=?14, deploy_status='not_deployed', last_error=NULL, updated_at=?15
+             WHERE id=?1",
+            params![
+                id,
+                config.node_id,
+                config.name.trim(),
+                config.enabled,
+                config.protocol,
+                config.address_mode,
+                custom_address,
+                config.listen_port,
+                config.uuid.trim(),
+                config.reality_private_key.trim(),
+                config.reality_public_key.trim(),
+                config.reality_short_id.trim(),
+                config.reality_server_name.trim(),
+                config.reality_dest.trim(),
+                now,
+            ],
+        )? > 0)
+    }
+
+    pub fn delete_proxy_node(&self, id: i64) -> Result<bool> {
+        Ok(self.conn().execute("DELETE FROM proxy_node WHERE id=?1", [id])? > 0)
     }
 
     /// 只保存白名单状态观测和配置摘要；嵌套 Option 用于区分字段未提供与显式 null。
@@ -1888,7 +2120,11 @@ impl Db {
         if version > SCHEMA_VERSION {
             refuse!("备份来自更新版本的 hub（数据库版本 {version}，这台只认到 {SCHEMA_VERSION}），先升级 hub 再恢复");
         }
-        let required_tables: &[&str] = if version < 10 { &LEGACY_TABLES } else { &TABLES };
+        let required_tables: &[&str] = match version {
+            v if v < 10 => &LEGACY_TABLES,
+            10 => &V10_TABLES,
+            _ => &TABLES,
+        };
         for table in required_tables {
             let found: i64 = candidate.query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
@@ -2131,6 +2367,29 @@ fn row_to_proxy_user(r: &rusqlite::Row<'_>) -> rusqlite::Result<ProxyUser> {
     })
 }
 
+fn row_to_proxy_node(r: &rusqlite::Row<'_>) -> rusqlite::Result<ProxyNode> {
+    Ok(ProxyNode {
+        id: r.get("id")?,
+        node_id: r.get("node_id")?,
+        name: r.get("name")?,
+        enabled: r.get("enabled")?,
+        protocol: r.get("protocol")?,
+        address_mode: r.get("address_mode")?,
+        custom_address: r.get("custom_address")?,
+        listen_port: r.get("listen_port")?,
+        uuid: r.get("uuid")?,
+        reality_private_key: r.get("reality_private_key")?,
+        reality_public_key: r.get("reality_public_key")?,
+        reality_short_id: r.get("reality_short_id")?,
+        reality_server_name: r.get("reality_server_name")?,
+        reality_dest: r.get("reality_dest")?,
+        deploy_status: r.get("deploy_status")?,
+        last_error: r.get("last_error")?,
+        created_at: r.get("created_at")?,
+        updated_at: r.get("updated_at")?,
+    })
+}
+
 /// Start of the billing period containing `today`, given a reset day of month.
 /// A reset day past the end of a short month lands on that month's last day.
 pub fn period_start(today: NaiveDate, reset_day: u32) -> NaiveDate {
@@ -2160,6 +2419,24 @@ mod tests {
 
     fn db() -> Db {
         Db::open(":memory:").unwrap()
+    }
+
+    fn proxy_node_config(node_id: i64, listen_port: u16) -> ProxyNodeConfig {
+        ProxyNodeConfig {
+            node_id,
+            name: "VLESS Reality".into(),
+            enabled: true,
+            protocol: "vless_reality".into(),
+            address_mode: "ipv4".into(),
+            custom_address: None,
+            listen_port,
+            uuid: "test-uuid".into(),
+            reality_private_key: "private-secret".into(),
+            reality_public_key: "public-key".into(),
+            reality_short_id: "1234abcd".into(),
+            reality_server_name: "example.com".into(),
+            reality_dest: "example.com:443".into(),
+        }
     }
 
     #[test]
@@ -2215,6 +2492,75 @@ mod tests {
         assert_eq!(loaded.expire_at, Some(1234));
         assert!(db.delete_proxy_user(id).unwrap());
         assert!(db.proxy_user(id).unwrap().is_none());
+    }
+
+    #[test]
+    fn proxy_nodes_have_independent_crud_constraints_and_cascade() {
+        let db = db();
+        let server = db
+            .create_node(&Node { name: "server-a".into(), ..Default::default() }, "server-a-token")
+            .unwrap();
+        let other_server = db
+            .create_node(&Node { name: "server-b".into(), ..Default::default() }, "server-b-token")
+            .unwrap();
+
+        let mut config = proxy_node_config(server, 443);
+        config.name = "  reality-a  ".into();
+        let created = db.create_proxy_node(&config).unwrap();
+        assert_eq!(created.node_id, server);
+        assert_eq!(created.name, "reality-a");
+        assert_eq!(created.protocol, "vless_reality");
+        assert_eq!(created.deploy_status, "not_deployed");
+        assert_eq!(created.last_error, None);
+        assert_eq!(created.reality_private_key, "private-secret");
+        assert_eq!(db.proxy_node(created.id).unwrap().unwrap().uuid, "test-uuid");
+
+        let duplicate_port = db.create_proxy_node(&proxy_node_config(server, 443)).err().unwrap();
+        assert!(!duplicate_port.to_string().contains("private-secret"));
+        let on_other_server = db.create_proxy_node(&proxy_node_config(other_server, 443)).unwrap();
+        assert_eq!(on_other_server.listen_port, created.listen_port);
+        assert_eq!(db.proxy_nodes().unwrap().len(), 2);
+
+        let mut bad = proxy_node_config(server, 8443);
+        bad.protocol = "xray".into();
+        assert!(db.create_proxy_node(&bad).err().unwrap().downcast_ref::<crate::Shown>().is_some());
+        bad.protocol = "vless_reality".into();
+        bad.address_mode = "automatic".into();
+        assert!(db.create_proxy_node(&bad).err().unwrap().downcast_ref::<crate::Shown>().is_some());
+        bad.address_mode = "ipv4".into();
+        bad.listen_port = 0;
+        assert!(db.create_proxy_node(&bad).err().unwrap().downcast_ref::<crate::Shown>().is_some());
+        bad.listen_port = 8443;
+        bad.address_mode = "custom".into();
+        assert!(db.create_proxy_node(&bad).err().unwrap().downcast_ref::<crate::Shown>().is_some());
+
+        db.conn()
+            .execute(
+                "UPDATE proxy_node SET deploy_status='deployed', last_error='old error', updated_at=0 WHERE id=?1",
+                [created.id],
+            )
+            .unwrap();
+        config.name = "reality-updated".into();
+        config.address_mode = "custom".into();
+        config.custom_address = Some(" edge.example.net ".into());
+        config.listen_port = 8443;
+        config.enabled = false;
+        assert!(db.update_proxy_node(created.id, &config).unwrap());
+        let updated = db.proxy_node(created.id).unwrap().unwrap();
+        assert_eq!(updated.name, "reality-updated");
+        assert_eq!(updated.address_mode, "custom");
+        assert_eq!(updated.custom_address.as_deref(), Some("edge.example.net"));
+        assert_eq!(updated.deploy_status, "not_deployed");
+        assert_eq!(updated.last_error, None);
+        assert!(updated.updated_at > 0);
+        assert!(!updated.enabled);
+
+        assert!(db.delete_proxy_node(created.id).unwrap());
+        assert!(!db.delete_proxy_node(created.id).unwrap());
+        assert!(db.proxy_node(created.id).unwrap().is_none());
+
+        db.delete_node(other_server).unwrap();
+        assert!(db.proxy_nodes().unwrap().is_empty());
     }
 
     /// PRAGMA settings are per connection, so a value read through any other
@@ -2370,7 +2716,7 @@ mod tests {
                 .unwrap(),
             5_000
         );
-        for table in ["proxy_instance", "proxy_user"] {
+        for table in ["proxy_instance", "proxy_user", "proxy_node"] {
             let found: i64 = candidate
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
@@ -2380,6 +2726,43 @@ mod tests {
                 .unwrap();
             assert_eq!(found, 1, "{table}");
         }
+    }
+
+    #[test]
+    fn a_v10_backup_gains_proxy_nodes_before_schema_validation() {
+        let scratch = Scratch::new();
+        {
+            let db = Db::open(&scratch.0).unwrap();
+            let node_id =
+                db.create_node(&Node { name: "v10".into(), ..Default::default() }, "v10-token").unwrap();
+            db.observe_singbox(node_id, Some("running"), Some(Some("1.14.0")), None, None, 10).unwrap();
+            let conn = db.conn();
+            conn.execute("DROP TABLE proxy_node", []).unwrap();
+            conn.execute_batch("PRAGMA user_version = 10").unwrap();
+        }
+
+        let db = Db::open(":memory:").unwrap();
+        db.check_backup(&scratch.0).unwrap();
+        let candidate = Connection::open(&scratch.0).unwrap();
+        let version: i64 = candidate.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(
+            candidate
+                .query_row("SELECT status FROM proxy_instance WHERE node_id=1", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "running"
+        );
+        assert_eq!(
+            candidate
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='proxy_node'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
     }
 
     /// `oldest` is what the data page compares against the retention window, so it

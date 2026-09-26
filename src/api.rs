@@ -18,7 +18,7 @@ use crate::agent_ws::Agent;
 use crate::auth::{
     authed, client_ip, current_session, hash_password, issue_session, issued_at, random_token, with_cookies,
 };
-use crate::db::{Db, Node, NodePatch, PingTask, Traffic, TrafficPatch};
+use crate::db::{Db, Node, NodePatch, PingTask, ProxyNodeConfig, Traffic, TrafficPatch};
 use crate::{agent_ws, App, Shared};
 
 /// Present only on requests carrying a valid session. Handlers taking it cannot
@@ -322,13 +322,72 @@ pub async fn nodes(State(app): State<Shared>, headers: HeaderMap) -> Response {
 
 pub async fn proxy_instances(_: Admin, State(app): State<Shared>) -> Response {
     match app.db.proxy_instances() {
-        Ok(instances) => {
-            let mut response = Json(json!({"instances": instances})).into_response();
-            response
-                .headers_mut()
-                .insert(header::CACHE_CONTROL, axum::http::HeaderValue::from_static("no-store"));
-            response
+        Ok(instances) => no_store(Json(json!({"instances": instances})).into_response()),
+        Err(error) => fail(error),
+    }
+}
+
+fn no_store(mut response: Response) -> Response {
+    response.headers_mut().insert(header::CACHE_CONTROL, axum::http::HeaderValue::from_static("no-store"));
+    response
+}
+
+fn proxy_node_write_failure(error: anyhow::Error) -> Response {
+    if let Some(rusqlite::Error::SqliteFailure(code, _)) = error.downcast_ref::<rusqlite::Error>() {
+        match code.extended_code {
+            rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE => {
+                return answer(StatusCode::CONFLICT, "该服务器的监听端口已被占用");
+            }
+            rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY => {
+                return answer(StatusCode::NOT_FOUND, "服务器节点不存在，可能已被删除");
+            }
+            _ => {}
         }
+    }
+    fail(error)
+}
+
+pub async fn proxy_nodes(_: Admin, State(app): State<Shared>) -> Response {
+    match app.db.proxy_nodes() {
+        Ok(nodes) => no_store(Json(json!({"nodes": nodes})).into_response()),
+        Err(error) => fail(error),
+    }
+}
+
+pub async fn create_proxy_node(
+    _: Admin,
+    State(app): State<Shared>,
+    body: Result<Json<ProxyNodeConfig>, JsonRejection>,
+) -> Response {
+    let Ok(Json(config)) = body else { return bad("代理节点数据格式不对") };
+    match app.db.create_proxy_node(&config) {
+        Ok(node) => no_store((StatusCode::CREATED, Json(json!({"node": node}))).into_response()),
+        Err(error) => proxy_node_write_failure(error),
+    }
+}
+
+pub async fn update_proxy_node(
+    _: Admin,
+    State(app): State<Shared>,
+    Path(id): Path<i64>,
+    body: Result<Json<ProxyNodeConfig>, JsonRejection>,
+) -> Response {
+    let Ok(Json(config)) = body else { return bad("代理节点数据格式不对") };
+    match app.db.update_proxy_node(id, &config) {
+        Ok(true) => match app.db.proxy_node(id) {
+            Ok(Some(node)) => no_store(Json(json!({"node": node})).into_response()),
+            Ok(None) => answer(StatusCode::NOT_FOUND, "代理节点不存在"),
+            Err(error) => fail(error),
+        },
+        Ok(false) => answer(StatusCode::NOT_FOUND, "代理节点不存在"),
+        Err(error) => proxy_node_write_failure(error),
+    }
+}
+
+pub async fn delete_proxy_node(_: Admin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
+    match app.db.delete_proxy_node(id) {
+        Ok(true) => Json(json!({"ok": true})).into_response(),
+        Ok(false) => answer(StatusCode::NOT_FOUND, "代理节点不存在"),
         Err(error) => fail(error),
     }
 }
@@ -1976,6 +2035,133 @@ mod tests {
 
     fn app() -> App {
         App::for_test(Db::open(":memory:").unwrap())
+    }
+
+    fn proxy_node_body(node_id: i64, listen_port: u16) -> Value {
+        json!({
+            "node_id": node_id,
+            "name": "Reality node",
+            "enabled": true,
+            "protocol": "vless_reality",
+            "address_mode": "ipv4",
+            "custom_address": null,
+            "listen_port": listen_port,
+            "uuid": "test-uuid",
+            "reality_private_key": "private-test-secret",
+            "reality_public_key": "public-test-key",
+            "reality_short_id": "1234abcd",
+            "reality_server_name": "example.com",
+            "reality_dest": "example.com:443"
+        })
+    }
+
+    #[tokio::test]
+    async fn proxy_node_crud_is_admin_only_and_keeps_responses_out_of_caches() {
+        let app = std::sync::Arc::new(app());
+        let node_id = app
+            .db
+            .create_node(&Node { name: "server".into(), ..Default::default() }, "server-token")
+            .unwrap();
+
+        let (mut parts, _) = axum::http::Request::new(()).into_parts();
+        assert_eq!(
+            Admin::from_request_parts(&mut parts, &app).await.err().map(|response| response.status()),
+            Some(StatusCode::UNAUTHORIZED)
+        );
+
+        let created = create_proxy_node(
+            Admin,
+            State(app.clone()),
+            Ok(Json(serde_json::from_value(proxy_node_body(node_id, 443)).unwrap())),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::CREATED);
+        assert_eq!(created.headers()[header::CACHE_CONTROL], "no-store");
+        let created: Value =
+            serde_json::from_slice(&axum::body::to_bytes(created.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let id = created["node"]["id"].as_i64().unwrap();
+        assert_eq!(created["node"]["protocol"], "vless_reality");
+        assert_eq!(created["node"]["deploy_status"], "not_deployed");
+        assert_eq!(created["node"]["reality_private_key"], "private-test-secret");
+
+        let listed = proxy_nodes(Admin, State(app.clone())).await;
+        assert_eq!(listed.status(), StatusCode::OK);
+        assert_eq!(listed.headers()[header::CACHE_CONTROL], "no-store");
+        let listed: Value =
+            serde_json::from_slice(&axum::body::to_bytes(listed.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(listed["nodes"].as_array().unwrap().len(), 1);
+
+        let mut duplicate = proxy_node_body(node_id, 443);
+        duplicate["reality_private_key"] = json!("another-private-secret");
+        let conflict = create_proxy_node(
+            Admin,
+            State(app.clone()),
+            Ok(Json(serde_json::from_value(duplicate).unwrap())),
+        )
+        .await;
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        let conflict_text =
+            String::from_utf8(axum::body::to_bytes(conflict.into_body(), usize::MAX).await.unwrap().to_vec())
+                .unwrap();
+        assert!(!conflict_text.contains("another-private-secret"));
+
+        let mut update = proxy_node_body(node_id, 8443);
+        update["name"] = json!("updated Reality node");
+        update["address_mode"] = json!("custom");
+        update["custom_address"] = json!("edge.example.net");
+        let updated = update_proxy_node(
+            Admin,
+            State(app.clone()),
+            Path(id),
+            Ok(Json(serde_json::from_value(update).unwrap())),
+        )
+        .await;
+        assert_eq!(updated.status(), StatusCode::OK);
+        assert_eq!(updated.headers()[header::CACHE_CONTROL], "no-store");
+        let updated: Value =
+            serde_json::from_slice(&axum::body::to_bytes(updated.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(updated["node"]["name"], "updated Reality node");
+        assert_eq!(updated["node"]["custom_address"], "edge.example.net");
+
+        assert_eq!(delete_proxy_node(Admin, State(app.clone()), Path(id)).await.status(), StatusCode::OK);
+        assert_eq!(
+            delete_proxy_node(Admin, State(app.clone()), Path(id)).await.status(),
+            StatusCode::NOT_FOUND
+        );
+        assert!(app.db.proxy_nodes().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn proxy_node_api_refuses_unsupported_protocol_without_returning_secrets() {
+        let app = std::sync::Arc::new(app());
+        let node_id = app
+            .db
+            .create_node(&Node { name: "server".into(), ..Default::default() }, "server-token")
+            .unwrap();
+        let mut body = proxy_node_body(node_id, 443);
+        body["protocol"] = json!("xray");
+        let response =
+            create_proxy_node(Admin, State(app.clone()), Ok(Json(serde_json::from_value(body).unwrap())))
+                .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let text =
+            String::from_utf8(axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap().to_vec())
+                .unwrap();
+        assert!(text.contains("VLESS + Reality"));
+        assert!(!text.contains("private-test-secret"));
+        assert!(app.db.proxy_nodes().unwrap().is_empty());
+
+        let missing_server = create_proxy_node(
+            Admin,
+            State(app.clone()),
+            Ok(Json(serde_json::from_value(proxy_node_body(999_999, 443)).unwrap())),
+        )
+        .await;
+        assert_eq!(missing_server.status(), StatusCode::NOT_FOUND);
+        assert!(app.db.proxy_nodes().unwrap().is_empty());
     }
 
     /// Taken by every test that calls `metrics`. `HISTORY_GATE` is process-wide,

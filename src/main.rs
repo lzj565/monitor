@@ -602,6 +602,8 @@ async fn main() -> Result<()> {
         .route("/api/nodes/{id}/commands", post(command::submit))
         .route("/api/nodes/{id}/commands/{command_id}", get(command::status))
         .route("/api/proxy/instances", get(api::proxy_instances))
+        .route("/api/proxy/nodes", get(api::proxy_nodes).post(api::create_proxy_node))
+        .route("/api/proxy/nodes/{id}", put(api::update_proxy_node).delete(api::delete_proxy_node))
         .route("/api/ping-tasks", get(api::ping_tasks).post(api::save_ping_task))
         .route("/api/ping-tasks/order", put(api::reorder_ping_tasks))
         .route("/api/ping-tasks/{id}", delete(api::delete_ping_task))
