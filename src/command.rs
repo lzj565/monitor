@@ -11,7 +11,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tracing::{debug, warn};
 
 use crate::api::{self, Admin};
@@ -104,6 +104,7 @@ struct Record {
 #[derive(Default)]
 pub struct Registry {
     records: Mutex<HashMap<String, Record>>,
+    changed: Notify,
 }
 
 impl Registry {
@@ -150,77 +151,98 @@ impl Registry {
 
     fn finish(&self, id: &str, node_id: i64, session: u64, result: Result<Value, Value>) -> bool {
         let now = Instant::now();
-        let mut records = self.lock();
-        Self::purge(&mut records, now);
-        let Some(record) = records.get_mut(id) else { return false };
-        if record.node_id != node_id || record.session != session || record.status != Status::Pending {
-            return false;
-        }
-        let result = if record.method == SINGBOX_CONFIG_GET_METHOD {
-            result.and_then(|mut value| {
-                let content = value.get("content").and_then(Value::as_str).ok_or_else(
-                    || json!({"code": -32603, "message": "agent 返回的 sing-box 配置格式不正确"}),
-                )?;
-                value["sha256"] = json!(sha256(content));
-                Ok(value)
-            })
-        } else {
-            result
+        let accepted = {
+            let mut records = self.lock();
+            Self::purge(&mut records, now);
+            let Some(record) = records.get_mut(id) else { return false };
+            if record.node_id != node_id || record.session != session || record.status != Status::Pending {
+                return false;
+            }
+            let result = if record.method == SINGBOX_CONFIG_GET_METHOD {
+                result.and_then(|mut value| {
+                    let content = value.get("content").and_then(Value::as_str).ok_or_else(
+                        || json!({"code": -32603, "message": "agent 返回的 sing-box 配置格式不正确"}),
+                    )?;
+                    value["sha256"] = json!(sha256(content));
+                    Ok(value)
+                })
+            } else {
+                result
+            };
+            match result {
+                Ok(result) => {
+                    record.status = Status::Succeeded;
+                    record.result = Some(result);
+                }
+                Err(error) if error.get("code").and_then(Value::as_i64) == Some(REMOTE_TIMEOUT_CODE) => {
+                    record.status = Status::OutcomeUnknown;
+                    record.error = Some(json!({
+                        "reason": "timeout",
+                        "message": if is_config_content_method(&record.method) {
+                            error.get("message").and_then(Value::as_str).unwrap_or("sing-box 配置应用结果未知")
+                        } else {
+                            "Agent 本地执行超时，服务操作可能已生效"
+                        }
+                    }));
+                }
+                Err(error) => {
+                    record.status = Status::Failed;
+                    record.error = Some(error);
+                }
+            }
+            record.expires_at = Some(now + result_retention(&record.method));
+            true
         };
-        match result {
-            Ok(result) => {
-                record.status = Status::Succeeded;
-                record.result = Some(result);
-            }
-            Err(error) if error.get("code").and_then(Value::as_i64) == Some(REMOTE_TIMEOUT_CODE) => {
-                record.status = Status::OutcomeUnknown;
-                record.error = Some(json!({
-                    "reason": "timeout",
-                    "message": if is_config_content_method(&record.method) {
-                        error.get("message").and_then(Value::as_str).unwrap_or("sing-box 配置应用结果未知")
-                    } else {
-                        "Agent 本地执行超时，服务操作可能已生效"
-                    }
-                }));
-            }
-            Err(error) => {
-                record.status = Status::Failed;
-                record.error = Some(error);
-            }
+        if accepted {
+            self.changed.notify_waiters();
         }
-        record.expires_at = Some(now + result_retention(&record.method));
-        true
+        accepted
     }
 
     fn outcome_unknown(&self, id: &str, session: u64, reason: &str) {
         let now = Instant::now();
-        let mut records = self.lock();
-        Self::purge(&mut records, now);
-        let Some(record) = records.get_mut(id) else { return };
-        if record.session != session || record.status != Status::Pending {
-            return;
+        let changed = {
+            let mut records = self.lock();
+            Self::purge(&mut records, now);
+            let Some(record) = records.get_mut(id) else { return };
+            if record.session != session || record.status != Status::Pending {
+                return;
+            }
+            record.status = Status::OutcomeUnknown;
+            record.error = Some(json!({
+                "reason": reason,
+                "message": if reason == "timeout" { "命令等待响应超时，agent 可能已经执行" } else { "agent 连接中断，命令执行结果未知" }
+            }));
+            record.expires_at = Some(now + result_retention(&record.method));
+            true
+        };
+        if changed {
+            self.changed.notify_waiters();
         }
-        record.status = Status::OutcomeUnknown;
-        record.error = Some(json!({
-            "reason": reason,
-            "message": if reason == "timeout" { "命令等待响应超时，agent 可能已经执行" } else { "agent 连接中断，命令执行结果未知" }
-        }));
-        record.expires_at = Some(now + result_retention(&record.method));
     }
 
     fn disconnect(&self, node_id: i64, session: u64) {
         let now = Instant::now();
-        let mut records = self.lock();
-        Self::purge(&mut records, now);
-        for record in records.values_mut() {
-            if record.node_id == node_id && record.session == session && record.status == Status::Pending {
-                record.status = Status::OutcomeUnknown;
-                record.error = Some(json!({
-                    "reason": "disconnected",
-                    "message": "agent 连接中断，命令执行结果未知"
-                }));
-                record.expires_at = Some(now + result_retention(&record.method));
+        let changed = {
+            let mut records = self.lock();
+            Self::purge(&mut records, now);
+            let mut changed = false;
+            for record in records.values_mut() {
+                if record.node_id == node_id && record.session == session && record.status == Status::Pending
+                {
+                    record.status = Status::OutcomeUnknown;
+                    record.error = Some(json!({
+                        "reason": "disconnected",
+                        "message": "agent 连接中断，命令执行结果未知"
+                    }));
+                    record.expires_at = Some(now + result_retention(&record.method));
+                    changed = true;
+                }
             }
+            changed
+        };
+        if changed {
+            self.changed.notify_waiters();
         }
     }
 
@@ -241,6 +263,23 @@ impl Registry {
             error: record.error.clone(),
         })
     }
+
+    async fn wait_terminal(&self, id: &str, node_id: i64, timeout: Duration) -> Option<View> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            let view = self.get(id, node_id)?;
+            if view.status != Status::Pending {
+                return Some(view);
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return self.get(id, node_id);
+            }
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -253,6 +292,171 @@ pub struct Request {
 
 fn empty_params() -> Value {
     json!({})
+}
+
+/// 配置部署通过既有 Agent 命令通道等待执行结果时使用的安全错误分类。
+#[derive(Debug)]
+pub enum ConfigCommandError {
+    UnsupportedMethod,
+    InvalidParams,
+    PayloadTooLarge,
+    NodeNotFound,
+    Database(anyhow::Error),
+    AgentOffline,
+    AgentUnsupported,
+    QueueFull,
+    Disconnected,
+    Timeout,
+    OutcomeUnknown,
+    AgentRejected,
+    InvalidResult,
+}
+
+struct QueuedCommand {
+    id: String,
+    method: String,
+    session: u64,
+    timeout: Duration,
+}
+
+fn enqueue_command(
+    app: &Shared,
+    node_id: i64,
+    method: &str,
+    params: Value,
+) -> Result<QueuedCommand, ConfigCommandError> {
+    if !is_supported_method(method) {
+        return Err(ConfigCommandError::UnsupportedMethod);
+    }
+    if is_config_content_method(method) {
+        let Some(values) = params.as_object() else { return Err(ConfigCommandError::InvalidParams) };
+        if values.len() != 1 || !values.contains_key("content") {
+            return Err(ConfigCommandError::InvalidParams);
+        }
+        let Some(content) = values.get("content").and_then(Value::as_str) else {
+            return Err(ConfigCommandError::InvalidParams);
+        };
+        if content.len() > MAX_CONFIG_BYTES {
+            return Err(ConfigCommandError::PayloadTooLarge);
+        }
+    } else if params != json!({}) {
+        return Err(ConfigCommandError::InvalidParams);
+    }
+
+    match app.db.node(node_id).map_err(ConfigCommandError::Database)? {
+        Some(_) => {}
+        None => return Err(ConfigCommandError::NodeNotFound),
+    }
+
+    let (session, sender) = {
+        let agents = app.agents.read().unwrap_or_else(|e| e.into_inner());
+        let Some(agent) = agents.get(&node_id) else { return Err(ConfigCommandError::AgentOffline) };
+        if !agent.capabilities.contains(method) {
+            return Err(ConfigCommandError::AgentUnsupported);
+        }
+        (agent.session, agent.tx.clone())
+    };
+
+    let id = random_token()[..24].to_owned();
+    let timeout = command_timeout(method);
+    let message = request_message(&id, method, params);
+    app.commands.insert(id.clone(), node_id, session, method.to_owned());
+    match sender.try_send(message) {
+        Ok(()) => Ok(QueuedCommand { id, method: method.to_owned(), session, timeout }),
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            app.commands.remove(&id);
+            Err(ConfigCommandError::QueueFull)
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            app.commands.remove(&id);
+            Err(ConfigCommandError::Disconnected)
+        }
+    }
+}
+
+fn command_error_response(error: ConfigCommandError) -> Response {
+    match error {
+        ConfigCommandError::UnsupportedMethod => api::answer(StatusCode::BAD_REQUEST, "未注册的命令方法"),
+        ConfigCommandError::InvalidParams => api::answer(StatusCode::BAD_REQUEST, "命令参数格式不正确"),
+        ConfigCommandError::PayloadTooLarge => {
+            api::answer(StatusCode::PAYLOAD_TOO_LARGE, "sing-box 配置超过 32 KiB 限制")
+        }
+        ConfigCommandError::NodeNotFound => api::answer(StatusCode::NOT_FOUND, "节点不存在，可能已被删除"),
+        ConfigCommandError::Database(error) => api::fail(error),
+        ConfigCommandError::AgentOffline => api::answer(StatusCode::CONFLICT, "节点当前离线"),
+        ConfigCommandError::AgentUnsupported => {
+            api::answer(StatusCode::CONFLICT, "当前 agent 不支持该命令方法")
+        }
+        ConfigCommandError::QueueFull => api::answer(StatusCode::SERVICE_UNAVAILABLE, "节点命令队列已满"),
+        ConfigCommandError::Disconnected => api::answer(StatusCode::CONFLICT, "节点连接已断开"),
+        ConfigCommandError::Timeout => api::answer(StatusCode::GATEWAY_TIMEOUT, "等待 Agent 命令结果超时"),
+        ConfigCommandError::OutcomeUnknown => {
+            api::answer(StatusCode::GATEWAY_TIMEOUT, "Agent 连接中断，命令执行结果未知")
+        }
+        ConfigCommandError::AgentRejected => api::answer(StatusCode::BAD_GATEWAY, "Agent 拒绝了命令"),
+        ConfigCommandError::InvalidResult => {
+            api::answer(StatusCode::BAD_GATEWAY, "Agent 返回的命令结果格式不正确")
+        }
+    }
+}
+
+/// 配置部署通过既有 command.result Registry 等待结果，不向调用方透传 Agent 错误原文。
+async fn execute_config_command(
+    app: &Shared,
+    node_id: i64,
+    method: &str,
+    params: Value,
+) -> Result<Value, ConfigCommandError> {
+    let pending = enqueue_command(app, node_id, method, params)?;
+    let view = match tokio::time::timeout(
+        pending.timeout,
+        app.commands.wait_terminal(&pending.id, node_id, pending.timeout),
+    )
+    .await
+    {
+        Ok(view) => view,
+        Err(_) => {
+            app.commands.outcome_unknown(&pending.id, pending.session, "timeout");
+            app.commands.get(&pending.id, node_id)
+        }
+    };
+    app.commands.remove(&pending.id);
+
+    let Some(view) = view else { return Err(ConfigCommandError::OutcomeUnknown) };
+    match view.status {
+        Status::Succeeded => view.result.ok_or(ConfigCommandError::InvalidResult),
+        Status::Failed => Err(ConfigCommandError::AgentRejected),
+        Status::OutcomeUnknown => {
+            if view.error.as_ref().and_then(|error| error.get("reason")).and_then(Value::as_str)
+                == Some("timeout")
+            {
+                Err(ConfigCommandError::Timeout)
+            } else {
+                Err(ConfigCommandError::OutcomeUnknown)
+            }
+        }
+        Status::Pending => Err(ConfigCommandError::Timeout),
+    }
+}
+
+pub async fn singbox_config_get(app: &Shared, node_id: i64) -> Result<Value, ConfigCommandError> {
+    execute_config_command(app, node_id, SINGBOX_CONFIG_GET_METHOD, json!({})).await
+}
+
+pub async fn singbox_config_check(
+    app: &Shared,
+    node_id: i64,
+    content: &str,
+) -> Result<Value, ConfigCommandError> {
+    execute_config_command(app, node_id, SINGBOX_CONFIG_CHECK_METHOD, json!({"content": content})).await
+}
+
+pub async fn singbox_config_apply(
+    app: &Shared,
+    node_id: i64,
+    content: &str,
+) -> Result<Value, ConfigCommandError> {
+    execute_config_command(app, node_id, SINGBOX_CONFIG_APPLY_METHOD, json!({"content": content})).await
 }
 
 pub async fn submit(
@@ -283,54 +487,27 @@ pub async fn submit(
     } else if request.params != json!({}) {
         return api::answer(StatusCode::BAD_REQUEST, format!("{} 不接收参数", request.method));
     }
-    match app.db.node(node_id) {
-        Ok(Some(_)) => {}
-        Ok(None) => return api::answer(StatusCode::NOT_FOUND, "节点不存在，可能已被删除"),
-        Err(e) => return api::fail(e),
-    }
-
-    let (session, sender) = {
-        let agents = app.agents.read().unwrap_or_else(|e| e.into_inner());
-        let Some(agent) = agents.get(&node_id) else {
-            return api::answer(StatusCode::CONFLICT, "节点当前离线");
-        };
-        if !agent.capabilities.contains(&request.method) {
-            return api::answer(StatusCode::CONFLICT, "当前 agent 不支持该命令方法");
-        }
-        (agent.session, agent.tx.clone())
+    let pending = match enqueue_command(&app, node_id, &request.method, request.params) {
+        Ok(pending) => pending,
+        Err(error) => return command_error_response(error),
     };
-
-    let id = random_token()[..24].to_owned();
-    let timeout = command_timeout(&request.method);
-    let method = request.method;
-    let message = request_message(&id, &method, request.params);
-    app.commands.insert(id.clone(), node_id, session, method.to_owned());
-    match sender.try_send(message) {
-        Ok(()) => {
-            let app_for_timeout = app.clone();
-            let timeout_id = id.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(timeout).await;
-                app_for_timeout.commands.outcome_unknown(&timeout_id, session, "timeout");
-                if method == SINGBOX_CONFIG_GET_METHOD {
-                    tokio::time::sleep(CONFIG_RESULT_RETENTION).await;
-                    app_for_timeout.commands.purge_expired();
-                }
-            });
-            no_store(
-                (StatusCode::ACCEPTED, Json(json!({"command_id": id, "status": Status::Pending})))
-                    .into_response(),
-            )
+    let app_for_timeout = app.clone();
+    let timeout_id = pending.id.clone();
+    let session = pending.session;
+    let timeout = pending.timeout;
+    let method = pending.method.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(timeout).await;
+        app_for_timeout.commands.outcome_unknown(&timeout_id, session, "timeout");
+        if method == SINGBOX_CONFIG_GET_METHOD {
+            tokio::time::sleep(CONFIG_RESULT_RETENTION).await;
+            app_for_timeout.commands.purge_expired();
         }
-        Err(mpsc::error::TrySendError::Full(_)) => {
-            app.commands.remove(&id);
-            api::answer(StatusCode::SERVICE_UNAVAILABLE, "节点命令队列已满")
-        }
-        Err(mpsc::error::TrySendError::Closed(_)) => {
-            app.commands.remove(&id);
-            api::answer(StatusCode::CONFLICT, "节点连接已断开")
-        }
-    }
+    });
+    no_store(
+        (StatusCode::ACCEPTED, Json(json!({"command_id": pending.id, "status": Status::Pending})))
+            .into_response(),
+    )
 }
 
 pub async fn status(

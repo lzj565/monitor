@@ -32,6 +32,7 @@ mod db;
 mod frontend;
 mod notify;
 pub mod proxy_config;
+mod proxy_deploy;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -62,6 +63,8 @@ pub struct App {
     pub agents: RwLock<HashMap<i64, Agent>>,
     /// 正在执行或等待查询结果的内存命令记录；hub 重启后重新建立。
     pub commands: command::Registry,
+    /// 每个服务器一个部署锁；Hub 是单进程服务，不需要跨进程锁。
+    pub proxy_deploy_locks: Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>,
     /// Each node's newest traffic reading, booked about once a minute rather
     /// than with every report. Per node rather than per connection; see
     /// `agent_ws::file`.
@@ -109,6 +112,7 @@ impl App {
             db,
             agents: RwLock::default(),
             commands: command::Registry::default(),
+            proxy_deploy_locks: Mutex::default(),
             readings: Mutex::default(),
             snapshot: Mutex::new([(0, Default::default()), (0, Default::default())]),
             throttle: auth::Throttle::default(),
@@ -134,6 +138,11 @@ impl App {
 
     pub fn public_page(&self) -> bool {
         self.db.get("public_page").as_deref() != Some("off")
+    }
+
+    pub fn proxy_deploy_lock(&self, node_id: i64) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.proxy_deploy_locks.lock().unwrap_or_else(|error| error.into_inner());
+        locks.entry(node_id).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
     }
 
     /// Whether a session cookie may be marked Secure. With `--site` this follows
@@ -605,6 +614,7 @@ async fn main() -> Result<()> {
         .route("/api/proxy/instances", get(api::proxy_instances))
         .route("/api/proxy/nodes", get(api::proxy_nodes).post(api::create_proxy_node))
         .route("/api/proxy/nodes/{id}", put(api::update_proxy_node).delete(api::delete_proxy_node))
+        .route("/api/proxy/servers/{node_id}/deploy", post(proxy_deploy::deploy))
         .route("/api/ping-tasks", get(api::ping_tasks).post(api::save_ping_task))
         .route("/api/ping-tasks/order", put(api::reorder_ping_tasks))
         .route("/api/ping-tasks/{id}", delete(api::delete_ping_task))

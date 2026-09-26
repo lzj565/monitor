@@ -877,6 +877,38 @@ impl Db {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    pub fn proxy_nodes_for_node(&self, node_id: i64) -> Result<Vec<ProxyNode>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, node_id, name, enabled, protocol, address_mode, custom_address, listen_port,
+                    uuid, reality_private_key, reality_public_key, reality_short_id,
+                    reality_server_name, reality_dest, deploy_status, last_error, created_at, updated_at
+             FROM proxy_node WHERE node_id = ?1 ORDER BY id",
+        )?;
+        let rows = stmt.query_map([node_id], row_to_proxy_node)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// 同一条 SQL 原子更新该服务器全部代理节点的部署结果。
+    pub fn set_proxy_nodes_deploy_status(
+        &self,
+        node_id: i64,
+        status: &str,
+        last_error: Option<&str>,
+    ) -> Result<()> {
+        if node_id <= 0 || !matches!(status, "not_deployed" | "deploying" | "deployed" | "failed") {
+            anyhow::bail!("invalid proxy deployment status");
+        }
+        if last_error.is_some_and(|message| message.len() > 512) {
+            anyhow::bail!("proxy deployment error summary is too long");
+        }
+        self.conn().execute(
+            "UPDATE proxy_node SET deploy_status=?1, last_error=?2, updated_at=?3 WHERE node_id=?4",
+            params![status, last_error, Utc::now().timestamp(), node_id],
+        )?;
+        Ok(())
+    }
+
     pub fn proxy_node(&self, id: i64) -> Result<Option<ProxyNode>> {
         Ok(self
             .conn()
