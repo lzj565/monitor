@@ -27,12 +27,13 @@ RC_FILE="/etc/init.d/monitor-agent"
 LOG_FILE="/var/log/monitor-agent.log"
 
 if [ -t 1 ] && [ -z "${NO_COLOR-}" ]; then
-	B="$(printf '\033[1m')" D="$(printf '\033[2m')" N="$(printf '\033[0m')"
+	B="$(printf '\033[1m')" D="$(printf '\033[2m')" N="$(printf '\033[0m')" G="$(printf '\033[32m')"
 else
-	B="" D="" N=""
+	B="" D="" N="" G=""
 fi
 
 rule() { printf '  %s────────────────────────────────────────────%s\n' "$D" "$N"; }
+ok() { printf '  %s✓%s  %s    %s%s%s\n' "$G" "$N" "$1" "$D" "${2-}" "$N"; }
 field() { printf '  %s%s%s    %s\n' "$D" "$1" "$N" "$2"; }
 
 SERVER=""
@@ -68,6 +69,11 @@ while [ $# -gt 0 ]; do
 done
 
 [ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 1; }
+
+AGENT_FIRST=1
+if [ -n "$UPGRADE" ] || [ -f "$BIN" ] || [ -f "$UNIT_FILE" ] || [ -f "$RC_FILE" ]; then
+	AGENT_FIRST=""
+fi
 
 is_managed_sing_box_systemd_unit() {
 	[ -f "$SING_BOX_SYSTEMD_UNIT" ] && [ ! -L "$SING_BOX_SYSTEMD_UNIT" ] &&
@@ -763,26 +769,43 @@ report_install() {
 	fi
 	if [ "$SING_BOX_RUNNING" = yes ]; then SING_BOX_RUNNING_TEXT=运行中; else SING_BOX_RUNNING_TEXT=已停止; fi
 	if [ "$SING_BOX_ENABLED" = yes ]; then SING_BOX_ENABLED_TEXT=已启用; else SING_BOX_ENABLED_TEXT=未启用; fi
-	printf '\n  %smonitor-agent 安装完成%s\n' "$B" "$N"
+	AGENT_DOWNLOAD_SIZE=$(du -h "$TMP" | awk 'NR == 1 { print $1 }')
+	SING_BOX_DOWNLOAD_SIZE=$(du -h "$SING_BOX_ARCHIVE" | awk 'NR == 1 { print $1 }')
+	printf '\n  %smonitor agent%s  %s·%s  安装器\n' "$B" "$N" "$D" "$N"
 	rule
-	field "架构" "$HOST_ARCH → Agent $ARCH / sing-box $SING_BOX_ARCH"
-	field "Agent 版本" "$AGENT_VERSION"
-	field "sing-box 版本" "$SING_BOX_VERSION"
+	printf '\n'
+	ok "架构" "$HOST_ARCH → Agent $ARCH / sing-box $SING_BOX_ARCH"
+	if [ "$AGENT_VERSION" = unknown ]; then
+		field "Agent 版本" "$AGENT_VERSION"
+	else
+		ok "Agent 版本" "$AGENT_VERSION"
+	fi
+	ok "sing-box 版本" "$SING_BOX_VERSION"
+	ok "下载" "Agent ${AGENT_DOWNLOAD_SIZE}；sing-box ${SING_BOX_DOWNLOAD_SIZE}"
+	ok "校验" "Agent ELF；sing-box ELF、版本及配置有效"
+	ok "服务" "Agent 已启动并开机自启"
+	if [ "$SING_BOX_RUNNING" = yes ] && [ "$SING_BOX_ENABLED" = yes ]; then
+		ok "sing-box" "运行中并开机自启"
+	else
+		field "sing-box 状态" "${SING_BOX_RUNNING_TEXT}；开机自启$SING_BOX_ENABLED_TEXT"
+	fi
+	if [ -n "$AGENT_FIRST" ]; then done_title="安装完成"; else done_title="升级完成"; fi
+	printf '\n  %s%s%s\n' "$B" "$done_title" "$N"
 	rule
-	field "Agent 文件" "$BIN"
+	printf '\n'
+	field "Agent" "$BIN"
 	field "Agent 服务" "$AGENT_SERVICE_FILE"
-	field "sing-box 文件" "$SING_BOX_BIN"
+	field "sing-box" "$SING_BOX_BIN"
 	field "运行库" "$SING_BOX_LIB"
 	field "配置文件" "$SING_BOX_CONFIG"
 	field "sing-box 服务" "$SING_BOX_SERVICE_FILE"
-	field "Agent 状态" "运行中；开机自启已启用"
-	field "sing-box 状态" "$SING_BOX_RUNNING_TEXT；开机自启$SING_BOX_ENABLED_TEXT"
 	rule
 	field "Agent 日志" "$AGENT_LOG_COMMAND"
 	field "sing-box 日志" "$SING_BOX_LOG_COMMAND"
 	if [ "$SING_BOX_CONFIG_CREATED" = yes ]; then
 		field "提示" "初始配置没有入站，目前尚无代理监听"
 	fi
+	printf '\n'
 }
 
 # 在注册前完成两个二进制的下载和校验，避免网络失败先占用节点；注册 token 会在
