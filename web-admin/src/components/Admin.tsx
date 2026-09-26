@@ -1563,7 +1563,6 @@ function ProxyAdvanced({ nodes }: { nodes: Node[] }) {
   return (
     <div className="space-y-4">
       <ProxyNodeManager nodes={nodes} liveStatuses={liveStatuses} rowBusy={rowBusy} />
-      <h2 className="text-base font-semibold">高级管理</h2>
       <Card className="gap-4 p-5">
         <div className="space-y-1">
           <h2 className="text-base font-semibold">sing-box 实例</h2>
@@ -1735,14 +1734,7 @@ function ProxyAdvanced({ nodes }: { nodes: Node[] }) {
 }
 
 function Proxy({ nodes }: { nodes: Node[] }) {
-  return (
-    <div className="space-y-6">
-      <div>
-        <h1 className="text-lg font-semibold">代理</h1>
-      </div>
-      <ProxyAdvanced nodes={nodes} />
-    </div>
-  )
+  return <ProxyAdvanced nodes={nodes} />
 }
 
 function ConfigDialog({ node, onClose, onLoaded }: { node: Node; onClose: () => void; onLoaded?: () => void }) {

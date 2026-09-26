@@ -116,9 +116,16 @@ assert.equal(createResult.node.reality_short_id, proxyNode.reality_short_id, "�
 assert.equal(createResult.node.uuid, proxyNode.uuid, "创建后保留服务端返回的 UUID")
 
 const managerSource = readFileSync(new URL("../components/ProxyNodeManager.tsx", import.meta.url), "utf8")
+const adminSource = readFileSync(new URL("../components/Admin.tsx", import.meta.url), "utf8")
 const modalSource = managerSource.slice(managerSource.indexOf("function ProxyNodeFormModal("))
 const advancedSource = modalSource.match(/<details\b[\s\S]*?<\/details>/)?.[0] || ""
 assert.match(managerSource, /onClick={openCreate}><Plus \/>新建代理节点<\/Button>/, "新建按钮打开创建表单")
+assert.doesNotMatch(adminSource, /<h1 className="text-lg font-semibold">代理<\/h1>/, "代理列表不重复显示页面标题")
+assert.match(managerSource, /placeholder="名称\/服务器\/协议\/地址\/SNI"[\s\S]*aria-label="搜索代理节点"[\s\S]*onChange=\{\(event\) => setQuery\(event\.target\.value\)\}/, "代理工具栏提供节点搜索")
+assert.match(managerSource, /flex flex-wrap items-center justify-end gap-2[\s\S]*placeholder="名称\/服务器\/协议\/地址\/SNI"[\s\S]*导入现有配置[\s\S]*新建代理节点/, "搜索和操作按钮共用服务器工具栏布局")
+assert.match(managerSource, /<Card className="overflow-x-auto p-0">[\s\S]*<Table>[\s\S]*<TableHeader>/, "代理表格复用服务器列表的单层表格卡片")
+assert.match(managerSource, /<TableHead>状态<\/TableHead>[\s\S]*<TableHead>服务器<\/TableHead>[\s\S]*<TableHead>名称<\/TableHead>[\s\S]*<TableHead>协议<\/TableHead>[\s\S]*<TableHead>连接地址<\/TableHead>[\s\S]*<TableHead>端口<\/TableHead>[\s\S]*<TableHead>SNI<\/TableHead>[\s\S]*<TableHead>期望状态<\/TableHead>[\s\S]*<TableHead>部署状态<\/TableHead>[\s\S]*<TableHead className="text-right">操作<\/TableHead>/, "代理表格保留全部业务字段")
+assert.doesNotMatch(managerSource, /已配置的代理节点|管理服务器上的 sing-box 代理节点/, "代理列表不再使用独立卡片标题和描述")
 assert.match(managerSource, /mode="create"\s+open={createOpen}/, "创建表单受 Dialog open 状态控制")
 assert.match(modalSource, /sm:max-w-\[660px\]/, "创建和编辑 Dialog 使用紧凑宽度")
 assert.match(modalSource, /max-h-\[85dvh\]/, "Dialog 高度随内容变化并限制在视口内")

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react"
-import { ChevronDown, Copy, Download, Globe2, LoaderCircle, MapPin, Pencil, PencilLine, Plus, QrCode, Settings2, Trash2, Zap } from "lucide-react"
+import { ChevronDown, Copy, Download, Globe2, LoaderCircle, MapPin, Pencil, PencilLine, Plus, QrCode, Search, Settings2, Trash2, Zap } from "lucide-react"
 import { QRCodeSVG } from "qrcode.react"
 import { toast } from "sonner"
 
@@ -96,18 +96,28 @@ function loadProxyNodes() {
   return api<{ nodes: ProxyNode[] }>("/proxy/nodes", { cache: "no-store" })
 }
 
+function deploymentStatusLabel(status: string) {
+  switch (status) {
+    case "deployed": return "已部署"
+    case "deploying": return "部署中"
+    case "failed": return "部署失败"
+    case "not_deployed": return "未部署"
+    default: return "状态未知"
+  }
+}
+
 function DeploymentBadge({ proxyNode }: { proxyNode: ProxyNode }) {
   switch (proxyNode.deploy_status) {
     case "deployed":
-      return <Badge className="border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950 dark:text-emerald-300">已部署</Badge>
+      return <Badge className="border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950 dark:text-emerald-300">{deploymentStatusLabel(proxyNode.deploy_status)}</Badge>
     case "deploying":
-      return <Badge variant="secondary"><LoaderCircle className="animate-spin" />部署中</Badge>
+      return <Badge variant="secondary"><LoaderCircle className="animate-spin" />{deploymentStatusLabel(proxyNode.deploy_status)}</Badge>
     case "failed":
-      return <Badge variant="destructive" title={proxyNode.last_error || "部署失败，暂无错误详情"}>部署失败</Badge>
+      return <Badge variant="destructive" title={proxyNode.last_error || "部署失败，暂无错误详情"}>{deploymentStatusLabel(proxyNode.deploy_status)}</Badge>
     case "not_deployed":
-      return <Badge variant="secondary">未部署</Badge>
+      return <Badge variant="secondary">{deploymentStatusLabel(proxyNode.deploy_status)}</Badge>
     default:
-      return <Badge variant="outline">状态未知</Badge>
+      return <Badge variant="outline">{deploymentStatusLabel(proxyNode.deploy_status)}</Badge>
   }
 }
 
@@ -129,6 +139,7 @@ export function ProxyNodeManager({
   const [proxyNodes, setProxyNodes] = useState<ProxyNode[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState("")
+  const [query, setQuery] = useState("")
   const [nodeOperations, setNodeOperations] = useState<Record<number, string>>({})
   const operationGuard = useRef(createProxyNodeOperationGuard())
   const [createOpen, setCreateOpen] = useState(false)
@@ -162,6 +173,20 @@ export function ProxyNodeManager({
   const importConnection = importTarget && importForm
     ? connectionAddress(importForm.addressMode, importForm.customAddress, selectedImportServer)
     : ""
+  const normalizedQuery = query.trim().toLowerCase()
+  const visibleProxyNodes = proxyNodes.filter((proxyNode) => {
+    const server = serversById.get(proxyNode.node_id)
+    return [
+      server?.name,
+      proxyNode.name,
+      protocolLabel(proxyNode.protocol),
+      connectionAddress(proxyNode.address_mode, proxyNode.custom_address, server),
+      proxyNode.listen_port,
+      proxyNode.reality_server_name,
+      proxyNode.enabled ? "已启用" : "已停用",
+      deploymentStatusLabel(proxyNode.deploy_status),
+    ].filter(Boolean).join(" ").toLowerCase().includes(normalizedQuery)
+  })
 
   const refresh = useCallback(async () => {
     try {
@@ -564,39 +589,23 @@ export function ProxyNodeManager({
   }
 
   return (
-    <Card className="gap-4 p-5">
-      <div className="space-y-1">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <h2 className="text-base font-semibold">已配置的代理节点</h2>
-          <div className="flex flex-wrap gap-2">
-            <Button variant="outline" onClick={openImport}><Download />导入现有配置</Button>
-            <Button onClick={openCreate}><Plus />新建代理节点</Button>
-          </div>
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-center justify-end gap-2">
+        <div className="relative mr-auto w-full sm:w-64">
+          <Search className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
+          <Input
+            className="pl-8"
+            placeholder="名称/服务器/协议/地址/SNI"
+            aria-label="搜索代理节点"
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+          />
         </div>
-        <p className="text-sm text-muted-foreground">管理服务器上的 sing-box 代理节点</p>
+        <Button variant="outline" onClick={openImport}><Download />导入现有配置</Button>
+        <Button onClick={openCreate}><Plus />新建代理节点</Button>
       </div>
-      {error && (
-        <div className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-destructive/30 p-3 text-sm">
-          <p role="alert" className="text-destructive">加载代理节点失败：{error}</p>
-          <Button variant="outline" size="sm" onClick={() => { setError(""); setLoading(true); void refresh() }}>重试</Button>
-        </div>
-      )}
-      {loading ? (
-        <div className="space-y-3" aria-label="正在加载代理节点">
-          <Skeleton className="h-10" />
-          <Skeleton className="h-12" />
-          <Skeleton className="h-12" />
-        </div>
-      ) : !error && proxyNodes.length === 0 ? (
-        <div className="rounded-md border border-dashed px-4 py-12 text-center">
-          <p className="font-medium">暂无代理节点</p>
-          <p className="mt-1 text-sm text-muted-foreground">创建第一个 VLESS Reality 代理节点。</p>
-          <div className="mt-4 flex justify-center gap-2">
-            <Button variant="outline" onClick={openImport}><Download />导入现有配置</Button>
-            <Button onClick={openCreate}><Plus />新建代理节点</Button>
-          </div>
-        </div>
-      ) : proxyNodes.length > 0 ? (
+
+      <Card className="overflow-x-auto p-0">
         <Table>
           <TableHeader>
             <TableRow>
@@ -609,11 +618,28 @@ export function ProxyNodeManager({
               <TableHead>SNI</TableHead>
               <TableHead>期望状态</TableHead>
               <TableHead>部署状态</TableHead>
-              <TableHead>操作</TableHead>
+              <TableHead className="text-right">操作</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
-            {proxyNodes.map((proxyNode) => {
+            {loading && Array.from({ length: 2 }, (_, rowIndex) => (
+              <TableRow key={`loading-${rowIndex}`} aria-label="正在加载代理节点">
+                {Array.from({ length: 10 }, (_, cellIndex) => (
+                  <TableCell key={cellIndex}><Skeleton className={`h-4 ${cellIndex === 0 ? "w-10" : "w-20"}`} /></TableCell>
+                ))}
+              </TableRow>
+            ))}
+            {!loading && error && (
+              <TableRow>
+                <TableCell colSpan={10}>
+                  <div className="flex flex-wrap items-center justify-between gap-3 text-sm">
+                    <p role="alert" className="text-destructive">加载代理节点失败：{error}</p>
+                    <Button variant="outline" size="sm" onClick={() => { setError(""); setLoading(true); void refresh() }}>重试</Button>
+                  </div>
+                </TableCell>
+              </TableRow>
+            )}
+            {!loading && !error && visibleProxyNodes.map((proxyNode) => {
               const server = serversById.get(proxyNode.node_id)
               const nodeBusy = Boolean(nodeOperations[proxyNode.id])
               const shareDisabled = true
@@ -637,8 +663,8 @@ export function ProxyNodeManager({
                   <TableCell>{proxyNode.reality_server_name || "—"}</TableCell>
                   <TableCell><DesiredStateBadge enabled={proxyNode.enabled} /></TableCell>
                   <TableCell><DeploymentBadge proxyNode={proxyNode} /></TableCell>
-                  <TableCell className="whitespace-nowrap">
-                    <div className="flex gap-1">
+                  <TableCell className="text-right whitespace-nowrap">
+                    <div className="flex justify-end gap-1">
                       <Button
                         variant="ghost"
                         size="icon"
@@ -682,9 +708,19 @@ export function ProxyNodeManager({
                 </TableRow>
               )
             })}
+            {!loading && !error && proxyNodes.length === 0 && (
+              <TableRow>
+                <TableCell colSpan={10} className="py-10 text-center text-sm text-muted-foreground">还没有代理节点，右上角新建</TableCell>
+              </TableRow>
+            )}
+            {!loading && !error && proxyNodes.length > 0 && visibleProxyNodes.length === 0 && (
+              <TableRow>
+                <TableCell colSpan={10} className="py-10 text-center text-sm text-muted-foreground">没有匹配的代理节点</TableCell>
+              </TableRow>
+            )}
           </TableBody>
-      </Table>
-      ) : null}
+        </Table>
+      </Card>
       <Dialog
         open={importOpen}
         onOpenChange={(open) => {
@@ -955,7 +991,7 @@ export function ProxyNodeManager({
           )
         })()}
       </Dialog>
-    </Card>
+    </div>
   )
 }
 
