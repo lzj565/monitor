@@ -294,14 +294,14 @@ assert.equal(getUserCenterMock("?quota=unlimited&expiry=never&preview=1").user.i
 assert.equal(getUserCenterMock("?quota=unlimited&expiry=never").traffic.limitBytes, 0)
 assert.equal(getUserCenterMock("?quota=unlimited&expiry=never").expireAt, null)
 const proxyUserManagerSource = readFileSync(new URL("../components/ProxyUserManager.tsx", import.meta.url), "utf8")
-const trafficCell = proxyUserManagerSource.match(/<TableCell\b[^>]*>\s*<div className="space-y-2">(?:(?!<\/TableCell>)[\s\S])*?user\.traffic\.used_bytes(?:(?!<\/TableCell>)[\s\S])*?RotateCcw(?:(?!<\/TableCell>)[\s\S])*?<\/TableCell>/)?.[0] ?? ""
-assert.ok(trafficCell, "清空入口位于流量使用情况单元格")
-assert.match(trafficCell, /setConfirm\(\{ kind: "traffic", user \}\)/, "清零前进入二次确认")
+const trafficCell = proxyUserManagerSource.match(/<TableCell\b[^>]*>(?:(?!<\/TableCell>)[\s\S])*?user\.traffic\.used_bytes(?:(?!<\/TableCell>)[\s\S])*?<\/TableCell>/)?.[0] ?? ""
+assert.ok(trafficCell, "流量使用量位于流量单元格")
+assert.match(trafficCell, /<Button\b[^>]*onClick=\{\(\) => setConfirm\(\{ kind: "traffic", user \}\)\}[^>]*>[^]*?清空[^]*?<\/Button>/, "清空按钮显示入口并先进入二次确认")
 assert.match(proxyUserManagerSource, /<AlertDialogCancel[^>]*>取消<\/AlertDialogCancel>/, "取消操作不绑定流量 API")
 assert.match(proxyUserManagerSource, /<Skeleton/, "加载时显示表格骨架")
 assert.match(proxyUserManagerSource, /暂无用户/, "空列表有空状态")
 assert.match(proxyUserManagerSource, /用户 UUID[\s\S]*dialogUser\.uuid[\s\S]*重新生成/, "UUID 复制与重生成仍在编辑弹窗")
-assert.match(proxyUserManagerSource, /resetProxyUserTraffic\(api, target\.user\.id\)/, "只在确认处理分支请求清零 API")
+assert.match(proxyUserManagerSource, /if \(target\.kind === "traffic"\) \{\s*const result = await resetProxyUserTraffic\(api, target\.user\.id\)/, "确认清零时调用流量 API")
 assert.match(proxyUserManagerSource, /traffic_limit_gb[\s\S]*traffic_reset_day[\s\S]*expire_date/, "编辑表单含额度、重置日与到期日期")
 assert.match(proxyUserManagerSource, /length: 28/, "重置日选项仅包含 1 到 28")
 assert.match(proxyUserManagerSource, /用户中心登录密码/, "新用户必须设置登录密码")
