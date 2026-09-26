@@ -1,13 +1,26 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { Copy, KeyRound, LoaderCircle, Pencil, Plus, RefreshCw, RotateCcw, RotateCw, Trash2 } from "lucide-react"
+import { ChevronDown, Copy, LoaderCircle, Pencil, Plus, RefreshCw, RotateCcw, RotateCw, Trash2 } from "lucide-react"
 import { toast } from "sonner"
 
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible"
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { Progress } from "@/components/ui/progress"
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
@@ -19,17 +32,74 @@ import {
   proxyUserDeleteConfirmation,
   proxyUserRegenerateConfirmation,
   regenerateProxyUser,
+  resetProxyUserTraffic,
   saveProxyUser,
   syncProxyUser,
   type ProxyUserInput,
   type ProxyUserResult,
 } from "@/lib/proxy-user-actions"
-import { PROXY_USER_TABLE_COLUMNS, proxyUserCountText, proxyUserListState, proxyUserRowView } from "@/lib/proxy-user-view"
+import {
+  expiryDateLabel,
+  formatBytes,
+  limitBytesFromGb,
+  limitGbInput,
+  proxyUserCountText,
+  proxyUserListState,
+  proxyUserRowView,
+  PROXY_USER_TABLE_COLUMNS,
+  trafficPercent,
+} from "@/lib/proxy-user-view"
 
-type Confirmation = { kind: "regenerate" | "delete"; user: ProxyUser }
-type FormState = ProxyUserInput
+type Confirmation = { kind: "regenerate" | "delete" | "traffic"; user: ProxyUser }
+type FormState = {
+  name: string
+  enabled: boolean
+  note: string
+  proxy_node_ids: number[]
+  traffic_limit_gb: string
+  traffic_reset_day: string
+  expire_date: string
+}
 
-const NEW_USER: FormState = { name: "", enabled: true, note: "", proxy_node_ids: [] }
+const NEW_USER: FormState = {
+  name: "",
+  enabled: true,
+  note: "",
+  proxy_node_ids: [],
+  traffic_limit_gb: "0",
+  traffic_reset_day: "1",
+  expire_date: "",
+}
+
+function formFromUser(user: ProxyUser): FormState {
+  return {
+    name: user.name,
+    enabled: user.enabled,
+    note: user.note,
+    proxy_node_ids: [...user.proxy_node_ids],
+    traffic_limit_gb: limitGbInput(user.traffic_limit_bytes),
+    traffic_reset_day: String(user.traffic_reset_day),
+    expire_date: user.expire_date ?? "",
+  }
+}
+
+function accessLabel(user: ProxyUser): string {
+  switch (user.access_state) {
+    case "admin_disabled": return "停用"
+    case "expired": return "已到期"
+    case "traffic_exceeded": return "已超额"
+    default: return "启用"
+  }
+}
+
+function accessClass(user: ProxyUser): string {
+  switch (user.access_state) {
+    case "enabled": return "border-emerald-600/20 bg-emerald-600/10 text-emerald-700 dark:text-emerald-400"
+    case "expired":
+    case "traffic_exceeded": return "border-amber-600/20 bg-amber-600/10 text-amber-700 dark:text-amber-400"
+    default: return "border-border bg-muted text-muted-foreground"
+  }
+}
 
 export function ProxyUserManager({ servers }: { servers: Node[] }) {
   const [users, setUsers] = useState<ProxyUser[]>([])
@@ -39,6 +109,7 @@ export function ProxyUserManager({ servers }: { servers: Node[] }) {
   const [dialogUser, setDialogUser] = useState<ProxyUser | null | undefined>(undefined)
   const [confirm, setConfirm] = useState<Confirmation | null>(null)
   const [form, setForm] = useState<FormState>(NEW_USER)
+  const [advancedOpen, setAdvancedOpen] = useState(false)
   const [saving, setSaving] = useState(false)
   const [busyIds, setBusyIds] = useState<number[]>([])
   const [failedByUser, setFailedByUser] = useState<Record<number, ProxyUserResult["failed_servers"]>>({})
@@ -68,11 +139,13 @@ export function ProxyUserManager({ servers }: { servers: Node[] }) {
 
   function openCreate() {
     setForm(NEW_USER)
+    setAdvancedOpen(true)
     setDialogUser(null)
   }
 
   function openEdit(user: ProxyUser) {
-    setForm({ name: user.name, enabled: user.enabled, note: user.note, proxy_node_ids: [...user.proxy_node_ids] })
+    setForm(formFromUser(user))
+    setAdvancedOpen(false)
     setDialogUser(user)
   }
 
@@ -84,24 +157,34 @@ export function ProxyUserManager({ servers }: { servers: Node[] }) {
     replaceUser(user)
     setDialogUser((current) => current && current.id === user.id ? user : current)
     setFailedByUser((current) => ({ ...current, [user.id]: failed }))
-    if (failed.length) {
-      toast.error(`${successText}，同步失败：${failed.map((server) => server.server_name).join("、")}`)
-    } else {
-      toast.success(successText)
-    }
+    if (failed.length) toast.error(`${successText}，同步失败：${failed.map((server) => server.server_name).join("、")}`)
+    else toast.success(successText)
   }
 
   async function submitForm(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    if (!form.name.trim()) return toast.error("请填写用户名称")
+    if (!form.name.trim()) return toast.error("请填写用户名")
+    const unchangedLimit = dialogUser !== null && dialogUser !== undefined
+      && form.traffic_limit_gb === limitGbInput(dialogUser.traffic_limit_bytes)
+    const limitBytes = unchangedLimit ? dialogUser.traffic_limit_bytes : limitBytesFromGb(form.traffic_limit_gb)
+    if (limitBytes === null) return toast.error("流量限额必须是有效的非负 GB 数值")
+    const resetDay = Number(form.traffic_reset_day)
+    if (!Number.isInteger(resetDay) || resetDay < 1 || resetDay > 28) return toast.error("每月重置日必须在 1 到 28 之间")
     setSaving(true)
     try {
-      const result = await saveProxyUser(api, dialogUser?.id ?? null, {
+      const input: ProxyUserInput = {
         name: form.name.trim(),
         enabled: form.enabled,
         note: form.note,
         proxy_node_ids: [...new Set(form.proxy_node_ids)],
-      })
+        traffic_limit_bytes: limitBytes,
+        traffic_reset_day: resetDay,
+        expire_date: dialogUser !== null && dialogUser !== undefined
+          && form.expire_date === (dialogUser.expire_date ?? "")
+          ? undefined
+          : form.expire_date || null,
+      }
+      const result = await saveProxyUser(api, dialogUser?.id ?? null, input)
       if (dialogUser) {
         showSyncResult(result.user, result.failed_servers, "用户已保存")
       } else {
@@ -138,6 +221,8 @@ export function ProxyUserManager({ servers }: { servers: Node[] }) {
           enabled,
           note: user.note,
           proxy_node_ids: user.proxy_node_ids,
+          traffic_limit_bytes: user.traffic_limit_bytes,
+          traffic_reset_day: user.traffic_reset_day,
         })
         showSyncResult(result.user, result.failed_servers, enabled ? "用户已启用" : "用户已停用")
       } catch (cause) {
@@ -166,6 +251,9 @@ export function ProxyUserManager({ servers }: { servers: Node[] }) {
         if (target.kind === "regenerate") {
           const result = await regenerateProxyUser(api, target.user.id)
           showSyncResult(result.user, result.failed_servers, "UUID 已重新生成")
+        } else if (target.kind === "traffic") {
+          const result = await resetProxyUserTraffic(api, target.user.id)
+          showSyncResult(result.user, result.failed_servers, "流量已清空")
         } else {
           const result = await deleteProxyUser(api, target.user.id)
           if (result.deleted) {
@@ -183,7 +271,8 @@ export function ProxyUserManager({ servers }: { servers: Node[] }) {
           }
         }
       } catch (cause) {
-        toast.error(`${target.kind === "delete" ? "删除" : "重新生成 UUID"}失败：${(cause as Error).message}`)
+        const label = target.kind === "delete" ? "删除" : target.kind === "traffic" ? "清空流量" : "重新生成 UUID"
+        toast.error(`${label}失败：${(cause as Error).message}`)
         await load()
       } finally {
         setConfirm(null)
@@ -212,9 +301,7 @@ export function ProxyUserManager({ servers }: { servers: Node[] }) {
 
   const groupedNodes = useMemo(() => {
     const groups = new Map<number, ProxyNode[]>()
-    for (const proxyNode of proxyNodes) {
-      groups.set(proxyNode.node_id, [...(groups.get(proxyNode.node_id) ?? []), proxyNode])
-    }
+    for (const proxyNode of proxyNodes) groups.set(proxyNode.node_id, [...(groups.get(proxyNode.node_id) ?? []), proxyNode])
     return [...groups.entries()].sort(([a], [b]) => (serverById.get(a)?.name ?? "").localeCompare(serverById.get(b)?.name ?? ""))
   }, [proxyNodes, serverById])
   const editBusy = dialogUser != null && busyIds.includes(dialogUser.id)
@@ -224,8 +311,8 @@ export function ProxyUserManager({ servers }: { servers: Node[] }) {
     <div className="space-y-4">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="space-y-1">
-          <h1 className="text-lg font-semibold">用户与订阅管理</h1>
-          <p className="text-sm text-muted-foreground">管理代理用户、专属订阅链接与流量使用情况。</p>
+          <h1 className="text-lg font-semibold">用户与流量管理</h1>
+          <p className="text-sm text-muted-foreground">管理代理用户、流量额度、重置周期与有效期。</p>
         </div>
         <div className="flex gap-2">
           <Button size="sm" variant="outline" onClick={() => { setLoading(true); void load() }} disabled={loading}>
@@ -245,99 +332,76 @@ export function ProxyUserManager({ servers }: { servers: Node[] }) {
             </div>
           </div>
           <div className="overflow-x-auto">
-            <Table className="min-w-[1140px]">
+            <Table className="min-w-[1080px]">
               <TableHeader className="bg-muted/40">
-                <TableRow className="hover:bg-muted/40">
-                  {PROXY_USER_TABLE_COLUMNS.map((column) => (
-                    <TableHead key={column.key} className={column.className}>{column.label}</TableHead>
-                  ))}
+                <TableRow className="h-11 hover:bg-muted/40">
+                  {PROXY_USER_TABLE_COLUMNS.map((column) => <TableHead key={column.key} className={column.className}>{column.label}</TableHead>)}
                 </TableRow>
               </TableHeader>
               <TableBody>
                 {listState === "loading" ? Array.from({ length: 3 }, (_, index) => (
-                  <TableRow key={`loading-${index}`} className="h-20">
-                    {PROXY_USER_TABLE_COLUMNS.map((column) => (
-                      <TableCell key={column.key}><Skeleton className="h-4 w-24" /></TableCell>
-                    ))}
+                  <TableRow key={`loading-${index}`} className="h-24">
+                    {PROXY_USER_TABLE_COLUMNS.map((column) => <TableCell key={column.key}><Skeleton className="h-4 w-24" /></TableCell>)}
                   </TableRow>
                 )) : listState === "empty" ? (
-                  <TableRow>
-                    <TableCell colSpan={PROXY_USER_TABLE_COLUMNS.length} className="h-28 text-center text-sm text-muted-foreground">暂无用户</TableCell>
-                  </TableRow>
+                  <TableRow><TableCell colSpan={PROXY_USER_TABLE_COLUMNS.length} className="h-28 text-center text-sm text-muted-foreground">暂无用户</TableCell></TableRow>
                 ) : users.map((user) => {
-                const busy = busyIds.includes(user.id)
-                const row = proxyUserRowView(user)
-                const nodeIssues = user.proxy_node_ids
-                  .map((id) => proxyNodes.find((node) => node.id === id))
-                  .filter((node): node is ProxyNode => !!node && node.deploy_status !== "deployed")
-                const inferredFailures = [...new Map(nodeIssues.map((node) => [node.node_id, {
-                  server_id: node.node_id,
-                  server_name: serverById.get(node.node_id)?.name ?? `服务器 ${node.node_id}`,
-                  error: node.last_error || (node.deploy_status === "deploying" ? "配置正在部署" : "代理节点尚未成功部署"),
-                }])).values()]
-                const failures = failedByUser[user.id] ?? inferredFailures
-                return (
-                  <TableRow key={user.id} className="h-20">
-                    <TableCell className="font-mono text-sm text-muted-foreground">{row.id}</TableCell>
-                    <TableCell className="font-medium">
-                      {user.name}
-                      {row.systemLabel && <Badge variant="secondary" className="ml-2">{row.systemLabel}</Badge>}
-                    </TableCell>
-                    <TableCell>
-                      <div className="flex items-center gap-2">
-                          <span className="font-medium tabular-nums">{row.traffic}</span>
-                          <Tooltip>
-                            <TooltipTrigger asChild>
-                              <span tabIndex={0} className="inline-flex rounded-sm" aria-label={row.trafficTooltip}>
-                                <Button size="sm" variant="ghost" className="h-7 px-2 text-xs" disabled={row.trafficClearDisabled}>
-                                  <RotateCcw className="size-3.5" />清空
+                  const busy = busyIds.includes(user.id)
+                  const row = proxyUserRowView(user)
+                  const percent = trafficPercent(user.traffic.used_bytes, user.traffic_limit_bytes)
+                  const progressColor = percent >= 100 ? "bg-destructive" : percent >= 80 ? "bg-amber-500" : "bg-primary"
+                  const nodeIssues = user.proxy_node_ids
+                    .map((id) => proxyNodes.find((node) => node.id === id))
+                    .filter((node): node is ProxyNode => !!node && node.deploy_status !== "deployed")
+                  const inferredFailures = [...new Map(nodeIssues.map((node) => [node.node_id, {
+                    server_id: node.node_id,
+                    server_name: serverById.get(node.node_id)?.name ?? `服务器 ${node.node_id}`,
+                    error: node.last_error || (node.deploy_status === "deploying" ? "配置正在部署" : "代理节点尚未成功部署"),
+                  }])).values()]
+                  const failures = failedByUser[user.id] ?? inferredFailures
+                  return (
+                    <TableRow key={user.id} className="h-24">
+                      <TableCell className="font-mono text-sm text-muted-foreground">{row.id}</TableCell>
+                      <TableCell className="font-medium">
+                        {user.name}
+                        {row.systemLabel && <Badge variant="secondary" className="ml-2">{row.systemLabel}</Badge>}
+                      </TableCell>
+                      <TableCell>
+                        <div className="space-y-1.5">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="font-medium tabular-nums">{formatBytes(user.traffic.used_bytes)}</span>
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <Button size="sm" variant="ghost" className="h-7 px-2 text-xs text-amber-700 hover:bg-amber-500/10 hover:text-amber-800 dark:text-amber-400" disabled={busy} onClick={() => setConfirm({ kind: "traffic", user })}>
+                                  <RotateCcw className="size-3.5" /> 清空
                                 </Button>
-                              </span>
-                            </TooltipTrigger>
-                            <TooltipContent>{row.trafficTooltip}</TooltipContent>
-                          </Tooltip>
-                      </div>
-                    </TableCell>
-                    <TableCell>
-                      <div className="flex items-center gap-2">
-                        <Switch checked={user.enabled} disabled={busy} onCheckedChange={(enabled) => void toggleUser(user, enabled)} aria-label={`${user.enabled ? "停用" : "启用"} ${user.name}`} />
-                        <span className="text-xs text-muted-foreground">{user.enabled ? "启用" : "停用"}</span>
-                      </div>
-                      {failures.length > 0 && <span className="mt-1 block text-xs text-destructive" title={failures.map((failure) => `${failure.server_name}：${failure.error}`).join("\n")}>服务器配置未同步</span>}
-                    </TableCell>
-                    <TableCell>
-                      <div className="flex items-center gap-1">
-                        <span className="truncate text-sm text-muted-foreground" title={row.subscription}>{row.subscription}</span>
-                        <Tooltip>
-                          <TooltipTrigger asChild>
-                            <span tabIndex={0} className="inline-flex rounded-sm" aria-label={row.subscriptionTooltip}>
-                              <Button size="icon-sm" variant="ghost" disabled={row.subscriptionActionsDisabled} aria-label="复制订阅链接">
-                                <Copy className="size-3.5" />
-                              </Button>
-                            </span>
-                          </TooltipTrigger>
-                          <TooltipContent>{row.subscriptionTooltip}</TooltipContent>
-                        </Tooltip>
-                        <Tooltip>
-                          <TooltipTrigger asChild>
-                            <span tabIndex={0} className="inline-flex rounded-sm" aria-label={row.subscriptionTooltip}>
-                              <Button size="icon-sm" variant="ghost" disabled={row.subscriptionActionsDisabled} aria-label="管理订阅密钥">
-                                <KeyRound className="size-3.5" />
-                              </Button>
-                            </span>
-                          </TooltipTrigger>
-                          <TooltipContent>{row.subscriptionTooltip}</TooltipContent>
-                        </Tooltip>
-                      </div>
-                    </TableCell>
-                    <TableCell>
-                      <div className="flex justify-end gap-1">
-                        {row.actions.includes("edit") && <Button size="sm" variant="ghost" disabled={busy} onClick={() => openEdit(user)}><Pencil className="size-4" />编辑</Button>}
-                        {row.actions.includes("delete") && <Button size="icon-sm" variant="ghost" disabled={busy} title="删除用户" onClick={() => setConfirm({ kind: "delete", user })}><Trash2 className="size-4 text-destructive" /></Button>}
-                      </div>
-                    </TableCell>
-                  </TableRow>
-                )
+                              </TooltipTrigger>
+                              <TooltipContent>清空 Hub 当前周期累计，并在服务器下次上报时重新建立 baseline</TooltipContent>
+                            </Tooltip>
+                          </div>
+                          <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
+                            <span>{user.traffic_limit_bytes === 0 ? "不限量" : `${formatBytes(user.traffic_limit_bytes)} (${Math.floor(percent)}%)`}</span>
+                            <span>每月 {user.traffic_reset_day} 日重置</span>
+                          </div>
+                          <Progress aria-label={`${user.name} 流量使用比例`} value={percent} indicatorClassName={progressColor} />
+                        </div>
+                      </TableCell>
+                      <TableCell className="text-sm">{expiryDateLabel(user.expire_date)}</TableCell>
+                      <TableCell>
+                        <div className="flex items-center gap-2">
+                          <Switch checked={user.enabled} disabled={busy} onCheckedChange={(enabled) => void toggleUser(user, enabled)} aria-label={`${user.enabled ? "停用" : "启用"} ${user.name}`} />
+                          <Badge variant="outline" className={accessClass(user)}>{accessLabel(user)}</Badge>
+                        </div>
+                        {failures.length > 0 && <span className="mt-1 block text-xs text-destructive" title={failures.map((failure) => `${failure.server_name}：${failure.error}`).join("\n")}>服务器配置未同步</span>}
+                      </TableCell>
+                      <TableCell>
+                        <div className="flex justify-end gap-1">
+                          {row.actions.includes("edit") && <Button size="sm" variant="ghost" disabled={busy} onClick={() => openEdit(user)}><Pencil className="size-4" /> 编辑</Button>}
+                          {row.actions.includes("delete") && <Button size="icon-sm" variant="ghost" disabled={busy} title="删除用户" onClick={() => setConfirm({ kind: "delete", user })}><Trash2 className="size-4 text-destructive" /></Button>}
+                        </div>
+                      </TableCell>
+                    </TableRow>
+                  )
                 })}
               </TableBody>
             </Table>
@@ -346,102 +410,123 @@ export function ProxyUserManager({ servers }: { servers: Node[] }) {
       </TooltipProvider>
 
       <Dialog open={dialogUser !== undefined} onOpenChange={(open) => !open && !saving && setDialogUser(undefined)}>
-        <DialogContent className="max-h-[calc(100dvh-64px)] overflow-y-auto sm:max-w-2xl">
+        <DialogContent className="max-h-[calc(100dvh-32px)] overflow-y-auto sm:max-w-[560px]">
           <DialogHeader>
-            <DialogTitle>{dialogUser ? "编辑代理用户" : "新建代理用户"}</DialogTitle>
-            <DialogDescription>用户 UUID 由服务器生成；保存后会同步到授权节点。</DialogDescription>
+            <DialogTitle>{dialogUser ? `编辑用户：${dialogUser.name}` : "新建代理用户"}</DialogTitle>
+            <DialogDescription>修改该用户的流量额度、重置日期与有效期。</DialogDescription>
           </DialogHeader>
           <form onSubmit={(event) => void submitForm(event)} className="space-y-5">
             <div className="grid gap-4 sm:grid-cols-2">
               <div className="space-y-2">
-                <Label htmlFor="proxy-user-name">用户名称</Label>
-                <Input id="proxy-user-name" value={form.name} maxLength={120} autoFocus disabled={saving || editBusy || !!dialogUser?.is_system} onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))} />
+                <Label htmlFor="proxy-user-limit">流量限额 (GB)</Label>
+                <Input id="proxy-user-limit" type="number" inputMode="decimal" min="0" step="0.01" value={form.traffic_limit_gb} disabled={saving || editBusy} onChange={(event) => setForm((current) => ({ ...current, traffic_limit_gb: event.target.value }))} />
+                <p className="text-xs text-muted-foreground">0 表示不限量，按 1 GB = 1024³ bytes 保存。</p>
               </div>
-              <div className="flex items-end justify-between rounded-md border px-3 py-2.5">
-                <div><Label htmlFor="proxy-user-enabled">状态</Label><p className="text-xs text-muted-foreground">停用后会从授权节点配置中移除。</p></div>
-                <Switch id="proxy-user-enabled" checked={form.enabled} disabled={saving || editBusy} onCheckedChange={(enabled) => setForm((current) => ({ ...current, enabled }))} />
-              </div>
-            </div>
-
-            {dialogUser ? (
               <div className="space-y-2">
-                <Label>用户 UUID</Label>
-                <div className="flex gap-2">
-                  <Input readOnly value={dialogUser.uuid} className="font-mono" />
-                  <Button type="button" variant="outline" onClick={() => void copyUuid(dialogUser.uuid)}><Copy className="size-4" />复制</Button>
-                  <Button type="button" variant="outline" onClick={() => setConfirm({ kind: "regenerate", user: dialogUser })}>重新生成</Button>
-                </div>
+                <Label htmlFor="proxy-user-reset-day">每月重置日</Label>
+                <Select value={form.traffic_reset_day} disabled={saving || editBusy} onValueChange={(value) => setForm((current) => ({ ...current, traffic_reset_day: value }))}>
+                  <SelectTrigger id="proxy-user-reset-day"><SelectValue /></SelectTrigger>
+                  <SelectContent>{Array.from({ length: 28 }, (_, index) => String(index + 1)).map((day) => <SelectItem key={day} value={day}>每月 {day} 日</SelectItem>)}</SelectContent>
+                </Select>
               </div>
-            ) : (
-              <p className="rounded-md bg-muted px-3 py-2 text-sm text-muted-foreground">UUID：创建时自动生成。</p>
-            )}
-
-            <fieldset className="space-y-2">
-              <legend className="text-sm font-medium">可用代理节点</legend>
-              {groupedNodes.length ? (
-                <div className="max-h-64 space-y-3 overflow-y-auto rounded-md border p-3">
-                  {groupedNodes.map(([serverId, group]) => (
-                    <section key={serverId} className="space-y-1.5">
-                      <h3 className="text-xs font-medium text-muted-foreground">{serverById.get(serverId)?.name ?? `服务器 ${serverId}`}</h3>
-                      {group.map((proxyNode) => (
-                        <label key={proxyNode.id} className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 hover:bg-muted">
-                          <input
-                            type="checkbox"
-                            checked={form.proxy_node_ids.includes(proxyNode.id)}
-                            disabled={saving || editBusy}
-                            onChange={(event) => toggleProxyNode(proxyNode.id, event.target.checked)}
-                            className="size-4 accent-primary"
-                          />
-                          <span className="min-w-0 flex-1 text-sm">{proxyNode.name}<span className="ml-2 text-xs text-muted-foreground">VLESS + Reality · {proxyNode.listen_port}</span></span>
-                          {!proxyNode.enabled && <span className="text-xs text-muted-foreground">节点已停用</span>}
-                        </label>
-                      ))}
-                    </section>
-                  ))}
-                </div>
-              ) : <p className="rounded-md border border-dashed p-4 text-sm text-muted-foreground">当前没有可分配的代理节点。</p>}
-            </fieldset>
-
-            <div className="space-y-2">
-              <Label htmlFor="proxy-user-note">备注</Label>
-              <textarea
-                id="proxy-user-note"
-                value={form.note}
-                maxLength={2000}
-                rows={3}
-                disabled={saving || editBusy}
-                onChange={(event) => setForm((current) => ({ ...current, note: event.target.value }))}
-                className="flex w-full resize-y rounded-md border border-input bg-transparent px-3 py-2 text-sm shadow-xs outline-none placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
-              />
             </div>
+            <div className="space-y-2">
+              <Label htmlFor="proxy-user-expiry">到期时间（留空为永久有效）</Label>
+              <Input id="proxy-user-expiry" type="date" value={form.expire_date} disabled={saving || editBusy} onChange={(event) => setForm((current) => ({ ...current, expire_date: event.target.value }))} />
+              <p className="text-xs text-muted-foreground">所选日期全天有效，Hub 时区次日 00:00 到期。</p>
+            </div>
+
+            <Collapsible open={advancedOpen} onOpenChange={setAdvancedOpen} className="rounded-lg border">
+              <CollapsibleTrigger asChild>
+                <Button type="button" variant="ghost" className="h-10 w-full justify-between px-3 font-medium">
+                  代理设置 <ChevronDown className={`size-4 transition-transform ${advancedOpen ? "rotate-180" : ""}`} />
+                </Button>
+              </CollapsibleTrigger>
+              <CollapsibleContent className="space-y-4 border-t p-4">
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <div className="space-y-2">
+                    <Label htmlFor="proxy-user-name">用户名</Label>
+                    <Input id="proxy-user-name" value={form.name} maxLength={120} autoFocus disabled={saving || editBusy || !!dialogUser?.is_system} onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))} />
+                  </div>
+                  <div className="flex items-center justify-between rounded-md border px-3 py-2.5">
+                    <div><Label htmlFor="proxy-user-enabled">管理员开关</Label><p className="text-xs text-muted-foreground">关闭后会从节点配置中移除。</p></div>
+                    <Switch id="proxy-user-enabled" checked={form.enabled} disabled={saving || editBusy} onCheckedChange={(enabled) => setForm((current) => ({ ...current, enabled }))} />
+                  </div>
+                </div>
+                {dialogUser ? (
+                  <div className="space-y-2">
+                    <Label>用户 UUID</Label>
+                    <div className="flex flex-wrap gap-2">
+                      <Input readOnly value={dialogUser.uuid} className="min-w-48 flex-1 font-mono" />
+                      <Button type="button" variant="outline" onClick={() => void copyUuid(dialogUser.uuid)}><Copy className="size-4" />复制</Button>
+                      <Button type="button" variant="outline" onClick={() => setConfirm({ kind: "regenerate", user: dialogUser })}>重新生成</Button>
+                    </div>
+                  </div>
+                ) : <p className="rounded-md bg-muted px-3 py-2 text-sm text-muted-foreground">UUID 将在服务器创建时生成。</p>}
+
+                <fieldset className="space-y-2">
+                  <legend className="text-sm font-medium">可用代理节点</legend>
+                  {groupedNodes.length ? (
+                    <div className="max-h-48 space-y-3 overflow-y-auto rounded-md border p-3">
+                      {groupedNodes.map(([serverId, group]) => (
+                        <section key={serverId} className="space-y-1.5">
+                          <h3 className="text-xs font-medium text-muted-foreground">{serverById.get(serverId)?.name ?? `服务器 ${serverId}`}</h3>
+                          {group.map((proxyNode) => (
+                            <label key={proxyNode.id} className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 hover:bg-muted">
+                              <input type="checkbox" checked={form.proxy_node_ids.includes(proxyNode.id)} disabled={saving || editBusy} onChange={(event) => toggleProxyNode(proxyNode.id, event.target.checked)} className="size-4 accent-primary" />
+                              <span className="min-w-0 flex-1 text-sm">{proxyNode.name}<span className="ml-2 text-xs text-muted-foreground">VLESS + Reality · {proxyNode.listen_port}</span></span>
+                              {!proxyNode.enabled && <span className="text-xs text-muted-foreground">节点已停用</span>}
+                            </label>
+                          ))}
+                        </section>
+                      ))}
+                    </div>
+                  ) : <p className="rounded-md border border-dashed p-4 text-sm text-muted-foreground">当前没有可分配的代理节点。</p>}
+                </fieldset>
+                <div className="space-y-2">
+                  <Label htmlFor="proxy-user-note">备注</Label>
+                  <textarea id="proxy-user-note" value={form.note} maxLength={2000} rows={2} disabled={saving || editBusy} onChange={(event) => setForm((current) => ({ ...current, note: event.target.value }))} className="flex w-full resize-y rounded-md border border-input bg-transparent px-3 py-2 text-sm shadow-xs outline-none placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50" />
+                </div>
+              </CollapsibleContent>
+            </Collapsible>
+
             <DialogFooter>
               <Button type="button" variant="outline" disabled={saving || editBusy} onClick={() => setDialogUser(undefined)}>取消</Button>
               {dialogUser && <Button type="button" variant="outline" disabled={saving || editBusy} onClick={() => void resync(dialogUser)}><RotateCw className="size-4" />重新同步</Button>}
               <Button type="submit" disabled={saving || editBusy}>
                 {saving && <LoaderCircle className="size-4 animate-spin" />}
-                {dialogUser ? "保存并同步" : "创建并同步"}
+                {dialogUser ? "保存修改" : "创建用户"}
               </Button>
             </DialogFooter>
           </form>
         </DialogContent>
       </Dialog>
 
-      <Dialog open={confirm !== null} onOpenChange={(open) => !open && setConfirm(null)}>
-        <DialogContent className="sm:max-w-md">
-          <DialogHeader>
-            <DialogTitle>{confirm ? (confirm.kind === "delete" ? proxyUserDeleteConfirmation(confirm.user.name).title : proxyUserRegenerateConfirmation(confirm.user.name).title) : "确认操作"}</DialogTitle>
-            <DialogDescription>
-              {confirm ? (confirm.kind === "delete" ? proxyUserDeleteConfirmation(confirm.user.name).description : proxyUserRegenerateConfirmation(confirm.user.name).description) : ""}
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button variant="outline" disabled={confirm ? busyIds.includes(confirm.user.id) : false} onClick={() => setConfirm(null)}>取消</Button>
-            <Button variant={confirm?.kind === "delete" ? "destructive" : "default"} disabled={confirm ? busyIds.includes(confirm.user.id) : false} onClick={() => void confirmAction()}>
-              {confirm?.kind === "delete" ? "删除用户" : "重新生成 UUID"}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      <AlertDialog open={confirm !== null} onOpenChange={(open) => !open && setConfirm(null)}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {confirm?.kind === "traffic" ? "清空用户流量？" : confirm?.kind === "delete" ? proxyUserDeleteConfirmation(confirm.user.name).title : confirm?.kind === "regenerate" ? proxyUserRegenerateConfirmation(confirm.user.name).title : "确认操作"}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {confirm?.kind === "traffic"
+                ? `将清空「${confirm.user.name}」当前周期累计流量，并以各服务器下一次统计数据重新建立基线。`
+                : confirm?.kind === "delete" ? proxyUserDeleteConfirmation(confirm.user.name).description
+                  : confirm?.kind === "regenerate" ? proxyUserRegenerateConfirmation(confirm.user.name).description : ""}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={confirm ? busyIds.includes(confirm.user.id) : false}>取消</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={confirm ? busyIds.includes(confirm.user.id) : false}
+              onClick={(event) => { event.preventDefault(); void confirmAction() }}
+              className={confirm?.kind === "delete" ? "bg-destructive text-white hover:bg-destructive/90" : confirm?.kind === "traffic" ? "bg-amber-600 text-white hover:bg-amber-700" : ""}
+            >
+              {confirm?.kind === "traffic" ? "确认清空" : confirm?.kind === "delete" ? "删除用户" : "重新生成 UUID"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   )
 }

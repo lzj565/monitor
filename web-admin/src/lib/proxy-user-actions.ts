@@ -1,6 +1,9 @@
 import type { ProxyUser } from "./api.ts"
 
-export type ProxyUserInput = Pick<ProxyUser, "name" | "enabled" | "note" | "proxy_node_ids">
+export type ProxyUserInput = Omit<Pick<
+  ProxyUser,
+  "name" | "enabled" | "note" | "proxy_node_ids" | "traffic_limit_bytes" | "traffic_reset_day" | "expire_date"
+>, "expire_date"> & { expire_date?: string | null }
 export type ProxyUserResult = { user: ProxyUser; failed_servers: { server_id: number; server_name: string; error: string }[] }
 export type ProxyUserDeleteResult = { deleted: boolean; user: ProxyUser | null; failed_servers: ProxyUserResult["failed_servers"] }
 export type ProxyUserActionApi = <T = unknown>(path: string, init?: RequestInit) => Promise<T>
@@ -26,6 +29,10 @@ export function deleteProxyUser(request: ProxyUserActionApi, id: number): Promis
 
 export function syncProxyUser(request: ProxyUserActionApi, id: number): Promise<ProxyUserResult> {
   return request<ProxyUserResult>(`/proxy/users/${id}/sync`, { method: "POST" })
+}
+
+export function resetProxyUserTraffic(request: ProxyUserActionApi, id: number): Promise<ProxyUserResult> {
+  return request<ProxyUserResult>(`/proxy/users/${id}/traffic/reset`, { method: "POST" })
 }
 
 export function proxyUserRegenerateConfirmation(name: string) {

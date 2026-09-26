@@ -1183,6 +1183,9 @@ mod tests {
                     enabled: false,
                     note: "disabled".into(),
                     proxy_node_ids: vec![first_proxy, second_proxy],
+                    traffic_limit_bytes: None,
+                    traffic_reset_day: None,
+                    expire_date: None,
                 })),
             )
             .await

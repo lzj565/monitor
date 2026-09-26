@@ -166,7 +166,7 @@ CREATE TABLE IF NOT EXISTS session (
 /// cannot: `open` runs `SCHEMA` before migrating, and on an older file the
 /// column is not there yet. `an_upgraded_release_matches_a_fresh_database`
 /// holds every migration to these rules, starting from v1.0.0's schema.
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 15;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -398,6 +398,54 @@ fn migrate_to_14(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// 用户流量业务累计与每台服务器的 sing-box counter baseline 独立于网卡流量。
+fn migrate_to_15(conn: &Connection) -> Result<()> {
+    add_column(
+        conn,
+        "proxy_user",
+        "traffic_limit_bytes INTEGER NOT NULL DEFAULT 0 CHECK (traffic_limit_bytes >= 0)",
+    )?;
+    add_column(
+        conn,
+        "proxy_user",
+        "traffic_reset_day INTEGER NOT NULL DEFAULT 1 CHECK (traffic_reset_day BETWEEN 1 AND 28)",
+    )?;
+    add_column(
+        conn,
+        "proxy_user",
+        "last_access_state TEXT NOT NULL DEFAULT 'enabled' CHECK (last_access_state IN ('enabled', 'admin_disabled', 'expired', 'traffic_exceeded'))",
+    )?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS proxy_user_traffic (
+           user_id INTEGER PRIMARY KEY REFERENCES proxy_user(id) ON DELETE CASCADE,
+           uplink_bytes INTEGER NOT NULL DEFAULT 0 CHECK (uplink_bytes >= 0),
+           downlink_bytes INTEGER NOT NULL DEFAULT 0 CHECK (downlink_bytes >= 0),
+           period_started_at INTEGER NOT NULL,
+           last_reset_at INTEGER NOT NULL,
+           reset_generation INTEGER NOT NULL DEFAULT 0 CHECK (reset_generation >= 0),
+           updated_at INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS proxy_user_traffic_source (
+           user_id INTEGER NOT NULL REFERENCES proxy_user(id) ON DELETE CASCADE,
+           server_id INTEGER NOT NULL REFERENCES node(id) ON DELETE CASCADE,
+           last_uplink_counter INTEGER NOT NULL CHECK (last_uplink_counter >= 0),
+           last_downlink_counter INTEGER NOT NULL CHECK (last_downlink_counter >= 0),
+           last_uptime_secs INTEGER NOT NULL CHECK (last_uptime_secs >= 0),
+           reset_generation INTEGER NOT NULL CHECK (reset_generation >= 0),
+           updated_at INTEGER NOT NULL,
+           PRIMARY KEY (user_id, server_id)
+         ) WITHOUT ROWID;",
+    )?;
+    let now = Utc::now().timestamp();
+    conn.execute(
+        "INSERT OR IGNORE INTO proxy_user_traffic
+           (user_id, period_started_at, last_reset_at, updated_at)
+         SELECT id, ?1, ?1, ?1 FROM proxy_user",
+        [now],
+    )?;
+    Ok(())
+}
+
 /// 每次打开数据库时确保唯一的系统 admin 存在，不改变既有代理凭据或授权。
 fn ensure_default_proxy_user(conn: &Connection) -> Result<()> {
     let system_user_exists: bool =
@@ -478,7 +526,17 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     if from < 14 {
         migrate_to_14(&tx)?;
     }
+    if from < 15 {
+        migrate_to_15(&tx)?;
+    }
     ensure_default_proxy_user(&tx)?;
+    let now = Utc::now().timestamp();
+    tx.execute(
+        "INSERT OR IGNORE INTO proxy_user_traffic
+           (user_id, period_started_at, last_reset_at, updated_at)
+         SELECT id, ?1, ?1, ?1 FROM proxy_user",
+        [now],
+    )?;
     tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     tx.commit()?;
     Ok(())
@@ -528,8 +586,8 @@ const V12_TABLES: [&str; 11] = [
     "proxy_user",
     "proxy_node",
 ];
-/// 执行当前版本迁移后，备份必须包含的全部表。
-const TABLES: [&str; 12] = [
+/// v13/v14 备份还没有代理用户流量累计与 counter baseline 表。
+const V14_TABLES: [&str; 12] = [
     "setting",
     "node",
     "traffic",
@@ -542,6 +600,23 @@ const TABLES: [&str; 12] = [
     "proxy_user",
     "proxy_node",
     "proxy_user_node",
+];
+/// 执行当前版本迁移后，备份必须包含的全部表。
+const TABLES: [&str; 14] = [
+    "setting",
+    "node",
+    "traffic",
+    "metric",
+    "ping_task",
+    "ping_node",
+    "ping_record",
+    "session",
+    "proxy_instance",
+    "proxy_user",
+    "proxy_node",
+    "proxy_user_node",
+    "proxy_user_traffic",
+    "proxy_user_traffic_source",
 ];
 
 /// One node's stored configuration and last known facts.
@@ -665,6 +740,41 @@ pub struct ProxyUser {
     pub note: String,
     pub updated_at: i64,
     pub proxy_node_ids: Vec<i64>,
+    pub traffic_limit_bytes: i64,
+    pub traffic_reset_day: u8,
+    pub expire_at: Option<i64>,
+    pub uplink_bytes: i64,
+    pub downlink_bytes: i64,
+    pub period_started_at: i64,
+    pub last_reset_at: i64,
+    pub reset_generation: i64,
+}
+
+impl ProxyUser {
+    pub fn used_bytes(&self) -> i64 {
+        self.uplink_bytes.saturating_add(self.downlink_bytes)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ProxyUserTrafficSample {
+    pub user_id: i64,
+    pub user_key: String,
+    pub uplink_bytes: i64,
+    pub downlink_bytes: i64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ProxyUserLimits {
+    pub traffic_limit_bytes: i64,
+    pub traffic_reset_day: u8,
+    pub expire_at: Option<i64>,
+}
+
+impl Default for ProxyUserLimits {
+    fn default() -> Self {
+        Self { traffic_limit_bytes: 0, traffic_reset_day: 1, expire_at: None }
+    }
 }
 
 /// 新建节点的默认监听地址；导入节点会保存服务器配置中的实际地址。
@@ -1351,8 +1461,15 @@ impl Db {
         let conn = self.conn();
         let mut user = conn
             .query_row(
-                "SELECT id, username AS name, uuid, enabled, is_system, created_at, note, updated_at
-                 FROM proxy_user WHERE id = ?1",
+                "SELECT pu.id, pu.username AS name, pu.uuid, pu.enabled, pu.is_system,
+                        pu.created_at, pu.note, pu.updated_at, pu.traffic_limit_bytes,
+                        pu.traffic_reset_day, pu.expire_at, COALESCE(t.uplink_bytes, 0) AS uplink_bytes,
+                        COALESCE(t.downlink_bytes, 0) AS downlink_bytes,
+                        COALESCE(t.period_started_at, 0) AS period_started_at,
+                        COALESCE(t.last_reset_at, 0) AS last_reset_at,
+                        COALESCE(t.reset_generation, 0) AS reset_generation
+                 FROM proxy_user pu LEFT JOIN proxy_user_traffic t ON t.user_id=pu.id
+                 WHERE pu.id = ?1",
                 [id],
                 row_to_proxy_user,
             )
@@ -1366,8 +1483,15 @@ impl Db {
     pub fn proxy_users(&self) -> Result<Vec<ProxyUser>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT id, username AS name, uuid, enabled, is_system, created_at, note, updated_at
-             FROM proxy_user ORDER BY created_at, id",
+            "SELECT pu.id, pu.username AS name, pu.uuid, pu.enabled, pu.is_system,
+                    pu.created_at, pu.note, pu.updated_at, pu.traffic_limit_bytes,
+                    pu.traffic_reset_day, pu.expire_at, COALESCE(t.uplink_bytes, 0) AS uplink_bytes,
+                    COALESCE(t.downlink_bytes, 0) AS downlink_bytes,
+                    COALESCE(t.period_started_at, 0) AS period_started_at,
+                    COALESCE(t.last_reset_at, 0) AS last_reset_at,
+                    COALESCE(t.reset_generation, 0) AS reset_generation
+             FROM proxy_user pu LEFT JOIN proxy_user_traffic t ON t.user_id=pu.id
+             ORDER BY pu.created_at, pu.id",
         )?;
         let rows = stmt.query_map([], row_to_proxy_user)?;
         let mut users = rows.collect::<Result<Vec<_>, _>>()?;
@@ -1387,19 +1511,64 @@ impl Db {
         note: &str,
         requested_node_ids: &[i64],
     ) -> Result<(ProxyUser, Vec<i64>)> {
+        self.create_proxy_user_with_limits(
+            name,
+            uuid,
+            enabled,
+            note,
+            requested_node_ids,
+            ProxyUserLimits::default(),
+        )
+    }
+
+    pub fn create_proxy_user_with_limits(
+        &self,
+        name: &str,
+        uuid: &str,
+        enabled: bool,
+        note: &str,
+        requested_node_ids: &[i64],
+        limits: ProxyUserLimits,
+    ) -> Result<(ProxyUser, Vec<i64>)> {
         validate_proxy_user_profile(name, note, uuid)?;
+        validate_proxy_user_limits(limits)?;
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         ensure_proxy_user_name_available(&tx, name, None)?;
         let proxy_node_ids = validated_proxy_node_ids(&tx, requested_node_ids)?;
-        let now = Utc::now().timestamp();
+        let now = crate::hub_time::now_timestamp();
+        let initial_state = crate::proxy_access::effective_proxy_access(
+            enabled,
+            limits.expire_at,
+            limits.traffic_limit_bytes,
+            0,
+            0,
+            now,
+        );
         tx.execute(
             "INSERT INTO proxy_user
-               (username, uuid, enabled, is_system, created_at, note, updated_at)
-             VALUES (?1, ?2, ?3, 0, ?4, ?5, ?4)",
-            params![name.trim(), uuid.trim(), enabled, now, note.trim()],
+               (username, uuid, enabled, is_system, created_at, note, updated_at,
+                traffic_limit_bytes, traffic_reset_day, expire_at, last_access_state)
+             VALUES (?1, ?2, ?3, 0, ?4, ?5, ?4, ?6, ?7, ?8, ?9)",
+            params![
+                name.trim(),
+                uuid.trim(),
+                enabled,
+                now,
+                note.trim(),
+                limits.traffic_limit_bytes,
+                limits.traffic_reset_day,
+                limits.expire_at,
+                initial_state.as_str()
+            ],
         )?;
         let id = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO proxy_user_traffic
+               (user_id, period_started_at, last_reset_at, updated_at)
+             VALUES (?1, ?2, ?2, ?2)",
+            params![id, now],
+        )?;
         for proxy_node_id in &proxy_node_ids {
             tx.execute(
                 "INSERT INTO proxy_user_node (user_id, proxy_node_id) VALUES (?1, ?2)",
@@ -1423,7 +1592,32 @@ impl Db {
         note: &str,
         requested_node_ids: &[i64],
     ) -> Result<Option<(ProxyUser, Vec<i64>)>> {
+        let Some(user) = self.proxy_user(id)? else { return Ok(None) };
+        self.update_proxy_user_settings(
+            id,
+            name,
+            enabled,
+            note,
+            requested_node_ids,
+            ProxyUserLimits {
+                traffic_limit_bytes: user.traffic_limit_bytes,
+                traffic_reset_day: user.traffic_reset_day,
+                expire_at: user.expire_at,
+            },
+        )
+    }
+
+    pub fn update_proxy_user_settings(
+        &self,
+        id: i64,
+        name: &str,
+        enabled: bool,
+        note: &str,
+        requested_node_ids: &[i64],
+        limits: ProxyUserLimits,
+    ) -> Result<Option<(ProxyUser, Vec<i64>)>> {
         validate_proxy_user_name_note(name, note)?;
+        validate_proxy_user_limits(limits)?;
         if id <= 0 {
             refuse!("代理用户 ID 无效");
         }
@@ -1443,11 +1637,31 @@ impl Db {
         server_ids.sort_unstable();
         server_ids.dedup();
 
-        let now = Utc::now().timestamp();
+        let now = crate::hub_time::now_timestamp();
         let stored_name = if user.is_system { user.name.clone() } else { name.trim().to_owned() };
         tx.execute(
-            "UPDATE proxy_user SET username=?2, enabled=?3, note=?4, updated_at=?5 WHERE id=?1",
-            params![id, stored_name, enabled, note.trim(), now],
+            "UPDATE proxy_user SET username=?2, enabled=?3, note=?4, updated_at=?5,
+               traffic_limit_bytes=?6, traffic_reset_day=?7, expire_at=?8,
+               last_access_state=?9 WHERE id=?1",
+            params![
+                id,
+                stored_name,
+                enabled,
+                note.trim(),
+                now,
+                limits.traffic_limit_bytes,
+                limits.traffic_reset_day,
+                limits.expire_at,
+                crate::proxy_access::effective_proxy_access(
+                    enabled,
+                    limits.expire_at,
+                    limits.traffic_limit_bytes,
+                    user.uplink_bytes,
+                    user.downlink_bytes,
+                    now,
+                )
+                .as_str()
+            ],
         )?;
         tx.execute("DELETE FROM proxy_user_node WHERE user_id=?1", [id])?;
         for proxy_node_id in &proxy_node_ids {
@@ -1461,6 +1675,9 @@ impl Db {
         user.note = note.trim().to_owned();
         user.updated_at = now;
         user.proxy_node_ids = proxy_node_ids;
+        user.traffic_limit_bytes = limits.traffic_limit_bytes;
+        user.traffic_reset_day = limits.traffic_reset_day;
+        user.expire_at = limits.expire_at;
         tx.commit()?;
         Ok(Some((user, server_ids)))
     }
@@ -1507,8 +1724,14 @@ impl Db {
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT pu.id, pu.username AS name, pu.uuid, pu.enabled, pu.is_system,
-                    pu.created_at, pu.note, pu.updated_at, pun.proxy_node_id
+                    pu.created_at, pu.note, pu.updated_at, pu.traffic_limit_bytes,
+                    pu.traffic_reset_day, pu.expire_at, COALESCE(t.uplink_bytes, 0) AS uplink_bytes,
+                    COALESCE(t.downlink_bytes, 0) AS downlink_bytes,
+                    COALESCE(t.period_started_at, 0) AS period_started_at,
+                    COALESCE(t.last_reset_at, 0) AS last_reset_at,
+                    COALESCE(t.reset_generation, 0) AS reset_generation, pun.proxy_node_id
              FROM proxy_user pu
+             LEFT JOIN proxy_user_traffic t ON t.user_id=pu.id
              JOIN proxy_user_node pun ON pun.user_id=pu.id
              JOIN proxy_node pn ON pn.id=pun.proxy_node_id
              WHERE pn.node_id=?1 ORDER BY pu.id, pun.proxy_node_id",
@@ -1525,6 +1748,14 @@ impl Db {
                     note: row.get("note")?,
                     updated_at: row.get("updated_at")?,
                     proxy_node_ids: Vec::new(),
+                    traffic_limit_bytes: row.get("traffic_limit_bytes")?,
+                    traffic_reset_day: row.get("traffic_reset_day")?,
+                    expire_at: row.get("expire_at")?,
+                    uplink_bytes: row.get("uplink_bytes")?,
+                    downlink_bytes: row.get("downlink_bytes")?,
+                    period_started_at: row.get("period_started_at")?,
+                    last_reset_at: row.get("last_reset_at")?,
+                    reset_generation: row.get("reset_generation")?,
                 },
                 row.get::<_, i64>("proxy_node_id")?,
             ))
@@ -1535,6 +1766,273 @@ impl Db {
             users.entry(user.id).or_insert(user).proxy_node_ids.push(proxy_node_id);
         }
         Ok(users.into_values().collect())
+    }
+
+    /// 返回服务器授权用户在本轮 Stats RPC 发出前的周期代次，用于丢弃跨手动清零的旧响应。
+    pub fn proxy_user_generations_for_node(&self, node_id: i64) -> Result<HashMap<i64, i64>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT pu.id, COALESCE(t.reset_generation, 0)
+             FROM proxy_user pu
+             JOIN proxy_user_node pun ON pun.user_id=pu.id
+             JOIN proxy_node pn ON pn.id=pun.proxy_node_id
+             LEFT JOIN proxy_user_traffic t ON t.user_id=pu.id
+             WHERE pn.node_id=?1",
+        )?;
+        let rows = stmt.query_map([node_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// 以服务器 counter 更新 Hub 累计；来源代次不一致或 sing-box 重启时只重建 baseline。
+    pub fn apply_proxy_user_traffic_samples(
+        &self,
+        server_id: i64,
+        uptime_secs: i64,
+        expected_generations: &HashMap<i64, i64>,
+        samples: &[ProxyUserTrafficSample],
+        now: i64,
+    ) -> Result<Vec<i64>> {
+        if server_id <= 0 || uptime_secs < 0 {
+            refuse!("流量采集来源无效");
+        }
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut changed_server_ids = Vec::new();
+        for sample in samples {
+            if sample.user_id <= 0 || sample.uplink_bytes < 0 || sample.downlink_bytes < 0 {
+                continue;
+            }
+            if sample.user_key != format!("monitor-user-{}", sample.user_id) {
+                continue;
+            }
+            let Some(expected_generation) = expected_generations.get(&sample.user_id).copied() else {
+                continue;
+            };
+            let record = tx
+                .query_row(
+                    "SELECT pu.enabled, pu.traffic_limit_bytes, pu.expire_at,
+                            t.uplink_bytes, t.downlink_bytes, t.reset_generation
+                     FROM proxy_user pu JOIN proxy_user_traffic t ON t.user_id=pu.id
+                     WHERE pu.id=?1",
+                    [sample.user_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, bool>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, Option<i64>>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, i64>(4)?,
+                            row.get::<_, i64>(5)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((enabled, limit, expire_at, used_up, used_down, generation)) = record else {
+                // RPC 在途期间用户可能被删除；旧 Agent 身份不应重新创建 Hub 用户。
+                continue;
+            };
+            if generation != expected_generation {
+                // 响应对应的是 reset 前的代次，丢弃后等待下一轮建立 baseline。
+                continue;
+            }
+            let previous = tx
+                .query_row(
+                    "SELECT last_uplink_counter, last_downlink_counter, last_uptime_secs, reset_generation
+                     FROM proxy_user_traffic_source WHERE user_id=?1 AND server_id=?2",
+                    params![sample.user_id, server_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let (delta_up, delta_down) = match previous {
+                Some((last_up, last_down, last_uptime, source_generation))
+                    if source_generation == generation
+                        && uptime_secs >= last_uptime
+                        && sample.uplink_bytes >= last_up
+                        && sample.downlink_bytes >= last_down =>
+                {
+                    (sample.uplink_bytes - last_up, sample.downlink_bytes - last_down)
+                }
+                _ => (0, 0),
+            };
+            tx.execute(
+                "INSERT INTO proxy_user_traffic_source
+                   (user_id, server_id, last_uplink_counter, last_downlink_counter,
+                    last_uptime_secs, reset_generation, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(user_id, server_id) DO UPDATE SET
+                   last_uplink_counter=excluded.last_uplink_counter,
+                   last_downlink_counter=excluded.last_downlink_counter,
+                   last_uptime_secs=excluded.last_uptime_secs,
+                   reset_generation=excluded.reset_generation,
+                   updated_at=excluded.updated_at",
+                params![
+                    sample.user_id,
+                    server_id,
+                    sample.uplink_bytes,
+                    sample.downlink_bytes,
+                    uptime_secs,
+                    generation,
+                    now
+                ],
+            )?;
+            let old_state = crate::proxy_access::effective_proxy_access(
+                enabled, expire_at, limit, used_up, used_down, now,
+            );
+            let next_up = used_up.saturating_add(delta_up);
+            let next_down = used_down.saturating_add(delta_down);
+            let next_state = crate::proxy_access::effective_proxy_access(
+                enabled, expire_at, limit, next_up, next_down, now,
+            );
+            tx.execute(
+                "UPDATE proxy_user_traffic SET uplink_bytes=?2, downlink_bytes=?3, updated_at=?4
+                 WHERE user_id=?1",
+                params![sample.user_id, next_up, next_down, now],
+            )?;
+            tx.execute(
+                "UPDATE proxy_user SET last_access_state=?2 WHERE id=?1",
+                params![sample.user_id, next_state.as_str()],
+            )?;
+            if old_state != next_state {
+                changed_server_ids.extend(proxy_server_ids_for_user(&tx, sample.user_id)?);
+            }
+        }
+        changed_server_ids.sort_unstable();
+        changed_server_ids.dedup();
+        tx.commit()?;
+        Ok(changed_server_ids)
+    }
+
+    /// 手动清空业务累计并提升代次；不要求 Agent 在线，也不操作 sing-box StatsService。
+    pub fn reset_proxy_user_traffic(&self, id: i64, now: i64) -> Result<Option<(ProxyUser, Vec<i64>)>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(user) = query_proxy_user(&tx, id)? else { return Ok(None) };
+        let old_state = crate::proxy_access::effective_proxy_access(
+            user.enabled,
+            user.expire_at,
+            user.traffic_limit_bytes,
+            user.uplink_bytes,
+            user.downlink_bytes,
+            now,
+        );
+        let next_generation =
+            user.reset_generation.checked_add(1).ok_or_else(|| anyhow::anyhow!("流量周期代次超出范围"))?;
+        let next_state = crate::proxy_access::effective_proxy_access(
+            user.enabled,
+            user.expire_at,
+            user.traffic_limit_bytes,
+            0,
+            0,
+            now,
+        );
+        tx.execute(
+            "UPDATE proxy_user_traffic SET uplink_bytes=0, downlink_bytes=0,
+               period_started_at=?2, last_reset_at=?2, reset_generation=?3, updated_at=?2
+             WHERE user_id=?1",
+            params![id, now, next_generation],
+        )?;
+        tx.execute(
+            "UPDATE proxy_user SET last_access_state=?2 WHERE id=?1",
+            params![id, next_state.as_str()],
+        )?;
+        let mut updated = query_proxy_user(&tx, id)?.ok_or_else(|| anyhow::anyhow!("代理用户不存在"))?;
+        updated.proxy_node_ids = proxy_user_node_ids(&tx, id)?;
+        let servers = if old_state != next_state { proxy_server_ids_for_user(&tx, id)? } else { Vec::new() };
+        tx.commit()?;
+        Ok(Some((updated, servers)))
+    }
+
+    /// 仅在当前周期边界确实晚于上次 reset 时重置，调用可安全重复。
+    pub fn reset_proxy_user_traffic_for_period(
+        &self,
+        id: i64,
+        period_start: i64,
+        now: i64,
+    ) -> Result<Option<Vec<i64>>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(user) = query_proxy_user(&tx, id)? else { return Ok(None) };
+        if user.period_started_at >= period_start {
+            return Ok(None);
+        }
+        let old_state = crate::proxy_access::effective_proxy_access(
+            user.enabled,
+            user.expire_at,
+            user.traffic_limit_bytes,
+            user.uplink_bytes,
+            user.downlink_bytes,
+            now,
+        );
+        let next_generation =
+            user.reset_generation.checked_add(1).ok_or_else(|| anyhow::anyhow!("流量周期代次超出范围"))?;
+        let next_state = crate::proxy_access::effective_proxy_access(
+            user.enabled,
+            user.expire_at,
+            user.traffic_limit_bytes,
+            0,
+            0,
+            now,
+        );
+        tx.execute(
+            "UPDATE proxy_user_traffic SET uplink_bytes=0, downlink_bytes=0,
+               period_started_at=?2, last_reset_at=?3, reset_generation=?4, updated_at=?3
+             WHERE user_id=?1",
+            params![id, period_start, now, next_generation],
+        )?;
+        tx.execute(
+            "UPDATE proxy_user SET last_access_state=?2 WHERE id=?1",
+            params![id, next_state.as_str()],
+        )?;
+        let servers = if old_state != next_state { proxy_server_ids_for_user(&tx, id)? } else { Vec::new() };
+        tx.commit()?;
+        Ok(Some(servers))
+    }
+
+    /// 到期由单独的轻量任务检查；仅在实际状态变化时返回需要同步的服务器。
+    pub fn refresh_proxy_user_access_states(&self, now: i64) -> Result<Vec<i64>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut stmt = tx.prepare(
+            "SELECT pu.id, pu.enabled, pu.traffic_limit_bytes, pu.expire_at, pu.last_access_state,
+                    t.uplink_bytes, t.downlink_bytes
+             FROM proxy_user pu JOIN proxy_user_traffic t ON t.user_id=pu.id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, bool>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
+        })?;
+        let users = rows.collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+        let mut server_ids = Vec::new();
+        for (id, enabled, limit, expires, old_state, uplink, downlink) in users {
+            let state =
+                crate::proxy_access::effective_proxy_access(enabled, expires, limit, uplink, downlink, now);
+            if old_state != state.as_str() {
+                tx.execute(
+                    "UPDATE proxy_user SET last_access_state=?2 WHERE id=?1",
+                    params![id, state.as_str()],
+                )?;
+                server_ids.extend(proxy_server_ids_for_user(&tx, id)?);
+            }
+        }
+        server_ids.sort_unstable();
+        server_ids.dedup();
+        tx.commit()?;
+        Ok(server_ids)
     }
 
     pub fn delete_proxy_user(&self, id: i64) -> Result<bool> {
@@ -2615,6 +3113,7 @@ impl Db {
             10 => &V10_TABLES,
             11 => &V11_TABLES,
             12 => &V12_TABLES,
+            13 | 14 => &V14_TABLES,
             _ => &TABLES,
         };
         for table in required_tables {
@@ -2629,11 +3128,23 @@ impl Db {
         }
         if version >= SCHEMA_VERSION {
             let columns = columns_of(&candidate, "proxy_user")?;
-            let missing =
-                ["id", "username", "uuid", "enabled", "is_system", "created_at", "note", "updated_at"]
-                    .into_iter()
-                    .filter(|column| !columns.contains(*column))
-                    .collect::<Vec<_>>();
+            let missing = [
+                "id",
+                "username",
+                "uuid",
+                "enabled",
+                "is_system",
+                "created_at",
+                "note",
+                "updated_at",
+                "traffic_limit_bytes",
+                "traffic_reset_day",
+                "expire_at",
+                "last_access_state",
+            ]
+            .into_iter()
+            .filter(|column| !columns.contains(*column))
+            .collect::<Vec<_>>();
             if !missing.is_empty() {
                 refuse!("{NOT_A_BACKUP}：proxy_user 表缺少字段 {}", missing.join("、"));
             }
@@ -2875,14 +3386,29 @@ fn row_to_proxy_user(r: &rusqlite::Row<'_>) -> rusqlite::Result<ProxyUser> {
         note: r.get("note")?,
         updated_at: r.get("updated_at")?,
         proxy_node_ids: Vec::new(),
+        traffic_limit_bytes: r.get("traffic_limit_bytes")?,
+        traffic_reset_day: r.get("traffic_reset_day")?,
+        expire_at: r.get("expire_at")?,
+        uplink_bytes: r.get("uplink_bytes")?,
+        downlink_bytes: r.get("downlink_bytes")?,
+        period_started_at: r.get("period_started_at")?,
+        last_reset_at: r.get("last_reset_at")?,
+        reset_generation: r.get("reset_generation")?,
     })
 }
 
 fn query_proxy_user(conn: &Connection, id: i64) -> Result<Option<ProxyUser>> {
     Ok(conn
         .query_row(
-            "SELECT id, username AS name, uuid, enabled, is_system, created_at, note, updated_at
-             FROM proxy_user WHERE id=?1",
+            "SELECT pu.id, pu.username AS name, pu.uuid, pu.enabled, pu.is_system,
+                    pu.created_at, pu.note, pu.updated_at, pu.traffic_limit_bytes,
+                    pu.traffic_reset_day, pu.expire_at, COALESCE(t.uplink_bytes, 0) AS uplink_bytes,
+                    COALESCE(t.downlink_bytes, 0) AS downlink_bytes,
+                    COALESCE(t.period_started_at, 0) AS period_started_at,
+                    COALESCE(t.last_reset_at, 0) AS last_reset_at,
+                    COALESCE(t.reset_generation, 0) AS reset_generation
+             FROM proxy_user pu LEFT JOIN proxy_user_traffic t ON t.user_id=pu.id
+             WHERE pu.id=?1",
             [id],
             row_to_proxy_user,
         )
@@ -2925,6 +3451,24 @@ fn proxy_server_ids_for_nodes(conn: &Connection, proxy_node_ids: &[i64]) -> Resu
         }
     }
     Ok(server_ids.into_iter().collect())
+}
+
+fn proxy_server_ids_for_user(conn: &Connection, user_id: i64) -> Result<Vec<i64>> {
+    let proxy_node_ids = proxy_user_node_ids(conn, user_id)?;
+    proxy_server_ids_for_nodes(conn, &proxy_node_ids)
+}
+
+fn validate_proxy_user_limits(limits: ProxyUserLimits) -> Result<()> {
+    if limits.traffic_limit_bytes < 0 {
+        refuse!("流量限额不能小于 0");
+    }
+    if !(1..=28).contains(&limits.traffic_reset_day) {
+        refuse!("每月重置日必须在 1 到 28 之间");
+    }
+    if limits.expire_at.is_some_and(|timestamp| crate::hub_time::expiry_timestamp_date(timestamp).is_none()) {
+        refuse!("到期时间戳无效");
+    }
+    Ok(())
 }
 
 fn validate_proxy_user_name_note(name: &str, note: &str) -> Result<()> {
@@ -3047,6 +3591,9 @@ mod tests {
             assert!(crate::proxy_config::is_uuid(&admin.uuid));
             assert!(admin.note.is_empty());
             assert!(admin.proxy_node_ids.is_empty(), "新建 admin 不应自动获得节点授权");
+            assert_eq!(admin.traffic_limit_bytes, 0, "admin 默认不限量");
+            assert_eq!(admin.traffic_reset_day, 1);
+            assert_eq!(admin.expire_at, None);
         }
         for _ in 0..2 {
             let db = Db::open(&scratch.0).unwrap();
@@ -3277,6 +3824,217 @@ mod tests {
         assert_eq!(updated.uuid, uuid, "普通资料编辑不允许改变 UUID");
         assert!(db.delete_proxy_user(id).unwrap());
         assert!(db.proxy_user(id).unwrap().is_none());
+    }
+
+    #[test]
+    fn proxy_user_traffic_accumulates_per_server_and_generation_resets_offline_baselines() {
+        let db = db();
+        let servers = ["traffic-a", "traffic-b"]
+            .map(|token| db.create_node(&Node { name: token.into(), ..Default::default() }, token).unwrap());
+        let proxy_nodes = servers
+            .iter()
+            .enumerate()
+            .map(|(index, server)| {
+                db.create_proxy_node(&proxy_node_config(*server, 25_000 + index as u16)).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let (user, _) = db
+            .create_proxy_user_with_limits(
+                "metered",
+                "f15aec0b-10d2-4794-b07a-64c817f6cabe",
+                true,
+                "",
+                &[proxy_nodes[0].id, proxy_nodes[1].id],
+                ProxyUserLimits { traffic_limit_bytes: 250, traffic_reset_day: 5, expire_at: None },
+            )
+            .unwrap();
+        let sample = |user_id, up, down| ProxyUserTrafficSample {
+            user_id,
+            user_key: format!("monitor-user-{user_id}"),
+            uplink_bytes: up,
+            downlink_bytes: down,
+        };
+        let generations_a = db.proxy_user_generations_for_node(servers[0]).unwrap();
+        let generations_b = db.proxy_user_generations_for_node(servers[1]).unwrap();
+        assert!(db
+            .apply_proxy_user_traffic_samples(
+                servers[0],
+                100,
+                &generations_a,
+                &[sample(user.id, 100, 200)],
+                1
+            )
+            .unwrap()
+            .is_empty());
+        assert_eq!(db.proxy_user(user.id).unwrap().unwrap().uplink_bytes, 0, "首次采集只建立 baseline");
+        db.apply_proxy_user_traffic_samples(servers[0], 110, &generations_a, &[sample(user.id, 150, 280)], 2)
+            .unwrap();
+        assert_eq!(db.proxy_user(user.id).unwrap().unwrap().used_bytes(), 130);
+
+        db.apply_proxy_user_traffic_samples(
+            servers[1],
+            10,
+            &generations_b,
+            &[sample(user.id, 1_000, 2_000)],
+            3,
+        )
+        .unwrap();
+        let crossed = db
+            .apply_proxy_user_traffic_samples(
+                servers[1],
+                20,
+                &generations_b,
+                &[sample(user.id, 1_050, 2_100)],
+                4,
+            )
+            .unwrap();
+        assert_eq!(crossed, servers, "额度状态跨线时同步用户授权的所有服务器");
+        let over = db.proxy_user(user.id).unwrap().unwrap();
+        assert_eq!(over.uplink_bytes, 100);
+        assert_eq!(over.downlink_bytes, 180);
+        assert_eq!(
+            crate::proxy_access::effective_proxy_access(
+                true,
+                None,
+                over.traffic_limit_bytes,
+                over.uplink_bytes,
+                over.downlink_bytes,
+                4
+            ),
+            crate::proxy_access::ProxyUserAccessState::TrafficExceeded
+        );
+
+        let response_started_before_reset = db.proxy_user_generations_for_node(servers[1]).unwrap();
+        let (reset, changed_servers) = db.reset_proxy_user_traffic(user.id, 5).unwrap().unwrap();
+        assert_eq!(changed_servers, servers, "超额用户清零后同步以恢复访问");
+        assert_eq!(reset.uplink_bytes + reset.downlink_bytes, 0);
+        assert_eq!(reset.reset_generation, 1);
+        assert_eq!(reset.traffic_reset_day, 5, "手动清零不改变月度重置日");
+
+        db.apply_proxy_user_traffic_samples(
+            servers[1],
+            21,
+            &response_started_before_reset,
+            &[sample(user.id, 1_060, 2_120)],
+            6,
+        )
+        .unwrap();
+        assert_eq!(db.proxy_user(user.id).unwrap().unwrap().used_bytes(), 0, "清零前发出的 RPC 响应被丢弃");
+
+        let generations_after_reset = db.proxy_user_generations_for_node(servers[1]).unwrap();
+        db.apply_proxy_user_traffic_samples(
+            servers[1],
+            22,
+            &generations_after_reset,
+            &[sample(user.id, 1_060, 2_120)],
+            7,
+        )
+        .unwrap();
+        assert_eq!(
+            db.proxy_user(user.id).unwrap().unwrap().used_bytes(),
+            0,
+            "离线 source 下一次上报只重建 baseline"
+        );
+        db.apply_proxy_user_traffic_samples(
+            servers[1],
+            23,
+            &generations_after_reset,
+            &[sample(user.id, 1_070, 2_130)],
+            8,
+        )
+        .unwrap();
+        assert_eq!(db.proxy_user(user.id).unwrap().unwrap().used_bytes(), 20);
+        db.apply_proxy_user_traffic_samples(
+            servers[1],
+            1,
+            &generations_after_reset,
+            &[sample(user.id, 5, 8)],
+            9,
+        )
+        .unwrap();
+        assert_eq!(
+            db.proxy_user(user.id).unwrap().unwrap().used_bytes(),
+            20,
+            "uptime / counter 回退只重建 baseline"
+        );
+    }
+
+    #[test]
+    fn monthly_reset_is_idempotent_and_manual_reset_does_not_move_calendar_day() {
+        let db = db();
+        let user = db
+            .create_proxy_user_with_limits(
+                "monthly",
+                "a0f81cec-73c5-4eb8-a2e2-cd1544946e8e",
+                true,
+                "",
+                &[],
+                ProxyUserLimits { traffic_limit_bytes: 0, traffic_reset_day: 8, expire_at: None },
+            )
+            .unwrap()
+            .0;
+        db.conn()
+            .execute(
+                "UPDATE proxy_user_traffic SET period_started_at=100, uplink_bytes=20, reset_generation=3 WHERE user_id=?1",
+                [user.id],
+            )
+            .unwrap();
+        assert_eq!(db.reset_proxy_user_traffic_for_period(user.id, 200, 250).unwrap(), Some(vec![]));
+        assert_eq!(db.reset_proxy_user_traffic_for_period(user.id, 200, 251).unwrap(), None);
+        let monthly = db.proxy_user(user.id).unwrap().unwrap();
+        assert_eq!(monthly.period_started_at, 200);
+        assert_eq!(monthly.traffic_reset_day, 8);
+        assert_eq!(monthly.reset_generation, 4);
+        assert_eq!(monthly.uplink_bytes, 0);
+
+        db.reset_proxy_user_traffic(user.id, 300).unwrap();
+        assert_eq!(db.reset_proxy_user_traffic_for_period(user.id, 200, 301).unwrap(), None);
+        assert_eq!(db.reset_proxy_user_traffic_for_period(user.id, 400, 401).unwrap(), Some(vec![]));
+        let next_month = db.proxy_user(user.id).unwrap().unwrap();
+        assert_eq!(next_month.traffic_reset_day, 8);
+        assert_eq!(next_month.period_started_at, 400);
+    }
+
+    #[test]
+    fn v14_migration_preserves_legacy_quota_and_expiry_without_guessing_quota_units() {
+        let scratch = Scratch::new();
+        let user_id;
+        {
+            let db = Db::open(&scratch.0).unwrap();
+            user_id = db
+                .create_proxy_user_with_nodes("legacy", "a0f81cec-73c5-4eb8-a2e2-cd1544946e8e", true, "", &[])
+                .unwrap()
+                .0
+                .id;
+            db.conn()
+                .execute("UPDATE proxy_user SET quota=8192, expire_at=123456 WHERE id=?1", [user_id])
+                .unwrap();
+        }
+        let old = Connection::open(&scratch.0).unwrap();
+        old.execute_batch(
+            "DROP TABLE proxy_user_traffic_source;
+             DROP TABLE proxy_user_traffic;
+             ALTER TABLE proxy_user DROP COLUMN last_access_state;
+             ALTER TABLE proxy_user DROP COLUMN traffic_reset_day;
+             ALTER TABLE proxy_user DROP COLUMN traffic_limit_bytes;
+             PRAGMA user_version = 14;",
+        )
+        .unwrap();
+        drop(old);
+
+        let db = Db::open(&scratch.0).unwrap();
+        let migrated = db.proxy_user(user_id).unwrap().unwrap();
+        assert_eq!(migrated.traffic_limit_bytes, 0, "未知单位的旧 quota 不转换");
+        assert_eq!(migrated.traffic_reset_day, 1);
+        assert_eq!(migrated.expire_at, Some(123456), "旧 expiry 原值保留");
+        assert_eq!(migrated.reset_generation, 0);
+        assert_eq!(
+            db.conn()
+                .query_row("SELECT quota FROM proxy_user WHERE id=?1", [user_id], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            8192
+        );
+        assert_eq!(db.conn().query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 15);
     }
 
     #[test]
@@ -4552,7 +5310,7 @@ mod tests {
         let upgraded = dump(&db.conn());
         assert_eq!(
             upgraded.len(),
-            LEGACY_TABLES.len() + 1,
+            LEGACY_TABLES.len() + 2,
             "every existing row survives, plus the default admin: {upgraded:#?}"
         );
 

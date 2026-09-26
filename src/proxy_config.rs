@@ -83,7 +83,7 @@ pub fn generate_singbox_config_excluding(
     generate_singbox_config_excluding_users(node_id, current_config, nodes, &[], additionally_excluded_tags)
 }
 
-/// 使用当前服务器上被授权且启用的 ProxyUser 重建托管 inbound。
+/// 使用当前服务器上已授权且实际可访问的 ProxyUser 重建托管 inbound。
 pub fn generate_singbox_config_excluding_users(
     node_id: i64,
     mut current_config: Value,
@@ -158,6 +158,7 @@ fn merge_v2ray_api(
     nodes: &[ProxyNode],
     users: &[ProxyUser],
 ) -> Result<(), ProxyConfigError> {
+    let now = crate::hub_time::now_timestamp();
     let experimental = config.entry("experimental").or_insert_with(|| json!({}));
     let Some(experimental) = experimental.as_object_mut() else {
         return Err(ProxyConfigError::InvalidV2rayApiConfig);
@@ -209,7 +210,8 @@ fn merge_v2ray_api(
         .collect::<BTreeSet<_>>();
     let mut monitor_user_ids = BTreeSet::new();
     for user in users.iter().filter(|user| {
-        user.enabled && user.proxy_node_ids.iter().any(|node_id| enabled_node_ids.contains(node_id))
+        is_effectively_enabled(user, now)
+            && user.proxy_node_ids.iter().any(|node_id| enabled_node_ids.contains(node_id))
     }) {
         if user.id <= 0 {
             return Err(ProxyConfigError::InvalidProxyUserId);
@@ -242,9 +244,10 @@ fn generate_inbound(node: &ProxyNode, users: &[ProxyUser]) -> Result<Value, Prox
     let mut inbound_users = Vec::new();
     let mut seen_user_ids = BTreeSet::new();
     let mut seen_user_uuids = BTreeSet::new();
+    let now = crate::hub_time::now_timestamp();
     let mut assigned_users = users
         .iter()
-        .filter(|user| user.enabled && user.proxy_node_ids.contains(&node.id))
+        .filter(|user| is_effectively_enabled(user, now) && user.proxy_node_ids.contains(&node.id))
         .collect::<Vec<_>>();
     assigned_users.sort_unstable_by_key(|user| user.id);
     for user in assigned_users {
@@ -285,6 +288,17 @@ fn generate_inbound(node: &ProxyNode, users: &[ProxyUser]) -> Result<Value, Prox
             }
         }
     }))
+}
+
+fn is_effectively_enabled(user: &ProxyUser, now: i64) -> bool {
+    crate::proxy_access::effective_proxy_access(
+        user.enabled,
+        user.expire_at,
+        user.traffic_limit_bytes,
+        user.uplink_bytes,
+        user.downlink_bytes,
+        now,
+    ) == crate::proxy_access::ProxyUserAccessState::Enabled
 }
 
 pub(crate) fn is_uuid(value: &str) -> bool {
@@ -405,6 +419,14 @@ mod tests {
             note: String::new(),
             updated_at: 1,
             proxy_node_ids: proxy_node_ids.to_vec(),
+            traffic_limit_bytes: 0,
+            traffic_reset_day: 1,
+            expire_at: None,
+            uplink_bytes: 0,
+            downlink_bytes: 0,
+            period_started_at: 1,
+            last_reset_at: 1,
+            reset_generation: 0,
         }
     }
 
@@ -559,6 +581,31 @@ mod tests {
             generated["experimental"]["v2ray_api"]["stats"]["users"],
             json!(["monitor-user-2", "monitor-user-3", "monitor-user-5"])
         );
+    }
+
+    #[test]
+    fn expired_and_quota_exceeded_users_are_omitted_from_inbounds_and_stats() {
+        let node = proxy_node(10, 1, true);
+        let now = crate::hub_time::now_timestamp();
+        let mut expired = proxy_user(1, "a0f81cec-73c5-4eb8-a2e2-cd1544946e8e", true, &[node.id]);
+        expired.expire_at = Some(now - 1);
+        let mut exceeded = proxy_user(2, "f15aec0b-10d2-4794-b07a-64c817f6cabe", true, &[node.id]);
+        exceeded.traffic_limit_bytes = 100;
+        exceeded.uplink_bytes = 40;
+        exceeded.downlink_bytes = 60;
+        let enabled = proxy_user(3, "ea9b23b8-ff74-47a7-b8af-88e961e49cb5", true, &[node.id]);
+
+        let generated = generate_singbox_config_excluding_users(
+            1,
+            empty_config(),
+            &[node],
+            &[expired, exceeded, enabled],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(generated["inbounds"][0]["users"].as_array().unwrap().len(), 1);
+        assert_eq!(generated["inbounds"][0]["users"][0]["name"], "monitor-user-3");
+        assert_eq!(generated["experimental"]["v2ray_api"]["stats"]["users"], json!(["monitor-user-3"]));
     }
 
     #[test]

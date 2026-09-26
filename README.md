@@ -30,3 +30,9 @@ curl -fsSL https://github.com/lzj565/monitor/releases/latest/download/install-hu
 ```
 agent (Linux)  ──WebSocket / JSON-RPC 2.0──▶  hub (axum + SQLite)  ──▶  后台 + 状态页
 ```
+
+## 代理用户流量
+
+Hub 每 10 秒通过 Agent 的 `singbox.stats.users` 只读采集用户 counter，按用户和服务器分别保存 baseline，再将上传与下载增量汇总为当前周期用量。额度以 bytes 保存，`traffic_limit_bytes = 0` 表示不限量；每月重置日为 1 到 28 日，按 Hub 系统时区的本地零点切换周期。到期日期在所选日期全天有效，并于次日 Hub 本地零点过期。
+
+管理员可调用 `POST /api/proxy/users/{id}/traffic/reset` 清空 Hub 的累计量。此操作递增 `reset_generation`，各服务器下一次上报时只重建 baseline；不会调用 sing-box StatsService 的 counter reset。旧 `quota` 字段会在迁移中保留，不会在单位未经确认时转换为新额度。

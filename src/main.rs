@@ -30,12 +30,15 @@ mod auth;
 mod command;
 mod db;
 mod frontend;
+mod hub_time;
 mod notify;
+mod proxy_access;
 pub mod proxy_config;
 mod proxy_deploy;
 mod proxy_import;
 mod proxy_provision;
 mod proxy_share;
+mod proxy_traffic;
 mod proxy_user;
 
 use std::collections::HashMap;
@@ -526,6 +529,8 @@ async fn main() -> Result<()> {
     tokio::spawn(housekeeping(app.clone()));
     tokio::spawn(notify::deliver(app.clone(), inbox));
     tokio::spawn(notify::watch(app.clone()));
+    tokio::spawn(proxy_traffic::run_poller(app.clone()));
+    tokio::spawn(proxy_traffic::run_access_maintenance(app.clone()));
 
     let router = Router::new()
         // Read paths; the public page reaches these unauthenticated.
@@ -561,6 +566,7 @@ async fn main() -> Result<()> {
         )
         .route("/api/proxy/users/{id}/regenerate", post(proxy_user::regenerate_proxy_user))
         .route("/api/proxy/users/{id}/sync", post(proxy_user::sync_proxy_user))
+        .route("/api/proxy/users/{id}/traffic/reset", post(proxy_user::reset_proxy_user_traffic))
         .route("/api/proxy/servers/{node_id}/deploy", post(proxy_deploy::deploy))
         .route(
             "/api/proxy/servers/{node_id}/imports",

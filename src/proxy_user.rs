@@ -5,11 +5,12 @@ use axum::extract::{Path, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use serde::{Deserialize, Serialize};
+use chrono::NaiveDate;
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::json;
 
 use crate::api::{self, Admin};
-use crate::db::ProxyUser;
+use crate::db::{ProxyUser, ProxyUserLimits};
 use crate::proxy_deploy;
 use crate::proxy_provision;
 use crate::Shared;
@@ -23,6 +24,12 @@ pub struct CreateProxyUserRequest {
     pub note: String,
     #[serde(default)]
     pub proxy_node_ids: Vec<i64>,
+    #[serde(default)]
+    pub traffic_limit_bytes: Option<i64>,
+    #[serde(default)]
+    pub traffic_reset_day: Option<u8>,
+    #[serde(default, deserialize_with = "deserialize_expire_date")]
+    pub expire_date: Option<Option<String>>,
 }
 
 #[derive(Deserialize)]
@@ -34,6 +41,19 @@ pub struct UpdateProxyUserRequest {
     pub note: String,
     #[serde(default)]
     pub proxy_node_ids: Vec<i64>,
+    #[serde(default)]
+    pub traffic_limit_bytes: Option<i64>,
+    #[serde(default)]
+    pub traffic_reset_day: Option<u8>,
+    #[serde(default, deserialize_with = "deserialize_expire_date")]
+    pub expire_date: Option<Option<String>>,
+}
+
+fn deserialize_expire_date<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Serialize)]
@@ -47,10 +67,24 @@ struct ProxyUserResponse {
     proxy_node_ids: Vec<i64>,
     created_at: i64,
     updated_at: i64,
+    traffic_limit_bytes: i64,
+    traffic_reset_day: u8,
+    expire_at: Option<i64>,
+    expire_date: Option<String>,
+    traffic: ProxyUserTrafficResponse,
+    access_state: crate::proxy_access::ProxyUserAccessState,
 }
 
-impl From<ProxyUser> for ProxyUserResponse {
-    fn from(user: ProxyUser) -> Self {
+#[derive(Serialize)]
+struct ProxyUserTrafficResponse {
+    uplink_bytes: i64,
+    downlink_bytes: i64,
+    used_bytes: i64,
+}
+
+impl ProxyUserResponse {
+    fn from_user(user: ProxyUser, now: i64) -> Self {
+        let used_bytes = user.used_bytes();
         Self {
             id: user.id,
             name: user.name,
@@ -61,16 +95,42 @@ impl From<ProxyUser> for ProxyUserResponse {
             proxy_node_ids: user.proxy_node_ids,
             created_at: user.created_at,
             updated_at: user.updated_at,
+            traffic_limit_bytes: user.traffic_limit_bytes,
+            traffic_reset_day: user.traffic_reset_day,
+            expire_at: user.expire_at,
+            expire_date: user.expire_at.and_then(crate::hub_time::expiry_timestamp_date),
+            traffic: ProxyUserTrafficResponse {
+                uplink_bytes: user.uplink_bytes,
+                downlink_bytes: user.downlink_bytes,
+                used_bytes,
+            },
+            access_state: crate::proxy_access::effective_proxy_access(
+                user.enabled,
+                user.expire_at,
+                user.traffic_limit_bytes,
+                user.uplink_bytes,
+                user.downlink_bytes,
+                now,
+            ),
         }
     }
 }
 
+fn parse_expire_date(value: Option<&str>) -> Result<Option<i64>, &'static str> {
+    value
+        .map(|value| {
+            let date = NaiveDate::parse_from_str(value, "%Y-%m-%d").map_err(|_| "到期日期格式无效")?;
+            crate::hub_time::expiry_date_timestamp(date).map_err(|_| "到期日期超出可用范围")
+        })
+        .transpose()
+}
+
 pub async fn list_proxy_users(_: Admin, State(app): State<Shared>) -> Response {
     match app.db.proxy_users() {
-        Ok(users) => no_store(
-            Json(json!({ "users": users.into_iter().map(ProxyUserResponse::from).collect::<Vec<_>>() }))
-                .into_response(),
-        ),
+        Ok(users) => {
+            let now = crate::hub_time::now_timestamp();
+            no_store(Json(json!({ "users": users.into_iter().map(|user| ProxyUserResponse::from_user(user, now)).collect::<Vec<_>>() })).into_response())
+        }
         Err(error) => no_store(api::fail(error)),
     }
 }
@@ -83,21 +143,33 @@ pub async fn create_proxy_user(
     let Ok(Json(request)) = body else {
         return no_store(api::answer(StatusCode::BAD_REQUEST, "用户请求格式不正确"));
     };
+    let traffic_limit_bytes = request.traffic_limit_bytes.unwrap_or(0);
+    let traffic_reset_day = request.traffic_reset_day.unwrap_or(1);
+    let expire_date = request.expire_date.unwrap_or(None);
+    let expire_at = match parse_expire_date(expire_date.as_deref()) {
+        Ok(expire_at) => expire_at,
+        Err(message) => return no_store(api::answer(StatusCode::BAD_REQUEST, message)),
+    };
+    if traffic_limit_bytes < 0 || !(1..=28).contains(&traffic_reset_day) {
+        return no_store(api::answer(StatusCode::BAD_REQUEST, "流量限额或每月重置日无效"));
+    }
     let uuid = proxy_provision::uuid_v4();
-    match app.db.create_proxy_user_with_nodes(
+    match app.db.create_proxy_user_with_limits(
         &request.name,
         &uuid,
         request.enabled,
         &request.note,
         &request.proxy_node_ids,
+        ProxyUserLimits { traffic_limit_bytes, traffic_reset_day, expire_at },
     ) {
         Ok((user, server_ids)) => {
             let failures = proxy_deploy::deploy_proxy_user_servers(&app, &server_ids).await;
+            let response_user = ProxyUserResponse::from_user(user, crate::hub_time::now_timestamp());
             no_store(
                 (
                     StatusCode::CREATED,
                     Json(json!({
-                        "user": ProxyUserResponse::from(user),
+                        "user": response_user,
                         "failed_servers": failures
                     })),
                 )
@@ -130,19 +202,30 @@ pub async fn update_proxy_user(
     if current.is_system && request.name.trim() != current.name {
         return no_store(api::answer(StatusCode::CONFLICT, "系统代理用户名称不能修改"));
     }
-    match app.db.update_proxy_user_profile(
+    let traffic_limit_bytes = request.traffic_limit_bytes.unwrap_or(current.traffic_limit_bytes);
+    let traffic_reset_day = request.traffic_reset_day.unwrap_or(current.traffic_reset_day);
+    let expire_at = match request.expire_date {
+        Some(expire_date) => match parse_expire_date(expire_date.as_deref()) {
+            Ok(expire_at) => expire_at,
+            Err(message) => return no_store(api::answer(StatusCode::BAD_REQUEST, message)),
+        },
+        None => current.expire_at,
+    };
+    if traffic_limit_bytes < 0 || !(1..=28).contains(&traffic_reset_day) {
+        return no_store(api::answer(StatusCode::BAD_REQUEST, "流量限额或每月重置日无效"));
+    }
+    match app.db.update_proxy_user_settings(
         id,
         &request.name,
         request.enabled,
         &request.note,
         &request.proxy_node_ids,
+        ProxyUserLimits { traffic_limit_bytes, traffic_reset_day, expire_at },
     ) {
         Ok(Some((user, server_ids))) => {
             let failures = proxy_deploy::deploy_proxy_user_servers(&app, &server_ids).await;
-            no_store(
-                Json(json!({ "user": ProxyUserResponse::from(user), "failed_servers": failures }))
-                    .into_response(),
-            )
+            let response_user = ProxyUserResponse::from_user(user, crate::hub_time::now_timestamp());
+            no_store(Json(json!({ "user": response_user, "failed_servers": failures })).into_response())
         }
         Ok(None) => no_store(api::answer(StatusCode::NOT_FOUND, "代理用户不存在")),
         Err(error) => no_store(api::fail(error)),
@@ -158,10 +241,8 @@ pub async fn regenerate_proxy_user(_: Admin, State(app): State<Shared>, Path(id)
     match app.db.regenerate_proxy_user_uuid(id, &proxy_provision::uuid_v4()) {
         Ok(Some((user, server_ids))) => {
             let failures = proxy_deploy::deploy_proxy_user_servers(&app, &server_ids).await;
-            no_store(
-                Json(json!({ "user": ProxyUserResponse::from(user), "failed_servers": failures }))
-                    .into_response(),
-            )
+            let response_user = ProxyUserResponse::from_user(user, crate::hub_time::now_timestamp());
+            no_store(Json(json!({ "user": response_user, "failed_servers": failures })).into_response())
         }
         Ok(None) => no_store(api::answer(StatusCode::NOT_FOUND, "代理用户不存在")),
         Err(error) => no_store(api::fail(error)),
@@ -184,9 +265,25 @@ pub async fn sync_proxy_user(_: Admin, State(app): State<Shared>, Path(id): Path
         Err(error) => return no_store(api::fail(error)),
     };
     let failures = proxy_deploy::deploy_proxy_user_servers(&app, &server_ids).await;
-    no_store(
-        Json(json!({ "user": ProxyUserResponse::from(user), "failed_servers": failures })).into_response(),
-    )
+    let response_user = ProxyUserResponse::from_user(user, crate::hub_time::now_timestamp());
+    no_store(Json(json!({ "user": response_user, "failed_servers": failures })).into_response())
+}
+
+pub async fn reset_proxy_user_traffic(_: Admin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
+    if id <= 0 {
+        return no_store(api::answer(StatusCode::BAD_REQUEST, "代理用户 ID 无效"));
+    }
+    let lock = app.proxy_user_lock(id);
+    let _operation = lock.lock().await;
+    match app.db.reset_proxy_user_traffic(id, crate::hub_time::now_timestamp()) {
+        Ok(Some((user, server_ids))) => {
+            let failures = proxy_deploy::deploy_proxy_user_servers(&app, &server_ids).await;
+            let response_user = ProxyUserResponse::from_user(user, crate::hub_time::now_timestamp());
+            no_store(Json(json!({ "user": response_user, "failed_servers": failures })).into_response())
+        }
+        Ok(None) => no_store(api::answer(StatusCode::NOT_FOUND, "代理用户不存在")),
+        Err(error) => no_store(api::fail(error)),
+    }
 }
 
 pub async fn delete_proxy_user(_: Admin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
@@ -220,7 +317,7 @@ pub async fn delete_proxy_user(_: Admin, State(app): State<Shared>, Path(id): Pa
         return no_store(
             Json(json!({
                 "deleted": false,
-                "user": ProxyUserResponse::from(disabled),
+                "user": ProxyUserResponse::from_user(disabled, crate::hub_time::now_timestamp()),
                 "failed_servers": failures
             }))
             .into_response(),
@@ -270,6 +367,9 @@ mod tests {
                 enabled: true,
                 note: "first note".into(),
                 proxy_node_ids: Vec::new(),
+                traffic_limit_bytes: Some(0),
+                traffic_reset_day: Some(1),
+                expire_date: Some(None),
             })),
         )
         .await;
@@ -285,7 +385,11 @@ mod tests {
         assert_eq!(user["note"], "first note");
         assert_eq!(user["proxy_node_ids"], json!([]));
         assert!(user.get("quota").is_none());
-        assert!(user.get("expire_at").is_none());
+        assert_eq!(user["traffic_limit_bytes"], 0);
+        assert_eq!(user["traffic_reset_day"], 1);
+        assert_eq!(user["expire_at"], serde_json::Value::Null);
+        assert_eq!(user["expire_date"], serde_json::Value::Null);
+        assert_eq!(user["traffic"]["used_bytes"], 0);
 
         let updated = update_proxy_user(
             Admin,
@@ -296,6 +400,9 @@ mod tests {
                 enabled: false,
                 note: "paused".into(),
                 proxy_node_ids: Vec::new(),
+                traffic_limit_bytes: Some(0),
+                traffic_reset_day: Some(1),
+                expire_date: Some(None),
             })),
         )
         .await;
@@ -349,6 +456,9 @@ mod tests {
                 enabled: true,
                 note: String::new(),
                 proxy_node_ids: Vec::new(),
+                traffic_limit_bytes: None,
+                traffic_reset_day: None,
+                expire_date: None,
             })),
         )
         .await;
@@ -364,6 +474,9 @@ mod tests {
                 enabled: false,
                 note: "paused by operator".into(),
                 proxy_node_ids: Vec::new(),
+                traffic_limit_bytes: None,
+                traffic_reset_day: None,
+                expire_date: None,
             })),
         )
         .await;
@@ -382,6 +495,68 @@ mod tests {
         assert_eq!(app.db.proxy_user(id).unwrap().unwrap().uuid, regenerated["uuid"]);
     }
 
+    #[tokio::test]
+    async fn quota_and_expiry_inputs_round_trip_as_bytes_and_hub_date() {
+        let app = app();
+        let request = CreateProxyUserRequest {
+            name: "metered".into(),
+            enabled: true,
+            note: String::new(),
+            proxy_node_ids: Vec::new(),
+            traffic_limit_bytes: Some(200 * 1024 * 1024 * 1024),
+            traffic_reset_day: Some(28),
+            expire_date: Some(Some("2099-10-25".into())),
+        };
+        let response = create_proxy_user(Admin, State(app.clone()), Ok(Json(request))).await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let user_json = response_json(response).await["user"].clone();
+        assert_eq!(user_json["traffic_limit_bytes"], 200_i64 * 1024 * 1024 * 1024);
+        assert_eq!(user_json["traffic_reset_day"], 28);
+        assert_eq!(user_json["expire_date"], "2099-10-25");
+        assert_eq!(user_json["access_state"], "enabled");
+        let id = user_json["id"].as_i64().unwrap();
+        assert_eq!(
+            app.db.proxy_user(id).unwrap().unwrap().expire_at,
+            crate::hub_time::expiry_date_timestamp(NaiveDate::from_ymd_opt(2099, 10, 25).unwrap()).ok()
+        );
+
+        let invalid = update_proxy_user(
+            Admin,
+            State(app.clone()),
+            Path(id),
+            Ok(Json(UpdateProxyUserRequest {
+                name: "metered".into(),
+                enabled: true,
+                note: String::new(),
+                proxy_node_ids: Vec::new(),
+                traffic_limit_bytes: Some(0),
+                traffic_reset_day: Some(29),
+                expire_date: None,
+            })),
+        )
+        .await;
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        let still_set = app.db.proxy_user(id).unwrap().unwrap();
+        assert_eq!(still_set.traffic_limit_bytes, 200 * 1024 * 1024 * 1024);
+        assert_eq!(still_set.traffic_reset_day, 28);
+        assert!(still_set.expire_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn traffic_reset_endpoint_clears_system_users_and_returns_not_found_for_missing_users() {
+        let app = app();
+        let admin = app.db.proxy_users().unwrap().into_iter().find(|user| user.is_system).unwrap();
+        let before = app.db.proxy_user(admin.id).unwrap().unwrap().reset_generation;
+        let response = reset_proxy_user_traffic(Admin, State(app.clone()), Path(admin.id)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+        assert_eq!(payload["user"]["traffic"]["used_bytes"], 0);
+        assert_eq!(app.db.proxy_user(admin.id).unwrap().unwrap().reset_generation, before + 1);
+
+        let missing = reset_proxy_user_traffic(Admin, State(app), Path(i64::MAX)).await;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    }
+
     #[test]
     fn create_proxy_user_request_does_not_accept_system_identity() {
         let parsed = serde_json::from_value::<CreateProxyUserRequest>(json!({
@@ -397,5 +572,20 @@ mod tests {
             "is_system": false
         }));
         assert!(parsed.is_err());
+
+        let legacy = serde_json::from_value::<UpdateProxyUserRequest>(json!({
+            "name": "admin",
+            "enabled": true
+        }))
+        .unwrap();
+        assert_eq!(legacy.traffic_limit_bytes, None, "旧客户端缺省字段不会意外重置现有配置");
+        assert_eq!(legacy.expire_date, None);
+        let clear_expiry = serde_json::from_value::<UpdateProxyUserRequest>(json!({
+            "name": "admin",
+            "enabled": true,
+            "expire_date": null
+        }))
+        .unwrap();
+        assert_eq!(clear_expiry.expire_date, Some(None), "显式 null 表示清除到期日");
     }
 }

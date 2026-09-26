@@ -5,10 +5,10 @@ import { createElement } from "react"
 import { renderToStaticMarkup } from "react-dom/server"
 import { QRCodeSVG } from "qrcode.react"
 import { createProxyNode, createProxyNodeOperationGuard, deleteConfirmation, fetchProxyNodeShare, proxyNodeCreatePayload, regenerateAndDeployProxyNode, regenerateConfirmation, removeProxyNode, updateAndDeployProxyNode, proxyNodeUpdatePayload, type ProxyNodeActionApi, type ProxyNodeUpdatePayload } from "./proxy-node-actions.ts"
-import { createProxyUserOperationGuard, deleteProxyUser, proxyUserDeleteConfirmation, proxyUserRegenerateConfirmation, regenerateProxyUser, saveProxyUser, syncProxyUser, type ProxyUserActionApi } from "./proxy-user-actions.ts"
+import { createProxyUserOperationGuard, deleteProxyUser, proxyUserDeleteConfirmation, proxyUserRegenerateConfirmation, regenerateProxyUser, resetProxyUserTraffic, saveProxyUser, syncProxyUser, type ProxyUserActionApi } from "./proxy-user-actions.ts"
 import { importProxyNodeInbound, scanProxyNodeImports, type ProxyNodeImportApi, type ProxyNodeImportRequest, type ProxyNodeImportScan } from "./proxy-node-imports.ts"
 import { bytes } from "./format.ts"
-import { PROXY_USER_TABLE_COLUMNS, proxyUserCountText, proxyUserListState, proxyUserRowView } from "./proxy-user-view.ts"
+import { expiryDateLabel, formatBytes, limitBytesFromGb, limitGbInput, PROXY_USER_TABLE_COLUMNS, proxyUserCountText, proxyUserListState, proxyUserRowView, trafficPercent } from "./proxy-user-view.ts"
 import { badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, loopbackOrigin, outdatedAgents, provisioningSite, provisionRefusal, trafficCorrection } from "./api.ts"
 
 assert.deepEqual(changes({ public: true, price: 5 }, { price: 20 }), { price: 20 })
@@ -239,20 +239,22 @@ const proxyUser = {
   proxy_node_ids: [7, 8],
   created_at: 1_800_000_000,
   updated_at: 1_800_000_000,
+  traffic_limit_bytes: 200 * 1024 ** 3,
+  traffic_reset_day: 1,
+  expire_at: null,
+  expire_date: null,
+  traffic: { uplink_bytes: 120, downlink_bytes: 880, used_bytes: 1000 },
+  access_state: "enabled" as const,
 }
-assert.deepEqual(PROXY_USER_TABLE_COLUMNS.map(({ label }) => label), ["ID", "用户名", "流量使用情况", "账户状态", "专属订阅链接", "操作"])
-assert.equal(PROXY_USER_TABLE_COLUMNS.some(({ label }) => /UUID|设备限制|到期时间/.test(label)), false)
+assert.deepEqual(PROXY_USER_TABLE_COLUMNS.map(({ label }) => label), ["ID", "用户名", "流量使用情况", "到期时间", "账户状态", "操作"])
+assert.equal(PROXY_USER_TABLE_COLUMNS.some(({ label }) => /设备限制/.test(label)), false)
+assert.equal(PROXY_USER_TABLE_COLUMNS.some(({ label }) => /UUID/.test(label)), false)
 const adminView = proxyUserRowView({ id: 1, is_system: true })
 assert.equal(adminView.systemLabel, "系统")
 assert.deepEqual(adminView.actions, ["edit"], "系统用户不能显示删除操作")
 const ordinaryView = proxyUserRowView({ id: proxyUser.id, is_system: false })
 assert.deepEqual(ordinaryView.actions, ["edit", "delete"])
-assert.equal(ordinaryView.traffic, "--", "Hub 暂无用户累计流量 API 时不显示伪造数据")
-assert.equal(ordinaryView.trafficClearDisabled, true)
-assert.equal(ordinaryView.trafficTooltip, "流量统计接入后可用")
 assert.ok(PROXY_USER_TABLE_COLUMNS.find(({ key }) => key === "traffic"), "清空入口归属流量列")
-assert.equal(ordinaryView.subscription, "尚未支持")
-assert.equal(ordinaryView.subscriptionActionsDisabled, true)
 assert.equal("uuid" in ordinaryView, false, "主表展示模型不暴露 UUID")
 assert.equal(proxyUserCountText(2, false), "当前用户：2 户")
 assert.equal(proxyUserCountText(0, true), "正在加载用户…")
@@ -263,20 +265,42 @@ assert.equal(bytes(0), "0 B")
 assert.equal(bytes(1024), "1 KB")
 assert.equal(bytes(1_048_576), "1 MB")
 assert.equal(bytes(1_073_741_824), "1 GB")
+assert.equal(formatBytes(0), "0 B")
+assert.equal(formatBytes(1024), "1 KB")
+assert.equal(formatBytes(1_048_576), "1 MB")
+assert.equal(formatBytes(1_073_741_824), "1 GB")
+assert.equal(formatBytes(1_342_177), "1.28 MB")
+assert.equal(limitBytesFromGb("200"), 200 * 1024 ** 3)
+assert.equal(limitBytesFromGb("-1"), null)
+assert.equal(limitBytesFromGb("not a number"), null)
+assert.equal(limitGbInput(200 * 1024 ** 3), "200")
+assert.equal(limitGbInput(1), "0.000000001")
+assert.equal(limitBytesFromGb(limitGbInput(1)), 1)
+assert.equal(trafficPercent(82, 200), 41)
+assert.equal(trafficPercent(300, 200), 100)
+assert.equal(trafficPercent(12, 0), 0)
+assert.equal(expiryDateLabel(null), "永久有效")
+assert.equal(expiryDateLabel("2026-10-25"), "2026/10/25")
 const proxyUserManagerSource = readFileSync(new URL("../components/ProxyUserManager.tsx", import.meta.url), "utf8")
-const trafficCell = proxyUserManagerSource.match(/<TableCell>[\s\S]*?row\.traffic[\s\S]*?RotateCcw[\s\S]*?<\/TableCell>/)?.[0] ?? ""
+const trafficCell = proxyUserManagerSource.match(/<TableCell>[\s\S]*?user\.traffic\.used_bytes[\s\S]*?RotateCcw[\s\S]*?<\/TableCell>/)?.[0] ?? ""
 assert.ok(trafficCell, "清空入口位于流量使用情况单元格")
-assert.match(trafficCell, /disabled={row\.trafficClearDisabled}/, "没有清零 API 时清空按钮禁用")
+assert.match(trafficCell, /setConfirm\(\{ kind: "traffic", user \}\)/, "清零前进入二次确认")
+assert.match(proxyUserManagerSource, /<AlertDialogCancel[^>]*>取消<\/AlertDialogCancel>/, "取消操作不绑定流量 API")
 assert.match(proxyUserManagerSource, /<Skeleton/, "加载时显示表格骨架")
 assert.match(proxyUserManagerSource, /暂无用户/, "空列表有空状态")
 assert.match(proxyUserManagerSource, /用户 UUID[\s\S]*dialogUser\.uuid[\s\S]*重新生成/, "UUID 复制与重生成仍在编辑弹窗")
-assert.doesNotMatch(proxyUserManagerSource, /traffic\/reset|resetProxyUserTraffic|singbox\.stats\.users/, "清空占位不会调用 Agent counter reset")
-assert.doesNotMatch(proxyUserManagerSource, /traffic_limit|device_limit|expire_at/, "主页面不引入额度、设备限制或到期字段")
+assert.match(proxyUserManagerSource, /resetProxyUserTraffic\(api, target\.user\.id\)/, "只在确认处理分支请求清零 API")
+assert.match(proxyUserManagerSource, /traffic_limit_gb[\s\S]*traffic_reset_day[\s\S]*expire_date/, "编辑表单含额度、重置日与到期日期")
+assert.match(proxyUserManagerSource, /length: 28/, "重置日选项仅包含 1 到 28")
+assert.doesNotMatch(proxyUserManagerSource, /device_limit|subscription|订阅链接/, "未引入设备限制或伪造订阅")
 const proxyUserInput = {
   name: proxyUser.name,
   enabled: false,
   note: proxyUser.note,
   proxy_node_ids: proxyUser.proxy_node_ids,
+  traffic_limit_bytes: proxyUser.traffic_limit_bytes,
+  traffic_reset_day: proxyUser.traffic_reset_day,
+  expire_date: proxyUser.expire_date,
 }
 const proxyUserCalls: { path: string; init?: RequestInit }[] = []
 const proxyUserRequest: ProxyUserActionApi = async <T>(path: string, init?: RequestInit): Promise<T> => {
@@ -312,6 +336,9 @@ assert.match(proxyUserDeleteConfirmation("Alice").description, /全部服务器�
 proxyUserCalls.length = 0
 await syncProxyUser(proxyUserRequest, proxyUser.id)
 assert.deepEqual(proxyUserCalls.map(({ path, init }) => [path, init?.method]), [["/proxy/users/12/sync", "POST"]])
+proxyUserCalls.length = 0
+await resetProxyUserTraffic(proxyUserRequest, proxyUser.id)
+assert.deepEqual(proxyUserCalls.map(({ path, init }) => [path, init?.method]), [["/proxy/users/12/traffic/reset", "POST"]])
 const retainedUser: ProxyUserActionApi = async <T>(path: string, init?: RequestInit): Promise<T> => {
   proxyUserCalls.push({ path, init })
   return { deleted: false, user: { ...proxyUser, enabled: false }, failed_servers: [{ server_id: 3, server_name: "HK", error: "agent offline" }] } as T

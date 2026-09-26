@@ -129,6 +129,13 @@ export type ProxyUser = {
   proxy_node_ids: number[]
   created_at: number
   updated_at: number
+  traffic_limit_bytes: number
+  traffic_reset_day: number
+  expire_at: number | null
+  /** Hub 已按本地时区还原为用户选择的日期，避免浏览器再推导到期日。 */
+  expire_date: string | null
+  traffic: { uplink_bytes: number; downlink_bytes: number; used_bytes: number }
+  access_state: "enabled" | "admin_disabled" | "expired" | "traffic_exceeded"
 }
 
 /** Every group in use, in the order of the first node carrying it: the node order decides the group order. */

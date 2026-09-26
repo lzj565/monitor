@@ -30,6 +30,7 @@ const SINGBOX_STATUS_METHOD: &str = "singbox.status";
 const SINGBOX_CONFIG_GET_METHOD: &str = "singbox.config.get";
 const SINGBOX_CONFIG_CHECK_METHOD: &str = "singbox.config.check";
 const SINGBOX_CONFIG_APPLY_METHOD: &str = "singbox.config.apply";
+pub const SINGBOX_STATS_USERS_METHOD: &str = "singbox.stats.users";
 const SINGBOX_CONTROL_METHODS: [&str; 4] =
     ["singbox.start", "singbox.stop", "singbox.restart", "singbox.reload"];
 const REMOTE_TIMEOUT_CODE: i64 = -32001;
@@ -47,6 +48,7 @@ fn is_config_method(method: &str) -> bool {
 fn is_supported_method(method: &str) -> bool {
     method == AGENT_STATUS_METHOD
         || method == SINGBOX_STATUS_METHOD
+        || method == SINGBOX_STATS_USERS_METHOD
         || is_config_method(method)
         || is_control_method(method)
 }
@@ -447,6 +449,10 @@ pub async fn singbox_status(app: &Shared, node_id: i64) -> Result<Value, ConfigC
     execute_config_command(app, node_id, SINGBOX_STATUS_METHOD, json!({})).await
 }
 
+pub async fn singbox_stats_users(app: &Shared, node_id: i64) -> Result<Value, ConfigCommandError> {
+    execute_config_command(app, node_id, SINGBOX_STATS_USERS_METHOD, json!({})).await
+}
+
 pub async fn singbox_config_check(
     app: &Shared,
     node_id: i64,
@@ -655,6 +661,25 @@ mod tests {
         assert_eq!(result.status, Status::Succeeded);
         assert_eq!(result.result.unwrap()["agent_version"], "1.0");
         assert!(registry.get("id", 8).is_none());
+    }
+
+    #[tokio::test]
+    async fn singbox_user_stats_use_the_correlated_agent_command_without_reset_parameters() {
+        let (app, node_id) = app_node();
+        let (tx, mut rx) = mpsc::channel(2);
+        let mut agent = Agent::new(22, tx);
+        agent.capabilities.insert(SINGBOX_STATS_USERS_METHOD.into());
+        app.agents.write().unwrap().insert(node_id, agent);
+
+        let query_app = app.clone();
+        let query = tokio::spawn(async move { singbox_stats_users(&query_app, node_id).await });
+        let sent: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        assert_eq!(sent["method"], SINGBOX_STATS_USERS_METHOD);
+        assert_eq!(sent["params"], json!({}));
+        let request_id = sent["id"].as_str().unwrap();
+        let report = json!({"uptime_secs": 5, "users": []});
+        assert!(app.commands.complete(request_id, node_id, 22, Ok(report.clone())));
+        assert_eq!(query.await.unwrap().unwrap(), report);
     }
 
     #[test]
