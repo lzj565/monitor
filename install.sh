@@ -963,6 +963,8 @@ User=root
 NoNewPrivileges=yes
 RestrictSUIDSGID=yes
 ProtectSystem=strict
+# 将写白名单限定在 sing-box 配置目录，其余系统路径仍保持只读。
+ReadWritePaths=/etc/sing-box
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
