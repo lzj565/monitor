@@ -1,14 +1,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { Copy, LoaderCircle, Pencil, Plus, RefreshCw, RotateCw, Trash2 } from "lucide-react"
+import { Copy, KeyRound, LoaderCircle, Pencil, Plus, RefreshCw, RotateCcw, RotateCw, Trash2 } from "lucide-react"
 import { toast } from "sonner"
 
+import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { Skeleton } from "@/components/ui/skeleton"
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
 import { api, type Node, type ProxyNode, type ProxyUser } from "@/lib/api"
 import {
   createProxyUserOperationGuard,
@@ -21,6 +24,7 @@ import {
   type ProxyUserInput,
   type ProxyUserResult,
 } from "@/lib/proxy-user-actions"
+import { PROXY_USER_TABLE_COLUMNS, proxyUserCountText, proxyUserListState, proxyUserRowView } from "@/lib/proxy-user-view"
 
 type Confirmation = { kind: "regenerate" | "delete"; user: ProxyUser }
 type FormState = ProxyUserInput
@@ -143,6 +147,17 @@ export function ProxyUserManager({ servers }: { servers: Node[] }) {
     })
   }
 
+  async function resync(user: ProxyUser) {
+    await runUserOperation(user, async () => {
+      try {
+        const result = await syncProxyUser(api, user.id)
+        showSyncResult(result.user, result.failed_servers, "用户配置已重新同步")
+      } catch (cause) {
+        toast.error(`同步用户配置失败：${(cause as Error).message}`)
+      }
+    })
+  }
+
   async function confirmAction() {
     if (!confirm) return
     const target = confirm
@@ -176,17 +191,6 @@ export function ProxyUserManager({ servers }: { servers: Node[] }) {
     })
   }
 
-  async function resync(user: ProxyUser) {
-    await runUserOperation(user, async () => {
-      try {
-        const result = await syncProxyUser(api, user.id)
-        showSyncResult(result.user, result.failed_servers, "用户配置已重新同步")
-      } catch (cause) {
-        toast.error(`同步用户配置失败：${(cause as Error).message}`)
-      }
-    })
-  }
-
   async function copyUuid(uuid: string) {
     try {
       if (!navigator.clipboard?.writeText) throw new Error("当前浏览器不支持剪贴板访问")
@@ -214,43 +218,55 @@ export function ProxyUserManager({ servers }: { servers: Node[] }) {
     return [...groups.entries()].sort(([a], [b]) => (serverById.get(a)?.name ?? "").localeCompare(serverById.get(b)?.name ?? ""))
   }, [proxyNodes, serverById])
   const editBusy = dialogUser != null && busyIds.includes(dialogUser.id)
+  const listState = proxyUserListState(users.length, loading)
 
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="space-y-1">
-          <h1 className="text-lg font-semibold">用户管理</h1>
-          <p className="text-sm text-muted-foreground">管理代理用户及其可访问的代理节点。</p>
+          <h1 className="text-lg font-semibold">用户与订阅管理</h1>
+          <p className="text-sm text-muted-foreground">管理代理用户、专属订阅链接与流量使用情况。</p>
         </div>
         <div className="flex gap-2">
-          <Button variant="outline" onClick={() => { setLoading(true); void load() }} disabled={loading}>
+          <Button size="sm" variant="outline" onClick={() => { setLoading(true); void load() }} disabled={loading}>
             <RefreshCw className={`size-4 ${loading ? "animate-spin" : ""}`} /> 刷新
           </Button>
-          <Button onClick={openCreate}><Plus className="size-4" /> 新建用户</Button>
+          <Button size="sm" onClick={openCreate}><Plus className="size-4" /> 新建用户</Button>
         </div>
       </div>
 
       {loadError && <p role="alert" className="text-sm text-destructive">{loadError}</p>}
-      <Card className="overflow-hidden p-0">
-        {loading && !users.length ? (
-          <div className="flex items-center gap-2 p-6 text-sm text-muted-foreground"><LoaderCircle className="size-4 animate-spin" />正在加载用户…</div>
-        ) : !users.length ? (
-          <div className="p-8 text-center text-sm text-muted-foreground">还没有代理用户。</div>
-        ) : (
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>用户</TableHead>
-                <TableHead>UUID</TableHead>
-                <TableHead>状态</TableHead>
-                <TableHead>代理节点</TableHead>
-                <TableHead>备注</TableHead>
-                <TableHead className="text-right">操作</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {users.map((user) => {
+      <TooltipProvider delayDuration={250}>
+        <Card className="overflow-hidden rounded-xl p-0 shadow-sm">
+          <div className="border-b bg-muted/30 px-5 py-3">
+            <div className="flex items-center gap-3 text-sm">
+              <Badge variant="secondary">代理用户</Badge>
+              <span className="text-muted-foreground">{proxyUserCountText(users.length, listState === "loading")}</span>
+            </div>
+          </div>
+          <div className="overflow-x-auto">
+            <Table className="min-w-[1140px]">
+              <TableHeader className="bg-muted/40">
+                <TableRow className="hover:bg-muted/40">
+                  {PROXY_USER_TABLE_COLUMNS.map((column) => (
+                    <TableHead key={column.key} className={column.className}>{column.label}</TableHead>
+                  ))}
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {listState === "loading" ? Array.from({ length: 3 }, (_, index) => (
+                  <TableRow key={`loading-${index}`} className="h-20">
+                    {PROXY_USER_TABLE_COLUMNS.map((column) => (
+                      <TableCell key={column.key}><Skeleton className="h-4 w-24" /></TableCell>
+                    ))}
+                  </TableRow>
+                )) : listState === "empty" ? (
+                  <TableRow>
+                    <TableCell colSpan={PROXY_USER_TABLE_COLUMNS.length} className="h-28 text-center text-sm text-muted-foreground">暂无用户</TableCell>
+                  </TableRow>
+                ) : users.map((user) => {
                 const busy = busyIds.includes(user.id)
+                const row = proxyUserRowView(user)
                 const nodeIssues = user.proxy_node_ids
                   .map((id) => proxyNodes.find((node) => node.id === id))
                   .filter((node): node is ProxyNode => !!node && node.deploy_status !== "deployed")
@@ -261,17 +277,25 @@ export function ProxyUserManager({ servers }: { servers: Node[] }) {
                 }])).values()]
                 const failures = failedByUser[user.id] ?? inferredFailures
                 return (
-                  <TableRow key={user.id}>
+                  <TableRow key={user.id} className="h-20">
+                    <TableCell className="font-mono text-sm text-muted-foreground">{row.id}</TableCell>
                     <TableCell className="font-medium">
                       {user.name}
-                      {user.is_system && <span className="ml-2 rounded bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">系统</span>}
+                      {row.systemLabel && <Badge variant="secondary" className="ml-2">{row.systemLabel}</Badge>}
                     </TableCell>
                     <TableCell>
-                      <div className="flex items-center gap-1.5 font-mono text-xs">
-                        <span title={user.uuid}>{user.uuid.slice(0, 8)}…{user.uuid.slice(-4)}</span>
-                        <Button size="icon" variant="ghost" className="size-7" title="复制 UUID" onClick={() => void copyUuid(user.uuid)}>
-                          <Copy className="size-3.5" />
-                        </Button>
+                      <div className="flex items-center gap-2">
+                          <span className="font-medium tabular-nums">{row.traffic}</span>
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <span tabIndex={0} className="inline-flex rounded-sm" aria-label={row.trafficTooltip}>
+                                <Button size="sm" variant="ghost" className="h-7 px-2 text-xs" disabled={row.trafficClearDisabled}>
+                                  <RotateCcw className="size-3.5" />清空
+                                </Button>
+                              </span>
+                            </TooltipTrigger>
+                            <TooltipContent>{row.trafficTooltip}</TooltipContent>
+                          </Tooltip>
                       </div>
                     </TableCell>
                     <TableCell>
@@ -281,31 +305,45 @@ export function ProxyUserManager({ servers }: { servers: Node[] }) {
                       </div>
                       {failures.length > 0 && <span className="mt-1 block text-xs text-destructive" title={failures.map((failure) => `${failure.server_name}：${failure.error}`).join("\n")}>服务器配置未同步</span>}
                     </TableCell>
-                    <TableCell className="max-w-64">
-                      <div className="flex flex-wrap gap-1">
-                        {user.proxy_node_ids.length ? user.proxy_node_ids.map((id) => {
-                          const proxyNode = proxyNodes.find((node) => node.id === id)
-                          const serverName = proxyNode ? serverById.get(proxyNode.node_id)?.name ?? `服务器 ${proxyNode.node_id}` : "已删除节点"
-                          return <span key={id} className="rounded bg-muted px-1.5 py-0.5 text-xs" title={`${serverName} · VLESS + Reality · ${proxyNode?.listen_port ?? "-"}`}>{proxyNode?.name ?? `节点 ${id}`}</span>
-                        }) : <span className="text-xs text-muted-foreground">未分配</span>}
+                    <TableCell>
+                      <div className="flex items-center gap-1">
+                        <span className="truncate text-sm text-muted-foreground" title={row.subscription}>{row.subscription}</span>
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <span tabIndex={0} className="inline-flex rounded-sm" aria-label={row.subscriptionTooltip}>
+                              <Button size="icon-sm" variant="ghost" disabled={row.subscriptionActionsDisabled} aria-label="复制订阅链接">
+                                <Copy className="size-3.5" />
+                              </Button>
+                            </span>
+                          </TooltipTrigger>
+                          <TooltipContent>{row.subscriptionTooltip}</TooltipContent>
+                        </Tooltip>
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <span tabIndex={0} className="inline-flex rounded-sm" aria-label={row.subscriptionTooltip}>
+                              <Button size="icon-sm" variant="ghost" disabled={row.subscriptionActionsDisabled} aria-label="管理订阅密钥">
+                                <KeyRound className="size-3.5" />
+                              </Button>
+                            </span>
+                          </TooltipTrigger>
+                          <TooltipContent>{row.subscriptionTooltip}</TooltipContent>
+                        </Tooltip>
                       </div>
                     </TableCell>
-                    <TableCell className="max-w-48 truncate text-sm text-muted-foreground" title={user.note}>{user.note || "-"}</TableCell>
                     <TableCell>
                       <div className="flex justify-end gap-1">
-                        <Button size="sm" variant="ghost" disabled={busy} onClick={() => openEdit(user)}><Pencil className="size-4" />编辑</Button>
-                        <Button size="icon" variant="ghost" disabled={busy} title="重新同步" onClick={() => void resync(user)}><RotateCw className="size-4" /></Button>
-                        <Button size="icon" variant="ghost" disabled={busy} title="重新生成 UUID" onClick={() => setConfirm({ kind: "regenerate", user })}><RefreshCw className="size-4" /></Button>
-                        {!user.is_system && <Button size="icon" variant="ghost" disabled={busy} title="删除用户" onClick={() => setConfirm({ kind: "delete", user })}><Trash2 className="size-4 text-destructive" /></Button>}
+                        {row.actions.includes("edit") && <Button size="sm" variant="ghost" disabled={busy} onClick={() => openEdit(user)}><Pencil className="size-4" />编辑</Button>}
+                        {row.actions.includes("delete") && <Button size="icon-sm" variant="ghost" disabled={busy} title="删除用户" onClick={() => setConfirm({ kind: "delete", user })}><Trash2 className="size-4 text-destructive" /></Button>}
                       </div>
                     </TableCell>
                   </TableRow>
                 )
-              })}
-            </TableBody>
-          </Table>
-        )}
-      </Card>
+                })}
+              </TableBody>
+            </Table>
+          </div>
+        </Card>
+      </TooltipProvider>
 
       <Dialog open={dialogUser !== undefined} onOpenChange={(open) => !open && !saving && setDialogUser(undefined)}>
         <DialogContent className="max-h-[calc(100dvh-64px)] overflow-y-auto sm:max-w-2xl">
@@ -378,6 +416,7 @@ export function ProxyUserManager({ servers }: { servers: Node[] }) {
             </div>
             <DialogFooter>
               <Button type="button" variant="outline" disabled={saving || editBusy} onClick={() => setDialogUser(undefined)}>取消</Button>
+              {dialogUser && <Button type="button" variant="outline" disabled={saving || editBusy} onClick={() => void resync(dialogUser)}><RotateCw className="size-4" />重新同步</Button>}
               <Button type="submit" disabled={saving || editBusy}>
                 {saving && <LoaderCircle className="size-4 animate-spin" />}
                 {dialogUser ? "保存并同步" : "创建并同步"}

@@ -3,9 +3,7 @@ const UNITS = ["B", "KB", "MB", "GB", "TB", "PB"]
 const unitOf = (n: number) => Math.min(Math.floor(Math.log(n) / Math.log(1024)), UNITS.length - 1)
 
 /**
- * 1024-based, as VPS dashboards and `df` report bytes, but labelled MB/GB the way
- * `df -h` and hosting plans write them. Three significant digits by default. Kept
- * in step with the theme's copy of this file.
+ * 按 1024 进位显示字节数；默认最多保留两位小数，并去掉无意义的尾零。
  */
 export function bytes(n: number, digits?: number): string {
   // `< 1` rather than `< 0`: a fraction of a byte puts `unitOf` at -1 and prints
@@ -13,7 +11,8 @@ export function bytes(n: number, digits?: number): string {
   if (!n || n < 1) return "0 B"
   const i = unitOf(n)
   const v = n / 1024 ** i
-  return `${v.toFixed(i === 0 ? 0 : (digits ?? (v >= 100 ? 0 : v >= 10 ? 1 : 2)))} ${UNITS[i]}`
+  const precision = i === 0 ? 0 : (digits ?? (v >= 100 ? 0 : 2))
+  return `${Number(v.toFixed(precision))} ${UNITS[i]}`
 }
 
 export function uptime(seconds: number): string {

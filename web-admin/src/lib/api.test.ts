@@ -263,6 +263,15 @@ assert.equal(bytes(0), "0 B")
 assert.equal(bytes(1024), "1 KB")
 assert.equal(bytes(1_048_576), "1 MB")
 assert.equal(bytes(1_073_741_824), "1 GB")
+const proxyUserManagerSource = readFileSync(new URL("../components/ProxyUserManager.tsx", import.meta.url), "utf8")
+const trafficCell = proxyUserManagerSource.match(/<TableCell>[\s\S]*?row\.traffic[\s\S]*?RotateCcw[\s\S]*?<\/TableCell>/)?.[0] ?? ""
+assert.ok(trafficCell, "清空入口位于流量使用情况单元格")
+assert.match(trafficCell, /disabled={row\.trafficClearDisabled}/, "没有清零 API 时清空按钮禁用")
+assert.match(proxyUserManagerSource, /<Skeleton/, "加载时显示表格骨架")
+assert.match(proxyUserManagerSource, /暂无用户/, "空列表有空状态")
+assert.match(proxyUserManagerSource, /用户 UUID[\s\S]*dialogUser\.uuid[\s\S]*重新生成/, "UUID 复制与重生成仍在编辑弹窗")
+assert.doesNotMatch(proxyUserManagerSource, /traffic\/reset|resetProxyUserTraffic|singbox\.stats\.users/, "清空占位不会调用 Agent counter reset")
+assert.doesNotMatch(proxyUserManagerSource, /traffic_limit|device_limit|expire_at/, "主页面不引入额度、设备限制或到期字段")
 const proxyUserInput = {
   name: proxyUser.name,
   enabled: false,
