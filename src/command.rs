@@ -12,7 +12,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::api::{self, Admin};
 use crate::auth::{random_token, sha256};
@@ -134,6 +134,14 @@ impl Registry {
 
     fn remove(&self, id: &str) {
         self.lock().remove(id);
+    }
+
+    fn pending_method(&self, id: &str, node_id: i64, session: u64) -> Option<String> {
+        let records = self.lock();
+        records.get(id).and_then(|record| {
+            (record.node_id == node_id && record.session == session && record.status == Status::Pending)
+                .then(|| record.method.clone())
+        })
     }
 
     fn purge_expired(&self) {
@@ -351,11 +359,82 @@ pub fn disconnect(app: &App, node_id: i64, session: u64) {
 }
 
 pub fn complete(app: &App, id: &str, node_id: i64, session: u64, result: Result<Value, Value>) -> bool {
+    let method = app.commands.pending_method(id, node_id, session);
+    let observation = method
+        .as_deref()
+        .and_then(|method| result.as_ref().ok().and_then(|value| singbox_observation(method, value)));
     let accepted = app.commands.complete(id, node_id, session, result);
+    if accepted {
+        if let Some(observation) = observation {
+            if let Err(error) = app.db.observe_singbox(
+                node_id,
+                observation.status.as_deref(),
+                observation.version_update.as_ref().map(|version| version.as_deref()),
+                observation.config_hash.as_deref(),
+                observation.config_updated_at,
+                chrono::Utc::now().timestamp(),
+            ) {
+                warn!("node {node_id}: failed to persist sing-box status metadata: {error:#}");
+            }
+        }
+    }
     if !accepted {
         debug!("node {node_id}: ignored unknown, late, or mismatched command response {id}");
     }
     accepted
+}
+
+struct SingboxObservation {
+    status: Option<String>,
+    version_update: Option<Option<String>>,
+    config_hash: Option<String>,
+    config_updated_at: Option<i64>,
+}
+
+fn singbox_observation(method: &str, value: &Value) -> Option<SingboxObservation> {
+    let is_status = method == SINGBOX_STATUS_METHOD || SINGBOX_CONTROL_METHODS.contains(&method);
+    let is_config_get = method == SINGBOX_CONFIG_GET_METHOD;
+    if !is_status && !is_config_get {
+        return None;
+    }
+
+    let status = if is_status {
+        let installed = value.get("installed").and_then(Value::as_bool);
+        let service_exists = value.get("service_exists").and_then(Value::as_bool);
+        let running = value.get("running").and_then(Value::as_bool);
+        let state_known = match value.get("service_state_known").and_then(Value::as_bool) {
+            Some(known) => known,
+            None => service_exists == Some(true) || installed == Some(false),
+        };
+        if !state_known {
+            None
+        } else {
+            match (installed, service_exists, running) {
+                (Some(false), _, _) => Some("not_installed".to_owned()),
+                (Some(true), Some(false), _) => Some("service_missing".to_owned()),
+                (Some(true), Some(true), Some(false)) => Some("stopped".to_owned()),
+                (Some(true), Some(true), Some(true)) => Some("running".to_owned()),
+                _ => None,
+            }
+        }
+    } else {
+        None
+    };
+
+    let version_update =
+        is_status.then(|| value.get("version").map(|version| version.as_str().map(str::to_owned))).flatten();
+    let config_hash = if is_config_get {
+        value.get("content").and_then(Value::as_str).map(sha256)
+    } else {
+        value.get("config_sha256").and_then(Value::as_str).map(str::to_owned)
+    };
+    let config_updated_at = if is_config_get {
+        value.get("modified_at").and_then(Value::as_i64)
+    } else {
+        value.get("config_updated_at").and_then(Value::as_i64)
+    };
+
+    Some(SingboxObservation { status, version_update, config_hash, config_updated_at })
 }
 
 pub fn request_message(id: &str, method: &str, params: Value) -> String {
@@ -405,6 +484,68 @@ mod tests {
         let result = registry.get("id", 7).unwrap();
         assert_eq!(result.status, Status::OutcomeUnknown);
         assert_eq!(result.error.unwrap()["reason"], "disconnected");
+    }
+
+    #[test]
+    fn accepted_singbox_results_persist_only_status_and_config_metadata() {
+        let (app, node_id) = app_node();
+        let hash = "c".repeat(64);
+        app.commands.insert("status-id".into(), node_id, 11, SINGBOX_STATUS_METHOD.into());
+        assert!(complete(
+            &app,
+            "status-id",
+            node_id,
+            11,
+            Ok(json!({
+                "installed": true,
+                "version": "1.12.0",
+                "service_exists": true,
+                "running": true,
+                "service_state_known": true,
+                "config_exists": true,
+                "config_sha256": hash,
+                "config_updated_at": 1234
+            }))
+        ));
+        let instance = app.db.proxy_instances().unwrap().remove(0);
+        assert_eq!(instance.status, "running");
+        assert_eq!(instance.version.as_deref(), Some("1.12.0"));
+        assert_eq!(instance.config_hash.as_deref(), Some(hash.as_str()));
+        assert_eq!(instance.config_version, 1);
+        assert_eq!(instance.config_updated_at, Some(1234));
+    }
+
+    #[test]
+    fn singbox_observation_does_not_mistake_failed_service_queries_for_missing_services() {
+        let value = json!({
+            "installed": true,
+            "version": "1.12.0",
+            "service_exists": false,
+            "running": false,
+            "service_state_known": false
+        });
+        let observation = singbox_observation(SINGBOX_STATUS_METHOD, &value).unwrap();
+        assert_eq!(observation.status, None);
+        assert_eq!(observation.version_update, Some(Some("1.12.0".into())));
+
+        let old_agent = json!({
+            "installed": true,
+            "version": "1.12.0",
+            "service_exists": true,
+            "running": false
+        });
+        assert_eq!(
+            singbox_observation(SINGBOX_STATUS_METHOD, &old_agent).unwrap().status.as_deref(),
+            Some("stopped")
+        );
+
+        let config_get = json!({"content": "{}", "modified_at": 8});
+        let observation = singbox_observation(SINGBOX_CONFIG_GET_METHOD, &config_get).unwrap();
+        assert_eq!(
+            observation.config_hash.as_deref(),
+            Some("44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a")
+        );
+        assert_eq!(observation.config_updated_at, Some(8));
     }
 
     #[test]

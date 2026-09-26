@@ -87,6 +87,19 @@ export type Node = {
 
 export type PingTask = { id: number; name: string; target: string; interval: number; nodes: number[]; auto_join: boolean }
 
+export type ProxyInstance = {
+  id: number
+  node_id: number
+  engine: "singbox" | "xray"
+  version: string | null
+  status: "unknown" | "not_installed" | "service_missing" | "stopped" | "running"
+  config_hash: string | null
+  config_version: number
+  config_updated_at: number | null
+  created_at: number
+  updated_at: number
+}
+
 /** Every group in use, in the order of the first node carrying it: the node order decides the group order. */
 export function groupsOf(nodes: Pick<Node, "group">[]): string[] {
   return [...new Set(nodes.map((n) => n.group ?? "").filter(Boolean))]

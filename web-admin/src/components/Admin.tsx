@@ -13,7 +13,7 @@ import { Popover, PopoverAnchor, PopoverContent } from "@/components/ui/popover"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { api, badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, outdatedAgents, provisioningSite, trafficCorrection, upload, type ConfigField, type IfaceChoice, type Node, type PingTask, type Source } from "@/lib/api"
+import { api, badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, outdatedAgents, provisioningSite, trafficCorrection, upload, type ConfigField, type IfaceChoice, type Node, type PingTask, type ProxyInstance, type Source } from "@/lib/api"
 import { bytes, CYCLES, FOREVER, money, uptime } from "@/lib/format"
 
 // Counters the panel can correct after migration or an accounting error.
@@ -1241,23 +1241,100 @@ type ConfigCommand = {
   error?: { message?: string }
 }
 
-type ProxyConfigResult = {
+type ProxyCommandResult = {
   content?: string
   valid?: boolean
   config_path?: string
   size_bytes?: number
   sha256?: string
   running?: boolean
+  installed?: boolean
+  version?: string | null
+  service_exists?: boolean
+  service_state_known?: boolean
+  config_exists?: boolean
+  config_sha256?: string | null
+  config_updated_at?: number | null
 }
 
 type ProxyCommand = {
   status: "pending" | "succeeded" | "failed" | "outcome_unknown"
-  result?: ProxyConfigResult
+  result?: ProxyCommandResult
   error?: { message?: string }
+}
+
+type ProxyMethod =
+  | "singbox.status"
+  | "singbox.restart"
+  | "singbox.reload"
+  | "singbox.config.get"
+  | "singbox.config.check"
+  | "singbox.config.apply"
+
+async function runProxyCommand(nodeId: number, method: ProxyMethod, params: Record<string, unknown> = {}) {
+  const submitted = await api<{ command_id: string }>("/nodes/" + nodeId + "/commands", {
+    method: "POST",
+    body: JSON.stringify({ method, params }),
+    cache: "no-store",
+  })
+  const timeout = method === "singbox.config.apply"
+    ? 115_000
+    : method === "singbox.config.check"
+      ? 35_000
+      : method === "singbox.restart" || method === "singbox.reload"
+        ? 40_000
+        : 12_000
+  const deadline = Date.now() + timeout
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 500))
+    const command = await api<ProxyCommand>("/nodes/" + nodeId + "/commands/" + submitted.command_id, { cache: "no-store" })
+    if (command.status === "pending") continue
+    if (command.status !== "succeeded" || !command.result) {
+      throw new Error(command.error?.message || (command.status === "outcome_unknown" ? "执行结果未知，请先检查节点状态和配置" : "sing-box 操作失败"))
+    }
+    return command.result
+  }
+  throw new Error(method === "singbox.config.apply"
+    ? "等待应用结果超时；操作可能仍在执行，请查看节点状态"
+    : "等待 sing-box 命令结果超时")
+}
+
+async function loadProxyInstances() {
+  return api<{ instances: ProxyInstance[] }>("/proxy/instances", { cache: "no-store" })
+}
+
+function observedSingboxStatus(result: ProxyCommandResult | undefined): ProxyInstance["status"] | null {
+  if (!result || result.service_state_known === false) return null
+  if (result.installed === false) return "not_installed"
+  if (result.service_state_known === true && result.installed === true && result.service_exists === false) {
+    return "service_missing"
+  }
+  if (result.service_exists === true && result.running === true) return "running"
+  if (result.service_exists === true && result.running === false) return "stopped"
+  return null
+}
+
+function singboxStatusLabel(status: ProxyInstance["status"]) {
+  switch (status) {
+    case "not_installed": return "未安装"
+    case "service_missing": return "服务不存在"
+    case "stopped": return "已停止"
+    case "running": return "运行中"
+    default: return "未知"
+  }
 }
 
 function Proxy({ nodes }: { nodes: Node[] }) {
   const onlineNodes = nodes.filter((node) => node.online)
+  const nodesKey = nodes.map((node) => node.id + ":" + Number(node.online)).join("|")
+  const nodesRef = useRef(nodes)
+  const [instances, setInstances] = useState<ProxyInstance[]>([])
+  const [liveStatuses, setLiveStatuses] = useState<Record<number, ProxyCommandResult>>({})
+  const [rowBusy, setRowBusy] = useState<Record<number, string>>({})
+  const [rowErrors, setRowErrors] = useState<Record<number, string>>({})
+  const [instancesLoading, setInstancesLoading] = useState(true)
+  const [instancesError, setInstancesError] = useState("")
+  const [viewingConfig, setViewingConfig] = useState<Node | null>(null)
   const [nodeId, setNodeId] = useState("")
   const [content, setContent] = useState("")
   const [contentNodeId, setContentNodeId] = useState("")
@@ -1276,11 +1353,91 @@ function Proxy({ nodes }: { nodes: Node[] }) {
   const selected = nodes.find((node) => node.id.toString() === selectedId)
   const visibleContent = contentNodeId === selectedId ? content : ""
   const contentBytes = new TextEncoder().encode(visibleContent).length
+  const instancesByNode = new Map(instances.filter((instance) => instance.engine === "singbox").map((instance) => [instance.node_id, instance]))
+  const onConfigLoaded = useCallback(() => {
+    void loadProxyInstances().then((cached) => {
+      setInstances(cached.instances)
+      setInstancesError("")
+    }).catch((cause) => setInstancesError((cause as Error).message))
+  }, [setInstances, setInstancesError])
+
+  useEffect(() => {
+    nodesRef.current = nodes
+  }, [nodes])
 
   useEffect(() => () => {
     generation.current += 1
     contentRef.current = ""
   }, [])
+
+  useEffect(() => {
+    let active = true
+    void (async () => {
+      setInstancesLoading(true)
+      try {
+        const cached = await loadProxyInstances()
+        if (active) {
+          setInstances(cached.instances)
+          setInstancesError("")
+        }
+      } catch (cause) {
+        if (active) setInstancesError((cause as Error).message)
+      }
+      await Promise.all(nodesRef.current.filter((node) => node.online).map(async (node) => {
+        if (!active) return
+        setRowBusy((current) => ({ ...current, [node.id]: "status" }))
+        setRowErrors((current) => ({ ...current, [node.id]: "" }))
+        try {
+          const status = await runProxyCommand(node.id, "singbox.status")
+          if (active) setLiveStatuses((current) => ({ ...current, [node.id]: status }))
+        } catch (cause) {
+          if (active) setRowErrors((current) => ({ ...current, [node.id]: (cause as Error).message }))
+        } finally {
+          if (active) {
+            setRowBusy((current) => {
+              const next = { ...current }
+              delete next[node.id]
+              return next
+            })
+          }
+        }
+      }))
+      if (!active) return
+      try {
+        const cached = await loadProxyInstances()
+        if (active) setInstances(cached.instances)
+      } catch (cause) {
+        if (active) setInstancesError((cause as Error).message)
+      }
+      if (active) setInstancesLoading(false)
+    })()
+    return () => { active = false }
+  }, [nodesKey])
+
+  async function refreshInstances() {
+    const cached = await loadProxyInstances()
+    setInstances(cached.instances)
+    setInstancesError("")
+  }
+
+  async function runNodeAction(node: Node, method: "singbox.restart" | "singbox.reload") {
+    if (!node.online || rowBusy[node.id]) return
+    setRowBusy((current) => ({ ...current, [node.id]: method }))
+    setRowErrors((current) => ({ ...current, [node.id]: "" }))
+    try {
+      const status = await runProxyCommand(node.id, method)
+      setLiveStatuses((current) => ({ ...current, [node.id]: status }))
+      await refreshInstances()
+    } catch (cause) {
+      setRowErrors((current) => ({ ...current, [node.id]: (cause as Error).message }))
+    } finally {
+      setRowBusy((current) => {
+        const next = { ...current }
+        delete next[node.id]
+        return next
+      })
+    }
+  }
 
   async function runCommand(method: "singbox.config.get" | "singbox.config.check" | "singbox.config.apply") {
     if (!selected?.online || busy) return
@@ -1318,6 +1475,11 @@ function Proxy({ nodes }: { nodes: Node[] }) {
           setCheckedContent(null)
           setCheckedNodeId(null)
           setCheckedBytes(null)
+          void refreshInstances().catch((cause) => {
+            if (generation.current === requestGeneration) {
+              setError("配置已读取，但状态摘要刷新失败：" + (cause as Error).message)
+            }
+          })
         } else if (method.endsWith(".check")) {
           setCheckedContent(sentContent)
           setCheckedNodeId(targetNode.id.toString())
@@ -1326,6 +1488,16 @@ function Proxy({ nodes }: { nodes: Node[] }) {
           setApplied(true)
           setCheckedContent(sentContent)
           setCheckedNodeId(targetNode.id.toString())
+          try {
+            const status = await runProxyCommand(targetNode.id, "singbox.status")
+            if (generation.current !== requestGeneration) return
+            setLiveStatuses((current) => ({ ...current, [targetNode.id]: status }))
+            await refreshInstances()
+          } catch (cause) {
+            if (generation.current === requestGeneration) {
+              setError("配置已应用，但状态摘要刷新失败：" + (cause as Error).message)
+            }
+          }
         }
         return
       }
@@ -1370,6 +1542,95 @@ function Proxy({ nodes }: { nodes: Node[] }) {
 
   return (
     <div className="space-y-4">
+      <Card className="gap-4 p-5">
+        <div className="space-y-1">
+          <h2 className="text-base font-semibold">代理节点</h2>
+          <p className="text-sm text-muted-foreground">状态来自 Agent 命令；离线节点显示最近一次成功查询的记录。</p>
+        </div>
+        {instancesError && <p role="alert" className="text-sm text-destructive">{instancesError}</p>}
+        {!nodes.length ? (
+          <p className="text-sm text-muted-foreground">当前没有 Monitor 节点。</p>
+        ) : (
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>节点</TableHead>
+                <TableHead>Agent</TableHead>
+                <TableHead>sing-box</TableHead>
+                <TableHead>版本</TableHead>
+                <TableHead>配置</TableHead>
+                <TableHead>操作</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {nodes.map((node) => {
+                const instance = instancesByNode.get(node.id)
+                const live = liveStatuses[node.id]
+                const observed = observedSingboxStatus(live)
+                const status = observed ?? instance?.status ?? "unknown"
+                const version = live?.version !== undefined ? live.version : instance?.version
+                const configState = typeof live?.config_exists === "boolean"
+                  ? live.config_exists ? "存在" : "缺失"
+                  : instance?.config_hash ? "有最近摘要" : "未知"
+                const busyAction = rowBusy[node.id]
+                return (
+                  <TableRow key={node.id}>
+                    <TableCell className="font-medium">{node.name}</TableCell>
+                    <TableCell>{node.online ? "在线" : "离线"}</TableCell>
+                    <TableCell>
+                      {singboxStatusLabel(status)}
+                      {!node.online && instance && <span className="ml-1 text-xs text-muted-foreground">缓存</span>}
+                      {live?.service_state_known === false && <span className="ml-1 text-xs text-muted-foreground">未能确认</span>}
+                      {rowErrors[node.id] && <p role="alert" className="mt-1 max-w-56 break-words text-xs text-destructive">{rowErrors[node.id]}</p>}
+                    </TableCell>
+                    <TableCell>{version || "—"}</TableCell>
+                    <TableCell>
+                      <span>{configState}</span>
+                      {instance && instance.config_version > 0 && (
+                        <span className="ml-1 text-xs text-muted-foreground">v{instance.config_version}</span>
+                      )}
+                      {instance?.config_updated_at && (
+                        <p className="text-xs text-muted-foreground">
+                          {new Date(instance.config_updated_at * 1000).toLocaleString()}
+                        </p>
+                      )}
+                      {instancesLoading && !live && <span className="ml-1 text-xs text-muted-foreground">查询中</span>}
+                    </TableCell>
+                    <TableCell>
+                      <div className="flex flex-wrap gap-1">
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          disabled={!node.online || Boolean(busyAction)}
+                          onClick={() => void runNodeAction(node, "singbox.restart")}
+                        >
+                          {busyAction === "singbox.restart" ? "重启中…" : "Restart"}
+                        </Button>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          disabled={!node.online || Boolean(busyAction)}
+                          onClick={() => void runNodeAction(node, "singbox.reload")}
+                        >
+                          {busyAction === "singbox.reload" ? "重载中…" : "Reload"}
+                        </Button>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          disabled={!node.online || Boolean(busyAction)}
+                          onClick={() => setViewingConfig(node)}
+                        >
+                          查看配置
+                        </Button>
+                      </div>
+                    </TableCell>
+                  </TableRow>
+                )
+              })}
+            </TableBody>
+          </Table>
+        )}
+      </Card>
       <Card className="gap-4 p-5">
         <div className="space-y-1">
           <h2 className="text-base font-semibold">sing-box 配置</h2>
@@ -1440,11 +1701,18 @@ function Proxy({ nodes }: { nodes: Node[] }) {
           <p className="rounded-md bg-muted p-3 text-sm">节点：<strong>{selected.name}</strong></p>
         </ConfirmDialog>
       )}
+      {viewingConfig && (
+        <ConfigDialog
+          node={viewingConfig}
+          onClose={() => setViewingConfig(null)}
+          onLoaded={onConfigLoaded}
+        />
+      )}
     </div>
   )
 }
 
-function ConfigDialog({ node, onClose }: { node: Node; onClose: () => void }) {
+function ConfigDialog({ node, onClose, onLoaded }: { node: Node; onClose: () => void; onLoaded?: () => void }) {
   const [config, setConfig] = useState<ConfigResult | null>(null)
   const [error, setError] = useState("")
 
@@ -1465,6 +1733,7 @@ function ConfigDialog({ node, onClose }: { node: Node; onClose: () => void }) {
           if (command.status === "pending") continue
           if (command.status === "succeeded" && command.result) {
             setConfig(command.result)
+          onLoaded?.()
           } else {
             setError(command.error?.message || "配置读取失败")
           }
@@ -1477,7 +1746,7 @@ function ConfigDialog({ node, onClose }: { node: Node; onClose: () => void }) {
     }
     void load()
     return () => { closed = true }
-  }, [node.id])
+  }, [node.id, onLoaded])
 
   return (
     <Dialog open onOpenChange={(open) => !open && onClose()}>

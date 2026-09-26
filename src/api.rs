@@ -320,6 +320,19 @@ pub async fn nodes(State(app): State<Shared>, headers: HeaderMap) -> Response {
         .into_response()
 }
 
+pub async fn proxy_instances(_: Admin, State(app): State<Shared>) -> Response {
+    match app.db.proxy_instances() {
+        Ok(instances) => {
+            let mut response = Json(json!({"instances": instances})).into_response();
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, axum::http::HeaderValue::from_static("no-store"));
+            response
+        }
+        Err(error) => fail(error),
+    }
+}
+
 #[derive(Deserialize)]
 pub struct Window {
     #[serde(default = "default_hours")]

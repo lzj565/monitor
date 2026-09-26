@@ -146,6 +146,7 @@ CREATE TABLE IF NOT EXISTS session (
   token_hash TEXT    PRIMARY KEY,
   expires_at INTEGER NOT NULL
 );
+
 "#;
 
 /// Schema revision this build expects, stamped into `PRAGMA user_version`.
@@ -162,7 +163,7 @@ CREATE TABLE IF NOT EXISTS session (
 /// cannot: `open` runs `SCHEMA` before migrating, and on an older file the
 /// column is not there yet. `an_upgraded_release_matches_a_fresh_database`
 /// holds every migration to these rules, starting from v1.0.0's schema.
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -294,9 +295,39 @@ fn migrate_to_9(conn: &Connection) -> Result<()> {
     add_column(conn, "ping_task", "sort INTEGER NOT NULL DEFAULT 0")
 }
 
+/// Proxy 业务使用独立表，节点删除时清理其代理实例；用户暂不绑定节点。
+fn migrate_to_10(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS proxy_instance (
+           id INTEGER PRIMARY KEY,
+           node_id INTEGER NOT NULL REFERENCES node(id) ON DELETE CASCADE,
+           engine TEXT NOT NULL CHECK (engine IN ('singbox', 'xray')),
+           version TEXT,
+           status TEXT NOT NULL DEFAULT 'unknown'
+             CHECK (status IN ('unknown', 'not_installed', 'service_missing', 'stopped', 'running')),
+           config_hash TEXT,
+           config_version INTEGER NOT NULL DEFAULT 0 CHECK (config_version >= 0),
+           config_updated_at INTEGER,
+           created_at INTEGER NOT NULL,
+           updated_at INTEGER NOT NULL,
+           UNIQUE (node_id, engine)
+         );
+         CREATE TABLE IF NOT EXISTS proxy_user (
+           id INTEGER PRIMARY KEY,
+           username TEXT NOT NULL UNIQUE,
+           uuid TEXT NOT NULL UNIQUE,
+           enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+           quota INTEGER NOT NULL DEFAULT 0 CHECK (quota >= 0),
+           expire_at INTEGER,
+           created_at INTEGER NOT NULL
+         );",
+    )?;
+    Ok(())
+}
+
 /// Brings a database already in service up to `SCHEMA_VERSION` and stamps it.
-/// `from` is its current version, so a fresh file passes `SCHEMA_VERSION` and
-/// receives only the stamp.
+/// `from` is its current version. A fresh file runs the additive migration
+/// history inside one transaction as well.
 ///
 /// One transaction covers every step and the stamp. SQLite rolls back schema
 /// changes and `user_version` alike, so a failure part-way -- a full disk, a
@@ -334,14 +365,30 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     if from < 9 {
         migrate_to_9(&tx)?;
     }
+    if from < 10 {
+        migrate_to_10(&tx)?;
+    }
     tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     tx.commit()?;
     Ok(())
 }
 
-/// Every table a backup must carry before this build will restore it.
-const TABLES: [&str; 8] =
+/// 代理模型迁移前已有的表；旧备份中没有新增的两张表。
+const LEGACY_TABLES: [&str; 8] =
     ["setting", "node", "traffic", "metric", "ping_task", "ping_node", "ping_record", "session"];
+/// 执行对应版本迁移后，备份必须包含的全部表。
+const TABLES: [&str; 10] = [
+    "setting",
+    "node",
+    "traffic",
+    "metric",
+    "ping_task",
+    "ping_node",
+    "ping_record",
+    "session",
+    "proxy_instance",
+    "proxy_user",
+];
 
 /// One node's stored configuration and last known facts.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -434,6 +481,33 @@ pub struct Node {
     /// install command on demand; it never leaves the admin view.
     #[serde(default)]
     pub token: String,
+}
+
+/// 代理核心信息单独保存，避免把 sing-box 字段混入服务器节点记录。
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ProxyInstance {
+    pub id: i64,
+    pub node_id: i64,
+    pub engine: String,
+    pub version: Option<String>,
+    pub status: String,
+    pub config_hash: Option<String>,
+    pub config_version: i64,
+    pub config_updated_at: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// 代理用户身份独立于 Monitor 管理员和服务器节点。
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ProxyUser {
+    pub id: i64,
+    pub username: String,
+    pub uuid: String,
+    pub enabled: bool,
+    pub quota: i64,
+    pub expire_at: Option<i64>,
+    pub created_at: i64,
 }
 
 fn yes() -> bool {
@@ -597,16 +671,11 @@ const PING_ROWS: &str = "SELECT ts/?3, task_id, latency FROM ping_record
 impl Db {
     pub fn open(path: &str) -> Result<Self> {
         let conn = Connection::open(path)?;
-        // Queried before CREATE TABLE runs: a file with no tables receives the
-        // current schema directly rather than the history of how it was reached.
-        let fresh = conn
-            .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table'", [], |r| r.get::<_, i64>(0))?
-            == 0;
         conn.execute_batch(SCHEMA)?;
         restrict(path);
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        migrate(&conn, if fresh { SCHEMA_VERSION } else { version })?;
+        migrate(&conn, version)?;
         Ok(Self(Mutex::new(conn)))
     }
 
@@ -652,6 +721,117 @@ impl Db {
             .conn()
             .query_row("SELECT * FROM node WHERE id = ?1", [id], |r| Ok(row_to_node(r)))
             .optional()?)
+    }
+
+    pub fn proxy_instances(&self) -> Result<Vec<ProxyInstance>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, node_id, engine, version, status, config_hash, config_version,
+                    config_updated_at, created_at, updated_at
+             FROM proxy_instance ORDER BY node_id, engine",
+        )?;
+        let rows = stmt.query_map([], row_to_proxy_instance)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// 只保存白名单状态观测和配置摘要；嵌套 Option 用于区分字段未提供与显式 null。
+    pub fn observe_singbox(
+        &self,
+        node_id: i64,
+        status: Option<&str>,
+        version_update: Option<Option<&str>>,
+        config_hash: Option<&str>,
+        config_updated_at: Option<i64>,
+        now: i64,
+    ) -> Result<()> {
+        if let Some(status) = status {
+            if !matches!(status, "unknown" | "not_installed" | "service_missing" | "stopped" | "running") {
+                anyhow::bail!("invalid sing-box status");
+            }
+        }
+        if let Some(hash) = config_hash {
+            if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                anyhow::bail!("invalid sing-box config hash");
+            }
+        }
+        let version_observed = version_update.is_some();
+        let version = version_update.flatten();
+        self.conn().execute(
+            "INSERT INTO proxy_instance
+               (node_id, engine, version, status, config_hash, config_version,
+                config_updated_at, created_at, updated_at)
+             VALUES (?1, 'singbox', ?2, COALESCE(?3, 'unknown'), ?4,
+                     CASE WHEN ?4 IS NULL THEN 0 ELSE 1 END, ?5, ?6, ?6)
+             ON CONFLICT(node_id, engine) DO UPDATE SET
+               version = CASE WHEN ?7 THEN ?2 ELSE proxy_instance.version END,
+               status = COALESCE(?3, proxy_instance.status),
+               config_version = proxy_instance.config_version +
+                 CASE WHEN ?4 IS NOT NULL AND
+                   (proxy_instance.config_hash IS NULL OR proxy_instance.config_hash != ?4)
+                   THEN 1 ELSE 0 END,
+               config_hash = COALESCE(?4, proxy_instance.config_hash),
+               config_updated_at = CASE WHEN ?4 IS NOT NULL THEN ?5 ELSE proxy_instance.config_updated_at END,
+               updated_at = ?6",
+            params![node_id, version, status, config_hash, config_updated_at, now, version_observed],
+        )?;
+        Ok(())
+    }
+
+    pub fn create_proxy_user(
+        &self,
+        username: &str,
+        uuid: &str,
+        enabled: bool,
+        quota: i64,
+        expire_at: Option<i64>,
+    ) -> Result<i64> {
+        if username.trim().is_empty() || uuid.trim().is_empty() || quota < 0 {
+            anyhow::bail!("invalid proxy user");
+        }
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO proxy_user (username, uuid, enabled, quota, expire_at, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![username, uuid, enabled, quota, expire_at, Utc::now().timestamp()],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn proxy_user(&self, id: i64) -> Result<Option<ProxyUser>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT id, username, uuid, enabled, quota, expire_at, created_at
+                 FROM proxy_user WHERE id = ?1",
+                [id],
+                row_to_proxy_user,
+            )
+            .optional()?)
+    }
+
+    pub fn proxy_users(&self) -> Result<Vec<ProxyUser>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, username, uuid, enabled, quota, expire_at, created_at
+             FROM proxy_user ORDER BY created_at, id",
+        )?;
+        let rows = stmt.query_map([], row_to_proxy_user)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn update_proxy_user(&self, user: &ProxyUser) -> Result<bool> {
+        if user.username.trim().is_empty() || user.uuid.trim().is_empty() || user.quota < 0 {
+            anyhow::bail!("invalid proxy user");
+        }
+        Ok(self.conn().execute(
+            "UPDATE proxy_user SET username=?2, uuid=?3, enabled=?4, quota=?5, expire_at=?6
+             WHERE id=?1",
+            params![user.id, user.username, user.uuid, user.enabled, user.quota, user.expire_at],
+        )? > 0)
+    }
+
+    pub fn delete_proxy_user(&self, id: i64) -> Result<bool> {
+        Ok(self.conn().execute("DELETE FROM proxy_user WHERE id=?1", [id])? > 0)
     }
 
     /// Creates a node and returns its id.
@@ -1704,7 +1884,12 @@ impl Db {
         if plotted > 0 {
             refuse!("文件里有视图或触发器，不是 hub 导出的备份");
         }
-        for table in TABLES {
+        let version: i64 = candidate.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version > SCHEMA_VERSION {
+            refuse!("备份来自更新版本的 hub（数据库版本 {version}，这台只认到 {SCHEMA_VERSION}），先升级 hub 再恢复");
+        }
+        let required_tables: &[&str] = if version < 10 { &LEGACY_TABLES } else { &TABLES };
+        for table in required_tables {
             let found: i64 = candidate.query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
                 [table],
@@ -1713,10 +1898,6 @@ impl Db {
             if found == 0 {
                 refuse!("{NOT_A_BACKUP}：缺少 {table} 表");
             }
-        }
-        let version: i64 = candidate.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version > SCHEMA_VERSION {
-            refuse!("备份来自更新版本的 hub（数据库版本 {version}，这台只认到 {SCHEMA_VERSION}），先升级 hub 再恢复");
         }
         // The online backup API refuses a page size change while the destination
         // is in WAL mode; an explicit message is clearer than SQLITE_READONLY.
@@ -1737,7 +1918,7 @@ impl Db {
 
         // Table names are not a schema. Pages are copied verbatim, so the columns
         // the file carries become the ones this hub's statements run against, and
-        // eight correctly named tables holding the wrong columns pass every gate
+        // correctly named tables holding the wrong columns pass every gate
         // above while leaving the database unusable.
         //
         // Compared against a database this build creates for itself, so there is
@@ -1747,7 +1928,7 @@ impl Db {
         // `CREATE TABLE`. Extra columns are ignored.
         let reference = Connection::open_in_memory()?;
         reference.execute_batch(SCHEMA)?;
-        migrate(&reference, SCHEMA_VERSION)?;
+        migrate(&reference, 0)?;
         for table in TABLES {
             let want = columns_of(&reference, table)?;
             let got = columns_of(&candidate, table)?;
@@ -1923,6 +2104,33 @@ fn row_to_node(r: &rusqlite::Row<'_>) -> Node {
     }
 }
 
+fn row_to_proxy_instance(r: &rusqlite::Row<'_>) -> rusqlite::Result<ProxyInstance> {
+    Ok(ProxyInstance {
+        id: r.get("id")?,
+        node_id: r.get("node_id")?,
+        engine: r.get("engine")?,
+        version: r.get("version")?,
+        status: r.get("status")?,
+        config_hash: r.get("config_hash")?,
+        config_version: r.get("config_version")?,
+        config_updated_at: r.get("config_updated_at")?,
+        created_at: r.get("created_at")?,
+        updated_at: r.get("updated_at")?,
+    })
+}
+
+fn row_to_proxy_user(r: &rusqlite::Row<'_>) -> rusqlite::Result<ProxyUser> {
+    Ok(ProxyUser {
+        id: r.get("id")?,
+        username: r.get("username")?,
+        uuid: r.get("uuid")?,
+        enabled: r.get("enabled")?,
+        quota: r.get("quota")?,
+        expire_at: r.get("expire_at")?,
+        created_at: r.get("created_at")?,
+    })
+}
+
 /// Start of the billing period containing `today`, given a reset day of month.
 /// A reset day past the end of a short month lands on that month's last day.
 pub fn period_start(today: NaiveDate, reset_day: u32) -> NaiveDate {
@@ -1952,6 +2160,61 @@ mod tests {
 
     fn db() -> Db {
         Db::open(":memory:").unwrap()
+    }
+
+    #[test]
+    fn proxy_instance_observations_track_hash_revisions_and_cascade_with_nodes() {
+        let db = db();
+        let node_id =
+            db.create_node(&Node { name: "proxy".into(), ..Default::default() }, "proxy-token").unwrap();
+        let first_hash = "a".repeat(64);
+        let next_hash = "b".repeat(64);
+
+        db.observe_singbox(node_id, Some("running"), Some(Some("1.12.0")), Some(&first_hash), Some(100), 200)
+            .unwrap();
+        let first = db.proxy_instances().unwrap().remove(0);
+        assert_eq!(first.engine, "singbox");
+        assert_eq!(first.status, "running");
+        assert_eq!(first.version.as_deref(), Some("1.12.0"));
+        assert_eq!(first.config_version, 1);
+        assert_eq!(first.config_updated_at, Some(100));
+
+        db.observe_singbox(node_id, None, None, Some(&first_hash), Some(110), 210).unwrap();
+        assert_eq!(db.proxy_instances().unwrap()[0].config_version, 1);
+        db.observe_singbox(node_id, Some("stopped"), Some(None), Some(&next_hash), Some(120), 220).unwrap();
+        let changed = db.proxy_instances().unwrap().remove(0);
+        assert_eq!(changed.status, "stopped");
+        assert_eq!(changed.version, None);
+        assert_eq!(changed.config_hash.as_deref(), Some(next_hash.as_str()));
+        assert_eq!(changed.config_version, 2);
+
+        db.delete_node(node_id).unwrap();
+        assert!(db.proxy_instances().unwrap().is_empty());
+    }
+
+    #[test]
+    fn proxy_users_have_unique_identity_and_complete_db_crud() {
+        let db = db();
+        let id = db.create_proxy_user("alice", "uuid-a", true, 0, None).unwrap();
+        assert_eq!(db.proxy_user(id).unwrap().unwrap().username, "alice");
+        assert!(db.create_proxy_user("alice", "uuid-b", true, 0, None).is_err());
+        assert!(db.create_proxy_user("bob", "uuid-a", true, 0, None).is_err());
+        assert!(db.create_proxy_user(" ", "uuid-c", true, 0, None).is_err());
+        assert!(db.create_proxy_user("bob", "uuid-c", true, -1, None).is_err());
+
+        let mut user = db.proxy_user(id).unwrap().unwrap();
+        user.username = "alice-2".into();
+        user.enabled = false;
+        user.quota = 4096;
+        user.expire_at = Some(1234);
+        assert!(db.update_proxy_user(&user).unwrap());
+        let loaded = db.proxy_users().unwrap().remove(0);
+        assert_eq!(loaded.username, "alice-2");
+        assert!(!loaded.enabled);
+        assert_eq!(loaded.quota, 4096);
+        assert_eq!(loaded.expire_at, Some(1234));
+        assert!(db.delete_proxy_user(id).unwrap());
+        assert!(db.proxy_user(id).unwrap().is_none());
     }
 
     /// PRAGMA settings are per connection, so a value read through any other
@@ -2062,9 +2325,9 @@ mod tests {
             .unwrap();
         refused("a view where a table belongs");
 
-        // Eight tables with the right names and none of the right columns. Every
+        // Tables with the right names and none of the right columns. Every
         // gate above passes: it is a healthy SQLite file, it carries no view or
-        // trigger, all eight names are present, it stamps itself with this build's
+        // trigger, all ten names are present, it stamps itself with this build's
         // version and uses the same page size. Restoring copies pages, so those
         // columns would become the ones the hub runs every statement against,
         // leaving the panel reporting a failed restore over a database already
@@ -2084,11 +2347,39 @@ mod tests {
         let _ = std::fs::remove_file(&bad);
         let newer = Connection::open(&bad).unwrap();
         newer.execute_batch(SCHEMA).unwrap();
+        migrate(&newer, 0).unwrap();
         newer.execute_batch(&format!("PRAGMA user_version = {}", SCHEMA_VERSION + 1)).unwrap();
         refused("from a newer hub");
 
         newer.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}")).unwrap();
         db.check_backup(&bad).unwrap();
+    }
+
+    #[test]
+    fn an_older_backup_gains_proxy_tables_before_schema_validation() {
+        let scratch = Scratch::new();
+        release_file(&scratch.0);
+        let db = Db::open(":memory:").unwrap();
+        db.check_backup(&scratch.0).unwrap();
+        let candidate = Connection::open(&scratch.0).unwrap();
+        let version: i64 = candidate.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(
+            candidate
+                .query_row("SELECT total_rx FROM traffic WHERE node_id=1", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            5_000
+        );
+        for table in ["proxy_instance", "proxy_user"] {
+            let found: i64 = candidate
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(found, 1, "{table}");
+        }
     }
 
     /// `oldest` is what the data page compares against the retention window, so it
@@ -2763,6 +3054,9 @@ mod tests {
     fn dump(conn: &Connection) -> Vec<String> {
         let mut rows = Vec::new();
         for table in TABLES {
+            if columns_of(conn, table).unwrap().is_empty() {
+                continue;
+            }
             let mut stmt = conn.prepare(&format!("SELECT * FROM {table}")).unwrap();
             let width = stmt.column_count();
             let read =
@@ -2815,7 +3109,7 @@ mod tests {
             );
         }
         let upgraded = dump(&db.conn());
-        assert_eq!(upgraded.len(), TABLES.len(), "every row survives: {upgraded:#?}");
+        assert_eq!(upgraded.len(), LEGACY_TABLES.len(), "every existing row survives: {upgraded:#?}");
 
         // An earlier build opening the file stamps its own version, so the next
         // upgrade runs every migration again.
