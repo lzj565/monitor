@@ -4,6 +4,8 @@ import { Toaster } from "sonner"
 
 import { Admin } from "@/components/Admin"
 import { Login } from "@/components/Login"
+import { UserCenterPage } from "@/components/UserCenterPage"
+import { UserLoginPage } from "@/components/UserLoginPage"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import { api, provisionRefusal, useNodes } from "@/lib/api"
@@ -78,6 +80,23 @@ function useTheme() {
 export default function App() {
   const [path, go] = usePath()
   const [dark, toggleTheme] = useTheme()
+
+  if (path === "/user/login") {
+    return <><UserLoginPage go={go} /><Toaster position="top-center" theme={dark ? "dark" : "light"} /></>
+  }
+  if (path === "/user") {
+    return <><UserCenterPage dark={dark} toggleTheme={toggleTheme} go={go} search={location.search} /><Toaster position="top-center" theme={dark ? "dark" : "light"} /></>
+  }
+
+  return <AdminApp path={path} go={go} dark={dark} toggleTheme={toggleTheme} />
+}
+
+function AdminApp({ path, go, dark, toggleTheme }: {
+  path: string
+  go: (path: string) => void
+  dark: boolean
+  toggleTheme: () => void
+}) {
   const [me, setMe] = useState<Me | null>(null)
   const [meError, setMeError] = useState("")
   const { nodes, admin, error, refresh } = useNodes()

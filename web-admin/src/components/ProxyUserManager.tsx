@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { ChevronDown, Copy, KeyRound, LoaderCircle, Pencil, Plus, RefreshCw, RotateCcw, RotateCw, Trash2 } from "lucide-react"
+import { ChevronDown, Copy, ExternalLink, KeyRound, LoaderCircle, Pencil, Plus, RefreshCw, RotateCcw, RotateCw, Trash2 } from "lucide-react"
 import { toast } from "sonner"
 
 import {
@@ -368,7 +368,7 @@ export function ProxyUserManager({ servers }: { servers: Node[] }) {
             </div>
           </div>
           <div className="overflow-x-auto">
-            <Table className="min-w-[1080px]">
+            <Table className="min-w-[1120px]">
               <TableHeader className="bg-muted/40">
                 <TableRow className="h-11 hover:bg-muted/40">
                   {PROXY_USER_TABLE_COLUMNS.map((column) => <TableHead key={column.key} className={column.className}>{column.label}</TableHead>)}
@@ -429,6 +429,7 @@ export function ProxyUserManager({ servers }: { servers: Node[] }) {
                       </TableCell>
                       <TableCell className="py-3">
                         <div className="flex justify-end gap-1">
+                          <Button type="button" size="icon-sm" variant="ghost" disabled={busy} title="以用户身份查看" aria-label={`以用户身份查看 ${user.name}`} onClick={() => { window.open("/user?preview=1", "_blank", "noopener,noreferrer") }}><ExternalLink className="size-4" /></Button>
                           {row.actions.includes("edit") && <Button size="sm" variant="ghost" disabled={busy} onClick={() => openEdit(user)}><Pencil className="size-4" /> 编辑</Button>}
                           {!user.is_system && <Button size="icon-sm" variant="ghost" disabled={busy} title="设置用户中心密码" aria-label={`设置 ${user.name} 的用户中心密码`} onClick={() => openPassword(user)}><KeyRound className="size-4" /></Button>}
                           {row.actions.includes("delete") && <Button size="icon-sm" variant="ghost" disabled={busy} title="删除用户" onClick={() => setConfirm({ kind: "delete", user })}><Trash2 className="size-4 text-destructive" /></Button>}

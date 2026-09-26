@@ -6,7 +6,7 @@ export const PROXY_USER_TABLE_COLUMNS = [
   { key: "traffic", label: "流量使用情况", className: "w-[320px]" },
   { key: "expiry", label: "到期时间", className: "w-[150px]" },
   { key: "status", label: "账户状态", className: "w-[180px]" },
-  { key: "actions", label: "操作", className: "w-[160px] text-right" },
+  { key: "actions", label: "操作", className: "w-[200px] text-right" },
 ] as const
 
 export type ProxyUserRowAction = "edit" | "delete"

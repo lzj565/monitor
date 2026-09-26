@@ -9,6 +9,7 @@ import { createProxyUserOperationGuard, deleteProxyUser, proxyUserDeleteConfirma
 import { importProxyNodeInbound, scanProxyNodeImports, type ProxyNodeImportApi, type ProxyNodeImportRequest, type ProxyNodeImportScan } from "./proxy-node-imports.ts"
 import { bytes } from "./format.ts"
 import { expiryDateLabel, formatBytes, limitBytesFromGb, limitGbInput, PROXY_USER_TABLE_COLUMNS, proxyUserCountText, proxyUserListState, proxyUserRowView, trafficPercent } from "./proxy-user-view.ts"
+import { getUserCenterMock } from "./user-center-mock.ts"
 import { badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, loopbackOrigin, outdatedAgents, provisioningSite, provisionRefusal, trafficCorrection } from "./api.ts"
 
 assert.deepEqual(changes({ public: true, price: 5 }, { price: 20 }), { price: 20 })
@@ -281,6 +282,17 @@ assert.equal(trafficPercent(300, 200), 100)
 assert.equal(trafficPercent(12, 0), 0)
 assert.equal(expiryDateLabel(null), "永久有效")
 assert.equal(expiryDateLabel("2026-10-25"), "2026/10/25")
+const userCenterDemo = getUserCenterMock("")
+assert.equal(userCenterDemo.user.status, "active")
+assert.equal(userCenterDemo.traffic.usedBytes, 0)
+const exhaustedUserCenter = getUserCenterMock("?status=exhausted")
+assert.equal(exhaustedUserCenter.traffic.usedBytes, userCenterDemo.traffic.limitBytes)
+assert.equal(exhaustedUserCenter.traffic.uploadBytes + exhaustedUserCenter.traffic.downloadBytes, exhaustedUserCenter.traffic.usedBytes)
+assert.equal(getUserCenterMock("?status=expired").expireAt, "2025-10-25T08:00:00+08:00")
+assert.equal(getUserCenterMock("?status=disabled").user.status, "disabled")
+assert.equal(getUserCenterMock("?quota=unlimited&expiry=never&preview=1").user.impersonation, true)
+assert.equal(getUserCenterMock("?quota=unlimited&expiry=never").traffic.limitBytes, 0)
+assert.equal(getUserCenterMock("?quota=unlimited&expiry=never").expireAt, null)
 const proxyUserManagerSource = readFileSync(new URL("../components/ProxyUserManager.tsx", import.meta.url), "utf8")
 const trafficCell = proxyUserManagerSource.match(/<TableCell\b[^>]*>\s*<div className="space-y-2">(?:(?!<\/TableCell>)[\s\S])*?user\.traffic\.used_bytes(?:(?!<\/TableCell>)[\s\S])*?RotateCcw(?:(?!<\/TableCell>)[\s\S])*?<\/TableCell>/)?.[0] ?? ""
 assert.ok(trafficCell, "清空入口位于流量使用情况单元格")
