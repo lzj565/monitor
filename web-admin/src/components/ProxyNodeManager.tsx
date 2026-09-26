@@ -1204,7 +1204,7 @@ function ProxyNodeFormModal({
                   <Settings2 className="mt-0.5 size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
                   <span className="min-w-0">
                     <span className="block text-sm font-medium">高级配置</span>
-                    <span className="mt-1 block text-xs text-muted-foreground">SNI / Dest · 身份凭据</span>
+                    <span className="mt-1 block text-xs text-muted-foreground">SNI / Dest · Reality 参数</span>
                   </span>
                 </span>
                 <ChevronDown className="size-4 shrink-0 text-muted-foreground transition-transform group-open:rotate-180" aria-hidden="true" />
@@ -1243,17 +1243,16 @@ function ProxyNodeFormModal({
                 {editing && proxyNode ? (
                   <div className="space-y-3 rounded-lg border bg-background p-3">
                     <div>
-                      <p className="text-sm font-medium">身份凭据</p>
-                      <p className="mt-1 text-xs text-muted-foreground">凭据只读。重新生成后，旧客户端配置将失效。</p>
+                      <p className="text-sm font-medium">Reality 参数</p>
+                      <p className="mt-1 text-xs text-muted-foreground">展示客户端连接需要的公钥和 Short ID。重新生成后，使用旧值的客户端配置将失效。</p>
                     </div>
                     <CredentialRow label="Reality Public Key" value={proxyNode.reality_public_key} disabled={busy} onRegenerate={() => onRegenerate?.("reality_key")} regenerateLabel="重新生成 Reality 密钥" />
-                    <CredentialRow label="UUID" value={proxyNode.uuid} disabled={busy} onRegenerate={() => onRegenerate?.("uuid")} />
                     <CredentialRow label="Short ID" value={proxyNode.reality_short_id} disabled={busy} onRegenerate={() => onRegenerate?.("short_id")} />
                   </div>
                 ) : (
                   <div className="space-y-2 rounded-lg border bg-muted/30 p-3">
-                    <p className="text-sm font-medium">身份凭据</p>
-                    {(["UUID", "Reality 密钥", "Short ID"]).map((label) => (
+                    <p className="text-sm font-medium">Reality 参数</p>
+                    {["Reality Public Key", "Short ID"].map((label) => (
                       <div key={label} className="flex items-center justify-between gap-3 text-sm">
                         <span className="text-muted-foreground">{label}</span>
                         <span className="text-xs text-muted-foreground">创建时自动生成</span>

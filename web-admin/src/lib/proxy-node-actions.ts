@@ -5,7 +5,7 @@ export type ProxyNodeUpdatePayload = Pick<
   "name" | "enabled" | "address_mode" | "custom_address" | "listen_port" | "reality_server_name" | "reality_dest"
 >
 
-export type ProxyNodeCredential = "uuid" | "reality_key" | "short_id"
+export type ProxyNodeCredential = "reality_key" | "short_id"
 export type ProxyNodeActionApi = <T = unknown>(path: string, init?: RequestInit) => Promise<T>
 export type ProxyNodeShare = { node_id: number; name: string; address: string; uri: string }
 
@@ -77,12 +77,6 @@ export async function removeProxyNode(request: ProxyNodeActionApi, id: number): 
 export function regenerateConfirmation(credential: ProxyNodeCredential, name?: string): { title: string; description: string; action: string } {
   const forNode = name ? `节点「${name}」` : "当前"
   switch (credential) {
-    case "uuid":
-      return {
-        title: "重新生成 UUID？",
-        description: `${forNode}使用旧 UUID 的客户端配置将无法继续连接。`,
-        action: "重新生成 UUID",
-      }
     case "reality_key":
       return {
         title: "重新生成 Reality 密钥？",

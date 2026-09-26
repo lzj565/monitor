@@ -126,7 +126,6 @@ assert.deepEqual(calls.map((call) => [call.path, call.init?.method]), [
 ])
 assert.deepEqual(JSON.parse(calls[0].init?.body as string), { credential: "reality_key" })
 assert.equal(regenerated, proxyNode)
-assert.equal(regenerateConfirmation("uuid").description, "当前使用旧 UUID 的客户端配置将无法继续连接。")
 assert.equal(regenerateConfirmation("reality_key").action, "重新生成 Reality 密钥")
 assert.match(regenerateConfirmation("short_id").description, /旧 Short ID/)
 
