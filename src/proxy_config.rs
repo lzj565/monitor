@@ -565,9 +565,14 @@ mod tests {
     fn stats_identity_survives_proxy_user_name_and_uuid_changes() {
         let node = proxy_node(12, 1, true);
         let mut user = proxy_user(2, "a0f81cec-73c5-4eb8-a2e2-cd1544946e8e", true, &[12]);
-        let before =
-            generate_singbox_config_excluding_users(1, empty_config(), &[node.clone()], &[user.clone()], &[])
-                .unwrap();
+        let before = generate_singbox_config_excluding_users(
+            1,
+            empty_config(),
+            std::slice::from_ref(&node),
+            std::slice::from_ref(&user),
+            &[],
+        )
+        .unwrap();
         user.name = "renamed user".into();
         user.uuid = "aa8c947a-1dbd-4905-bcb1-71728c58effb".into();
         let after =
