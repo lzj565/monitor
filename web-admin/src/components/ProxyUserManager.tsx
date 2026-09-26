@@ -262,7 +262,10 @@ export function ProxyUserManager({ servers }: { servers: Node[] }) {
                 const failures = failedByUser[user.id] ?? inferredFailures
                 return (
                   <TableRow key={user.id}>
-                    <TableCell className="font-medium">{user.name}</TableCell>
+                    <TableCell className="font-medium">
+                      {user.name}
+                      {user.is_system && <span className="ml-2 rounded bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">系统</span>}
+                    </TableCell>
                     <TableCell>
                       <div className="flex items-center gap-1.5 font-mono text-xs">
                         <span title={user.uuid}>{user.uuid.slice(0, 8)}…{user.uuid.slice(-4)}</span>
@@ -293,7 +296,7 @@ export function ProxyUserManager({ servers }: { servers: Node[] }) {
                         <Button size="sm" variant="ghost" disabled={busy} onClick={() => openEdit(user)}><Pencil className="size-4" />编辑</Button>
                         <Button size="icon" variant="ghost" disabled={busy} title="重新同步" onClick={() => void resync(user)}><RotateCw className="size-4" /></Button>
                         <Button size="icon" variant="ghost" disabled={busy} title="重新生成 UUID" onClick={() => setConfirm({ kind: "regenerate", user })}><RefreshCw className="size-4" /></Button>
-                        <Button size="icon" variant="ghost" disabled={busy} title="删除用户" onClick={() => setConfirm({ kind: "delete", user })}><Trash2 className="size-4 text-destructive" /></Button>
+                        {!user.is_system && <Button size="icon" variant="ghost" disabled={busy} title="删除用户" onClick={() => setConfirm({ kind: "delete", user })}><Trash2 className="size-4 text-destructive" /></Button>}
                       </div>
                     </TableCell>
                   </TableRow>
@@ -314,7 +317,7 @@ export function ProxyUserManager({ servers }: { servers: Node[] }) {
             <div className="grid gap-4 sm:grid-cols-2">
               <div className="space-y-2">
                 <Label htmlFor="proxy-user-name">用户名称</Label>
-                <Input id="proxy-user-name" value={form.name} maxLength={120} autoFocus disabled={saving || editBusy} onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))} />
+                <Input id="proxy-user-name" value={form.name} maxLength={120} autoFocus disabled={saving || editBusy || !!dialogUser?.is_system} onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))} />
               </div>
               <div className="flex items-end justify-between rounded-md border px-3 py-2.5">
                 <div><Label htmlFor="proxy-user-enabled">状态</Label><p className="text-xs text-muted-foreground">停用后会从授权节点配置中移除。</p></div>

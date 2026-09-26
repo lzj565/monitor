@@ -326,6 +326,7 @@ mod tests {
             name: format!("user-{id}"),
             uuid: uuid.into(),
             enabled,
+            is_system: false,
             created_at: 1,
             note: String::new(),
             updated_at: 1,
@@ -397,12 +398,43 @@ mod tests {
     }
 
     #[test]
+    fn system_admin_uses_the_same_enabled_and_node_authorization_filters() {
+        let node_one = proxy_node(12, 1, true);
+        let node_two = proxy_node(18, 1, true);
+        let mut admin = proxy_user(1, "0d46b1aa-49ea-4889-998f-c3a1cd52942f", true, &[12]);
+        admin.name = "admin".into();
+        admin.is_system = true;
+        let generated = generate_singbox_config_excluding_users(
+            1,
+            empty_config(),
+            &[node_one.clone(), node_two.clone()],
+            &[admin.clone()],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(generated["inbounds"][0]["users"][0]["uuid"], admin.uuid);
+        assert_eq!(generated["inbounds"][1]["users"], json!([]));
+        assert!(!generated["inbounds"].to_string().contains(&node_one.uuid));
+        assert!(!generated["inbounds"].to_string().contains(&node_two.uuid));
+
+        admin.enabled = false;
+        let disabled =
+            generate_singbox_config_excluding_users(1, empty_config(), &[node_one, node_two], &[admin], &[])
+                .unwrap();
+        assert_eq!(disabled["inbounds"][0]["users"], json!([]));
+        assert_eq!(disabled["inbounds"][1]["users"], json!([]));
+    }
+
+    #[test]
     fn generates_only_enabled_users_authorized_for_each_node() {
         let node = proxy_node(12, 1, true);
         let node_uuid = node.uuid.clone();
         let second_node = proxy_node(18, 1, true);
         let mut first_user = proxy_user(2, "a0f81cec-73c5-4eb8-a2e2-cd1544946e8e", true, &[12, 18]);
         first_user.name = "Sensitive Display Name".into();
+        let mut admin_user = proxy_user(7, "0d46b1aa-49ea-4889-998f-c3a1cd52942f", false, &[12]);
+        admin_user.name = "admin".into();
+        admin_user.is_system = true;
         let generated = generate_singbox_config_excluding_users(
             1,
             empty_config(),
@@ -413,6 +445,7 @@ mod tests {
                 proxy_user(4, "e2b4b1d8-0af6-40f8-910b-cabfb913a7bc", false, &[12]),
                 proxy_user(5, "e91f28f5-5837-4b92-a281-224d155f01f6", true, &[18]),
                 proxy_user(6, "f3a9c7de-bc1a-4239-8c56-05e7a0984e41", true, &[999]),
+                admin_user,
             ],
             &[],
         )
@@ -438,6 +471,7 @@ mod tests {
         assert!(!credential_users.contains(&node_uuid));
         assert!(!credential_users.contains("e2b4b1d8-0af6-40f8-910b-cabfb913a7bc"));
         assert!(!credential_users.contains("f3a9c7de-bc1a-4239-8c56-05e7a0984e41"));
+        assert!(!credential_users.contains("0d46b1aa-49ea-4889-998f-c3a1cd52942f"));
         assert_eq!(
             generated["inbounds"][1]["users"][0]["uuid"], "a0f81cec-73c5-4eb8-a2e2-cd1544946e8e",
             "同一用户授权多个代理节点时使用同一个 UUID"

@@ -42,6 +42,7 @@ struct ProxyUserResponse {
     name: String,
     uuid: String,
     enabled: bool,
+    is_system: bool,
     note: String,
     proxy_node_ids: Vec<i64>,
     created_at: i64,
@@ -55,6 +56,7 @@ impl From<ProxyUser> for ProxyUserResponse {
             name: user.name,
             uuid: user.uuid,
             enabled: user.enabled,
+            is_system: user.is_system,
             note: user.note,
             proxy_node_ids: user.proxy_node_ids,
             created_at: user.created_at,
@@ -120,6 +122,14 @@ pub async fn update_proxy_user(
     }
     let lock = app.proxy_user_lock(id);
     let _operation = lock.lock().await;
+    let current = match app.db.proxy_user(id) {
+        Ok(Some(user)) => user,
+        Ok(None) => return no_store(api::answer(StatusCode::NOT_FOUND, "代理用户不存在")),
+        Err(error) => return no_store(api::fail(error)),
+    };
+    if current.is_system && request.name.trim() != current.name {
+        return no_store(api::answer(StatusCode::CONFLICT, "系统代理用户名称不能修改"));
+    }
     match app.db.update_proxy_user_profile(
         id,
         &request.name,
@@ -190,6 +200,9 @@ pub async fn delete_proxy_user(_: Admin, State(app): State<Shared>, Path(id): Pa
         Ok(None) => return no_store(api::answer(StatusCode::NOT_FOUND, "代理用户不存在")),
         Err(error) => return no_store(api::fail(error)),
     };
+    if current.is_system {
+        return no_store(api::answer(StatusCode::CONFLICT, "系统代理用户不能删除"));
+    }
     let Some((disabled, server_ids)) = (match app.db.update_proxy_user_profile(
         id,
         &current.name,
@@ -268,6 +281,7 @@ mod tests {
         let first_uuid = user["uuid"].as_str().unwrap();
         assert!(crate::proxy_config::is_uuid(first_uuid));
         assert_eq!(user["name"], "Alice");
+        assert_eq!(user["is_system"], false);
         assert_eq!(user["note"], "first note");
         assert_eq!(user["proxy_node_ids"], json!([]));
         assert!(user.get("quota").is_none());
@@ -296,9 +310,92 @@ mod tests {
         assert_ne!(regenerated["uuid"], first_uuid);
         assert_eq!(regenerated["enabled"], false, "regenerate 只换 UUID，不改其他 desired state");
 
-        let listed = list_proxy_users(Admin, State(app)).await;
+        let listed = list_proxy_users(Admin, State(app.clone())).await;
         let listed = response_json(listed).await;
-        assert_eq!(listed["users"][0]["name"], "Alice 2");
-        assert_eq!(listed["users"][0]["uuid"], regenerated["uuid"]);
+        let listed_user = listed["users"].as_array().unwrap().iter().find(|user| user["id"] == id).unwrap();
+        assert_eq!(listed_user["name"], "Alice 2");
+        assert_eq!(listed_user["uuid"], regenerated["uuid"]);
+        let listed_admin =
+            listed["users"].as_array().unwrap().iter().find(|user| user["name"] == "admin").unwrap();
+        assert_eq!(listed_admin["is_system"], true);
+
+        let admin = app.db.proxy_users().unwrap().into_iter().find(|user| user.is_system).unwrap();
+        assert_eq!(admin.name, "admin");
+        assert!(admin.enabled);
+        assert!(admin.proxy_node_ids.is_empty());
+
+        let deleted = delete_proxy_user(Admin, State(app), Path(id)).await;
+        assert_eq!(deleted.status(), StatusCode::OK);
+        assert_eq!(response_json(deleted).await["deleted"], true);
+    }
+
+    #[tokio::test]
+    async fn system_proxy_user_api_blocks_delete_and_rename_but_allows_edit_and_regenerate() {
+        let app = app();
+        let admin = app.db.proxy_users().unwrap().into_iter().find(|user| user.is_system).unwrap();
+        let id = admin.id;
+        let old_uuid = admin.uuid;
+
+        let deleted = delete_proxy_user(Admin, State(app.clone()), Path(id)).await;
+        assert_eq!(deleted.status(), StatusCode::CONFLICT);
+        assert_eq!(app.db.proxy_user(id).unwrap().unwrap().name, "admin");
+
+        let renamed = update_proxy_user(
+            Admin,
+            State(app.clone()),
+            Path(id),
+            Ok(Json(UpdateProxyUserRequest {
+                name: "renamed".into(),
+                enabled: true,
+                note: String::new(),
+                proxy_node_ids: Vec::new(),
+            })),
+        )
+        .await;
+        assert_eq!(renamed.status(), StatusCode::CONFLICT);
+        assert_eq!(app.db.proxy_user(id).unwrap().unwrap().name, "admin");
+
+        let edited = update_proxy_user(
+            Admin,
+            State(app.clone()),
+            Path(id),
+            Ok(Json(UpdateProxyUserRequest {
+                name: "admin".into(),
+                enabled: false,
+                note: "paused by operator".into(),
+                proxy_node_ids: Vec::new(),
+            })),
+        )
+        .await;
+        assert_eq!(edited.status(), StatusCode::OK);
+        let edited = response_json(edited).await["user"].clone();
+        assert_eq!(edited["name"], "admin");
+        assert_eq!(edited["enabled"], false);
+        assert_eq!(edited["note"], "paused by operator");
+        assert_eq!(edited["is_system"], true);
+
+        let regenerated = regenerate_proxy_user(Admin, State(app.clone()), Path(id)).await;
+        assert_eq!(regenerated.status(), StatusCode::OK);
+        let regenerated = response_json(regenerated).await["user"].clone();
+        assert_ne!(regenerated["uuid"], old_uuid);
+        assert_eq!(regenerated["is_system"], true);
+        assert_eq!(app.db.proxy_user(id).unwrap().unwrap().uuid, regenerated["uuid"]);
+    }
+
+    #[test]
+    fn create_proxy_user_request_does_not_accept_system_identity() {
+        let parsed = serde_json::from_value::<CreateProxyUserRequest>(json!({
+            "name": "forged-system",
+            "enabled": true,
+            "is_system": true
+        }));
+        assert!(parsed.is_err());
+
+        let parsed = serde_json::from_value::<UpdateProxyUserRequest>(json!({
+            "name": "admin",
+            "enabled": true,
+            "is_system": false
+        }));
+        assert!(parsed.is_err());
     }
 }

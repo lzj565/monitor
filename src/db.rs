@@ -166,7 +166,7 @@ CREATE TABLE IF NOT EXISTS session (
 /// cannot: `open` runs `SCHEMA` before migrating, and on an older file the
 /// column is not there yet. `an_upgraded_release_matches_a_fresh_database`
 /// holds every migration to these rules, starting from v1.0.0's schema.
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -320,6 +320,7 @@ fn migrate_to_10(conn: &Connection) -> Result<()> {
            username TEXT NOT NULL UNIQUE,
            uuid TEXT NOT NULL UNIQUE,
            enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+           is_system INTEGER NOT NULL DEFAULT 0 CHECK (is_system IN (0, 1)),
            quota INTEGER NOT NULL DEFAULT 0 CHECK (quota >= 0),
            expire_at INTEGER,
            created_at INTEGER NOT NULL
@@ -387,6 +388,41 @@ fn migrate_to_13(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// 增加系统用户标识；旧库中已有的 admin 记录会由启动检查原位升级。
+fn migrate_to_14(conn: &Connection) -> Result<()> {
+    add_column(conn, "proxy_user", "is_system INTEGER NOT NULL DEFAULT 0 CHECK (is_system IN (0, 1))")?;
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS proxy_user_single_system
+           ON proxy_user(is_system) WHERE is_system=1;",
+    )?;
+    Ok(())
+}
+
+/// 每次打开数据库时确保唯一的系统 admin 存在，不改变既有代理凭据或授权。
+fn ensure_default_proxy_user(conn: &Connection) -> Result<()> {
+    let system_user_exists: bool =
+        conn.query_row("SELECT EXISTS(SELECT 1 FROM proxy_user WHERE is_system=1)", [], |row| row.get(0))?;
+    if system_user_exists {
+        return Ok(());
+    }
+
+    let legacy_admin_id: Option<i64> = conn
+        .query_row("SELECT id FROM proxy_user WHERE username='admin'", [], |row| row.get(0))
+        .optional()?;
+    if let Some(id) = legacy_admin_id {
+        conn.execute("UPDATE proxy_user SET is_system=1 WHERE id=?1", [id])?;
+        return Ok(());
+    }
+
+    let now = Utc::now().timestamp();
+    conn.execute(
+        "INSERT INTO proxy_user (username, uuid, enabled, is_system, created_at, note, updated_at)
+         VALUES ('admin', ?1, 1, 1, ?2, '', ?2)",
+        params![crate::proxy_provision::uuid_v4(), now],
+    )?;
+    Ok(())
+}
+
 /// Brings a database already in service up to `SCHEMA_VERSION` and stamps it.
 /// `from` is its current version. A fresh file runs the additive migration
 /// history inside one transaction as well.
@@ -439,6 +475,10 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     if from < 13 {
         migrate_to_13(&tx)?;
     }
+    if from < 14 {
+        migrate_to_14(&tx)?;
+    }
+    ensure_default_proxy_user(&tx)?;
     tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     tx.commit()?;
     Ok(())
@@ -619,6 +659,8 @@ pub struct ProxyUser {
     pub name: String,
     pub uuid: String,
     pub enabled: bool,
+    #[serde(default)]
+    pub is_system: bool,
     pub created_at: i64,
     pub note: String,
     pub updated_at: i64,
@@ -1309,7 +1351,7 @@ impl Db {
         let conn = self.conn();
         let mut user = conn
             .query_row(
-                "SELECT id, username AS name, uuid, enabled, created_at, note, updated_at
+                "SELECT id, username AS name, uuid, enabled, is_system, created_at, note, updated_at
                  FROM proxy_user WHERE id = ?1",
                 [id],
                 row_to_proxy_user,
@@ -1324,7 +1366,7 @@ impl Db {
     pub fn proxy_users(&self) -> Result<Vec<ProxyUser>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT id, username AS name, uuid, enabled, created_at, note, updated_at
+            "SELECT id, username AS name, uuid, enabled, is_system, created_at, note, updated_at
              FROM proxy_user ORDER BY created_at, id",
         )?;
         let rows = stmt.query_map([], row_to_proxy_user)?;
@@ -1353,8 +1395,8 @@ impl Db {
         let now = Utc::now().timestamp();
         tx.execute(
             "INSERT INTO proxy_user
-               (username, uuid, enabled, created_at, note, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?4)",
+               (username, uuid, enabled, is_system, created_at, note, updated_at)
+             VALUES (?1, ?2, ?3, 0, ?4, ?5, ?4)",
             params![name.trim(), uuid.trim(), enabled, now, note.trim()],
         )?;
         let id = tx.last_insert_rowid();
@@ -1390,6 +1432,9 @@ impl Db {
         let Some(mut user) = query_proxy_user(&tx, id)? else {
             return Ok(None);
         };
+        if user.is_system && name.trim() != user.name {
+            refuse!("系统代理用户名称不能修改");
+        }
         ensure_proxy_user_name_available(&tx, name, Some(id))?;
         let old_proxy_node_ids = proxy_user_node_ids(&tx, id)?;
         let proxy_node_ids = validated_proxy_node_ids(&tx, requested_node_ids)?;
@@ -1399,9 +1444,10 @@ impl Db {
         server_ids.dedup();
 
         let now = Utc::now().timestamp();
+        let stored_name = if user.is_system { user.name.clone() } else { name.trim().to_owned() };
         tx.execute(
             "UPDATE proxy_user SET username=?2, enabled=?3, note=?4, updated_at=?5 WHERE id=?1",
-            params![id, name.trim(), enabled, note.trim(), now],
+            params![id, stored_name, enabled, note.trim(), now],
         )?;
         tx.execute("DELETE FROM proxy_user_node WHERE user_id=?1", [id])?;
         for proxy_node_id in &proxy_node_ids {
@@ -1410,7 +1456,7 @@ impl Db {
                 params![id, proxy_node_id],
             )?;
         }
-        user.name = name.trim().to_owned();
+        user.name = stored_name;
         user.enabled = enabled;
         user.note = note.trim().to_owned();
         user.updated_at = now;
@@ -1460,7 +1506,7 @@ impl Db {
     pub fn proxy_users_for_node(&self, node_id: i64) -> Result<Vec<ProxyUser>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT pu.id, pu.username AS name, pu.uuid, pu.enabled,
+            "SELECT pu.id, pu.username AS name, pu.uuid, pu.enabled, pu.is_system,
                     pu.created_at, pu.note, pu.updated_at, pun.proxy_node_id
              FROM proxy_user pu
              JOIN proxy_user_node pun ON pun.user_id=pu.id
@@ -1474,6 +1520,7 @@ impl Db {
                     name: row.get("name")?,
                     uuid: row.get("uuid")?,
                     enabled: row.get("enabled")?,
+                    is_system: row.get("is_system")?,
                     created_at: row.get("created_at")?,
                     note: row.get("note")?,
                     updated_at: row.get("updated_at")?,
@@ -1491,7 +1538,20 @@ impl Db {
     }
 
     pub fn delete_proxy_user(&self, id: i64) -> Result<bool> {
-        Ok(self.conn().execute("DELETE FROM proxy_user WHERE id=?1", [id])? > 0)
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let is_system: Option<bool> = tx
+            .query_row("SELECT is_system FROM proxy_user WHERE id=?1", [id], |row| row.get(0))
+            .optional()?;
+        let Some(is_system) = is_system else {
+            return Ok(false);
+        };
+        if is_system {
+            refuse!("系统代理用户不能删除");
+        }
+        tx.execute("DELETE FROM proxy_user WHERE id=?1", [id])?;
+        tx.commit()?;
+        Ok(true)
     }
 
     /// Creates a node and returns its id.
@@ -2567,6 +2627,17 @@ impl Db {
                 refuse!("{NOT_A_BACKUP}：缺少 {table} 表");
             }
         }
+        if version >= SCHEMA_VERSION {
+            let columns = columns_of(&candidate, "proxy_user")?;
+            let missing =
+                ["id", "username", "uuid", "enabled", "is_system", "created_at", "note", "updated_at"]
+                    .into_iter()
+                    .filter(|column| !columns.contains(*column))
+                    .collect::<Vec<_>>();
+            if !missing.is_empty() {
+                refuse!("{NOT_A_BACKUP}：proxy_user 表缺少字段 {}", missing.join("、"));
+            }
+        }
         // The online backup API refuses a page size change while the destination
         // is in WAL mode; an explicit message is clearer than SQLITE_READONLY.
         let theirs: i64 = candidate.query_row("PRAGMA page_size", [], |r| r.get(0))?;
@@ -2579,7 +2650,13 @@ impl Db {
         // could not use while reporting a failure to the panel -- the one
         // arrangement in which the restore has failed and the original data is
         // also gone.
-        migrate(&candidate, version)?;
+        migrate(&candidate, version).map_err(|error| {
+            if error.downcast_ref::<crate::Shown>().is_some() {
+                error
+            } else {
+                anyhow::Error::msg(crate::Shown(format!("{NOT_A_BACKUP}：数据库结构无法升级")))
+            }
+        })?;
         // The migration lands in a -wal beside a backup taken from a running hub.
         // Checkpointed here so the copy below reads a single file.
         let _ = candidate.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
@@ -2793,6 +2870,7 @@ fn row_to_proxy_user(r: &rusqlite::Row<'_>) -> rusqlite::Result<ProxyUser> {
         name: r.get("name")?,
         uuid: r.get("uuid")?,
         enabled: r.get("enabled")?,
+        is_system: r.get("is_system")?,
         created_at: r.get("created_at")?,
         note: r.get("note")?,
         updated_at: r.get("updated_at")?,
@@ -2803,7 +2881,7 @@ fn row_to_proxy_user(r: &rusqlite::Row<'_>) -> rusqlite::Result<ProxyUser> {
 fn query_proxy_user(conn: &Connection, id: i64) -> Result<Option<ProxyUser>> {
     Ok(conn
         .query_row(
-            "SELECT id, username AS name, uuid, enabled, created_at, note, updated_at
+            "SELECT id, username AS name, uuid, enabled, is_system, created_at, note, updated_at
              FROM proxy_user WHERE id=?1",
             [id],
             row_to_proxy_user,
@@ -2957,6 +3035,197 @@ mod tests {
     }
 
     #[test]
+    fn fresh_database_has_one_valid_system_admin_and_reopen_is_idempotent() {
+        let scratch = Scratch::new();
+        let admin_id;
+        {
+            let db = Db::open(&scratch.0).unwrap();
+            let admin = db.proxy_users().unwrap().into_iter().find(|user| user.is_system).unwrap();
+            admin_id = admin.id;
+            assert_eq!(admin.name, "admin");
+            assert!(admin.enabled);
+            assert!(crate::proxy_config::is_uuid(&admin.uuid));
+            assert!(admin.note.is_empty());
+            assert!(admin.proxy_node_ids.is_empty(), "新建 admin 不应自动获得节点授权");
+        }
+        for _ in 0..2 {
+            let db = Db::open(&scratch.0).unwrap();
+            assert_eq!(
+                db.conn()
+                    .query_row("SELECT COUNT(*) FROM proxy_user WHERE is_system=1", [], |row| row
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                db.proxy_users().unwrap().into_iter().find(|user| user.is_system).unwrap().id,
+                admin_id
+            );
+        }
+    }
+
+    #[test]
+    fn v13_admin_is_promoted_in_place_without_losing_identity_or_node_access() {
+        let scratch = Scratch::new();
+        let (admin_id, uuid, note, node_ids);
+        {
+            let db = Db::open(&scratch.0).unwrap();
+            let server = db
+                .create_node(
+                    &Node { name: "legacy-admin-server".into(), ..Default::default() },
+                    "legacy-admin-token",
+                )
+                .unwrap();
+            let proxy_node = db.create_proxy_node(&proxy_node_config(server, 24_101)).unwrap();
+            let mut admin = db.proxy_users().unwrap().into_iter().find(|user| user.is_system).unwrap();
+            (admin_id, uuid) = (admin.id, admin.uuid.clone());
+            let (updated, _) = db
+                .update_proxy_user_profile(admin.id, "admin", false, "keep this note", &[proxy_node.id])
+                .unwrap()
+                .unwrap();
+            admin = updated;
+            note = admin.note;
+            node_ids = admin.proxy_node_ids;
+            db.conn().execute("UPDATE proxy_user SET is_system=0 WHERE id=?1", [admin_id]).unwrap();
+        }
+        let old = Connection::open(&scratch.0).unwrap();
+        old.execute_batch(
+            "DROP INDEX proxy_user_single_system;
+             ALTER TABLE proxy_user DROP COLUMN is_system;
+             PRAGMA user_version = 13;",
+        )
+        .unwrap();
+        drop(old);
+
+        let db = Db::open(&scratch.0).unwrap();
+        let admin = db.proxy_user(admin_id).unwrap().unwrap();
+        assert!(admin.is_system);
+        assert_eq!(admin.name, "admin");
+        assert_eq!(admin.uuid, uuid);
+        assert_eq!(admin.note, note);
+        assert_eq!(admin.proxy_node_ids, node_ids);
+        assert!(!admin.enabled);
+        assert_eq!(db.proxy_users().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn v13_database_without_admin_keeps_users_and_adds_a_system_admin() {
+        let scratch = Scratch::new();
+        let regular_users;
+        {
+            let db = Db::open(&scratch.0).unwrap();
+            let server = db
+                .create_node(
+                    &Node { name: "ordinary-user-server".into(), ..Default::default() },
+                    "ordinary-token",
+                )
+                .unwrap();
+            let proxy_node = db.create_proxy_node(&proxy_node_config(server, 24_102)).unwrap();
+            let (first, _) = db
+                .create_proxy_user_with_nodes(
+                    "aaa",
+                    "a0f81cec-73c5-4eb8-a2e2-cd1544946e8e",
+                    true,
+                    "first",
+                    &[],
+                )
+                .unwrap();
+            db.update_proxy_user_profile(first.id, "aaa", true, "first", &[proxy_node.id]).unwrap();
+            db.create_proxy_user_with_nodes(
+                "bbb",
+                "aa8c947a-1dbd-4905-bcb1-71728c58effb",
+                false,
+                "second",
+                &[],
+            )
+            .unwrap();
+            regular_users = db
+                .proxy_users()
+                .unwrap()
+                .into_iter()
+                .filter(|user| !user.is_system)
+                .map(|user| {
+                    (
+                        user.id,
+                        user.name,
+                        user.uuid,
+                        user.enabled,
+                        user.note,
+                        user.created_at,
+                        user.updated_at,
+                        user.proxy_node_ids,
+                    )
+                })
+                .collect::<Vec<_>>();
+            db.conn().execute("DELETE FROM proxy_user WHERE is_system=1", []).unwrap();
+        }
+        let old = Connection::open(&scratch.0).unwrap();
+        old.execute_batch(
+            "DROP INDEX proxy_user_single_system;
+             ALTER TABLE proxy_user DROP COLUMN is_system;
+             PRAGMA user_version = 13;",
+        )
+        .unwrap();
+        drop(old);
+
+        let db = Db::open(&scratch.0).unwrap();
+        let mut migrated_regular = db
+            .proxy_users()
+            .unwrap()
+            .into_iter()
+            .filter(|user| !user.is_system)
+            .map(|user| {
+                (
+                    user.id,
+                    user.name,
+                    user.uuid,
+                    user.enabled,
+                    user.note,
+                    user.created_at,
+                    user.updated_at,
+                    user.proxy_node_ids,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut original_regular = regular_users;
+        migrated_regular.sort();
+        original_regular.sort();
+        assert_eq!(migrated_regular, original_regular);
+        let admin = db.proxy_users().unwrap().into_iter().find(|user| user.is_system).unwrap();
+        assert_eq!(admin.name, "admin");
+        assert!(admin.enabled);
+        assert!(crate::proxy_config::is_uuid(&admin.uuid));
+        assert!(admin.proxy_node_ids.is_empty());
+    }
+
+    #[test]
+    fn system_proxy_user_cannot_be_deleted_or_renamed_but_can_be_edited_and_regenerated() {
+        let db = db();
+        let admin = db.proxy_users().unwrap().into_iter().find(|user| user.is_system).unwrap();
+        assert!(db.update_proxy_user_profile(admin.id, "renamed", true, "", &[]).is_err());
+        assert!(db.delete_proxy_user(admin.id).is_err());
+        let (updated, _) =
+            db.update_proxy_user_profile(admin.id, "admin", false, "managed", &[]).unwrap().unwrap();
+        assert!(updated.is_system);
+        assert_eq!(updated.name, "admin");
+        assert!(!updated.enabled);
+        assert_eq!(updated.note, "managed");
+
+        let replacement = "ea9b23b8-ff74-47a7-b8af-88e961e49cb5";
+        let (regenerated, _) = db.regenerate_proxy_user_uuid(admin.id, replacement).unwrap().unwrap();
+        assert!(regenerated.is_system);
+        assert_eq!(regenerated.uuid, replacement);
+        assert!(db.proxy_user(admin.id).unwrap().is_some());
+
+        let (ordinary, _) = db
+            .create_proxy_user_with_nodes("ordinary", "f15aec0b-10d2-4794-b07a-64c817f6cabe", true, "", &[])
+            .unwrap();
+        assert!(!ordinary.is_system);
+        assert!(db.delete_proxy_user(ordinary.id).unwrap());
+        assert!(db.proxy_user(ordinary.id).unwrap().is_none());
+    }
+
+    #[test]
     fn proxy_instance_observations_track_hash_revisions_and_cascade_with_nodes() {
         let db = db();
         let node_id =
@@ -3002,7 +3271,7 @@ mod tests {
             .is_err());
 
         let (updated, _) = db.update_proxy_user_profile(id, "alice-2", false, "", &[]).unwrap().unwrap();
-        let loaded = db.proxy_users().unwrap().remove(0);
+        let loaded = db.proxy_user(id).unwrap().unwrap();
         assert_eq!(loaded.name, "alice-2");
         assert!(!loaded.enabled);
         assert_eq!(updated.uuid, uuid, "普通资料编辑不允许改变 UUID");
@@ -3046,7 +3315,14 @@ mod tests {
                 &[i64::MAX],
             )
             .is_err());
-        assert_eq!(db.proxy_users().unwrap().len(), 1, "无效授权不会留下孤立用户");
+        assert_eq!(
+            db.conn()
+                .query_row("SELECT COUNT(*) FROM proxy_user WHERE is_system=0", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "无效授权不会留下孤立用户"
+        );
 
         let (updated, affected_servers) = db
             .update_proxy_user_profile(
@@ -4274,7 +4550,11 @@ mod tests {
             );
         }
         let upgraded = dump(&db.conn());
-        assert_eq!(upgraded.len(), LEGACY_TABLES.len(), "every existing row survives: {upgraded:#?}");
+        assert_eq!(
+            upgraded.len(),
+            LEGACY_TABLES.len() + 1,
+            "every existing row survives, plus the default admin: {upgraded:#?}"
+        );
 
         // An earlier build opening the file stamps its own version, so the next
         // upgrade runs every migration again.

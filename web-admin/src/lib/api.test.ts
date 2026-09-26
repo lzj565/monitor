@@ -184,6 +184,7 @@ const proxyUser = {
   name: "Alice",
   uuid: "f15aec0b-10d2-4794-b07a-64c817f6cabe",
   enabled: true,
+  is_system: false,
   note: "test account",
   proxy_node_ids: [7, 8],
   created_at: 1_800_000_000,

@@ -124,6 +124,7 @@ export type ProxyUser = {
   name: string
   uuid: string
   enabled: boolean
+  is_system: boolean
   note: string
   proxy_node_ids: number[]
   created_at: number
