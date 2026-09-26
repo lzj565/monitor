@@ -18,8 +18,8 @@ use crate::agent_ws::Agent;
 use crate::auth::{
     authed, client_ip, current_session, hash_password, issue_session, issued_at, random_token, with_cookies,
 };
-use crate::db::{Db, Node, NodePatch, PingTask, ProxyNodeConfig, Traffic, TrafficPatch};
-use crate::proxy_provision::{self, ProxyNodeProvisionRequest};
+use crate::db::{Db, Node, NodePatch, PingTask, ProxyNodeUpdate, Traffic, TrafficPatch};
+use crate::proxy_provision::{self, ProxyNodeProvisionRequest, RegenerateProxyNodeRequest};
 use crate::{agent_ws, App, Shared};
 
 /// Present only on requests carrying a valid session. Handlers taking it cannot
@@ -386,9 +386,17 @@ pub async fn update_proxy_node(
     _: Admin,
     State(app): State<Shared>,
     Path(id): Path<i64>,
-    body: Result<Json<ProxyNodeConfig>, JsonRejection>,
+    body: Result<Json<ProxyNodeUpdate>, JsonRejection>,
 ) -> Response {
     let Ok(Json(config)) = body else { return bad("代理节点数据格式不对") };
+    let Some(existing) = (match app.db.proxy_node(id) {
+        Ok(node) => node,
+        Err(error) => return fail(error),
+    }) else {
+        return answer(StatusCode::NOT_FOUND, "代理节点不存在");
+    };
+    let lock = app.proxy_deploy_lock(existing.node_id);
+    let _operation = lock.lock().await;
     match app.db.update_proxy_node(id, &config) {
         Ok(true) => match app.db.proxy_node(id) {
             Ok(Some(node)) => no_store(Json(json!({"node": node})).into_response()),
@@ -400,9 +408,27 @@ pub async fn update_proxy_node(
     }
 }
 
-pub async fn delete_proxy_node(_: Admin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
-    match app.db.delete_proxy_node(id) {
-        Ok(true) => Json(json!({"ok": true})).into_response(),
+pub async fn regenerate_proxy_node(
+    _: Admin,
+    State(app): State<Shared>,
+    Path(id): Path<i64>,
+    body: Result<Json<RegenerateProxyNodeRequest>, JsonRejection>,
+) -> Response {
+    let Ok(Json(request)) = body else { return bad("代理节点凭据操作格式不对") };
+    let Some(existing) = (match app.db.proxy_node(id) {
+        Ok(node) => node,
+        Err(error) => return fail(error),
+    }) else {
+        return answer(StatusCode::NOT_FOUND, "代理节点不存在");
+    };
+    let lock = app.proxy_deploy_lock(existing.node_id);
+    let _operation = lock.lock().await;
+    match proxy_provision::regenerate_proxy_node(&app.db, id, request.credential) {
+        Ok(true) => match app.db.proxy_node(id) {
+            Ok(Some(node)) => no_store(Json(json!({ "node": node })).into_response()),
+            Ok(None) => answer(StatusCode::NOT_FOUND, "代理节点不存在"),
+            Err(error) => fail(error),
+        },
         Ok(false) => answer(StatusCode::NOT_FOUND, "代理节点不存在"),
         Err(error) => fail(error),
     }
@@ -2065,19 +2091,13 @@ mod tests {
         })
     }
 
-    fn proxy_node_update_body(node_id: i64, listen_port: u16) -> Value {
+    fn proxy_node_update_body(listen_port: u16) -> Value {
         json!({
-            "node_id": node_id,
             "name": "Reality node",
             "enabled": true,
-            "protocol": "vless_reality",
             "address_mode": "ipv4",
             "custom_address": null,
             "listen_port": listen_port,
-            "uuid": "test-uuid",
-            "reality_private_key": "private-test-secret",
-            "reality_public_key": "public-test-key",
-            "reality_short_id": "1234abcd",
             "reality_server_name": "example.com",
             "reality_dest": "example.com:443"
         })
@@ -2136,7 +2156,12 @@ mod tests {
         let id = created["node"]["id"].as_i64().unwrap();
         assert_eq!(created["node"]["protocol"], "vless_reality");
         assert_eq!(created["node"]["deploy_status"], "not_deployed");
-        assert_eq!(created["node"]["reality_private_key"].as_str().unwrap().len(), 43);
+        assert!(created["node"].get("reality_private_key").is_none());
+        let saved_before = app.db.proxy_node(id).unwrap().unwrap();
+        let private_before = saved_before.reality_private_key.clone();
+        let uuid_before = saved_before.uuid.clone();
+        let public_before = saved_before.reality_public_key.clone();
+        let short_id_before = saved_before.reality_short_id.clone();
         assert!((24_000..=29_999).contains(&created["node"]["listen_port"].as_u64().unwrap()));
 
         let listed = proxy_nodes(Admin, State(app.clone())).await;
@@ -2146,6 +2171,7 @@ mod tests {
             serde_json::from_slice(&axum::body::to_bytes(listed.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(listed["nodes"].as_array().unwrap().len(), 1);
+        assert!(listed["nodes"][0].get("reality_private_key").is_none());
 
         let mut duplicate = proxy_node_body(node_id);
         duplicate["listen_port"] = created["node"]["listen_port"].clone();
@@ -2159,17 +2185,20 @@ mod tests {
         let conflict_text =
             String::from_utf8(axum::body::to_bytes(conflict.into_body(), usize::MAX).await.unwrap().to_vec())
                 .unwrap();
-        assert!(!conflict_text.contains(created["node"]["reality_private_key"].as_str().unwrap()));
+        assert!(!conflict_text.contains(&private_before));
 
-        let mut update = proxy_node_update_body(node_id, 8443);
+        let mut update = proxy_node_update_body(8443);
         update["name"] = json!("updated Reality node");
         update["address_mode"] = json!("custom");
         update["custom_address"] = json!("edge.example.net");
+        let mut forbidden = update.clone();
+        forbidden["uuid"] = json!("browser-controlled-uuid");
+        assert!(serde_json::from_value::<ProxyNodeUpdate>(forbidden).is_err());
         let updated = update_proxy_node(
             Admin,
             State(app.clone()),
             Path(id),
-            Ok(Json(serde_json::from_value(update).unwrap())),
+            Ok(Json(serde_json::from_value::<ProxyNodeUpdate>(update).unwrap())),
         )
         .await;
         assert_eq!(updated.status(), StatusCode::OK);
@@ -2179,13 +2208,36 @@ mod tests {
                 .unwrap();
         assert_eq!(updated["node"]["name"], "updated Reality node");
         assert_eq!(updated["node"]["custom_address"], "edge.example.net");
+        assert!(updated["node"].get("reality_private_key").is_none());
+        let saved_after_update = app.db.proxy_node(id).unwrap().unwrap();
+        assert_eq!(saved_after_update.node_id, node_id);
+        assert_eq!(saved_after_update.uuid, uuid_before);
+        assert_eq!(saved_after_update.reality_private_key, private_before);
+        assert_eq!(saved_after_update.reality_public_key, public_before);
+        assert_eq!(saved_after_update.reality_short_id, short_id_before);
 
-        assert_eq!(delete_proxy_node(Admin, State(app.clone()), Path(id)).await.status(), StatusCode::OK);
+        let regenerated = regenerate_proxy_node(
+            Admin,
+            State(app.clone()),
+            Path(id),
+            Ok(Json(serde_json::from_value(json!({ "credential": "uuid" })).unwrap())),
+        )
+        .await;
+        assert_eq!(regenerated.status(), StatusCode::OK);
+        let regenerated: Value =
+            serde_json::from_slice(&axum::body::to_bytes(regenerated.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_ne!(regenerated["node"]["uuid"], uuid_before);
+        assert!(regenerated["node"].get("reality_private_key").is_none());
+        assert_eq!(app.db.proxy_node(id).unwrap().unwrap().reality_private_key, private_before);
+
+        let delete_failed = crate::proxy_deploy::remove_proxy_node(Admin, State(app.clone()), Path(id)).await;
+        assert_eq!(delete_failed.status(), StatusCode::CONFLICT);
+        assert!(app.db.proxy_node(id).unwrap().is_some(), "离线 Agent 时不能删除代理节点");
         assert_eq!(
-            delete_proxy_node(Admin, State(app.clone()), Path(id)).await.status(),
+            crate::proxy_deploy::remove_proxy_node(Admin, State(app.clone()), Path(id + 1)).await.status(),
             StatusCode::NOT_FOUND
         );
-        assert!(app.db.proxy_nodes().unwrap().is_empty());
     }
 
     #[tokio::test]

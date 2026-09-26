@@ -100,16 +100,21 @@ export type ProxyInstance = {
   updated_at: number
 }
 
-/** 代理节点列表只消费展示所需字段；密钥等服务端字段不会用于 UI。 */
+/** 服务端序列化会省略 Reality 私钥，浏览器只接收公开凭据和配置字段。 */
 export type ProxyNode = {
   id: number
   node_id: number
   name: string
+  enabled: boolean
   protocol: string
   address_mode: string
   custom_address: string | null
   listen_port: number
+  uuid: string
+  reality_public_key: string
+  reality_short_id: string
   reality_server_name: string
+  reality_dest: string
   deploy_status: string
   last_error: string | null
 }

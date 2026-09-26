@@ -574,6 +574,7 @@ pub struct ProxyNode {
     pub custom_address: Option<String>,
     pub listen_port: u16,
     pub uuid: String,
+    #[serde(skip_serializing)]
     pub reality_private_key: String,
     pub reality_public_key: String,
     pub reality_short_id: String,
@@ -603,6 +604,45 @@ pub struct ProxyNodeConfig {
     pub reality_short_id: String,
     pub reality_server_name: String,
     pub reality_dest: String,
+}
+
+/// 普通编辑只接受业务字段；所属服务器和凭据不能经此接口修改。
+#[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyNodeUpdate {
+    pub name: String,
+    pub enabled: bool,
+    pub address_mode: String,
+    #[serde(default)]
+    pub custom_address: Option<String>,
+    pub listen_port: u16,
+    pub reality_server_name: String,
+    pub reality_dest: String,
+}
+
+impl ProxyNodeUpdate {
+    fn validate(&self) -> Result<()> {
+        if self.name.trim().is_empty() {
+            refuse!("请填写代理节点名称");
+        }
+        if !matches!(self.address_mode.as_str(), "ipv4" | "ipv6" | "custom") {
+            refuse!("地址模式只支持 ipv4、ipv6 或 custom");
+        }
+        if self.listen_port == 0 {
+            refuse!("监听端口必须在 1 到 65535 之间");
+        }
+        let custom_address_set =
+            self.custom_address.as_deref().is_some_and(|address| !address.trim().is_empty());
+        if self.address_mode == "custom" && !custom_address_set {
+            refuse!("自定义地址模式必须填写 custom_address");
+        }
+        if self.address_mode != "custom" && custom_address_set {
+            refuse!("只有 custom 地址模式可以填写 custom_address");
+        }
+        crate::proxy_config::validate_reality_settings(&self.reality_server_name, &self.reality_dest)
+            .map_err(|error| anyhow::Error::msg(crate::Shown(error.to_string())))?;
+        Ok(())
+    }
 }
 
 fn validate_proxy_node(config: &ProxyNodeConfig) -> Result<()> {
@@ -1005,33 +1045,65 @@ impl Db {
         Ok(created)
     }
 
-    pub fn update_proxy_node(&self, id: i64, config: &ProxyNodeConfig) -> Result<bool> {
-        validate_proxy_node(config)?;
+    pub fn update_proxy_node(&self, id: i64, config: &ProxyNodeUpdate) -> Result<bool> {
+        config.validate()?;
         let now = Utc::now().timestamp();
         let custom_address =
             config.custom_address.as_deref().map(str::trim).filter(|value| !value.is_empty());
         Ok(self.conn().execute(
-            "UPDATE proxy_node SET node_id=?2, name=?3, enabled=?4, protocol=?5, address_mode=?6,
-                    custom_address=?7, listen_port=?8, uuid=?9, reality_private_key=?10,
-                    reality_public_key=?11, reality_short_id=?12, reality_server_name=?13,
-                    reality_dest=?14, deploy_status='not_deployed', last_error=NULL, updated_at=?15
+            "UPDATE proxy_node SET name=?2, enabled=?3, address_mode=?4,
+                    custom_address=?5, listen_port=?6, reality_server_name=?7,
+                    reality_dest=?8, deploy_status='not_deployed', last_error=NULL, updated_at=?9
              WHERE id=?1",
             params![
                 id,
-                config.node_id,
                 config.name.trim(),
                 config.enabled,
-                config.protocol,
                 config.address_mode,
                 custom_address,
                 config.listen_port,
-                config.uuid.trim(),
-                config.reality_private_key.trim(),
-                config.reality_public_key.trim(),
-                config.reality_short_id.trim(),
                 config.reality_server_name.trim(),
                 config.reality_dest.trim(),
                 now,
+            ],
+        )? > 0)
+    }
+
+    pub fn regenerate_proxy_node_credentials(
+        &self,
+        id: i64,
+        uuid: Option<&str>,
+        reality_private_key: Option<&str>,
+        reality_public_key: Option<&str>,
+        reality_short_id: Option<&str>,
+    ) -> Result<bool> {
+        if id <= 0 {
+            anyhow::bail!("invalid proxy node id");
+        }
+        if uuid.is_none()
+            && reality_private_key.is_none()
+            && reality_public_key.is_none()
+            && reality_short_id.is_none()
+        {
+            anyhow::bail!("no proxy credential selected for regeneration");
+        }
+        if reality_private_key.is_some() != reality_public_key.is_some() {
+            anyhow::bail!("Reality keys must be regenerated as a pair");
+        }
+        Ok(self.conn().execute(
+            "UPDATE proxy_node SET uuid=COALESCE(?2, uuid),
+                    reality_private_key=COALESCE(?3, reality_private_key),
+                    reality_public_key=COALESCE(?4, reality_public_key),
+                    reality_short_id=COALESCE(?5, reality_short_id),
+                    deploy_status='not_deployed', last_error=NULL, updated_at=?6
+             WHERE id=?1",
+            params![
+                id,
+                uuid.map(str::trim),
+                reality_private_key,
+                reality_public_key,
+                reality_short_id,
+                Utc::now().timestamp()
             ],
         )? > 0)
     }
@@ -2616,12 +2688,16 @@ mod tests {
                 [created.id],
             )
             .unwrap();
-        config.name = "reality-updated".into();
-        config.address_mode = "custom".into();
-        config.custom_address = Some(" edge.example.net ".into());
-        config.listen_port = 8443;
-        config.enabled = false;
-        assert!(db.update_proxy_node(created.id, &config).unwrap());
+        let update = ProxyNodeUpdate {
+            name: "reality-updated".into(),
+            enabled: false,
+            address_mode: "custom".into(),
+            custom_address: Some(" edge.example.net ".into()),
+            listen_port: 8443,
+            reality_server_name: "www.apple.com".into(),
+            reality_dest: "www.apple.com:443".into(),
+        };
+        assert!(db.update_proxy_node(created.id, &update).unwrap());
         let updated = db.proxy_node(created.id).unwrap().unwrap();
         assert_eq!(updated.name, "reality-updated");
         assert_eq!(updated.address_mode, "custom");
@@ -2630,6 +2706,27 @@ mod tests {
         assert_eq!(updated.last_error, None);
         assert!(updated.updated_at > 0);
         assert!(!updated.enabled);
+        assert_eq!(updated.node_id, server);
+        assert_eq!(updated.uuid, "test-uuid");
+        assert_eq!(updated.reality_private_key, "private-secret");
+        assert_eq!(updated.reality_public_key, "public-key");
+        assert_eq!(updated.reality_short_id, "1234abcd");
+
+        assert!(db
+            .regenerate_proxy_node_credentials(
+                created.id,
+                Some("new-uuid"),
+                Some("new-private"),
+                Some("new-public"),
+                Some("new-short-id"),
+            )
+            .unwrap());
+        let regenerated = db.proxy_node(created.id).unwrap().unwrap();
+        assert_eq!(regenerated.uuid, "new-uuid");
+        assert_eq!(regenerated.reality_private_key, "new-private");
+        assert_eq!(regenerated.reality_public_key, "new-public");
+        assert_eq!(regenerated.reality_short_id, "new-short-id");
+        assert_eq!(regenerated.deploy_status, "not_deployed");
 
         assert!(db.delete_proxy_node(created.id).unwrap());
         assert!(!db.delete_proxy_node(created.id).unwrap());

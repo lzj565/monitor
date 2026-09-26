@@ -28,6 +28,20 @@ pub struct ProxyNodeProvisionRequest {
     pub reality_dest: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegenerateProxyNodeRequest {
+    pub credential: ProxyCredential,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProxyCredential {
+    Uuid,
+    RealityKey,
+    ShortId,
+}
+
 impl ProxyNodeProvisionRequest {
     pub fn validate(&self) -> Result<()> {
         if self.node_id <= 0 {
@@ -87,6 +101,26 @@ pub fn create_proxy_node(db: &Db, request: &ProxyNodeProvisionRequest) -> Result
             &config,
             rand::random_range(AUTO_PROXY_PORT_MIN..=AUTO_PROXY_PORT_MAX),
         ),
+    }
+}
+
+pub fn regenerate_proxy_node(db: &Db, id: i64, credential: ProxyCredential) -> Result<bool> {
+    match credential {
+        ProxyCredential::Uuid => {
+            let uuid = uuid_v4();
+            db.regenerate_proxy_node_credentials(id, Some(&uuid), None, None, None)
+        }
+        ProxyCredential::RealityKey => {
+            let (mut private_key, public_key) = reality_keypair();
+            let result =
+                db.regenerate_proxy_node_credentials(id, None, Some(&private_key), Some(&public_key), None);
+            private_key.zeroize();
+            result
+        }
+        ProxyCredential::ShortId => {
+            let short_id = hex::encode(rand::random::<[u8; 4]>());
+            db.regenerate_proxy_node_credentials(id, None, None, None, Some(&short_id))
+        }
     }
 }
 
@@ -167,6 +201,29 @@ mod tests {
         let private = x25519_dalek::StaticSecret::from(private_bytes);
         let public = x25519_dalek::PublicKey::from(&private);
         assert_eq!(URL_SAFE_NO_PAD.encode(public.to_bytes()), created.reality_public_key);
+    }
+
+    #[test]
+    fn regenerating_reality_keys_changes_the_pair_and_preserves_other_credentials() {
+        let db = Db::open(":memory:").unwrap();
+        let server = db.create_node(&Node { name: "hk".into(), ..Node::default() }, "server-token").unwrap();
+        let created = create_proxy_node(&db, &request(server)).unwrap();
+        let old_uuid = created.uuid.clone();
+        let old_short_id = created.reality_short_id.clone();
+        let old_private = created.reality_private_key.clone();
+        let old_public = created.reality_public_key.clone();
+
+        assert!(regenerate_proxy_node(&db, created.id, ProxyCredential::RealityKey).unwrap());
+        let updated = db.proxy_node(created.id).unwrap().unwrap();
+        assert_ne!(updated.reality_private_key, old_private);
+        assert_ne!(updated.reality_public_key, old_public);
+        assert_eq!(updated.uuid, old_uuid);
+        assert_eq!(updated.reality_short_id, old_short_id);
+        let private_bytes: [u8; 32] =
+            URL_SAFE_NO_PAD.decode(&updated.reality_private_key).unwrap().try_into().unwrap();
+        let private = x25519_dalek::StaticSecret::from(private_bytes);
+        let public = x25519_dalek::PublicKey::from(&private);
+        assert_eq!(URL_SAFE_NO_PAD.encode(public.to_bytes()), updated.reality_public_key);
     }
 
     #[test]

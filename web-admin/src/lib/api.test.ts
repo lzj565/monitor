@@ -1,5 +1,6 @@
 /// <reference types="node" />
 import assert from "node:assert/strict"
+import { createProxyNodeOperationGuard, deleteConfirmation, regenerateAndDeployProxyNode, regenerateConfirmation, removeProxyNode, updateAndDeployProxyNode, proxyNodeUpdatePayload, type ProxyNodeActionApi, type ProxyNodeUpdatePayload } from "./proxy-node-actions.ts"
 import { badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, loopbackOrigin, outdatedAgents, provisioningSite, provisionRefusal, trafficCorrection } from "./api.ts"
 
 assert.deepEqual(changes({ public: true, price: 5 }, { price: 20 }), { price: 20 })
@@ -53,6 +54,97 @@ assert.deepEqual(trafficCorrection(shown, { ...shown, total_rx: "0" }), { total_
 assert.deepEqual(trafficCorrection(shown, { ...shown, total_tx: "3" }), { total_tx: 3 * GIB })
 assert.deepEqual(trafficCorrection(shown, shown), {})
 console.log("partial edits, traffic corrections and provisioning checks passed")
+
+const proxyNode = {
+  id: 7,
+  node_id: 3,
+  name: "HK Reality",
+  enabled: true,
+  protocol: "vless_reality",
+  address_mode: "ipv4",
+  custom_address: null,
+  listen_port: 24443,
+  uuid: "old-uuid",
+  reality_public_key: "old-public-key",
+  reality_short_id: "1234abcd",
+  reality_server_name: "www.apple.com",
+  reality_dest: "www.apple.com:443",
+  deploy_status: "deployed",
+  last_error: null,
+}
+const editable = proxyNodeUpdatePayload(proxyNode, { name: "HK edge", address_mode: "custom", custom_address: "edge.example.net" })
+assert.deepEqual(Object.keys(editable).sort(), ["address_mode", "custom_address", "enabled", "listen_port", "name", "reality_dest", "reality_server_name"].sort())
+assert.equal((editable as ProxyNodeUpdatePayload).enabled, true)
+
+const calls: { path: string; init?: RequestInit }[] = []
+const request: ProxyNodeActionApi = async <T>(path: string, init?: RequestInit): Promise<T> => {
+  calls.push({ path, init })
+  return { node: proxyNode } as T
+}
+let updated = false
+let deployed = false
+await updateAndDeployProxyNode(request, proxyNode.id, proxyNode.node_id, editable, () => { updated = true }, () => { deployed = true })
+assert.deepEqual(calls.map((call) => [call.path, call.init?.method]), [
+  ["/proxy/nodes/7", "PUT"],
+  ["/proxy/servers/3/deploy", "POST"],
+])
+assert.deepEqual(JSON.parse(calls[0].init?.body as string), editable)
+assert.equal(updated, true)
+assert.equal(deployed, true)
+
+calls.length = 0
+updated = false
+deployed = false
+const deployFailure: ProxyNodeActionApi = async <T>(path: string, init?: RequestInit): Promise<T> => {
+  calls.push({ path, init })
+  if (path.endsWith("/deploy")) throw new Error("agent offline")
+  return {} as T
+}
+await assert.rejects(updateAndDeployProxyNode(deployFailure, proxyNode.id, proxyNode.node_id, editable, () => { updated = true }, () => { deployed = true }), /agent offline/)
+assert.equal(updated, true, "成功的 PUT 会保留 desired state，即使后续部署失败")
+assert.equal(deployed, false)
+assert.equal(calls[0].init?.method, "PUT", "部署失败不发送旧值回滚请求")
+
+calls.length = 0
+await updateAndDeployProxyNode(request, proxyNode.id, proxyNode.node_id, proxyNodeUpdatePayload(proxyNode, { enabled: false }))
+assert.equal(JSON.parse(calls[0].init?.body as string).enabled, false)
+calls.length = 0
+await updateAndDeployProxyNode(request, proxyNode.id, proxyNode.node_id, proxyNodeUpdatePayload(proxyNode, { enabled: true }))
+assert.equal(JSON.parse(calls[0].init?.body as string).enabled, true)
+
+calls.length = 0
+let regenerated: unknown
+await regenerateAndDeployProxyNode(request, proxyNode.id, proxyNode.node_id, "reality_key", (node) => { regenerated = node })
+assert.deepEqual(calls.map((call) => [call.path, call.init?.method]), [
+  ["/proxy/nodes/7/regenerate", "POST"],
+  ["/proxy/servers/3/deploy", "POST"],
+])
+assert.deepEqual(JSON.parse(calls[0].init?.body as string), { credential: "reality_key" })
+assert.equal(regenerated, proxyNode)
+assert.equal(regenerateConfirmation("uuid").description, "当前使用旧 UUID 的客户端配置将无法继续连接。")
+assert.equal(regenerateConfirmation("reality_key").action, "重新生成 Reality 密钥")
+assert.match(regenerateConfirmation("short_id").description, /旧 Short ID/)
+
+const deletePrompt = deleteConfirmation("HK Reality")
+assert.match(deletePrompt.title, /HK Reality/)
+assert.match(deletePrompt.description, /sing-box 配置/)
+assert.match(deletePrompt.description, /客户端连接将立即失效/)
+calls.length = 0
+await removeProxyNode(request, proxyNode.id)
+assert.deepEqual(calls.map((call) => [call.path, call.init?.method]), [["/proxy/nodes/7", "DELETE"]])
+const deleteFailure: ProxyNodeActionApi = async <T>(path: string, init?: RequestInit): Promise<T> => {
+  calls.push({ path, init })
+  throw new Error("config apply failed")
+}
+await assert.rejects(removeProxyNode(deleteFailure, proxyNode.id), /config apply failed/)
+
+const operationGuard = createProxyNodeOperationGuard()
+assert.equal(operationGuard.tryStart(proxyNode.id), true)
+assert.equal(operationGuard.tryStart(proxyNode.id), false, "同一个代理节点的操作不能重复触发")
+operationGuard.finish(proxyNode.id)
+assert.equal(operationGuard.tryStart(proxyNode.id), true)
+operationGuard.finish(proxyNode.id)
+console.log("proxy node edit, deploy, toggle, regenerate and delete workflows passed")
 
 // --iface from the two lists the install dialogs show, and back.
 assert.equal(ifaceSpec({ only: " eth1, pppoe-wan ", skip: "" }), "eth1,pppoe-wan")
@@ -122,4 +214,3 @@ assert.deepEqual(
     .map((s) => [s.label, s.fields.map((f) => f.key)]),
   [["通用", ["a"]], ["外观", ["b"]]],
 )
-

@@ -24,6 +24,7 @@ struct DeployResult {
 enum DeployError {
     Database(anyhow::Error),
     ServerNotFound,
+    ProxyNodeNotFound,
     AgentOffline,
     AgentUnsupported,
     AgentQueueFull,
@@ -44,6 +45,7 @@ impl DeployError {
         match self {
             Self::Database(_) => "hub database error".into(),
             Self::ServerNotFound => "server not found".into(),
+            Self::ProxyNodeNotFound => "proxy node not found".into(),
             Self::AgentOffline => "agent offline".into(),
             Self::AgentUnsupported => "agent does not support sing-box config commands".into(),
             Self::AgentQueueFull => "agent command queue full".into(),
@@ -64,6 +66,7 @@ impl DeployError {
         match self {
             Self::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::ServerNotFound => StatusCode::NOT_FOUND,
+            Self::ProxyNodeNotFound => StatusCode::NOT_FOUND,
             Self::AgentOffline | Self::AgentUnsupported | Self::AgentDisconnected => StatusCode::CONFLICT,
             Self::AgentQueueFull => StatusCode::SERVICE_UNAVAILABLE,
             Self::Timeout | Self::OutcomeUnknown => StatusCode::GATEWAY_TIMEOUT,
@@ -81,6 +84,7 @@ impl DeployError {
         match self {
             Self::Database(_) => api::INTERNAL.into(),
             Self::ServerNotFound => "服务器不存在".into(),
+            Self::ProxyNodeNotFound => "代理节点不存在".into(),
             Self::AgentOffline => "服务器当前离线".into(),
             Self::AgentUnsupported => "当前 agent 不支持 sing-box 配置命令".into(),
             Self::AgentQueueFull => "服务器命令队列已满".into(),
@@ -149,6 +153,39 @@ pub async fn deploy(_: Admin, State(app): State<Shared>, Path(node_id): Path<i64
     }
 }
 
+pub async fn remove_proxy_node(_: Admin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
+    match remove_proxy_node_and_deploy(&app, id).await {
+        Ok(()) => no_store(Json(json!({ "ok": true })).into_response()),
+        Err(error) => no_store(error.response()),
+    }
+}
+
+async fn remove_proxy_node_and_deploy(app: &Shared, id: i64) -> Result<(), DeployError> {
+    let initial =
+        app.db.proxy_node(id).map_err(DeployError::Database)?.ok_or(DeployError::ProxyNodeNotFound)?;
+    let node_id = initial.node_id;
+    let lock = app.proxy_deploy_lock(node_id);
+    let _operation = lock.lock().await;
+
+    let proxy_node =
+        app.db.proxy_node(id).map_err(DeployError::Database)?.ok_or(DeployError::ProxyNodeNotFound)?;
+    if proxy_node.node_id != node_id {
+        return Err(DeployError::ProxyNodeNotFound);
+    }
+    match app.db.node(node_id).map_err(DeployError::Database)? {
+        Some(_) => {}
+        None => return Err(DeployError::ServerNotFound),
+    }
+    let mut desired_nodes = app.db.proxy_nodes_for_node(node_id).map_err(DeployError::Database)?;
+    desired_nodes.retain(|node| node.id != id);
+    deploy_nodes_locked(app, node_id, &desired_nodes).await?;
+
+    if !app.db.delete_proxy_node(id).map_err(DeployError::Database)? {
+        return Err(DeployError::ProxyNodeNotFound);
+    }
+    Ok(())
+}
+
 async fn deploy_server_proxy_config(app: &Shared, node_id: i64) -> Result<DeployResult, DeployError> {
     let lock = app.proxy_deploy_lock(node_id);
     let _operation = lock.lock().await;
@@ -158,9 +195,17 @@ async fn deploy_server_proxy_config(app: &Shared, node_id: i64) -> Result<Deploy
         None => return Err(DeployError::ServerNotFound),
     }
     let nodes = app.db.proxy_nodes_for_node(node_id).map_err(DeployError::Database)?;
+    deploy_nodes_locked(app, node_id, &nodes).await
+}
+
+async fn deploy_nodes_locked(
+    app: &Shared,
+    node_id: i64,
+    nodes: &[ProxyNode],
+) -> Result<DeployResult, DeployError> {
     app.db.set_proxy_nodes_deploy_status(node_id, "deploying", None).map_err(DeployError::Database)?;
 
-    let result = deploy_configuration(app, node_id, &nodes).await;
+    let result = deploy_configuration(app, node_id, nodes).await;
     match result {
         Ok(changed) => {
             app.db.set_proxy_nodes_deploy_status(node_id, "deployed", None).map_err(DeployError::Database)?;
@@ -342,6 +387,92 @@ mod tests {
         let saved = status(&app, proxy_id);
         assert_eq!(saved.deploy_status, "failed");
         assert_eq!(saved.last_error.as_deref(), Some("agent offline"));
+    }
+
+    #[tokio::test]
+    async fn deploy_aware_delete_applies_configuration_without_the_node_before_removing_db_row() {
+        let (app, node_id) = app_node();
+        let removed_id = create_proxy_node(&app, node_id, 443, true, "www.apple.com:443");
+        let kept_id = create_proxy_node(&app, node_id, 8443, true, "www.apple.com:443");
+        let rows = app.db.proxy_nodes_for_node(node_id).unwrap();
+        let current = generate_singbox_config(node_id, current_config(), &rows).unwrap().to_string();
+        let mut rx = add_agent(&app, node_id, SESSION);
+        let remove_app = app.clone();
+        let removal =
+            tokio::spawn(async move { remove_proxy_node_and_deploy(&remove_app, removed_id).await });
+
+        let get = next_request(&mut rx, SINGBOX_CONFIG_GET_METHOD).await;
+        reply(&app, node_id, SESSION, &get, get_result(&current));
+        let check = next_request(&mut rx, SINGBOX_CONFIG_CHECK_METHOD).await;
+        let checked_candidate = check["params"]["content"].as_str().unwrap().to_owned();
+        assert!(app.db.proxy_node(removed_id).unwrap().is_some());
+        reply(&app, node_id, SESSION, &check, Ok(json!({ "valid": true })));
+        let apply = next_request(&mut rx, SINGBOX_CONFIG_APPLY_METHOD).await;
+        let candidate = apply["params"]["content"].as_str().unwrap().to_owned();
+        assert_eq!(candidate, checked_candidate);
+        assert!(app.db.proxy_node(removed_id).unwrap().is_some(), "apply 成功前必须保留数据库记录");
+        reply(&app, node_id, SESSION, &apply, Ok(json!({ "running": true })));
+        removal.await.unwrap().unwrap();
+
+        let applied: Value = serde_json::from_str(&candidate).unwrap();
+        let inbounds = applied["inbounds"].as_array().unwrap();
+        assert_eq!(inbounds.len(), 1);
+        assert_eq!(inbounds[0]["tag"], format!("monitor-proxy-node-{kept_id}"));
+        assert!(app.db.proxy_node(removed_id).unwrap().is_none());
+        assert_eq!(status(&app, kept_id).deploy_status, "deployed");
+    }
+
+    #[tokio::test]
+    async fn delete_keeps_database_row_when_config_check_fails() {
+        let (app, node_id) = app_node();
+        let proxy_id = create_proxy_node(&app, node_id, 443, true, "www.apple.com:443");
+        let rows = app.db.proxy_nodes_for_node(node_id).unwrap();
+        let current = generate_singbox_config(node_id, current_config(), &rows).unwrap().to_string();
+        let mut rx = add_agent(&app, node_id, SESSION);
+        let remove_app = app.clone();
+        let removal = tokio::spawn(async move { remove_proxy_node_and_deploy(&remove_app, proxy_id).await });
+
+        let get = next_request(&mut rx, SINGBOX_CONFIG_GET_METHOD).await;
+        reply(&app, node_id, SESSION, &get, get_result(&current));
+        let check = next_request(&mut rx, SINGBOX_CONFIG_CHECK_METHOD).await;
+        reply(&app, node_id, SESSION, &check, Err(json!({"code": -32000, "message": PRIVATE_SENTINEL})));
+        assert!(matches!(removal.await.unwrap(), Err(DeployError::ConfigCheckFailed)));
+        assert!(rx.try_recv().is_err());
+        let saved = status(&app, proxy_id);
+        assert_eq!(saved.deploy_status, "failed");
+        assert_eq!(saved.last_error.as_deref(), Some("config check failed"));
+    }
+
+    #[tokio::test]
+    async fn delete_keeps_database_row_when_config_apply_fails() {
+        let (app, node_id) = app_node();
+        let proxy_id = create_proxy_node(&app, node_id, 443, true, "www.apple.com:443");
+        let rows = app.db.proxy_nodes_for_node(node_id).unwrap();
+        let current = generate_singbox_config(node_id, current_config(), &rows).unwrap().to_string();
+        let mut rx = add_agent(&app, node_id, SESSION);
+        let remove_app = app.clone();
+        let removal = tokio::spawn(async move { remove_proxy_node_and_deploy(&remove_app, proxy_id).await });
+
+        let get = next_request(&mut rx, SINGBOX_CONFIG_GET_METHOD).await;
+        reply(&app, node_id, SESSION, &get, get_result(&current));
+        let check = next_request(&mut rx, SINGBOX_CONFIG_CHECK_METHOD).await;
+        reply(&app, node_id, SESSION, &check, Ok(json!({"valid": true})));
+        let apply = next_request(&mut rx, SINGBOX_CONFIG_APPLY_METHOD).await;
+        reply(&app, node_id, SESSION, &apply, Err(json!({"code": -32000, "message": PRIVATE_SENTINEL})));
+        assert!(matches!(removal.await.unwrap(), Err(DeployError::ConfigApplyFailed)));
+        let saved = status(&app, proxy_id);
+        assert_eq!(saved.deploy_status, "failed");
+        assert_eq!(saved.last_error.as_deref(), Some("config apply failed"));
+    }
+
+    #[tokio::test]
+    async fn delete_keeps_database_row_when_agent_is_offline() {
+        let (app, node_id) = app_node();
+        let proxy_id = create_proxy_node(&app, node_id, 443, true, "www.apple.com:443");
+
+        assert!(matches!(remove_proxy_node_and_deploy(&app, proxy_id).await, Err(DeployError::AgentOffline)));
+        assert!(app.db.proxy_node(proxy_id).unwrap().is_some());
+        assert_eq!(status(&app, proxy_id).deploy_status, "failed");
     }
 
     #[tokio::test]
