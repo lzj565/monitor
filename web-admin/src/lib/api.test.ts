@@ -4,6 +4,7 @@ import { createElement } from "react"
 import { renderToStaticMarkup } from "react-dom/server"
 import { QRCodeSVG } from "qrcode.react"
 import { createProxyNodeOperationGuard, deleteConfirmation, fetchProxyNodeShare, regenerateAndDeployProxyNode, regenerateConfirmation, removeProxyNode, updateAndDeployProxyNode, proxyNodeShareDisabledReason, proxyNodeUpdatePayload, type ProxyNodeActionApi, type ProxyNodeUpdatePayload } from "./proxy-node-actions.ts"
+import { importProxyNodeInbound, scanProxyNodeImports, type ProxyNodeImportApi, type ProxyNodeImportRequest, type ProxyNodeImportScan } from "./proxy-node-imports.ts"
 import { badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, loopbackOrigin, outdatedAgents, provisioningSite, provisionRefusal, trafficCorrection } from "./api.ts"
 
 assert.deepEqual(changes({ public: true, price: 5 }, { price: 20 }), { price: 20 })
@@ -178,6 +179,54 @@ operationGuard.finish(proxyNode.id)
 assert.equal(operationGuard.tryStart(proxyNode.id), true)
 operationGuard.finish(proxyNode.id)
 console.log("proxy node edit, deploy, toggle, regenerate and delete workflows passed")
+
+const importScan: ProxyNodeImportScan = {
+  config_fingerprint: "a".repeat(64),
+  inbounds: [{
+    source_tag: "reality-hk",
+    importable: true,
+    reason: null,
+    name: "reality-hk",
+    protocol: "VLESS",
+    listen_address: "0.0.0.0",
+    listen_port: 33333,
+    uuid: "a0f81cec-73c5-4eb8-a2e2-cd1544946e8e",
+    reality_public_key: "derived-public-key",
+    reality_short_id: "3efe85475d460e65",
+    reality_server_name: "www.amd.com",
+    reality_dest: "www.amd.com:443",
+    suggested_address_mode: "ipv4",
+    suggested_address: "198.51.100.20",
+  }],
+}
+calls.length = 0
+const scanLoading: boolean[] = []
+const importApi: ProxyNodeImportApi = async <T>(path: string, init?: RequestInit): Promise<T> => {
+  calls.push({ path, init })
+  return importScan as T
+}
+assert.deepEqual(await scanProxyNodeImports(importApi, 3, (busy) => scanLoading.push(busy)), importScan)
+assert.deepEqual(calls.map((call) => [call.path, call.init?.cache]), [["/proxy/servers/3/imports", "no-store"]])
+assert.deepEqual(scanLoading, [true, false])
+assert.equal("reality_private_key" in importScan.inbounds[0], false, "preview DTO has no private-key field")
+
+calls.length = 0
+const importPayload: ProxyNodeImportRequest = {
+  config_fingerprint: importScan.config_fingerprint,
+  source_tag: "reality-hk",
+  name: "HK Reality",
+  address_mode: "ipv4",
+  custom_address: null,
+}
+const importLoading: boolean[] = []
+await importProxyNodeInbound(importApi, 3, importPayload, (busy) => importLoading.push(busy))
+assert.deepEqual(calls.map((call) => [call.path, call.init?.method]), [["/proxy/servers/3/imports", "POST"]])
+assert.deepEqual(JSON.parse(calls[0].init?.body as string), importPayload)
+assert.equal("reality_private_key" in JSON.parse(calls[0].init?.body as string), false)
+assert.deepEqual(importLoading, [true, false])
+const importFailure: ProxyNodeImportApi = async () => { throw new Error("配置已变化，请重新扫描") }
+await assert.rejects(scanProxyNodeImports(importFailure, 3), /配置已变化/)
+await assert.rejects(importProxyNodeInbound(importFailure, 3, importPayload), /配置已变化/)
 
 // --iface from the two lists the install dialogs show, and back.
 assert.equal(ifaceSpec({ only: " eth1, pppoe-wan ", skip: "" }), "eth1,pppoe-wan")

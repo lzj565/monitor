@@ -166,7 +166,7 @@ CREATE TABLE IF NOT EXISTS session (
 /// cannot: `open` runs `SCHEMA` before migrating, and on an older file the
 /// column is not there yet. `an_upgraded_release_matches_a_fresh_database`
 /// holds every migration to these rules, starting from v1.0.0's schema.
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -360,6 +360,18 @@ fn migrate_to_11(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// 导入时保留原 inbound 的监听地址，并在 apply 结果未确认时保留来源 tag 以便重试。
+fn migrate_to_12(conn: &Connection) -> Result<()> {
+    add_column(conn, "proxy_node", "listen_address TEXT NOT NULL DEFAULT '::'")?;
+    add_column(conn, "proxy_node", "source_inbound_tag TEXT")?;
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS proxy_node_source_tag
+           ON proxy_node(node_id, source_inbound_tag)
+           WHERE source_inbound_tag IS NOT NULL AND length(trim(source_inbound_tag)) > 0;",
+    )?;
+    Ok(())
+}
+
 /// Brings a database already in service up to `SCHEMA_VERSION` and stamps it.
 /// `from` is its current version. A fresh file runs the additive migration
 /// history inside one transaction as well.
@@ -406,6 +418,9 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     if from < 11 {
         migrate_to_11(&tx)?;
     }
+    if from < 12 {
+        migrate_to_12(&tx)?;
+    }
     tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     tx.commit()?;
     Ok(())
@@ -426,6 +441,20 @@ const V10_TABLES: [&str; 10] = [
     "session",
     "proxy_instance",
     "proxy_user",
+];
+/// v11 的备份中 ProxyNode 尚未保存监听地址和导入来源 tag。
+const V11_TABLES: [&str; 11] = [
+    "setting",
+    "node",
+    "traffic",
+    "metric",
+    "ping_task",
+    "ping_node",
+    "ping_record",
+    "session",
+    "proxy_instance",
+    "proxy_user",
+    "proxy_node",
 ];
 /// 执行当前版本迁移后，备份必须包含的全部表。
 const TABLES: [&str; 11] = [
@@ -562,6 +591,9 @@ pub struct ProxyUser {
     pub created_at: i64,
 }
 
+/// 新建节点的默认监听地址；导入节点会保存服务器配置中的实际地址。
+pub const DEFAULT_PROXY_LISTEN_ADDRESS: &str = "::";
+
 /// VLESS + Reality 业务节点包含私钥，因此不实现 `Debug`，避免意外打印到日志。
 #[derive(Serialize, Clone)]
 pub struct ProxyNode {
@@ -580,6 +612,9 @@ pub struct ProxyNode {
     pub reality_short_id: String,
     pub reality_server_name: String,
     pub reality_dest: String,
+    pub listen_address: String,
+    #[serde(skip_serializing)]
+    pub source_inbound_tag: Option<String>,
     pub deploy_status: String,
     pub last_error: Option<String>,
     pub created_at: i64,
@@ -685,15 +720,30 @@ fn validate_proxy_node(config: &ProxyNodeConfig) -> Result<()> {
 }
 
 fn insert_proxy_node(conn: &Connection, config: &ProxyNodeConfig) -> Result<ProxyNode> {
+    insert_proxy_node_with_source(conn, config, DEFAULT_PROXY_LISTEN_ADDRESS, None, "not_deployed")
+}
+
+fn insert_proxy_node_with_source(
+    conn: &Connection,
+    config: &ProxyNodeConfig,
+    listen_address: &str,
+    source_inbound_tag: Option<&str>,
+    deploy_status: &str,
+) -> Result<ProxyNode> {
     validate_proxy_node(config)?;
+    validate_proxy_listen_address(listen_address)?;
+    if source_inbound_tag.is_some_and(|tag| tag.trim().is_empty()) {
+        refuse!("inbound 来源 tag 不能为空");
+    }
     let now = Utc::now().timestamp();
     let custom_address = config.custom_address.as_deref().map(str::trim).filter(|value| !value.is_empty());
     conn.execute(
         "INSERT INTO proxy_node
            (node_id, name, enabled, protocol, address_mode, custom_address, listen_port,
             uuid, reality_private_key, reality_public_key, reality_short_id,
-            reality_server_name, reality_dest, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)",
+            reality_server_name, reality_dest, listen_address, source_inbound_tag,
+            deploy_status, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?17)",
         params![
             config.node_id,
             config.name.trim(),
@@ -708,6 +758,9 @@ fn insert_proxy_node(conn: &Connection, config: &ProxyNodeConfig) -> Result<Prox
             config.reality_short_id.trim(),
             config.reality_server_name.trim(),
             config.reality_dest.trim(),
+            listen_address,
+            source_inbound_tag,
+            deploy_status,
             now,
         ],
     )?;
@@ -715,11 +768,19 @@ fn insert_proxy_node(conn: &Connection, config: &ProxyNodeConfig) -> Result<Prox
     Ok(conn.query_row(
         "SELECT id, node_id, name, enabled, protocol, address_mode, custom_address, listen_port,
                 uuid, reality_private_key, reality_public_key, reality_short_id,
-                reality_server_name, reality_dest, deploy_status, last_error, created_at, updated_at
+                reality_server_name, reality_dest, listen_address, source_inbound_tag,
+                deploy_status, last_error, created_at, updated_at
          FROM proxy_node WHERE id = ?1",
         [id],
         row_to_proxy_node,
     )?)
+}
+
+fn validate_proxy_listen_address(value: &str) -> Result<()> {
+    if value.parse::<std::net::IpAddr>().is_err() {
+        refuse!("sing-box inbound 监听地址必须是 IPv4 或 IPv6 地址");
+    }
+    Ok(())
 }
 
 fn yes() -> bool {
@@ -951,7 +1012,8 @@ impl Db {
         let mut stmt = conn.prepare(
             "SELECT id, node_id, name, enabled, protocol, address_mode, custom_address, listen_port,
                     uuid, reality_private_key, reality_public_key, reality_short_id,
-                    reality_server_name, reality_dest, deploy_status, last_error, created_at, updated_at
+                    reality_server_name, reality_dest, listen_address, source_inbound_tag,
+                    deploy_status, last_error, created_at, updated_at
              FROM proxy_node ORDER BY node_id, listen_port, id",
         )?;
         let rows = stmt.query_map([], row_to_proxy_node)?;
@@ -963,7 +1025,8 @@ impl Db {
         let mut stmt = conn.prepare(
             "SELECT id, node_id, name, enabled, protocol, address_mode, custom_address, listen_port,
                     uuid, reality_private_key, reality_public_key, reality_short_id,
-                    reality_server_name, reality_dest, deploy_status, last_error, created_at, updated_at
+                    reality_server_name, reality_dest, listen_address, source_inbound_tag,
+                    deploy_status, last_error, created_at, updated_at
              FROM proxy_node WHERE node_id = ?1 ORDER BY id",
         )?;
         let rows = stmt.query_map([node_id], row_to_proxy_node)?;
@@ -990,13 +1053,56 @@ impl Db {
         Ok(())
     }
 
+    pub fn set_proxy_node_deploy_status(
+        &self,
+        id: i64,
+        status: &str,
+        last_error: Option<&str>,
+    ) -> Result<bool> {
+        if id <= 0 || !matches!(status, "not_deployed" | "deploying" | "deployed" | "failed") {
+            anyhow::bail!("invalid proxy deployment status");
+        }
+        if last_error.is_some_and(|message| message.len() > 512) {
+            anyhow::bail!("proxy deployment error summary is too long");
+        }
+        Ok(self.conn().execute(
+            "UPDATE proxy_node SET deploy_status=?1, last_error=?2, updated_at=?3 WHERE id=?4",
+            params![status, last_error, Utc::now().timestamp(), id],
+        )? > 0)
+    }
+
+    pub fn clear_proxy_node_source_tags(&self, node_id: i64) -> Result<()> {
+        self.conn().execute(
+            "UPDATE proxy_node SET source_inbound_tag=NULL, updated_at=?1
+             WHERE node_id=?2 AND source_inbound_tag IS NOT NULL",
+            params![Utc::now().timestamp(), node_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn proxy_node_by_source_tag(&self, node_id: i64, source_tag: &str) -> Result<Option<ProxyNode>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT id, node_id, name, enabled, protocol, address_mode, custom_address, listen_port,
+                        uuid, reality_private_key, reality_public_key, reality_short_id,
+                        reality_server_name, reality_dest, listen_address, source_inbound_tag,
+                        deploy_status, last_error, created_at, updated_at
+                 FROM proxy_node WHERE node_id=?1 AND source_inbound_tag=?2",
+                params![node_id, source_tag],
+                row_to_proxy_node,
+            )
+            .optional()?)
+    }
+
     pub fn proxy_node(&self, id: i64) -> Result<Option<ProxyNode>> {
         Ok(self
             .conn()
             .query_row(
                 "SELECT id, node_id, name, enabled, protocol, address_mode, custom_address, listen_port,
                         uuid, reality_private_key, reality_public_key, reality_short_id,
-                        reality_server_name, reality_dest, deploy_status, last_error, created_at, updated_at
+                        reality_server_name, reality_dest, listen_address, source_inbound_tag,
+                        deploy_status, last_error, created_at, updated_at
                  FROM proxy_node WHERE id = ?1",
                 [id],
                 row_to_proxy_node,
@@ -1007,6 +1113,16 @@ impl Db {
     pub fn create_proxy_node(&self, config: &ProxyNodeConfig) -> Result<ProxyNode> {
         let conn = self.conn();
         insert_proxy_node(&conn, config)
+    }
+
+    pub fn create_imported_proxy_node(
+        &self,
+        config: &ProxyNodeConfig,
+        listen_address: &str,
+        source_inbound_tag: &str,
+    ) -> Result<ProxyNode> {
+        let conn = self.conn();
+        insert_proxy_node_with_source(&conn, config, listen_address, Some(source_inbound_tag), "deploying")
     }
 
     /// 在事务中分配端口并创建记录，避免并发请求选中同一端口。
@@ -2271,6 +2387,7 @@ impl Db {
         let required_tables: &[&str] = match version {
             v if v < 10 => &LEGACY_TABLES,
             10 => &V10_TABLES,
+            11 => &V11_TABLES,
             _ => &TABLES,
         };
         for table in required_tables {
@@ -2531,6 +2648,8 @@ fn row_to_proxy_node(r: &rusqlite::Row<'_>) -> rusqlite::Result<ProxyNode> {
         reality_short_id: r.get("reality_short_id")?,
         reality_server_name: r.get("reality_server_name")?,
         reality_dest: r.get("reality_dest")?,
+        listen_address: r.get("listen_address")?,
+        source_inbound_tag: r.get("source_inbound_tag")?,
         deploy_status: r.get("deploy_status")?,
         last_error: r.get("last_error")?,
         created_at: r.get("created_at")?,
@@ -2734,6 +2853,30 @@ mod tests {
 
         db.delete_node(other_server).unwrap();
         assert!(db.proxy_nodes().unwrap().is_empty());
+    }
+
+    #[test]
+    fn imported_proxy_nodes_keep_source_and_listen_private_to_the_database() {
+        let db = db();
+        let server = db
+            .create_node(&Node { name: "import-server".into(), ..Default::default() }, "import-token")
+            .unwrap();
+        let imported = db
+            .create_imported_proxy_node(&proxy_node_config(server, 33333), "0.0.0.0", "legacy-reality")
+            .unwrap();
+        assert_eq!(imported.listen_address, "0.0.0.0");
+        assert_eq!(imported.source_inbound_tag.as_deref(), Some("legacy-reality"));
+        assert_eq!(imported.deploy_status, "deploying");
+        let serialized = serde_json::to_string(&imported).unwrap();
+        assert!(!serialized.contains("private-secret"));
+        assert!(!serialized.contains("source_inbound_tag"));
+        assert!(!serialized.contains("legacy-reality"));
+
+        assert!(db
+            .create_imported_proxy_node(&proxy_node_config(server, 33334), "::", "legacy-reality")
+            .is_err());
+        db.clear_proxy_node_source_tags(server).unwrap();
+        assert_eq!(db.proxy_node(imported.id).unwrap().unwrap().source_inbound_tag, None);
     }
 
     #[test]
@@ -2957,6 +3100,45 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn a_v11_backup_gains_proxy_import_fields_before_schema_validation() {
+        let scratch = Scratch::new();
+        let copy = format!("{}.copy", scratch.0);
+        let db = Db::open(&scratch.0).unwrap();
+        let server = db
+            .create_node(
+                &Node { name: "legacy-import-server".into(), ..Default::default() },
+                "legacy-import-token",
+            )
+            .unwrap();
+        let node = db.create_proxy_node(&proxy_node_config(server, 33333)).unwrap();
+        db.backup_into(&copy).unwrap();
+
+        let old = Connection::open(&copy).unwrap();
+        old.execute_batch(
+            "DROP INDEX proxy_node_source_tag;
+             ALTER TABLE proxy_node DROP COLUMN source_inbound_tag;
+             ALTER TABLE proxy_node DROP COLUMN listen_address;
+             PRAGMA user_version = 11;",
+        )
+        .unwrap();
+        drop(old);
+
+        db.check_backup(&copy).unwrap();
+        let migrated = Connection::open(&copy).unwrap();
+        let version = migrated.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let (listen, source): (String, Option<String>) = migrated
+            .query_row(
+                "SELECT listen_address, source_inbound_tag FROM proxy_node WHERE id=?1",
+                [node.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(listen, DEFAULT_PROXY_LISTEN_ADDRESS);
+        assert_eq!(source, None);
     }
 
     /// `oldest` is what the data page compares against the retention window, so it

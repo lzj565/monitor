@@ -155,6 +155,24 @@ fn reality_keypair() -> (String, String) {
     (private_key, URL_SAFE_NO_PAD.encode(public.to_bytes()))
 }
 
+pub(crate) fn reality_public_key_from_private(private_key: &str) -> Result<String> {
+    let mut decoded = URL_SAFE_NO_PAD
+        .decode(private_key)
+        .map_err(|_| anyhow::Error::msg(crate::Shown("Reality 私钥格式无效".into())))?;
+    if decoded.len() != 32 {
+        decoded.zeroize();
+        return Err(anyhow::Error::msg(crate::Shown("Reality 私钥格式无效".into())));
+    }
+    let private_bytes: [u8; 32] = decoded
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::Error::msg(crate::Shown("Reality 私钥格式无效".into())))?;
+    decoded.zeroize();
+    let private = x25519_dalek::StaticSecret::from(private_bytes);
+    let public = x25519_dalek::PublicKey::from(&private);
+    Ok(URL_SAFE_NO_PAD.encode(public.to_bytes()))
+}
+
 fn uuid_v4() -> String {
     let mut bytes = rand::random::<[u8; 16]>();
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
@@ -201,6 +219,10 @@ mod tests {
         let private = x25519_dalek::StaticSecret::from(private_bytes);
         let public = x25519_dalek::PublicKey::from(&private);
         assert_eq!(URL_SAFE_NO_PAD.encode(public.to_bytes()), created.reality_public_key);
+        assert_eq!(
+            reality_public_key_from_private(&created.reality_private_key).unwrap(),
+            created.reality_public_key
+        );
     }
 
     #[test]

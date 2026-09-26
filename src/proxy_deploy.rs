@@ -8,8 +8,9 @@ use serde_json::{json, Value};
 
 use crate::api::{self, Admin};
 use crate::command::{self, ConfigCommandError};
-use crate::db::ProxyNode;
-use crate::proxy_config::{generate_singbox_config, ProxyConfigError};
+use crate::db::{Node, ProxyNode, ProxyNodeConfig};
+use crate::proxy_config::{generate_singbox_config_excluding, ProxyConfigError};
+use crate::proxy_import::{self, ProxyImportCandidate, ProxyImportRequest};
 #[cfg(test)]
 use crate::App;
 use crate::Shared;
@@ -31,6 +32,7 @@ enum DeployError {
     AgentDisconnected,
     Timeout,
     OutcomeUnknown,
+    ApplyOutcomeUnknown,
     ConfigTooLarge,
     ConfigGetFailed,
     ConfigGetResponseInvalid,
@@ -52,6 +54,7 @@ impl DeployError {
             Self::AgentDisconnected => "agent disconnected".into(),
             Self::Timeout => "deployment timeout".into(),
             Self::OutcomeUnknown => "deployment outcome unknown".into(),
+            Self::ApplyOutcomeUnknown => "deployment apply outcome unknown".into(),
             Self::ConfigTooLarge => "sing-box config exceeds 32 KiB limit".into(),
             Self::ConfigGetFailed => "config get failed".into(),
             Self::ConfigGetResponseInvalid => "config get returned invalid content".into(),
@@ -69,7 +72,7 @@ impl DeployError {
             Self::ProxyNodeNotFound => StatusCode::NOT_FOUND,
             Self::AgentOffline | Self::AgentUnsupported | Self::AgentDisconnected => StatusCode::CONFLICT,
             Self::AgentQueueFull => StatusCode::SERVICE_UNAVAILABLE,
-            Self::Timeout | Self::OutcomeUnknown => StatusCode::GATEWAY_TIMEOUT,
+            Self::Timeout | Self::OutcomeUnknown | Self::ApplyOutcomeUnknown => StatusCode::GATEWAY_TIMEOUT,
             Self::ConfigTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Self::ConfigParseFailed | Self::Generator(_) | Self::ConfigCheckFailed => {
                 StatusCode::UNPROCESSABLE_ENTITY
@@ -91,6 +94,7 @@ impl DeployError {
             Self::AgentDisconnected => "服务器连接已断开".into(),
             Self::Timeout => "部署等待 Agent 响应超时".into(),
             Self::OutcomeUnknown => "Agent 连接中断，部署结果未知".into(),
+            Self::ApplyOutcomeUnknown => "Agent 响应中断，配置应用结果未知；请重新部署确认".into(),
             Self::ConfigTooLarge => "生成的 sing-box 配置超过 32 KiB 限制".into(),
             Self::ConfigGetFailed => "读取 sing-box 配置失败".into(),
             Self::ConfigGetResponseInvalid => "Agent 返回的 sing-box 配置格式不正确".into(),
@@ -116,9 +120,18 @@ fn map_command_error(error: ConfigCommandError, phase: CommandPhase) -> DeployEr
         ConfigCommandError::AgentOffline => DeployError::AgentOffline,
         ConfigCommandError::AgentUnsupported => DeployError::AgentUnsupported,
         ConfigCommandError::QueueFull => DeployError::AgentQueueFull,
-        ConfigCommandError::Disconnected => DeployError::AgentDisconnected,
-        ConfigCommandError::Timeout => DeployError::Timeout,
-        ConfigCommandError::OutcomeUnknown => DeployError::OutcomeUnknown,
+        ConfigCommandError::Disconnected => match phase {
+            CommandPhase::Apply => DeployError::ApplyOutcomeUnknown,
+            _ => DeployError::AgentDisconnected,
+        },
+        ConfigCommandError::Timeout => match phase {
+            CommandPhase::Apply => DeployError::ApplyOutcomeUnknown,
+            _ => DeployError::Timeout,
+        },
+        ConfigCommandError::OutcomeUnknown => match phase {
+            CommandPhase::Apply => DeployError::ApplyOutcomeUnknown,
+            _ => DeployError::OutcomeUnknown,
+        },
         ConfigCommandError::PayloadTooLarge => DeployError::ConfigTooLarge,
         ConfigCommandError::UnsupportedMethod
         | ConfigCommandError::InvalidParams
@@ -160,6 +173,252 @@ pub async fn remove_proxy_node(_: Admin, State(app): State<Shared>, Path(id): Pa
     }
 }
 
+pub async fn scan_proxy_imports(_: Admin, State(app): State<Shared>, Path(node_id): Path<i64>) -> Response {
+    let lock = app.proxy_deploy_lock(node_id);
+    let _operation = lock.lock().await;
+    let Some(server) = (match app.db.node(node_id) {
+        Ok(server) => server,
+        Err(error) => return no_store(api::fail(error)),
+    }) else {
+        return no_store(api::answer(StatusCode::NOT_FOUND, "服务器不存在"));
+    };
+    let (config, content) = match read_singbox_config(&app, node_id).await {
+        Ok(config) => config,
+        Err(error) => return no_store(error.response()),
+    };
+    let mut candidates = match proxy_import::scan_config(&config) {
+        Ok(candidates) => candidates,
+        Err(error) => return no_store(api::answer(StatusCode::UNPROCESSABLE_ENTITY, error)),
+    };
+    for candidate in &mut candidates {
+        set_suggested_address(candidate, &server);
+        if candidate.importable {
+            if let Some(tag) = candidate.source_tag.as_deref() {
+                match app.db.proxy_node_by_source_tag(node_id, tag) {
+                    Ok(Some(_)) => {
+                        candidate.importable = false;
+                        candidate.reason = Some("该 inbound 有待确认的接管记录，请先重新部署".into());
+                    }
+                    Ok(None) => {}
+                    Err(error) => return no_store(api::fail(error)),
+                }
+            }
+        }
+    }
+    no_store(
+        Json(json!({
+            "config_fingerprint": crate::auth::sha256(&content),
+            "inbounds": candidates
+        }))
+        .into_response(),
+    )
+}
+
+pub async fn import_proxy_inbound(
+    _: Admin,
+    State(app): State<Shared>,
+    Path(node_id): Path<i64>,
+    body: Result<Json<ProxyImportRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Ok(Json(request)) = body else {
+        return no_store(api::answer(StatusCode::BAD_REQUEST, "导入请求格式不正确"));
+    };
+    if request.name.trim().is_empty() || request.config_fingerprint.len() != 64 {
+        return no_store(api::answer(StatusCode::BAD_REQUEST, "请填写节点名称并重新扫描配置"));
+    }
+
+    let lock = app.proxy_deploy_lock(node_id);
+    let _operation = lock.lock().await;
+    let Some(server) = (match app.db.node(node_id) {
+        Ok(server) => server,
+        Err(error) => return no_store(api::fail(error)),
+    }) else {
+        return no_store(api::answer(StatusCode::NOT_FOUND, "服务器不存在"));
+    };
+    let (current_config, current_content) = match read_singbox_config(&app, node_id).await {
+        Ok(config) => config,
+        Err(error) => return no_store(error.response()),
+    };
+    if crate::auth::sha256(&current_content) != request.config_fingerprint {
+        return no_store(api::answer(StatusCode::CONFLICT, "配置已变化，请重新扫描"));
+    }
+    if request.source_tag.starts_with(crate::proxy_config::MANAGED_INBOUND_TAG_PREFIX) {
+        return no_store(api::answer(StatusCode::UNPROCESSABLE_ENTITY, "Monitor 已管理该 inbound"));
+    }
+    let imported = match proxy_import::find_importable(&current_config, &request.source_tag) {
+        Ok(imported) => imported,
+        Err(reason) => return no_store(api::answer(StatusCode::UNPROCESSABLE_ENTITY, reason)),
+    };
+    match app.db.proxy_node_by_source_tag(node_id, &request.source_tag) {
+        Ok(Some(_)) => {
+            return no_store(api::answer(StatusCode::CONFLICT, "该 inbound 已有待确认的接管记录"));
+        }
+        Ok(None) => {}
+        Err(error) => return no_store(api::fail(error)),
+    }
+    let (address_mode, custom_address) = match selected_connection_address(&server, &request) {
+        Ok(address) => address,
+        Err(message) => return no_store(api::answer(StatusCode::UNPROCESSABLE_ENTITY, message)),
+    };
+
+    let mut desired_nodes = match app.db.proxy_nodes_for_node(node_id) {
+        Ok(nodes) => nodes,
+        Err(error) => return no_store(api::fail(error)),
+    };
+    if desired_nodes.iter().any(|node| node.listen_port == imported.listen_port) {
+        return no_store(api::answer(StatusCode::CONFLICT, "该监听端口已被 ProxyNode 占用"));
+    }
+
+    let config = ProxyNodeConfig {
+        node_id,
+        name: request.name.trim().to_owned(),
+        enabled: true,
+        protocol: "vless_reality".into(),
+        address_mode,
+        custom_address,
+        listen_port: imported.listen_port,
+        uuid: imported.uuid,
+        reality_private_key: imported.reality_private_key,
+        reality_public_key: imported.reality_public_key,
+        reality_short_id: imported.reality_short_id,
+        reality_server_name: imported.reality_server_name,
+        reality_dest: imported.reality_dest,
+    };
+    let created =
+        match app.db.create_imported_proxy_node(&config, &imported.listen_address, &imported.source_tag) {
+            Ok(created) => created,
+            Err(error) => return no_store(api::fail(error)),
+        };
+    desired_nodes.push(created.clone());
+
+    match deploy_configuration_from_current(&app, node_id, &desired_nodes, &current_config, &[]).await {
+        Ok(_) => match complete_import(&app, node_id, created.id) {
+            Ok(node) => no_store((StatusCode::CREATED, Json(json!({ "node": node }))).into_response()),
+            Err(error) => {
+                mark_import_failed(&app, created.id, "配置已应用，但数据库状态未能更新");
+                no_store(error.response())
+            }
+        },
+        Err(error) if matches!(&error, DeployError::ApplyOutcomeUnknown) => {
+            match read_singbox_config(&app, node_id).await {
+                Ok((observed, _)) => {
+                    match inspect_import_outcome(&observed, &imported.source_tag, created.id) {
+                        ImportOutcome::Applied => match complete_import(&app, node_id, created.id) {
+                            Ok(node) => {
+                                no_store((StatusCode::CREATED, Json(json!({ "node": node }))).into_response())
+                            }
+                            Err(database_error) => {
+                                mark_import_failed(&app, created.id, "配置已应用，但数据库状态未能更新");
+                                no_store(database_error.response())
+                            }
+                        },
+                        ImportOutcome::NotApplied => {
+                            if let Err(database_error) = app.db.delete_proxy_node(created.id) {
+                                return no_store(DeployError::Database(database_error).response());
+                            }
+                            no_store(error.response())
+                        }
+                        ImportOutcome::Unclear => {
+                            mark_import_failed(&app, created.id, &error.last_error());
+                            no_store(error.response())
+                        }
+                    }
+                }
+                Err(_) => {
+                    mark_import_failed(&app, created.id, &error.last_error());
+                    no_store(error.response())
+                }
+            }
+        }
+        Err(error) => {
+            if let Err(database_error) = app.db.delete_proxy_node(created.id) {
+                return no_store(DeployError::Database(database_error).response());
+            }
+            no_store(error.response())
+        }
+    }
+}
+
+fn set_suggested_address(candidate: &mut ProxyImportCandidate, server: &Node) {
+    let addresses =
+        api::addresses(&server.ip, (&server.ipv4, &server.ipv6), (&server.ipv4_pin, &server.ipv6_pin));
+    let ipv4 = addresses
+        .iter()
+        .find(|(address, _)| address.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_ipv4()))
+        .map(|(address, _)| (*address).to_owned());
+    let ipv6 = addresses
+        .iter()
+        .find(|(address, _)| address.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_ipv6()))
+        .map(|(address, _)| (*address).to_owned());
+    if let Some(address) = ipv4 {
+        candidate.suggested_address_mode = Some("ipv4".into());
+        candidate.suggested_address = Some(address);
+    } else if let Some(address) = ipv6 {
+        candidate.suggested_address_mode = Some("ipv6".into());
+        candidate.suggested_address = Some(address);
+    }
+}
+
+fn selected_connection_address(
+    server: &Node,
+    request: &ProxyImportRequest,
+) -> Result<(String, Option<String>), &'static str> {
+    let custom_address = request.custom_address.as_deref().map(str::trim).filter(|value| !value.is_empty());
+    match request.address_mode.as_str() {
+        "ipv4" => server_address(server, false)
+            .map(|_| ("ipv4".into(), None))
+            .ok_or("所选服务器没有可用 IPv4，请选择 IPv6 或自定义地址"),
+        "ipv6" => server_address(server, true)
+            .map(|_| ("ipv6".into(), None))
+            .ok_or("所选服务器没有可用 IPv6，请选择 IPv4 或自定义地址"),
+        "custom" if custom_address.is_some() => Ok(("custom".into(), custom_address.map(str::to_owned))),
+        "custom" => Err("请填写自定义连接地址"),
+        _ => Err("连接地址模式无效"),
+    }
+}
+
+fn server_address(server: &Node, ipv6: bool) -> Option<&str> {
+    api::addresses(&server.ip, (&server.ipv4, &server.ipv6), (&server.ipv4_pin, &server.ipv6_pin))
+        .into_iter()
+        .find(|(address, _)| address.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_ipv6() == ipv6))
+        .map(|(address, _)| address)
+}
+
+enum ImportOutcome {
+    Applied,
+    NotApplied,
+    Unclear,
+}
+
+fn inspect_import_outcome(config: &Value, source_tag: &str, proxy_node_id: i64) -> ImportOutcome {
+    let Some(inbounds) = config.get("inbounds").and_then(Value::as_array) else {
+        return ImportOutcome::Unclear;
+    };
+    let source_exists =
+        inbounds.iter().any(|inbound| inbound.get("tag").and_then(Value::as_str) == Some(source_tag));
+    let managed_tag = format!("{}{}", crate::proxy_config::MANAGED_INBOUND_TAG_PREFIX, proxy_node_id);
+    let managed_exists = inbounds
+        .iter()
+        .any(|inbound| inbound.get("tag").and_then(Value::as_str) == Some(managed_tag.as_str()));
+    match (source_exists, managed_exists) {
+        (false, true) => ImportOutcome::Applied,
+        (true, false) => ImportOutcome::NotApplied,
+        _ => ImportOutcome::Unclear,
+    }
+}
+
+fn complete_import(app: &Shared, node_id: i64, proxy_node_id: i64) -> Result<ProxyNode, DeployError> {
+    app.db.set_proxy_nodes_deploy_status(node_id, "deployed", None).map_err(DeployError::Database)?;
+    app.db.clear_proxy_node_source_tags(node_id).map_err(DeployError::Database)?;
+    app.db.proxy_node(proxy_node_id).map_err(DeployError::Database)?.ok_or(DeployError::ProxyNodeNotFound)
+}
+
+fn mark_import_failed(app: &Shared, proxy_node_id: i64, last_error: &str) {
+    if let Err(error) = app.db.set_proxy_node_deploy_status(proxy_node_id, "failed", Some(last_error)) {
+        tracing::warn!(proxy_node_id, "could not persist pending proxy import state: {error:#}");
+    }
+}
+
 async fn remove_proxy_node_and_deploy(app: &Shared, id: i64) -> Result<(), DeployError> {
     let initial =
         app.db.proxy_node(id).map_err(DeployError::Database)?.ok_or(DeployError::ProxyNodeNotFound)?;
@@ -178,7 +437,8 @@ async fn remove_proxy_node_and_deploy(app: &Shared, id: i64) -> Result<(), Deplo
     }
     let mut desired_nodes = app.db.proxy_nodes_for_node(node_id).map_err(DeployError::Database)?;
     desired_nodes.retain(|node| node.id != id);
-    deploy_nodes_locked(app, node_id, &desired_nodes).await?;
+    let removed_source_tag = proxy_node.source_inbound_tag.clone().into_iter().collect::<Vec<_>>();
+    deploy_nodes_locked(app, node_id, &desired_nodes, &removed_source_tag).await?;
 
     if !app.db.delete_proxy_node(id).map_err(DeployError::Database)? {
         return Err(DeployError::ProxyNodeNotFound);
@@ -195,20 +455,22 @@ async fn deploy_server_proxy_config(app: &Shared, node_id: i64) -> Result<Deploy
         None => return Err(DeployError::ServerNotFound),
     }
     let nodes = app.db.proxy_nodes_for_node(node_id).map_err(DeployError::Database)?;
-    deploy_nodes_locked(app, node_id, &nodes).await
+    deploy_nodes_locked(app, node_id, &nodes, &[]).await
 }
 
 async fn deploy_nodes_locked(
     app: &Shared,
     node_id: i64,
     nodes: &[ProxyNode],
+    additionally_excluded_tags: &[String],
 ) -> Result<DeployResult, DeployError> {
     app.db.set_proxy_nodes_deploy_status(node_id, "deploying", None).map_err(DeployError::Database)?;
 
-    let result = deploy_configuration(app, node_id, nodes).await;
+    let result = deploy_configuration(app, node_id, nodes, additionally_excluded_tags).await;
     match result {
         Ok(changed) => {
             app.db.set_proxy_nodes_deploy_status(node_id, "deployed", None).map_err(DeployError::Database)?;
+            app.db.clear_proxy_node_source_tags(node_id).map_err(DeployError::Database)?;
             Ok(DeployResult { changed, deployed_nodes: nodes.len() })
         }
         Err(error) => {
@@ -224,19 +486,27 @@ async fn deploy_nodes_locked(
     }
 }
 
-async fn deploy_configuration(app: &Shared, node_id: i64, nodes: &[ProxyNode]) -> Result<bool, DeployError> {
-    let current_response = command::singbox_config_get(app, node_id)
-        .await
-        .map_err(|error| map_command_error(error, CommandPhase::Get))?;
-    let current_content = current_response
-        .get("content")
-        .and_then(Value::as_str)
-        .ok_or(DeployError::ConfigGetResponseInvalid)?;
-    let current_config: Value =
-        serde_json::from_str(current_content).map_err(|_| DeployError::ConfigParseFailed)?;
+async fn deploy_configuration(
+    app: &Shared,
+    node_id: i64,
+    nodes: &[ProxyNode],
+    additionally_excluded_tags: &[String],
+) -> Result<bool, DeployError> {
+    let (current_config, _) = read_singbox_config(app, node_id).await?;
+    deploy_configuration_from_current(app, node_id, nodes, &current_config, additionally_excluded_tags).await
+}
+
+async fn deploy_configuration_from_current(
+    app: &Shared,
+    node_id: i64,
+    nodes: &[ProxyNode],
+    current_config: &Value,
+    additionally_excluded_tags: &[String],
+) -> Result<bool, DeployError> {
     let desired_config =
-        generate_singbox_config(node_id, current_config.clone(), nodes).map_err(DeployError::Generator)?;
-    if desired_config == current_config {
+        generate_singbox_config_excluding(node_id, current_config.clone(), nodes, additionally_excluded_tags)
+            .map_err(DeployError::Generator)?;
+    if desired_config == *current_config {
         return Ok(false);
     }
 
@@ -257,6 +527,19 @@ async fn deploy_configuration(app: &Shared, node_id: i64, nodes: &[ProxyNode]) -
     Ok(true)
 }
 
+async fn read_singbox_config(app: &Shared, node_id: i64) -> Result<(Value, String), DeployError> {
+    let current_response = command::singbox_config_get(app, node_id)
+        .await
+        .map_err(|error| map_command_error(error, CommandPhase::Get))?;
+    let current_content = current_response
+        .get("content")
+        .and_then(Value::as_str)
+        .ok_or(DeployError::ConfigGetResponseInvalid)?;
+    let current_config: Value =
+        serde_json::from_str(current_content).map_err(|_| DeployError::ConfigParseFailed)?;
+    Ok((current_config, current_content.to_owned()))
+}
+
 fn no_store(mut response: Response) -> Response {
     response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
@@ -266,8 +549,11 @@ fn no_store(mut response: Response) -> Response {
 mod tests {
     use super::*;
     use crate::agent_ws::Agent;
-    use crate::db::{Db, Node, ProxyNodeConfig};
+    use crate::db::{Db, Node, NodePatch, ProxyNodeConfig};
+    use crate::proxy_config::generate_singbox_config;
+    use axum::body::to_bytes;
     use axum::extract::State;
+    use axum::http::StatusCode;
     use serde_json::Value;
     use std::collections::HashSet;
     use std::sync::Arc;
@@ -336,6 +622,87 @@ mod tests {
         })
     }
 
+    fn import_config() -> Value {
+        json!({
+            "log": {"level": "warn", "timestamp": true},
+            "inbounds": [{
+                "type": "vless",
+                "tag": "legacy-reality",
+                "listen": "0.0.0.0",
+                "listen_port": 33333,
+                "tls": {
+                    "enabled": true,
+                    "server_name": "www.amd.com",
+                    "reality": {
+                        "enabled": true,
+                        "handshake": {"server": "www.amd.com", "server_port": 443},
+                        "private_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                        "short_id": ["3efe85475d460e65"]
+                    }
+                },
+                "users": [{
+                    "flow": "xtls-rprx-vision",
+                    "name": "legacy-user",
+                    "uuid": "a0f81cec-73c5-4eb8-a2e2-cd1544946e8e"
+                }]
+            }],
+            "outbounds": [{"type": "direct", "tag": "direct"}]
+        })
+    }
+
+    fn import_request(fingerprint: String) -> ProxyImportRequest {
+        ProxyImportRequest {
+            config_fingerprint: fingerprint,
+            source_tag: "legacy-reality".into(),
+            name: "Imported Reality".into(),
+            address_mode: "ipv4".into(),
+            custom_address: None,
+        }
+    }
+
+    async fn response_json(response: Response) -> Value {
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn next_import_request(
+        rx: &mut mpsc::Receiver<String>,
+        importing: &mut tokio::task::JoinHandle<Response>,
+        expected_method: &str,
+    ) -> Value {
+        tokio::select! {
+            request = next_request(rx, expected_method) => request,
+            response = importing => {
+                let response = response.unwrap();
+                let status = response.status();
+                let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+                panic!("import returned before {expected_method}: {status} {}", String::from_utf8_lossy(&body));
+            }
+        }
+    }
+
+    fn app_with_import_address() -> (Shared, i64) {
+        let app = Arc::new(App::for_test(Db::open(":memory:").unwrap()));
+        let node_id = app
+            .db
+            .create_node(
+                &Node {
+                    name: "proxy-import-test".into(),
+                    ipv4_pin: "203.0.113.15".into(),
+                    ..Node::default()
+                },
+                "node-token",
+            )
+            .unwrap();
+        app.db
+            .update_node(
+                node_id,
+                &NodePatch { ipv4_pin: Some("203.0.113.15".into()), ..NodePatch::default() },
+            )
+            .unwrap();
+        (app, node_id)
+    }
+
     async fn next_request(rx: &mut mpsc::Receiver<String>, expected_method: &str) -> Value {
         let message = tokio::time::timeout(Duration::from_secs(2), rx.recv())
             .await
@@ -375,6 +742,232 @@ mod tests {
         assert_eq!(checked_content, applied_content, "check and apply must use the same candidate");
         reply(app, node_id, SESSION, &apply, Ok(json!({"running": true})));
         applied_content
+    }
+
+    #[tokio::test]
+    async fn scan_endpoint_returns_a_fingerprinted_preview_without_private_key() {
+        let (app, node_id) = app_with_import_address();
+        let mut rx = add_agent(&app, node_id, SESSION);
+        let content = import_config().to_string();
+        let scan_app = app.clone();
+        let scan =
+            tokio::spawn(async move { scan_proxy_imports(Admin, State(scan_app), Path(node_id)).await });
+
+        let get = next_request(&mut rx, SINGBOX_CONFIG_GET_METHOD).await;
+        reply(&app, node_id, SESSION, &get, get_result(&content));
+        let response = scan.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let body = response_json(response).await;
+        assert_eq!(body["config_fingerprint"], crate::auth::sha256(&content));
+        assert_eq!(body["inbounds"][0]["source_tag"], "legacy-reality");
+        assert_eq!(body["inbounds"][0]["suggested_address_mode"], "ipv4");
+        assert_eq!(body["inbounds"][0]["suggested_address"], "203.0.113.15");
+        let serialized = body.to_string();
+        assert!(!serialized.contains("private_key"));
+        assert!(!serialized.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
+        assert!(rx.try_recv().is_err(), "scan must not check or apply a config");
+    }
+
+    #[tokio::test]
+    async fn import_takes_over_the_source_and_persists_only_after_successful_apply() {
+        let (app, node_id) = app_with_import_address();
+        let mut rx = add_agent(&app, node_id, SESSION);
+        let content = import_config().to_string();
+        let request = import_request(crate::auth::sha256(&content));
+        let import_app = app.clone();
+        let mut importing = tokio::spawn(async move {
+            import_proxy_inbound(Admin, State(import_app), Path(node_id), Ok(Json(request))).await
+        });
+
+        let get = next_import_request(&mut rx, &mut importing, SINGBOX_CONFIG_GET_METHOD).await;
+        reply(&app, node_id, SESSION, &get, get_result(&content));
+        let check = next_request(&mut rx, SINGBOX_CONFIG_CHECK_METHOD).await;
+        let checked = check["params"]["content"].as_str().unwrap().to_owned();
+        let candidate: Value = serde_json::from_str(&checked).unwrap();
+        let inbounds = candidate["inbounds"].as_array().unwrap();
+        assert_eq!(inbounds.len(), 1);
+        assert_eq!(inbounds[0]["tag"], "monitor-proxy-node-1");
+        assert_eq!(inbounds[0]["listen"], "0.0.0.0");
+        assert_eq!(inbounds[0]["listen_port"], 33333);
+        assert!(inbounds.iter().all(|inbound| inbound["tag"] != "legacy-reality"));
+        assert_eq!(app.db.proxy_nodes_for_node(node_id).unwrap().len(), 1);
+        let staged = app.db.proxy_nodes_for_node(node_id).unwrap().remove(0);
+        assert_eq!(staged.deploy_status, "deploying");
+        assert_eq!(staged.source_inbound_tag.as_deref(), Some("legacy-reality"));
+
+        reply(&app, node_id, SESSION, &check, Ok(json!({"valid": true})));
+        let apply = next_request(&mut rx, SINGBOX_CONFIG_APPLY_METHOD).await;
+        assert_eq!(apply["params"]["content"], checked);
+        reply(&app, node_id, SESSION, &apply, Ok(json!({"running": true})));
+
+        let response = importing.await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = response_json(response).await;
+        assert_eq!(body["node"]["deploy_status"], "deployed");
+        assert_eq!(body["node"]["listen_address"], "0.0.0.0");
+        assert!(body.to_string().find("reality_private_key").is_none());
+        assert!(body.to_string().find("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").is_none());
+        let saved = app.db.proxy_nodes_for_node(node_id).unwrap().remove(0);
+        assert_eq!(saved.deploy_status, "deployed");
+        assert_eq!(saved.source_inbound_tag, None);
+        assert_eq!(saved.listen_address, "0.0.0.0");
+
+        let redeploy_app = app.clone();
+        let redeployment =
+            tokio::spawn(async move { deploy_server_proxy_config(&redeploy_app, node_id).await });
+        let get = next_request(&mut rx, SINGBOX_CONFIG_GET_METHOD).await;
+        reply(&app, node_id, SESSION, &get, get_result(&checked));
+        let result = redeployment.await.unwrap().unwrap();
+        assert!(!result.changed, "the first ordinary deploy after takeover must be idempotent");
+        assert_eq!(result.deployed_nodes, 1);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn scan_suggests_ipv6_when_no_ipv4_is_available() {
+        let (app, node_id) = app_with_import_address();
+        app.db
+            .update_node(
+                node_id,
+                &NodePatch {
+                    ipv4_pin: Some(String::new()),
+                    ipv6_pin: Some("2001:db8::15".into()),
+                    ..NodePatch::default()
+                },
+            )
+            .unwrap();
+        let mut rx = add_agent(&app, node_id, SESSION);
+        let content = import_config().to_string();
+        let scan_app = app.clone();
+        let scan =
+            tokio::spawn(async move { scan_proxy_imports(Admin, State(scan_app), Path(node_id)).await });
+
+        let get = next_request(&mut rx, SINGBOX_CONFIG_GET_METHOD).await;
+        reply(&app, node_id, SESSION, &get, get_result(&content));
+        let body = response_json(scan.await.unwrap()).await;
+        assert_eq!(body["inbounds"][0]["suggested_address_mode"], "ipv6");
+        assert_eq!(body["inbounds"][0]["suggested_address"], "2001:db8::15");
+    }
+
+    #[test]
+    fn import_address_selection_rejects_missing_server_families() {
+        let mut request = import_request("a".repeat(64));
+        assert_eq!(
+            selected_connection_address(&Node::default(), &request).unwrap_err(),
+            "所选服务器没有可用 IPv4，请选择 IPv6 或自定义地址"
+        );
+        request.address_mode = "ipv6".into();
+        assert_eq!(
+            selected_connection_address(&Node::default(), &request).unwrap_err(),
+            "所选服务器没有可用 IPv6，请选择 IPv4 或自定义地址"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_check_failure_does_not_leave_a_proxy_node_or_apply_config() {
+        let (app, node_id) = app_with_import_address();
+        let mut rx = add_agent(&app, node_id, SESSION);
+        let content = import_config().to_string();
+        let request = import_request(crate::auth::sha256(&content));
+        let import_app = app.clone();
+        let importing = tokio::spawn(async move {
+            import_proxy_inbound(Admin, State(import_app), Path(node_id), Ok(Json(request))).await
+        });
+
+        let get = next_request(&mut rx, SINGBOX_CONFIG_GET_METHOD).await;
+        reply(&app, node_id, SESSION, &get, get_result(&content));
+        let check = next_request(&mut rx, SINGBOX_CONFIG_CHECK_METHOD).await;
+        reply(&app, node_id, SESSION, &check, Err(json!({"code": -32000, "message": PRIVATE_SENTINEL})));
+
+        let response = importing.await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(app.db.proxy_nodes_for_node(node_id).unwrap().is_empty());
+        assert!(rx.try_recv().is_err(), "failed config.check must stop before apply");
+    }
+
+    #[tokio::test]
+    async fn import_apply_failure_does_not_leave_a_proxy_node() {
+        let (app, node_id) = app_with_import_address();
+        let mut rx = add_agent(&app, node_id, SESSION);
+        let content = import_config().to_string();
+        let request = import_request(crate::auth::sha256(&content));
+        let import_app = app.clone();
+        let importing = tokio::spawn(async move {
+            import_proxy_inbound(Admin, State(import_app), Path(node_id), Ok(Json(request))).await
+        });
+
+        let get = next_request(&mut rx, SINGBOX_CONFIG_GET_METHOD).await;
+        reply(&app, node_id, SESSION, &get, get_result(&content));
+        let check = next_request(&mut rx, SINGBOX_CONFIG_CHECK_METHOD).await;
+        reply(&app, node_id, SESSION, &check, Ok(json!({"valid": true})));
+        let apply = next_request(&mut rx, SINGBOX_CONFIG_APPLY_METHOD).await;
+        reply(&app, node_id, SESSION, &apply, Err(json!({"code": -32000, "message": PRIVATE_SENTINEL})));
+
+        let response = importing.await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(app.db.proxy_nodes_for_node(node_id).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn import_rejects_changed_preview_before_creating_a_proxy_node() {
+        let (app, node_id) = app_with_import_address();
+        let mut rx = add_agent(&app, node_id, SESSION);
+        let changed_content = import_config().to_string();
+        let stale_fingerprint = crate::auth::sha256("previous-config");
+        let request = import_request(stale_fingerprint);
+        let import_app = app.clone();
+        let importing = tokio::spawn(async move {
+            import_proxy_inbound(Admin, State(import_app), Path(node_id), Ok(Json(request))).await
+        });
+
+        let get = next_request(&mut rx, SINGBOX_CONFIG_GET_METHOD).await;
+        reply(&app, node_id, SESSION, &get, get_result(&changed_content));
+        let response = importing.await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(app.db.proxy_nodes_for_node(node_id).unwrap().is_empty());
+        assert!(rx.try_recv().is_err(), "a stale scan must not check or apply config");
+    }
+
+    #[tokio::test]
+    async fn uncertain_import_apply_keeps_a_failed_source_tag_record_for_retry() {
+        let (app, node_id) = app_with_import_address();
+        let mut rx = add_agent(&app, node_id, SESSION);
+        let content = import_config().to_string();
+        let request = import_request(crate::auth::sha256(&content));
+        let import_app = app.clone();
+        let importing = tokio::spawn(async move {
+            import_proxy_inbound(Admin, State(import_app), Path(node_id), Ok(Json(request))).await
+        });
+
+        let get = next_request(&mut rx, SINGBOX_CONFIG_GET_METHOD).await;
+        reply(&app, node_id, SESSION, &get, get_result(&content));
+        let check = next_request(&mut rx, SINGBOX_CONFIG_CHECK_METHOD).await;
+        reply(&app, node_id, SESSION, &check, Ok(json!({"valid": true})));
+        let apply = next_request(&mut rx, SINGBOX_CONFIG_APPLY_METHOD).await;
+        command::disconnect(&app, node_id, SESSION);
+        let outcome_check = next_request(&mut rx, SINGBOX_CONFIG_GET_METHOD).await;
+        reply(&app, node_id, SESSION, &outcome_check, get_result(&current_config().to_string()));
+
+        let response = importing.await.unwrap();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        let saved = app.db.proxy_nodes_for_node(node_id).unwrap().remove(0);
+        assert_eq!(saved.deploy_status, "failed");
+        assert_eq!(saved.source_inbound_tag.as_deref(), Some("legacy-reality"));
+        assert_eq!(saved.last_error.as_deref(), Some("deployment apply outcome unknown"));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(apply["method"], SINGBOX_CONFIG_APPLY_METHOD);
+    }
+
+    #[tokio::test]
+    async fn import_with_an_offline_agent_does_not_create_a_proxy_node() {
+        let (app, node_id) = app_with_import_address();
+        let content = import_config().to_string();
+        let request = import_request(crate::auth::sha256(&content));
+        let response =
+            import_proxy_inbound(Admin, State(app.clone()), Path(node_id), Ok(Json(request))).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(app.db.proxy_nodes_for_node(node_id).unwrap().is_empty());
     }
 
     #[tokio::test]

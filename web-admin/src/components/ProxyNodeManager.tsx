@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react"
-import { Copy, LoaderCircle, Pencil, Plus, QrCode, RotateCw, Trash2 } from "lucide-react"
+import { Copy, Download, LoaderCircle, Pencil, Plus, QrCode, RotateCw, Trash2 } from "lucide-react"
 import { QRCodeSVG } from "qrcode.react"
 import { toast } from "sonner"
 
@@ -28,6 +28,12 @@ import {
   type ProxyNodeShare,
   type ProxyNodeUpdatePayload,
 } from "@/lib/proxy-node-actions"
+import {
+  importProxyNodeInbound,
+  scanProxyNodeImports,
+  type ProxyNodeImportCandidate,
+  type ProxyNodeImportScan,
+} from "@/lib/proxy-node-imports"
 
 type AddressMode = "ipv4" | "ipv6" | "custom"
 type SubmitStage = "creating" | "deploying"
@@ -47,6 +53,11 @@ type EditProxyNodeForm = {
   listenPort: string
   realityServerName: string
   realityDest: string
+}
+type ImportProxyNodeForm = {
+  name: string
+  addressMode: AddressMode
+  customAddress: string
 }
 
 const EMPTY_FORM: NewProxyNodeForm = {
@@ -139,11 +150,23 @@ export function ProxyNodeManager({
   const [sharingNodes, setSharingNodes] = useState<Record<number, boolean>>({})
   const [shareTarget, setShareTarget] = useState<{ node: ProxyNode; share: ProxyNodeShare | null } | null>(null)
   const shareRequestId = useRef(0)
+  const [importOpen, setImportOpen] = useState(false)
+  const [importServerId, setImportServerId] = useState("")
+  const [importScan, setImportScan] = useState<ProxyNodeImportScan | null>(null)
+  const [importTarget, setImportTarget] = useState<ProxyNodeImportCandidate | null>(null)
+  const [importForm, setImportForm] = useState<ImportProxyNodeForm | null>(null)
+  const [importLoading, setImportLoading] = useState(false)
+  const [importing, setImporting] = useState(false)
+  const [importError, setImportError] = useState("")
   const serversById = new Map(nodes.map((server) => [server.id, server]))
   const selectedServer = nodes.find((server) => server.id.toString() === form.nodeId)
   const selectedReadiness = selectedServer
     ? serverReadiness(selectedServer, liveStatuses[selectedServer.id], rowBusy[selectedServer.id])
     : null
+  const selectedImportServer = nodes.find((server) => server.id.toString() === importServerId)
+  const importConnection = importTarget && importForm
+    ? connectionAddress(importForm.addressMode, importForm.customAddress, selectedImportServer)
+    : ""
 
   const refresh = useCallback(async () => {
     try {
@@ -163,6 +186,80 @@ export function ProxyNodeManager({
     setForm({ ...EMPTY_FORM })
     setFormError("")
     setCreateOpen(true)
+  }
+
+  function openImport() {
+    setImportServerId(nodes[0]?.id.toString() || "")
+    setImportScan(null)
+    setImportTarget(null)
+    setImportForm(null)
+    setImportError("")
+    setImportOpen(true)
+  }
+
+  async function scanExistingImports() {
+    const nodeId = Number(importServerId)
+    if (!Number.isInteger(nodeId) || nodeId <= 0) return
+    setImportScan(null)
+    setImportTarget(null)
+    setImportForm(null)
+    setImportError("")
+    try {
+      const result = await scanProxyNodeImports(api, nodeId, setImportLoading)
+      setImportScan(result)
+    } catch (cause) {
+      setImportError((cause as Error).message)
+    }
+  }
+
+  function selectImportTarget(candidate: ProxyNodeImportCandidate) {
+    if (!candidate.importable) return
+    setImportTarget(candidate)
+    setImportForm({
+      name: candidate.name,
+      addressMode: candidate.suggested_address_mode || "custom",
+      customAddress: "",
+    })
+    setImportError("")
+  }
+
+  async function confirmImport(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (!importTarget || !importForm || !importScan || !selectedImportServer || importing) return
+    if (!importForm.name.trim()) {
+      setImportError("请填写代理节点名称")
+      return
+    }
+    if (importForm.addressMode === "custom" && !importForm.customAddress.trim()) {
+      setImportError("请填写自定义连接地址")
+      return
+    }
+    if (importForm.addressMode !== "custom" && !importConnection) {
+      setImportError(`所选服务器没有可用 ${importForm.addressMode === "ipv4" ? "IPv4" : "IPv6"} 地址`)
+      return
+    }
+
+    setImportError("")
+    try {
+      await importProxyNodeInbound(api, selectedImportServer.id, {
+        config_fingerprint: importScan.config_fingerprint,
+        source_tag: importTarget.source_tag || "",
+        name: importForm.name.trim(),
+        address_mode: importForm.addressMode,
+        custom_address: importForm.addressMode === "custom" ? importForm.customAddress.trim() : null,
+      }, setImporting)
+      toast.success("代理节点已导入并接管配置")
+      setImportOpen(false)
+      setImportTarget(null)
+      setImportForm(null)
+      const refreshed = await refresh()
+      if (!refreshed) toast.error("导入成功，但代理节点列表刷新失败")
+    } catch (cause) {
+      const message = (cause as Error).message
+      setImportError(message)
+      toast.error(`导入代理节点失败：${message}`)
+      await refresh()
+    }
   }
 
   function beginNodeOperation(id: number, operation: string) {
@@ -492,7 +589,10 @@ export function ProxyNodeManager({
       <div className="space-y-1">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <h2 className="text-base font-semibold">已配置的代理节点</h2>
-          <Button onClick={openCreate}><Plus />新建代理节点</Button>
+          <div className="flex flex-wrap gap-2">
+            <Button variant="outline" onClick={openImport}><Download />导入现有配置</Button>
+            <Button onClick={openCreate}><Plus />新建代理节点</Button>
+          </div>
         </div>
         <p className="text-sm text-muted-foreground">管理服务器上的 sing-box 代理节点</p>
       </div>
@@ -512,7 +612,10 @@ export function ProxyNodeManager({
         <div className="rounded-md border border-dashed px-4 py-12 text-center">
           <p className="font-medium">暂无代理节点</p>
           <p className="mt-1 text-sm text-muted-foreground">创建第一个 VLESS Reality 代理节点。</p>
-          <Button className="mt-4" onClick={openCreate}><Plus />新建代理节点</Button>
+          <div className="mt-4 flex justify-center gap-2">
+            <Button variant="outline" onClick={openImport}><Download />导入现有配置</Button>
+            <Button onClick={openCreate}><Plus />新建代理节点</Button>
+          </div>
         </div>
       ) : proxyNodes.length > 0 ? (
         <Table>
@@ -616,6 +719,141 @@ export function ProxyNodeManager({
           </TableBody>
       </Table>
       ) : null}
+      <Dialog
+        open={importOpen}
+        onOpenChange={(open) => {
+          if (!importing) setImportOpen(open)
+        }}
+      >
+        <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>导入服务器已有配置</DialogTitle>
+            <DialogDescription>扫描 sing-box 中未由 Monitor 管理的 inbound。确认后会校验并应用接管配置。</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-2">
+            <Label htmlFor="proxy-import-server">所属服务器</Label>
+            <div className="flex gap-2">
+              <Select
+                value={importServerId}
+                disabled={importing || importLoading}
+                onValueChange={(value) => {
+                  setImportServerId(value)
+                  setImportScan(null)
+                  setImportTarget(null)
+                  setImportForm(null)
+                  setImportError("")
+                }}
+              >
+                <SelectTrigger id="proxy-import-server" className="min-w-0 flex-1"><SelectValue placeholder="选择服务器" /></SelectTrigger>
+                <SelectContent>
+                  {nodes.map((server) => (
+                    <SelectItem key={server.id} value={server.id.toString()}>
+                      {server.name} · {addressForServer(server) || "无可用 IP"}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <Button type="button" variant="outline" disabled={!importServerId || importLoading || importing} onClick={() => void scanExistingImports()}>
+                {importLoading ? <><LoaderCircle className="animate-spin" />扫描中…</> : "扫描"}
+              </Button>
+            </div>
+          </div>
+          {importError && <p role="alert" className="break-words text-sm text-destructive">{importError}</p>}
+          {importScan && (
+            <div className="space-y-3">
+              <p className="text-sm text-muted-foreground">
+                发现 {importScan.inbounds.length} 个未由 Monitor 管理的 inbound。确认后原 tag 会被替换为 Monitor 管理的 tag。
+              </p>
+              {importScan.inbounds.length === 0 ? (
+                <div className="rounded-md border border-dashed p-4 text-center text-sm text-muted-foreground">没有发现可扫描的 inbound。</div>
+              ) : (
+                <div className="max-h-64 space-y-2 overflow-y-auto pr-1">
+                  {importScan.inbounds.map((candidate, index) => (
+                    <div key={`${candidate.source_tag || "untagged"}-${index}`} className="rounded-md border p-3">
+                      <div className="flex flex-wrap items-start justify-between gap-3">
+                        <div className="min-w-0 space-y-1">
+                          <p className="font-medium">{candidate.source_tag || "无 tag"}</p>
+                          <p className="text-sm text-muted-foreground">
+                            {candidate.protocol} · {candidate.listen_port ? `端口 ${candidate.listen_port}` : "无有效端口"}
+                            {candidate.reality_server_name ? ` · SNI ${candidate.reality_server_name}` : ""}
+                          </p>
+                          <p className={candidate.importable ? "text-xs text-emerald-700 dark:text-emerald-300" : "text-xs text-destructive"}>
+                            {candidate.importable ? "可导入" : candidate.reason || "不可导入"}
+                          </p>
+                        </div>
+                        {candidate.importable && (
+                          <Button type="button" size="sm" variant={importTarget?.source_tag === candidate.source_tag ? "default" : "outline"} disabled={importing} onClick={() => selectImportTarget(candidate)}>
+                            选择导入
+                          </Button>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+          {importTarget && importForm && (
+            <form className="space-y-4 rounded-md border p-4" onSubmit={(event) => void confirmImport(event)}>
+              <div className="space-y-1">
+                <p className="font-medium">确认接管「{importTarget.source_tag}」</p>
+                <p className="text-sm text-muted-foreground">Monitor 会先校验生成配置，再替换服务器上的原 inbound。校验或明确应用失败时会保留原配置。</p>
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="proxy-import-name">代理节点名称</Label>
+                <Input id="proxy-import-name" value={importForm.name} disabled={importing} onChange={(event) => setImportForm((current) => current ? { ...current, name: event.target.value } : current)} required />
+              </div>
+              <div className="space-y-2">
+                <Label>客户端连接地址</Label>
+                <Select
+                  value={importForm.addressMode}
+                  disabled={importing}
+                  onValueChange={(addressMode: AddressMode) => setImportForm((current) => current ? { ...current, addressMode } : current)}
+                >
+                  <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="ipv4" disabled={!connectionAddress("ipv4", null, selectedImportServer)}>IPv4</SelectItem>
+                    <SelectItem value="ipv6" disabled={!connectionAddress("ipv6", null, selectedImportServer)}>IPv6</SelectItem>
+                    <SelectItem value="custom">自定义</SelectItem>
+                  </SelectContent>
+                </Select>
+                {importForm.addressMode === "custom" ? (
+                  <Input
+                    aria-label="导入节点自定义连接地址"
+                    placeholder="例如 proxy.example.com"
+                    value={importForm.customAddress}
+                    disabled={importing}
+                    onChange={(event) => setImportForm((current) => current ? { ...current, customAddress: event.target.value } : current)}
+                  />
+                ) : (
+                  <p className="text-xs text-muted-foreground">{importConnection || "所选服务器没有该地址"}</p>
+                )}
+              </div>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div className="space-y-1"><Label>服务器监听地址</Label><Input value={importTarget.listen_address || "—"} readOnly /></div>
+                <div className="space-y-1"><Label>端口</Label><Input value={importTarget.listen_port?.toString() || "—"} readOnly /></div>
+                <div className="space-y-1"><Label>SNI</Label><Input value={importTarget.reality_server_name || "—"} readOnly /></div>
+                <div className="space-y-1"><Label>Dest</Label><Input value={importTarget.reality_dest || "—"} readOnly /></div>
+              </div>
+              <div className="space-y-1 rounded-md bg-muted/50 p-3 text-xs">
+                <p>UUID：{importTarget.uuid ? `${importTarget.uuid.slice(0, 8)}…` : "—"}</p>
+                <p className="break-all">Reality Public Key：{importTarget.reality_public_key || "—"}</p>
+                <p>Short ID：{importTarget.reality_short_id || "—"}</p>
+                <p className="text-muted-foreground">服务器监听地址与客户端连接地址分别保存；Private Key 不会显示在浏览器。</p>
+              </div>
+              <DialogFooter>
+                <Button type="button" variant="outline" disabled={importing} onClick={() => { setImportTarget(null); setImportForm(null) }}>返回列表</Button>
+                <Button type="submit" disabled={importing || !importForm.name.trim() || !importTarget.source_tag || !importConnection}>
+                  {importing ? <><LoaderCircle className="animate-spin" />正在校验并接管…</> : "确认导入并接管"}
+                </Button>
+              </DialogFooter>
+            </form>
+          )}
+          <DialogFooter>
+            <Button type="button" variant="outline" disabled={importing} onClick={() => setImportOpen(false)}>关闭</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
       <Dialog
         open={Boolean(shareTarget)}
         onOpenChange={(open) => {

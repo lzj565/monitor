@@ -11,9 +11,6 @@ use crate::db::ProxyNode;
 /// Monitor 管理 inbound 使用的 tag 前缀；用户配置应避开此命名空间。
 pub const MANAGED_INBOUND_TAG_PREFIX: &str = "monitor-proxy-node-";
 
-/// Reality inbound 绑定 IPv6 通配地址；Linux 默认允许 IPv4-mapped 连接，系统可显式覆盖此行为。
-const DEFAULT_PROXY_LISTEN_ADDR: &str = "::";
-
 /// 生成配置时返回不含任何节点字段的错误，避免密钥进入日志或错误响应。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProxyConfigError {
@@ -29,6 +26,7 @@ pub enum ProxyConfigError {
     InvalidRealityDest,
     InvalidRealityPrivateKey,
     InvalidRealityServerName,
+    InvalidListenAddress,
 }
 
 impl fmt::Display for ProxyConfigError {
@@ -48,6 +46,7 @@ impl fmt::Display for ProxyConfigError {
             Self::InvalidRealityDest => "Reality Dest 必须是有效的 host:port 或 [IPv6]:port",
             Self::InvalidRealityPrivateKey => "Reality 私钥不能为空",
             Self::InvalidRealityServerName => "Reality Server Name 不能为空",
+            Self::InvalidListenAddress => "sing-box inbound 监听地址必须是 IPv4 或 IPv6 地址",
         };
         f.write_str(message)
     }
@@ -60,12 +59,29 @@ impl std::error::Error for ProxyConfigError {}
 /// 该函数不访问数据库、文件或 Agent；调用方负责提供当前配置和节点记录。
 pub fn generate_singbox_config(
     node_id: i64,
+    current_config: Value,
+    nodes: &[ProxyNode],
+) -> Result<Value, ProxyConfigError> {
+    generate_singbox_config_excluding(node_id, current_config, nodes, &[])
+}
+
+/// 导入和删除可以额外声明本次部署应移除的原始 inbound tag。
+pub fn generate_singbox_config_excluding(
+    node_id: i64,
     mut current_config: Value,
     nodes: &[ProxyNode],
+    additionally_excluded_tags: &[String],
 ) -> Result<Value, ProxyConfigError> {
     if node_id <= 0 {
         return Err(ProxyConfigError::InvalidNodeId);
     }
+
+    let mut excluded_source_tags = nodes
+        .iter()
+        .filter(|node| node.node_id == node_id)
+        .filter_map(|node| node.source_inbound_tag.clone())
+        .collect::<BTreeSet<_>>();
+    excluded_source_tags.extend(additionally_excluded_tags.iter().cloned());
 
     let mut managed_nodes =
         nodes.iter().filter(|node| node.node_id == node_id && node.enabled).collect::<Vec<_>>();
@@ -104,7 +120,9 @@ pub fn generate_singbox_config(
             .get("tag")
             .and_then(Value::as_str)
             .is_some_and(|tag| tag.starts_with(MANAGED_INBOUND_TAG_PREFIX));
-        if !monitor_managed {
+        let source_managed =
+            inbound.get("tag").and_then(Value::as_str).is_some_and(|tag| excluded_source_tags.contains(tag));
+        if !monitor_managed && !source_managed {
             merged.push(inbound);
         }
     }
@@ -130,12 +148,15 @@ fn generate_inbound(node: &ProxyNode) -> Result<Value, ProxyConfigError> {
     if node.reality_server_name.trim().is_empty() {
         return Err(ProxyConfigError::InvalidRealityServerName);
     }
+    if node.listen_address.parse::<IpAddr>().is_err() {
+        return Err(ProxyConfigError::InvalidListenAddress);
+    }
 
     let (server, server_port) = parse_reality_dest(&node.reality_dest)?;
     Ok(json!({
         "type": "vless",
         "tag": format!("{MANAGED_INBOUND_TAG_PREFIX}{}", node.id),
-        "listen": DEFAULT_PROXY_LISTEN_ADDR,
+        "listen": node.listen_address,
         "listen_port": node.listen_port,
         "users": [{
             "uuid": node.uuid,
@@ -157,7 +178,7 @@ fn generate_inbound(node: &ProxyNode) -> Result<Value, ProxyConfigError> {
     }))
 }
 
-fn is_uuid(value: &str) -> bool {
+pub(crate) fn is_uuid(value: &str) -> bool {
     let value = value.trim();
     let bytes = value.as_bytes();
     bytes.len() == 36
@@ -168,7 +189,7 @@ fn is_uuid(value: &str) -> bool {
             .all(|(index, byte)| [8, 13, 18, 23].contains(&index) || byte.is_ascii_hexdigit())
 }
 
-fn is_reality_short_id(value: &str) -> bool {
+pub(crate) fn is_reality_short_id(value: &str) -> bool {
     // sing-box 用十六进制文本表示最多 8 字节的 Reality Short ID。
     let value = value.trim();
     !value.is_empty()
@@ -255,6 +276,8 @@ mod tests {
             reality_short_id: "0123456789abcdef".into(),
             reality_server_name: "www.apple.com".into(),
             reality_dest: "www.apple.com:443".into(),
+            listen_address: crate::db::DEFAULT_PROXY_LISTEN_ADDRESS.into(),
+            source_inbound_tag: None,
             deploy_status: "not_deployed".into(),
             last_error: None,
             created_at: 1,
@@ -361,6 +384,29 @@ mod tests {
     }
 
     #[test]
+    fn replaces_the_imported_source_inbound_and_preserves_its_listener() {
+        let mut node = proxy_node(12, 1, true);
+        node.source_inbound_tag = Some("legacy-reality".into());
+        node.listen_address = "0.0.0.0".into();
+        let current = json!({
+            "inbounds": [
+                {"type": "vless", "tag": "legacy-reality", "listen_port": 33333},
+                {"type": "socks", "tag": "manual-socks"}
+            ]
+        });
+
+        let generated = generate_singbox_config(1, current, &[node.clone()]).unwrap();
+        let inbounds = generated["inbounds"].as_array().unwrap();
+        assert_eq!(inbounds.len(), 2);
+        assert_eq!(inbounds[0]["tag"], "manual-socks");
+        assert_eq!(inbounds[1]["tag"], "monitor-proxy-node-12");
+        assert_eq!(inbounds[1]["listen"], "0.0.0.0");
+
+        let redeployed = generate_singbox_config(1, generated.clone(), &[node]).unwrap();
+        assert_eq!(redeployed, generated, "后续部署保持幂等");
+    }
+
+    #[test]
     fn parses_domain_ipv4_and_bracketed_ipv6_reality_destinations() {
         assert_eq!(parse_reality_dest("www.apple.com:443").unwrap(), ("www.apple.com".into(), 443));
         assert_eq!(parse_reality_dest("1.2.3.4:8443").unwrap(), ("1.2.3.4".into(), 8443));
@@ -401,6 +447,13 @@ mod tests {
         node = proxy_node(1, 1, true);
         node.listen_port = 0;
         assert_eq!(generate_singbox_config(1, empty_config(), &[node]), Err(ProxyConfigError::InvalidPort));
+
+        let mut node = proxy_node(1, 1, true);
+        node.listen_address = "eth0".into();
+        assert_eq!(
+            generate_singbox_config(1, empty_config(), &[node]),
+            Err(ProxyConfigError::InvalidListenAddress)
+        );
     }
 
     #[test]

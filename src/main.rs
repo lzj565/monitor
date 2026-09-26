@@ -33,6 +33,7 @@ mod frontend;
 mod notify;
 pub mod proxy_config;
 mod proxy_deploy;
+mod proxy_import;
 mod proxy_provision;
 mod proxy_share;
 
@@ -619,6 +620,10 @@ async fn main() -> Result<()> {
         .route("/api/proxy/nodes/{id}/share", get(proxy_share::share_proxy_node))
         .route("/api/proxy/nodes/{id}/regenerate", post(api::regenerate_proxy_node))
         .route("/api/proxy/servers/{node_id}/deploy", post(proxy_deploy::deploy))
+        .route(
+            "/api/proxy/servers/{node_id}/imports",
+            get(proxy_deploy::scan_proxy_imports).post(proxy_deploy::import_proxy_inbound),
+        )
         .route("/api/ping-tasks", get(api::ping_tasks).post(api::save_ping_task))
         .route("/api/ping-tasks/order", put(api::reorder_ping_tasks))
         .route("/api/ping-tasks/{id}", delete(api::delete_ping_task))

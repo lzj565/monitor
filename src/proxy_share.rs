@@ -199,6 +199,8 @@ mod tests {
             reality_short_id: "1234abcd".into(),
             reality_server_name: "www.apple.com".into(),
             reality_dest: "www.apple.com:443".into(),
+            listen_address: crate::db::DEFAULT_PROXY_LISTEN_ADDRESS.into(),
+            source_inbound_tag: None,
             deploy_status: "deployed".into(),
             last_error: None,
             created_at: 0,
