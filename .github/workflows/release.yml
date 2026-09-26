@@ -100,10 +100,6 @@ jobs:
             -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=$SING_BOX_VERSION' $LDFLAGS -s -w -buildid=" \
             -o "$RUNNER_TEMP/sing-box" ./cmd/sing-box
 
-          "$RUNNER_TEMP/sing-box" version | tee "$RUNNER_TEMP/sing-box-version.txt"
-          grep -Eq "^sing-box version $SING_BOX_VERSION([[:space:]]|$)" "$RUNNER_TEMP/sing-box-version.txt"
-          grep -Eq '(^|[[:space:],])with_v2ray_api([[:space:],]|$)' "$RUNNER_TEMP/sing-box-version.txt"
-
           cat > "$RUNNER_TEMP/config.json" <<'CONFIG'
           {
             "log": {"level": "warn"},
@@ -117,7 +113,16 @@ jobs:
             }
           }
           CONFIG
-          "$RUNNER_TEMP/sing-box" check -c "$RUNNER_TEMP/config.json"
+
+          # GitHub 的 ubuntu-latest 是 amd64；交叉编译的 arm64 二进制不能在此运行。
+          if [ "${{ matrix.arch }}" = "amd64" ]; then
+            "$RUNNER_TEMP/sing-box" version | tee "$RUNNER_TEMP/sing-box-version.txt"
+            grep -Eq "^sing-box version $SING_BOX_VERSION([[:space:]]|$)" "$RUNNER_TEMP/sing-box-version.txt"
+            grep -Eq '(^|[[:space:],])with_v2ray_api([[:space:],]|$)' "$RUNNER_TEMP/sing-box-version.txt"
+            "$RUNNER_TEMP/sing-box" check -c "$RUNNER_TEMP/config.json"
+          else
+            echo "Skipping arm64 binary execution on amd64 runner; cross-compilation already succeeded."
+          fi
 
       - name: Package custom binary with official libcronet
         run: |
