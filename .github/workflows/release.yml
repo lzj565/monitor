@@ -125,11 +125,13 @@ jobs:
           ARCHIVE_DIR="sing-box-$SING_BOX_VERSION-linux-${{ matrix.arch }}"
           OFFICIAL_ARCHIVE="$RUNNER_TEMP/$ARCHIVE_DIR.tar.gz"
           PACKAGE_ROOT="$RUNNER_TEMP/package"
-          curl --fail --location --retry 5 \
+          curl --fail --location --retry 5 --retry-all-errors --retry-delay 2 --retry-max-time 300 --max-time 300 \
             "https://github.com/SagerNet/sing-box/releases/download/v$SING_BOX_VERSION/$ARCHIVE_DIR.tar.gz" \
             --output "$OFFICIAL_ARCHIVE"
-          tar -tzf "$OFFICIAL_ARCHIVE" | grep -Fqx "$ARCHIVE_DIR/sing-box"
-          tar -tzf "$OFFICIAL_ARCHIVE" | grep -Fqx "$ARCHIVE_DIR/libcronet.so"
+          ARCHIVE_CONTENTS="$RUNNER_TEMP/$ARCHIVE_DIR.contents"
+          tar -tzf "$OFFICIAL_ARCHIVE" > "$ARCHIVE_CONTENTS"
+          grep -Fqx "$ARCHIVE_DIR/sing-box" "$ARCHIVE_CONTENTS"
+          grep -Fqx "$ARCHIVE_DIR/libcronet.so" "$ARCHIVE_CONTENTS"
           mkdir -p "$PACKAGE_ROOT"
           tar -xzf "$OFFICIAL_ARCHIVE" -C "$PACKAGE_ROOT"
           install -m 0755 "$RUNNER_TEMP/sing-box" "$PACKAGE_ROOT/$ARCHIVE_DIR/sing-box"
