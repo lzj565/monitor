@@ -4227,7 +4227,7 @@ mod tests {
             8192
         );
         assert_eq!(db.conn().query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 16);
-        assert_eq!(
+        assert!(
             db.conn()
                 .query_row(
                     "SELECT password_hash IS NULL AND subscription_token IS NULL FROM proxy_user WHERE id=?1",
@@ -4235,7 +4235,6 @@ mod tests {
                     |row| row.get::<_, bool>(0)
                 )
                 .unwrap(),
-            true,
             "旧账号保留可登录前由管理员设置密码，订阅 token 不用 UUID 冒充"
         );
     }
@@ -4317,16 +4316,13 @@ mod tests {
         db.check_backup(&scratch.0).unwrap();
         let migrated = Connection::open(&scratch.0).unwrap();
         assert_eq!(migrated.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 16);
-        assert_eq!(
-            migrated
-                .query_row(
-                    "SELECT password_hash IS NULL AND subscription_token IS NULL FROM proxy_user WHERE id=?1",
-                    [user_id],
-                    |row| row.get::<_, bool>(0)
-                )
-                .unwrap(),
-            true
-        );
+        assert!(migrated
+            .query_row(
+                "SELECT password_hash IS NULL AND subscription_token IS NULL FROM proxy_user WHERE id=?1",
+                [user_id],
+                |row| row.get::<_, bool>(0)
+            )
+            .unwrap());
         assert_eq!(
             migrated
                 .query_row("SELECT COUNT(*) FROM proxy_user_session", [], |row| row.get::<_, i64>(0))
