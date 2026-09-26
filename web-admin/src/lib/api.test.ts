@@ -282,7 +282,7 @@ assert.equal(trafficPercent(12, 0), 0)
 assert.equal(expiryDateLabel(null), "永久有效")
 assert.equal(expiryDateLabel("2026-10-25"), "2026/10/25")
 const proxyUserManagerSource = readFileSync(new URL("../components/ProxyUserManager.tsx", import.meta.url), "utf8")
-const trafficCell = proxyUserManagerSource.match(/<TableCell>[\s\S]*?user\.traffic\.used_bytes[\s\S]*?RotateCcw[\s\S]*?<\/TableCell>/)?.[0] ?? ""
+const trafficCell = proxyUserManagerSource.match(/<TableCell\b[^>]*>\s*<div className="space-y-2">(?:(?!<\/TableCell>)[\s\S])*?user\.traffic\.used_bytes(?:(?!<\/TableCell>)[\s\S])*?RotateCcw(?:(?!<\/TableCell>)[\s\S])*?<\/TableCell>/)?.[0] ?? ""
 assert.ok(trafficCell, "清空入口位于流量使用情况单元格")
 assert.match(trafficCell, /setConfirm\(\{ kind: "traffic", user \}\)/, "清零前进入二次确认")
 assert.match(proxyUserManagerSource, /<AlertDialogCancel[^>]*>取消<\/AlertDialogCancel>/, "取消操作不绑定流量 API")
