@@ -31,6 +31,9 @@ const SILENCE: Duration = Duration::from_secs(120);
 /// Reports closer together than this are dropped. The agent's floor is one
 /// second; half of it leaves room for two reports the network has bunched.
 const REPORT_SPACING: Duration = Duration::from_millis(500);
+/// Proxy accounting snapshots are more expensive than host metrics and arrive
+/// every five seconds from the Agent.
+const PROXY_TRAFFIC_SPACING: Duration = Duration::from_secs(4);
 
 /// Probe results admitted per window: twice what the busiest honest node sends
 /// in one -- every probe it may run, each at the shortest interval -- since a
@@ -206,6 +209,7 @@ struct Session {
     tag: u64,
     greeted: bool,
     last_report: Option<Instant>,
+    last_proxy_traffic: Option<Instant>,
     /// Start of the current result window and the results admitted in it.
     window: Option<(Instant, u32)>,
     /// Whether a dropped or unusable frame has been logged; see [`Session::complain`].
@@ -221,6 +225,17 @@ impl Session {
             return false;
         }
         self.last_report = Some(tick);
+        true
+    }
+
+    fn admit_proxy_traffic(&mut self, tick: Instant) -> bool {
+        if self
+            .last_proxy_traffic
+            .is_some_and(|last| tick.saturating_duration_since(last) < PROXY_TRAFFIC_SPACING)
+        {
+            return false;
+        }
+        self.last_proxy_traffic = Some(tick);
         true
     }
 
@@ -260,6 +275,13 @@ struct Rpc {
     method: String,
     #[serde(default)]
     params: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProxyTrafficSnapshot {
+    users: HashMap<String, crate::db::ProxyTrafficCounter>,
+    inbounds: HashMap<String, crate::db::ProxyTrafficCounter>,
 }
 
 pub async fn handler(
@@ -504,6 +526,39 @@ fn dispatch(
             debug!("node {node_id}: a report within {REPORT_SPACING:?} of the last was dropped")
         }
         "report" => report(app, node_id, rpc.params, arrival)?,
+        "proxy.traffic" if !session.greeted => {
+            session.complain(node_id, "proxy traffic arrived before hello and was ignored");
+        }
+        "proxy.traffic" if !session.admit_proxy_traffic(arrival.tick) => {
+            debug!("node {node_id}: a proxy traffic snapshot inside {PROXY_TRAFFIC_SPACING:?} was dropped");
+        }
+        "proxy.traffic" => {
+            let snapshot: ProxyTrafficSnapshot = serde_json::from_value(rpc.params)?;
+            anyhow::ensure!(snapshot.users.len() <= 4096, "too many user counters in proxy traffic snapshot");
+            anyhow::ensure!(
+                snapshot.inbounds.len() <= 256,
+                "too many inbound counters in proxy traffic snapshot"
+            );
+            anyhow::ensure!(
+                snapshot.users.keys().all(|key| !key.is_empty() && key.len() <= 128)
+                    && snapshot.inbounds.keys().all(|key| key.starts_with("proxy-") && key.len() <= 128),
+                "invalid identity in proxy traffic snapshot"
+            );
+            let current = app
+                .agents
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&node_id)
+                .is_some_and(|agent| agent.session == session.tag);
+            if current {
+                app.db.record_proxy_traffic(
+                    node_id,
+                    &snapshot.users,
+                    &snapshot.inbounds,
+                    arrival.at.timestamp(),
+                )?;
+            }
+        }
         "ping.result" if !session.admit_result(arrival.tick) => session.complain(
             node_id,
             format_args!(

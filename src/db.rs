@@ -194,6 +194,33 @@ CREATE TABLE IF NOT EXISTS user_proxy_authorizations (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_user_proxy_authorizations_unique ON user_proxy_authorizations(user_id,proxy_id);
 CREATE INDEX IF NOT EXISTS idx_user_proxy_authorizations_user_id ON user_proxy_authorizations(user_id);
 CREATE INDEX IF NOT EXISTS idx_user_proxy_authorizations_proxy_id ON user_proxy_authorizations(proxy_id);
+
+CREATE TABLE IF NOT EXISTS proxy_user_traffic (
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  node_id INTEGER NOT NULL REFERENCES node(id) ON DELETE CASCADE,
+  uplink_bytes INTEGER NOT NULL DEFAULT 0 CHECK (uplink_bytes >= 0),
+  downlink_bytes INTEGER NOT NULL DEFAULT 0 CHECK (downlink_bytes >= 0),
+  last_uplink_counter INTEGER CHECK (last_uplink_counter IS NULL OR last_uplink_counter >= 0),
+  last_downlink_counter INTEGER CHECK (last_downlink_counter IS NULL OR last_downlink_counter >= 0),
+  last_seen_at INTEGER,
+  reset_at INTEGER,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (user_id, node_id)
+);
+CREATE INDEX IF NOT EXISTS idx_proxy_user_traffic_node_id ON proxy_user_traffic(node_id);
+
+CREATE TABLE IF NOT EXISTS proxy_node_traffic (
+  node_id INTEGER PRIMARY KEY REFERENCES node(id) ON DELETE CASCADE,
+  uplink_bytes INTEGER NOT NULL DEFAULT 0 CHECK (uplink_bytes >= 0),
+  downlink_bytes INTEGER NOT NULL DEFAULT 0 CHECK (downlink_bytes >= 0),
+  last_uplink_counter INTEGER CHECK (last_uplink_counter IS NULL OR last_uplink_counter >= 0),
+  last_downlink_counter INTEGER CHECK (last_downlink_counter IS NULL OR last_downlink_counter >= 0),
+  last_seen_at INTEGER,
+  reset_at INTEGER,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
 "#;
 
 /// Schema revision this build expects, stamped into `PRAGMA user_version`.
@@ -210,7 +237,7 @@ CREATE INDEX IF NOT EXISTS idx_user_proxy_authorizations_proxy_id ON user_proxy_
 /// cannot: `open` runs `SCHEMA` before migrating, and on an older file the
 /// column is not there yet. `an_upgraded_release_matches_a_fresh_database`
 /// holds every migration to these rules, starting from v1.0.0's schema.
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -410,6 +437,11 @@ fn migrate_to_13(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_to_14(conn: &Connection) -> Result<()> {
+    conn.execute_batch(RESOURCE_SCHEMA)?;
+    Ok(())
+}
+
 fn random_secret() -> String {
     hex::encode(rand::random::<[u8; 32]>())
 }
@@ -475,6 +507,9 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     if from < 13 {
         migrate_to_13(&tx)?;
     }
+    if from < 14 {
+        migrate_to_14(&tx)?;
+    }
     seed_default_admin(&tx)?;
     tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     tx.commit()?;
@@ -513,7 +548,24 @@ fn seed_default_admin(conn: &Connection) -> Result<()> {
 }
 
 /// Every table a backup must carry before this build will restore it.
-const TABLES: [&str; 11] = [
+const TABLES: [&str; 13] = [
+    "setting",
+    "node",
+    "proxies",
+    "users",
+    "user_proxy_authorizations",
+    "traffic",
+    "metric",
+    "ping_task",
+    "ping_node",
+    "ping_record",
+    "session",
+    "proxy_user_traffic",
+    "proxy_node_traffic",
+];
+const PRE_RESOURCE_TABLES: [&str; 8] =
+    ["setting", "node", "traffic", "metric", "ping_task", "ping_node", "ping_record", "session"];
+const PRE_PROXY_TRAFFIC_TABLES: [&str; 11] = [
     "setting",
     "node",
     "proxies",
@@ -526,8 +578,6 @@ const TABLES: [&str; 11] = [
     "ping_record",
     "session",
 ];
-const PRE_RESOURCE_TABLES: [&str; 8] =
-    ["setting", "node", "traffic", "metric", "ping_task", "ping_node", "ping_record", "session"];
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Proxy {
@@ -575,6 +625,43 @@ pub struct User {
     pub created_at: i64,
     pub updated_at: i64,
     pub proxy_count: i64,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+pub struct ProxyTrafficCounter {
+    pub uplink: i64,
+    pub downlink: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProxyUserTrafficSummary {
+    pub user_id: i64,
+    pub username: String,
+    pub uplink_bytes: i64,
+    pub downlink_bytes: i64,
+    pub last_seen_at: Option<i64>,
+    pub reset_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProxyUserTrafficByNode {
+    pub user_id: i64,
+    pub node_id: i64,
+    pub node_name: String,
+    pub uplink_bytes: i64,
+    pub downlink_bytes: i64,
+    pub last_seen_at: Option<i64>,
+    pub reset_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProxyNodeTrafficSummary {
+    pub node_id: i64,
+    pub node_name: String,
+    pub uplink_bytes: i64,
+    pub downlink_bytes: i64,
+    pub last_seen_at: Option<i64>,
+    pub reset_at: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -1135,6 +1222,218 @@ impl Db {
                 row_to_user,
             )
             .optional()?)
+    }
+
+    pub fn proxy_user_traffic(&self) -> Result<Vec<ProxyUserTrafficSummary>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT u.id,u.username,COALESCE(SUM(t.uplink_bytes),0),COALESCE(SUM(t.downlink_bytes),0),
+                    MAX(t.last_seen_at),MAX(t.reset_at)
+             FROM users u LEFT JOIN proxy_user_traffic t ON t.user_id=u.id
+             GROUP BY u.id ORDER BY u.id",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(ProxyUserTrafficSummary {
+                    user_id: r.get(0)?,
+                    username: r.get(1)?,
+                    uplink_bytes: r.get(2)?,
+                    downlink_bytes: r.get(3)?,
+                    last_seen_at: r.get(4)?,
+                    reset_at: r.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    pub fn proxy_user_traffic_by_node(&self, user_id: i64) -> Result<Vec<ProxyUserTrafficByNode>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT t.user_id,t.node_id,n.name,t.uplink_bytes,t.downlink_bytes,t.last_seen_at,t.reset_at
+             FROM proxy_user_traffic t JOIN node n ON n.id=t.node_id
+             WHERE t.user_id=?1 ORDER BY n.sort,n.id",
+        )?;
+        let rows = stmt
+            .query_map([user_id], |r| {
+                Ok(ProxyUserTrafficByNode {
+                    user_id: r.get(0)?,
+                    node_id: r.get(1)?,
+                    node_name: r.get(2)?,
+                    uplink_bytes: r.get(3)?,
+                    downlink_bytes: r.get(4)?,
+                    last_seen_at: r.get(5)?,
+                    reset_at: r.get(6)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    pub fn proxy_node_traffic(&self) -> Result<Vec<ProxyNodeTrafficSummary>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT n.id,n.name,COALESCE(t.uplink_bytes,0),COALESCE(t.downlink_bytes,0),t.last_seen_at,t.reset_at
+             FROM node n LEFT JOIN proxy_node_traffic t ON t.node_id=n.id ORDER BY n.sort,n.id",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(ProxyNodeTrafficSummary {
+                    node_id: r.get(0)?,
+                    node_name: r.get(1)?,
+                    uplink_bytes: r.get(2)?,
+                    downlink_bytes: r.get(3)?,
+                    last_seen_at: r.get(4)?,
+                    reset_at: r.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    pub fn reset_proxy_user_traffic(&self, user_id: i64, now: i64) -> Result<bool> {
+        let conn = self.conn();
+        let exists: bool =
+            conn.query_row("SELECT EXISTS(SELECT 1 FROM users WHERE id=?1)", [user_id], |r| r.get(0))?;
+        if !exists {
+            return Ok(false);
+        }
+        conn.execute(
+            "UPDATE proxy_user_traffic SET uplink_bytes=0,downlink_bytes=0,reset_at=?2,updated_at=?2
+             WHERE user_id=?1",
+            params![user_id, now],
+        )?;
+        Ok(true)
+    }
+
+    pub fn reset_proxy_node_traffic(&self, node_id: i64, now: i64) -> Result<bool> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let exists: bool =
+            tx.query_row("SELECT EXISTS(SELECT 1 FROM node WHERE id=?1)", [node_id], |r| r.get(0))?;
+        if !exists {
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO proxy_node_traffic(node_id,uplink_bytes,downlink_bytes,reset_at,created_at,updated_at)
+             VALUES(?1,0,0,?2,?2,?2)
+             ON CONFLICT(node_id) DO UPDATE SET uplink_bytes=0,downlink_bytes=0,reset_at=excluded.reset_at,
+                                                updated_at=excluded.updated_at",
+            params![node_id, now],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Books one complete Core snapshot atomically. Missing counters for a
+    /// currently configured user or inbound are zero; the first observation
+    /// establishes a baseline and contributes no historical Core bytes.
+    pub fn record_proxy_traffic(
+        &self,
+        node_id: i64,
+        users: &HashMap<String, ProxyTrafficCounter>,
+        inbounds: &HashMap<String, ProxyTrafficCounter>,
+        now: i64,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            users.values().chain(inbounds.values()).all(|c| c.uplink >= 0 && c.downlink >= 0),
+            "Core traffic counters must be non-negative"
+        );
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let proxy_ids = {
+            let mut stmt = tx.prepare("SELECT id FROM proxies WHERE node_id=?1 AND enabled=1 ORDER BY id")?;
+            let rows = stmt.query_map([node_id], |r| r.get::<_, i64>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let configured_users = {
+            let mut stmt = tx.prepare(
+                "SELECT DISTINCT u.id,u.username FROM users u
+                 JOIN user_proxy_authorizations a ON a.user_id=u.id
+                 JOIN proxies p ON p.id=a.proxy_id
+                 WHERE p.node_id=?1 AND p.enabled=1 AND a.enabled=1 AND u.enabled=1
+                       AND (u.expires_at IS NULL OR u.expires_at>?2)
+                 ORDER BY u.id",
+            )?;
+            let rows =
+                stmt.query_map(params![node_id, now], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        let mut inbound_total = ProxyTrafficCounter::default();
+        for proxy_id in proxy_ids {
+            let tag = format!("proxy-{proxy_id}");
+            let reading = inbounds.get(&tag).copied().unwrap_or_default();
+            inbound_total.uplink = inbound_total
+                .uplink
+                .checked_add(reading.uplink)
+                .context("inbound uplink total exceeds SQLite integer range")?;
+            inbound_total.downlink = inbound_total
+                .downlink
+                .checked_add(reading.downlink)
+                .context("inbound downlink total exceeds SQLite integer range")?;
+        }
+
+        for (user_id, username) in configured_users {
+            let current = users.get(&username).copied().unwrap_or_default();
+            let previous: Option<(i64, i64, Option<i64>, Option<i64>)> = tx
+                .query_row(
+                    "SELECT uplink_bytes,downlink_bytes,last_uplink_counter,last_downlink_counter
+                     FROM proxy_user_traffic WHERE user_id=?1 AND node_id=?2",
+                    params![user_id, node_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .optional()?;
+            let (total_up, total_down) = match previous {
+                Some((up, down, last_up, last_down)) => (
+                    up.checked_add(counter_delta(current.uplink, last_up))
+                        .context("user uplink total exceeds SQLite integer range")?,
+                    down.checked_add(counter_delta(current.downlink, last_down))
+                        .context("user downlink total exceeds SQLite integer range")?,
+                ),
+                None => (0, 0),
+            };
+            tx.execute(
+                "INSERT INTO proxy_user_traffic(user_id,node_id,uplink_bytes,downlink_bytes,
+                                                last_uplink_counter,last_downlink_counter,last_seen_at,created_at,updated_at)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?7,?7)
+                 ON CONFLICT(user_id,node_id) DO UPDATE SET uplink_bytes=excluded.uplink_bytes,
+                     downlink_bytes=excluded.downlink_bytes,last_uplink_counter=excluded.last_uplink_counter,
+                     last_downlink_counter=excluded.last_downlink_counter,last_seen_at=excluded.last_seen_at,
+                     updated_at=excluded.updated_at",
+                params![user_id, node_id, total_up, total_down, current.uplink, current.downlink, now],
+            )?;
+        }
+
+        let previous: Option<(i64, i64, Option<i64>, Option<i64>)> = tx
+            .query_row(
+                "SELECT uplink_bytes,downlink_bytes,last_uplink_counter,last_downlink_counter
+                 FROM proxy_node_traffic WHERE node_id=?1",
+                [node_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        let (total_up, total_down) = match previous {
+            Some((up, down, last_up, last_down)) => (
+                up.checked_add(counter_delta(inbound_total.uplink, last_up))
+                    .context("node uplink total exceeds SQLite integer range")?,
+                down.checked_add(counter_delta(inbound_total.downlink, last_down))
+                    .context("node downlink total exceeds SQLite integer range")?,
+            ),
+            None => (0, 0),
+        };
+        tx.execute(
+            "INSERT INTO proxy_node_traffic(node_id,uplink_bytes,downlink_bytes,last_uplink_counter,
+                                             last_downlink_counter,last_seen_at,created_at,updated_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?6,?6)
+             ON CONFLICT(node_id) DO UPDATE SET uplink_bytes=excluded.uplink_bytes,
+                 downlink_bytes=excluded.downlink_bytes,last_uplink_counter=excluded.last_uplink_counter,
+                 last_downlink_counter=excluded.last_downlink_counter,last_seen_at=excluded.last_seen_at,
+                 updated_at=excluded.updated_at",
+            params![node_id, total_up, total_down, inbound_total.uplink, inbound_total.downlink, now],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn user_login_record(&self, username: &str) -> Result<Option<UserLoginRecord>> {
@@ -2529,7 +2828,13 @@ impl Db {
         }
         // V1.3/schema 9 backups predate these three tables; their migration
         // creates them. Newer backups must carry every resource table already.
-        let required_tables: &[&str] = if version < 10 { &PRE_RESOURCE_TABLES } else { &TABLES };
+        let required_tables: &[&str] = if version < 10 {
+            &PRE_RESOURCE_TABLES
+        } else if version < 14 {
+            &PRE_PROXY_TRAFFIC_TABLES
+        } else {
+            &TABLES
+        };
         for table in required_tables {
             let found: i64 = candidate.query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
@@ -2832,6 +3137,14 @@ fn parse_json(r: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<serde_jso
     serde_json::from_str(&raw).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(index, rusqlite::types::Type::Text, Box::new(error))
     })
+}
+
+fn counter_delta(current: i64, last: Option<i64>) -> i64 {
+    match last {
+        None => 0,
+        Some(previous) if current >= previous => current - previous,
+        Some(_) => current,
+    }
 }
 
 fn row_to_proxy(r: &rusqlite::Row<'_>) -> rusqlite::Result<Proxy> {

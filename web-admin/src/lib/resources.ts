@@ -41,6 +41,17 @@ export type User = {
   proxy_count: number
 }
 
+export type ProxyTrafficSummary = {
+  user_id?: number
+  node_id: number
+  node_name: string
+  username?: string
+  uplink_bytes: number
+  downlink_bytes: number
+  last_seen_at: number | null
+  reset_at: number | null
+}
+
 export type UserDraft = Pick<User, "username" | "enabled" | "expires_at"> & { password?: string }
 export type VlessAuth = { flow: Flow }
 export type UserProxyAuthorization = {
@@ -75,6 +86,29 @@ export function deleteProxy(id: number) {
 export async function listUsers(): Promise<User[]> {
   const response = await api<{ items: User[] }>("/users")
   return response.items
+}
+
+export async function listProxyUserTraffic(): Promise<Array<Pick<ProxyTrafficSummary, "user_id" | "username" | "uplink_bytes" | "downlink_bytes" | "last_seen_at" | "reset_at">>> {
+  const response = await api<{ items: Array<Pick<ProxyTrafficSummary, "user_id" | "username" | "uplink_bytes" | "downlink_bytes" | "last_seen_at" | "reset_at">> }>("/proxy-traffic/users")
+  return response.items
+}
+
+export async function getProxyUserTraffic(userId: number): Promise<ProxyTrafficSummary[]> {
+  const response = await api<{ items: ProxyTrafficSummary[] }>(`/proxy-traffic/users/${userId}`)
+  return response.items
+}
+
+export async function listProxyNodeTraffic(): Promise<ProxyTrafficSummary[]> {
+  const response = await api<{ items: ProxyTrafficSummary[] }>("/proxy-traffic/nodes")
+  return response.items
+}
+
+export function resetProxyUserTraffic(userId: number) {
+  return api<void>(`/proxy-traffic/users/${userId}/reset`, { method: "POST" })
+}
+
+export function resetProxyNodeTraffic(nodeId: number) {
+  return api<void>(`/proxy-traffic/nodes/${nodeId}/reset`, { method: "POST" })
 }
 
 export function createUser(draft: UserDraft) {

@@ -16,6 +16,7 @@ import { Skeleton } from "@/components/ui/skeleton"
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
 import { AdminConfirmDialog as ConfirmDialog, AdminSearchInput } from "@/components/AdminShared"
 import type { Node } from "@/lib/api"
+import { bytes } from "@/lib/format"
 import { proxyDraft } from "@/lib/proxy-draft"
 import { countryFlag, displayProxyName } from "@/lib/proxy-name"
 import { ProxyAddressTypeBadge, ProxyProtocolBadge } from "@/components/ProxyBadges"
@@ -29,10 +30,15 @@ import {
   deleteUser,
   deleteUserProxy,
   listAllProxies,
+  getProxyUserTraffic,
+  listProxyNodeTraffic,
+  listProxyUserTraffic,
   listUserAuthorizations,
   listUsers,
   saveUserProxy,
   resetUserUuid,
+  resetProxyNodeTraffic,
+  resetProxyUserTraffic,
   updateProxy,
   updateUser,
   type Flow,
@@ -41,6 +47,7 @@ import {
   type User,
   type UserDraft,
   type UserProxyAuthorization,
+  type ProxyTrafficSummary,
 } from "@/lib/resources"
 
 type Go = (to: string) => void
@@ -387,6 +394,11 @@ function ProxyForm({ proxy, nodes, onClose, onSaved }: {
 
 function ProxyPage({ nodes }: { nodes: Node[] }) {
   const { items, error, loading, reload } = useAllProxies(nodes)
+  const [trafficItems, setTrafficItems] = useState<ProxyTrafficSummary[] | null>(null)
+  const [trafficError, setTrafficError] = useState("")
+  const [trafficRevision, setTrafficRevision] = useState(0)
+  const [trafficResetNode, setTrafficResetNode] = useState<ProxyTrafficSummary | null>(null)
+  const [resettingTraffic, setResettingTraffic] = useState(false)
   const [query, setQuery] = useState("")
   const [nodeFilter, setNodeFilter] = useState("all")
   const [statusFilter, setStatusFilter] = useState("all")
@@ -395,6 +407,17 @@ function ProxyPage({ nodes }: { nodes: Node[] }) {
   const [deleting, setDeleting] = useState<Proxy | null>(null)
   const [removing, setRemoving] = useState(false)
   const [updatingProxyId, setUpdatingProxyId] = useState<number | null>(null)
+  useEffect(() => {
+    let active = true
+    const load = () => listProxyNodeTraffic().then((next) => {
+      if (active) { setTrafficItems(next); setTrafficError("") }
+    }).catch((e: Error) => {
+      if (active) { setTrafficItems(null); setTrafficError(e.message) }
+    })
+    void load()
+    const timer = window.setInterval(() => void load(), 5_000)
+    return () => { active = false; window.clearInterval(timer) }
+  }, [trafficRevision])
   const nodeById = new Map(nodes.map((node) => [node.id, node]))
   const nodeOrder = new Map(nodes.map((node, index) => [node.id, index]))
   const visible = (items ?? []).filter((proxy) => {
@@ -418,6 +441,21 @@ function ProxyPage({ nodes }: { nodes: Node[] }) {
       toast.error((e as Error).message)
     } finally {
       setRemoving(false)
+    }
+  }
+
+  async function resetNodeTraffic() {
+    if (!trafficResetNode) return
+    setResettingTraffic(true)
+    try {
+      await resetProxyNodeTraffic(trafficResetNode.node_id)
+      toast.success(`已清空节点「${trafficResetNode.node_name}」的业务流量。`)
+      setTrafficResetNode(null)
+      setTrafficRevision((value) => value + 1)
+    } catch (e) {
+      toast.error((e as Error).message)
+    } finally {
+      setResettingTraffic(false)
     }
   }
 
@@ -452,6 +490,18 @@ function ProxyPage({ nodes }: { nodes: Node[] }) {
         </div>
         <Button disabled={!nodes.length} onClick={() => setCreating(true)}><Plus /> 新增代理</Button>
       </div>
+
+      {trafficError && <p role="alert" className="text-sm text-destructive">节点业务流量读取失败：{trafficError}</p>}
+      {trafficItems && trafficItems.length > 0 && <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+        {trafficItems.map((traffic) => <Card key={traffic.node_id} className="flex flex-row items-center justify-between gap-4 py-3">
+          <div className="min-w-0">
+            <div className="truncate font-medium">{traffic.node_name}</div>
+            <div className="mt-1 text-xs text-muted-foreground">上行 {bytes(traffic.uplink_bytes)} · 下行 {bytes(traffic.downlink_bytes)}</div>
+            <div className="mt-1 text-xs text-muted-foreground">最近采集：{traffic.last_seen_at ? new Date(traffic.last_seen_at * 1000).toLocaleString() : "尚未采集"}</div>
+          </div>
+          <Button variant="outline" size="sm" onClick={() => setTrafficResetNode(traffic)}>清零</Button>
+        </Card>)}
+      </div>}
 
       <Card className="overflow-x-auto p-0">
         <Table className="table-fixed">
@@ -531,6 +581,14 @@ function ProxyPage({ nodes }: { nodes: Node[] }) {
         busy={removing}
         onClose={() => setDeleting(null)}
         onConfirm={remove}
+      />}
+      {trafficResetNode && <ConfirmDialog
+        title={`清空节点「${trafficResetNode.node_name}」的业务流量？`}
+        description="只清空 Hub 累计量并保留 Core counter baseline，下一次采集只会累计之后新增的流量。"
+        confirmLabel="清空流量"
+        busy={resettingTraffic}
+        onClose={() => setTrafficResetNode(null)}
+        onConfirm={() => void resetNodeTraffic()}
       />}
     </div>
   )
@@ -724,9 +782,86 @@ function UserForm({ user, go, onClose, onSaved }: {
   )
 }
 
+function UserTrafficDialog({ user, onClose, onChanged }: { user: User; onClose: () => void; onChanged: () => void }) {
+  const [items, setItems] = useState<ProxyTrafficSummary[] | null>(null)
+  const [error, setError] = useState("")
+  const [revision, setRevision] = useState(0)
+  const [confirmReset, setConfirmReset] = useState(false)
+  const [resetting, setResetting] = useState(false)
+
+  useEffect(() => {
+    let active = true
+    getProxyUserTraffic(user.id).then((next) => {
+      if (active) { setItems(next); setError("") }
+    }).catch((e: Error) => {
+      if (active) { setItems(null); setError(e.message) }
+    })
+    return () => { active = false }
+  }, [user.id, revision])
+
+  async function reset() {
+    setResetting(true)
+    try {
+      await resetProxyUserTraffic(user.id)
+      toast.success(`已清空用户「${user.username}」在所有节点的业务流量。`)
+      setConfirmReset(false)
+      setRevision((value) => value + 1)
+      onChanged()
+    } catch (e) {
+      toast.error((e as Error).message)
+    } finally {
+      setResetting(false)
+    }
+  }
+
+  return (
+    <Dialog open onOpenChange={(open) => !open && onClose()}>
+      <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-2xl">
+        <DialogHeader>
+          <DialogTitle>业务流量：{user.username}</DialogTitle>
+          <DialogDescription>按主机节点汇总。清零会保留 Core counter baseline。</DialogDescription>
+        </DialogHeader>
+        <div className="space-y-3">
+          {error && <p role="alert" className="text-sm text-destructive">读取流量失败：{error}</p>}
+          <Card className="overflow-x-auto p-0">
+            <Table>
+              <TableHeader className="bg-muted/50"><TableRow>
+                <TableHead>节点</TableHead><TableHead>上行</TableHead><TableHead>下行</TableHead><TableHead>最近采集</TableHead>
+              </TableRow></TableHeader>
+              <TableBody>
+                {items?.map((item) => <TableRow key={item.node_id}>
+                  <TableCell>{item.node_name}</TableCell>
+                  <TableCell className="tnum">{bytes(item.uplink_bytes)}</TableCell>
+                  <TableCell className="tnum">{bytes(item.downlink_bytes)}</TableCell>
+                  <TableCell className="text-sm text-muted-foreground">{item.last_seen_at ? new Date(item.last_seen_at * 1000).toLocaleString() : "—"}</TableCell>
+                </TableRow>)}
+                {items?.length === 0 && <TableRow><TableCell colSpan={4} className="py-6 text-center text-sm text-muted-foreground">尚无已采集的流量</TableCell></TableRow>}
+                {items === null && !error && <TableRow><TableCell colSpan={4} className="p-4"><Skeleton className="h-9 w-full" /></TableCell></TableRow>}
+              </TableBody>
+            </Table>
+          </Card>
+        </div>
+        <DialogFooter className="border-t pt-4">
+          <Button variant="ghost" onClick={onClose}>关闭</Button>
+          <Button variant="destructive" onClick={() => setConfirmReset(true)}>清空该用户流量</Button>
+        </DialogFooter>
+      </DialogContent>
+      {confirmReset && <ConfirmDialog
+        title={`清空用户「${user.username}」的业务流量？`}
+        description="会清空该用户在所有节点的累计量，但保留 Core counter baseline，下一次新增流量会从零累计。"
+        confirmLabel="清空流量"
+        busy={resetting}
+        onClose={() => setConfirmReset(false)}
+        onConfirm={() => void reset()}
+      />}
+    </Dialog>
+  )
+}
+
 function UsersPage({ go }: { go: Go }) {
   const [revision, setRevision] = useState(0)
   const [result, setResult] = useState<{ revision: number; items: User[] | null; error: string } | null>(null)
+  const [trafficResult, setTrafficResult] = useState<{ revision: number; items: Awaited<ReturnType<typeof listProxyUserTraffic>> | null; error: string } | null>(null)
   const [query, setQuery] = useState("")
   const [status, setStatus] = useState("all")
   const [creating, setCreating] = useState(false)
@@ -734,6 +869,8 @@ function UsersPage({ go }: { go: Go }) {
   const [deleting, setDeleting] = useState<User | null>(null)
   const [removing, setRemoving] = useState(false)
   const [updatingUserId, setUpdatingUserId] = useState<number | null>(null)
+  const [trafficRevision, setTrafficRevision] = useState(0)
+  const [trafficUser, setTrafficUser] = useState<User | null>(null)
 
   useEffect(() => {
     let active = true
@@ -745,10 +882,25 @@ function UsersPage({ go }: { go: Go }) {
     return () => { active = false }
   }, [revision])
 
+  useEffect(() => {
+    let active = true
+    const load = () => listProxyUserTraffic().then((items) => {
+      if (active) setTrafficResult({ revision: trafficRevision, items, error: "" })
+    }).catch((e: Error) => {
+      if (active) setTrafficResult({ revision: trafficRevision, items: null, error: e.message })
+    })
+    void load()
+    const timer = window.setInterval(() => void load(), 5_000)
+    return () => { active = false; window.clearInterval(timer) }
+  }, [trafficRevision])
+
   const current = result?.revision === revision
   const items = current ? result.items : null
   const error = current ? result.error : ""
   const loading = !current
+  const trafficItems = trafficResult?.revision === trafficRevision ? trafficResult.items : null
+  const trafficError = trafficResult?.revision === trafficRevision ? trafficResult.error : ""
+  const trafficByUser = new Map((trafficItems ?? []).map((item) => [item.user_id, item]))
   const needle = query.trim().toLowerCase()
   const visible = (items ?? []).filter((user) => {
     const matchesText = !needle || user.username.toLowerCase().includes(needle)
@@ -766,7 +918,7 @@ function UsersPage({ go }: { go: Go }) {
       await deleteUser(deleting.id)
       toast.success("用户及其授权已删除，变更将在相关节点下次应用配置后生效。")
       setDeleting(null)
-      setRevision((value) => value + 1)
+      reload()
     } catch (e) {
       toast.error((e as Error).message)
     } finally {
@@ -779,12 +931,17 @@ function UsersPage({ go }: { go: Go }) {
     try {
       await updateUser(user.id, { username: user.username, enabled, expires_at: user.expires_at })
       toast.success("用户状态已更新，相关代理配置将在对应节点下次应用配置后生效。")
-      setRevision((value) => value + 1)
+      reload()
     } catch (e) {
       toast.error((e as Error).message)
     } finally {
       setUpdatingUserId(null)
     }
+  }
+
+  function reload() {
+    setRevision((value) => value + 1)
+    setTrafficRevision((value) => value + 1)
   }
 
   return (
@@ -796,6 +953,7 @@ function UsersPage({ go }: { go: Go }) {
         </div>
         <Button onClick={() => setCreating(true)}><Plus /> 新增用户</Button>
       </div>
+      {trafficError && <p role="alert" className="text-sm text-destructive">业务流量读取失败：{trafficError}</p>}
       <Card className="overflow-x-auto p-0">
         <Table>
           <TableHeader className="bg-muted/50"><TableRow>
@@ -804,6 +962,7 @@ function UsersPage({ go }: { go: Go }) {
             <TableHead className="w-[18%] px-4">代理授权</TableHead>
             <TableHead className="w-[20%] px-4">到期时间</TableHead>
             <TableHead className="w-[17%] px-4">账户状态</TableHead>
+            <TableHead className="w-[20%] px-4">业务流量</TableHead>
             <TableHead className="text-right">操作</TableHead>
           </TableRow></TableHeader>
           <TableBody>
@@ -825,6 +984,13 @@ function UsersPage({ go }: { go: Go }) {
                     {expired(user) && <Badge variant="destructive" className="font-normal">已过期</Badge>}
                   </div>
                 </TableCell>
+                <TableCell className="px-4">
+                  <div className="space-y-1 text-xs text-muted-foreground">
+                    <div>上行 {bytes(trafficByUser.get(user.id)?.uplink_bytes ?? 0)}</div>
+                    <div>下行 {bytes(trafficByUser.get(user.id)?.downlink_bytes ?? 0)}</div>
+                  </div>
+                  <Button variant="link" size="sm" className="h-7 px-0" onClick={() => setTrafficUser(user)}>明细 / 清零</Button>
+                </TableCell>
                 <TableCell className="whitespace-nowrap text-right">
                   <div className="flex items-center justify-end gap-1">
                     <Button variant="ghost" size="sm" onClick={() => setEditing(user)}><Pencil /> 编辑</Button>
@@ -834,17 +1000,18 @@ function UsersPage({ go }: { go: Go }) {
                 </TableCell>
               </TableRow>
             ))}
-            {!loading && !error && !visible.length && <TableRow><TableCell colSpan={6} className="py-10 text-center text-sm text-muted-foreground">{items?.length ? "没有匹配的用户" : "还没有用户，右上角新增"}</TableCell></TableRow>}
-            {loading && <TableRow><TableCell colSpan={6} className="p-4"><Skeleton className="h-10 w-full" /></TableCell></TableRow>}
-            {error && <TableRow><TableCell colSpan={6} className="py-8 text-center text-sm text-destructive">
+            {!loading && !error && !visible.length && <TableRow><TableCell colSpan={7} className="py-10 text-center text-sm text-muted-foreground">{items?.length ? "没有匹配的用户" : "还没有用户，右上角新增"}</TableCell></TableRow>}
+            {loading && <TableRow><TableCell colSpan={7} className="p-4"><Skeleton className="h-10 w-full" /></TableCell></TableRow>}
+            {error && <TableRow><TableCell colSpan={7} className="py-8 text-center text-sm text-destructive">
               <div role="alert">加载用户失败：{error}</div>
-              <Button variant="outline" size="sm" className="mt-3" onClick={() => setRevision((value) => value + 1)}>重试</Button>
+              <Button variant="outline" size="sm" className="mt-3" onClick={reload}>重试</Button>
             </TableCell></TableRow>}
           </TableBody>
         </Table>
       </Card>
-      {creating && <UserForm user={null} go={go} onClose={() => setCreating(false)} onSaved={() => setRevision((value) => value + 1)} />}
-      {editing && <UserForm user={editing} go={go} onClose={() => setEditing(null)} onSaved={() => setRevision((value) => value + 1)} />}
+      {creating && <UserForm user={null} go={go} onClose={() => setCreating(false)} onSaved={reload} />}
+      {editing && <UserForm user={editing} go={go} onClose={() => setEditing(null)} onSaved={reload} />}
+      {trafficUser && <UserTrafficDialog user={trafficUser} onClose={() => setTrafficUser(null)} onChanged={() => setTrafficRevision((value) => value + 1)} />}
       {deleting && <ConfirmDialog
         title={`删除用户「${deleting.username}」？`}
         description={`此用户的 ${deleting.proxy_count} 条代理授权也会删除。此操作只修改配置数据，不会自动应用到服务器。`}

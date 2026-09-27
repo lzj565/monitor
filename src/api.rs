@@ -332,6 +332,64 @@ pub async fn command_status(
 
 // ---- V1 Proxy, User and sing-box Desired State API ----
 
+pub async fn proxy_user_traffic(_: ApiAdmin, State(app): State<Shared>) -> Response {
+    match app.db.proxy_user_traffic() {
+        Ok(items) => Json(json!({"items":items})).into_response(),
+        Err(error) => api_internal(error),
+    }
+}
+
+pub async fn proxy_user_traffic_by_node(
+    _: ApiAdmin,
+    State(app): State<Shared>,
+    Path(user_id): Path<i64>,
+) -> Response {
+    if let Err(response) = api_user(&app, user_id) {
+        return response;
+    }
+    match app.db.proxy_user_traffic_by_node(user_id) {
+        Ok(items) => Json(json!({"items":items})).into_response(),
+        Err(error) => api_internal(error),
+    }
+}
+
+pub async fn proxy_node_traffic(_: ApiAdmin, State(app): State<Shared>) -> Response {
+    match app.db.proxy_node_traffic() {
+        Ok(items) => Json(json!({"items":items})).into_response(),
+        Err(error) => api_internal(error),
+    }
+}
+
+pub async fn reset_proxy_user_traffic(
+    _: ApiAdmin,
+    State(app): State<Shared>,
+    Path(user_id): Path<i64>,
+) -> Response {
+    if let Err(response) = api_user(&app, user_id) {
+        return response;
+    }
+    match app.db.reset_proxy_user_traffic(user_id, Utc::now().timestamp()) {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => api_error(StatusCode::NOT_FOUND, "USER_NOT_FOUND", "user does not exist"),
+        Err(error) => api_internal(error),
+    }
+}
+
+pub async fn reset_proxy_node_traffic(
+    _: ApiAdmin,
+    State(app): State<Shared>,
+    Path(node_id): Path<i64>,
+) -> Response {
+    if let Err(response) = api_node_exists(&app, node_id) {
+        return response;
+    }
+    match app.db.reset_proxy_node_traffic(node_id, Utc::now().timestamp()) {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => api_error(StatusCode::NOT_FOUND, "NODE_NOT_FOUND", "node does not exist"),
+        Err(error) => api_internal(error),
+    }
+}
+
 pub async fn list_proxies(_: ApiAdmin, State(app): State<Shared>, Path(node_id): Path<i64>) -> Response {
     if let Err(response) = api_node_exists(&app, node_id) {
         return response;
