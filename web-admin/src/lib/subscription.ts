@@ -52,7 +52,3 @@ export function subscriptionSearchMatches(
     return [displayProxyName(proxy, node), proxy.name, node?.name, proxy.address].some((value) => value?.toLocaleLowerCase().includes(needle))
   })
 }
-
-export function existingAuthorizationSettings(accesses: UserProxyAuthorization[]): Record<number, { flow: "" | "xtls-rprx-vision"; enabled: boolean }> {
-  return Object.fromEntries(accesses.map(({ proxy, access }) => [proxy.id, { flow: access.auth.flow, enabled: access.enabled }]))
-}

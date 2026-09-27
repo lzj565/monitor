@@ -624,7 +624,10 @@ async fn main() -> Result<()> {
                 .route("/api/proxy-traffic/nodes", get(api::proxy_node_traffic))
                 .route("/api/proxy-traffic/nodes/{id}/reset", post(api::reset_proxy_node_traffic))
                 .route("/api/users/{id}", get(api::get_user).put(api::update_user).delete(api::delete_user))
-                .route("/api/users/{user_id}/proxies", get(api::get_user_authorizations))
+                .route(
+                    "/api/users/{user_id}/proxies",
+                    get(api::get_user_authorizations).put(api::replace_user_authorizations),
+                )
                 .route("/api/users/{user_id}/uuid", post(api::reset_user_uuid))
                 .route(
                     "/api/users/{user_id}/proxies/{proxy_id}",

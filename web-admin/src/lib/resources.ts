@@ -22,9 +22,11 @@ export type Proxy = {
   address: string
   port: number
   enabled: boolean
+  flow: Flow
   config: { reality: RealityConfig }
   created_at: number
   updated_at: number
+  sync?: SyncReport
 }
 
 export type ProxyDraft = Omit<Proxy, "id" | "node_id" | "created_at" | "updated_at">
@@ -39,6 +41,47 @@ export type User = {
   updated_at: number
   /** Number of assigned proxy records, including disabled authorizations. */
   proxy_count: number
+  sync?: SyncReport
+}
+
+export type SyncReport = {
+  queued: Array<{ node_id: number; command_id: string }>
+  needs_sync: Array<{ node_id: number; reason: string }>
+}
+
+export type SyncResolution = {
+  succeeded: number[]
+  failed: Array<{ node_id: number; message: string }>
+  pending: number[]
+}
+
+/** Waits briefly for Agent command results; initial queue state is available immediately. */
+export async function resolveSync(report: SyncReport): Promise<SyncResolution> {
+  const resolution: SyncResolution = { succeeded: [], failed: [], pending: [] }
+  await Promise.all(report.queued.map(async ({ node_id, command_id }) => {
+    const deadline = Date.now() + 36_000
+    while (Date.now() < deadline) {
+      try {
+        const command = await api<{ status: string; error?: { message?: string } }>(
+          `/nodes/${node_id}/commands/${encodeURIComponent(command_id)}`,
+        )
+        if (command.status === "succeeded") {
+          resolution.succeeded.push(node_id)
+          return
+        }
+        if (command.status === "failed") {
+          resolution.failed.push({ node_id, message: command.error?.message ?? "Agent 应用失败" })
+          return
+        }
+      } catch (error) {
+        resolution.failed.push({ node_id, message: error instanceof Error ? error.message : "查询命令结果失败" })
+        return
+      }
+      await new Promise((resolve) => setTimeout(resolve, 500))
+    }
+    resolution.pending.push(node_id)
+  }))
+  return resolution
 }
 
 export type ProxyTrafficSummary = {
@@ -114,7 +157,7 @@ export type UserProxyAuthorization = {
   proxy: Pick<Proxy, "id" | "node_id" | "name" | "include_node_name" | "protocol" | "address_type" | "address" | "port" | "enabled">
   access: { enabled: boolean; auth: VlessAuth }
 }
-export type AccessDraft = { enabled: boolean; auth: VlessAuth }
+export type AccessDraft = { enabled: boolean }
 
 export async function listProxiesForNode(nodeId: number): Promise<Proxy[]> {
   const response = await api<{ items: Proxy[] }>(`/nodes/${nodeId}/proxies`)
@@ -136,7 +179,7 @@ export function updateProxy(id: number, draft: ProxyDraft, nodeId?: number) {
 }
 
 export function deleteProxy(id: number) {
-  return api<void>(`/proxies/${id}`, { method: "DELETE" })
+  return api<{ sync: SyncReport }>(`/proxies/${id}`, { method: "DELETE" })
 }
 
 export async function listUsers(): Promise<User[]> {
@@ -188,11 +231,11 @@ export function updateUser(id: number, draft: UserDraft) {
 }
 
 export function resetUserUuid(id: number) {
-  return api<{ uuid: string; queued_node_ids: number[]; needs_sync_node_ids: number[] }>(`/users/${id}/uuid`, { method: "POST" })
+  return api<{ uuid: string; queued_node_ids: number[]; needs_sync_node_ids: number[]; sync: SyncReport }>(`/users/${id}/uuid`, { method: "POST" })
 }
 
 export function deleteUser(id: number) {
-  return api<void>(`/users/${id}`, { method: "DELETE" })
+  return api<{ sync: SyncReport }>(`/users/${id}`, { method: "DELETE" })
 }
 
 export async function listUserAuthorizations(userId: number): Promise<UserProxyAuthorization[]> {
@@ -201,12 +244,19 @@ export async function listUserAuthorizations(userId: number): Promise<UserProxyA
 }
 
 export function saveUserProxy(userId: number, proxyId: number, draft: AccessDraft) {
-  return api<{ user_id: number; proxy_id: number; enabled: boolean; auth: VlessAuth }>(
+  return api<{ user_id: number; proxy_id: number; enabled: boolean; auth: VlessAuth; sync: SyncReport }>(
     `/users/${userId}/proxies/${proxyId}`,
     { method: "PUT", body: JSON.stringify(draft) },
   )
 }
 
 export function deleteUserProxy(userId: number, proxyId: number) {
-  return api<void>(`/users/${userId}/proxies/${proxyId}`, { method: "DELETE" })
+  return api<{ sync: SyncReport }>(`/users/${userId}/proxies/${proxyId}`, { method: "DELETE" })
+}
+
+export function replaceUserAuthorizations(userId: number, items: Array<{ proxy_id: number; enabled: boolean }>) {
+  return api<{ sync: SyncReport }>(`/users/${userId}/proxies`, {
+    method: "PUT",
+    body: JSON.stringify({ items }),
+  })
 }

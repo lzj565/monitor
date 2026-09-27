@@ -22,20 +22,20 @@ import { countryFlag, displayProxyName } from "@/lib/proxy-name"
 import { ProxyAddressTypeBadge, ProxyProtocolBadge } from "@/components/ProxyBadges"
 import { generateRealityKeyPair, generateShortId, realityKeyPairMatches } from "@/lib/reality"
 import { formatSni, parseSni } from "@/lib/sni"
-import { existingAuthorizationSettings, groupProxiesByNode, proxyGroupSelection, subscriptionSearchMatches, toggleProxyGroup } from "@/lib/subscription"
+import { groupProxiesByNode, proxyGroupSelection, subscriptionSearchMatches, toggleProxyGroup } from "@/lib/subscription"
 import {
   createProxy,
   createUser,
   deleteProxy,
   deleteUser,
-  deleteUserProxy,
   listAllProxies,
   getProxyUserTraffic,
   listProxyNodeTraffic,
   listProxyUserTraffic,
   listUserAuthorizations,
   listUsers,
-  saveUserProxy,
+  replaceUserAuthorizations,
+  resolveSync,
   resetUserUuid,
   resetProxyNodeTraffic,
   resetProxyUserTraffic,
@@ -44,11 +44,40 @@ import {
   type Flow,
   type Proxy,
   type ProxyDraft,
+  type SyncReport,
   type User,
   type UserDraft,
   type UserProxyAuthorization,
   type ProxyTrafficSummary,
 } from "@/lib/resources"
+
+function notifySync(message: string, sync?: SyncReport) {
+  if (!sync) {
+    toast.success(message)
+    return
+  }
+  const queued = sync.queued.length
+  const offline = sync.needs_sync.filter((item) => item.reason === "offline").length
+  const otherFailures = sync.needs_sync.length - offline
+  if (queued) toast.success(`${message}；已向 ${queued} 个节点下发配置，正在等待 Agent 应用`)
+  else if (!sync.needs_sync.length) toast.success(message)
+  if (offline) toast.warning(`${offline} 个节点当前离线，将在 Agent 重连时自动同步`)
+  if (otherFailures) toast.error(`${otherFailures} 个节点未能排队同步，请检查节点配置或命令队列`)
+
+  if (queued) {
+    void resolveSync(sync).then((result) => {
+      if (result.failed.length) {
+        toast.error(`有 ${result.failed.length} 个节点应用配置失败：${result.failed.map((item) => `${item.node_id}（${item.message}）`).join("、")}`)
+      }
+      if (result.pending.length) {
+        toast.warning(`${result.pending.length} 个节点仍未返回应用结果；可在节点重连后自动同步`)
+      }
+      if (result.succeeded.length) {
+        toast.success(`配置已在 ${result.succeeded.length} 个节点应用`)
+      }
+    }).catch((error) => toast.error(`查询配置同步结果失败：${(error as Error).message}`))
+  }
+}
 
 type Go = (to: string) => void
 
@@ -154,6 +183,7 @@ function ProxyForm({ proxy, nodes, onClose, onSaved }: {
   const [addressType, setAddressType] = useState<ProxyDraft["address_type"]>(proxy?.address_type ?? defaultAddressType(initialNode))
   const [customAddress, setCustomAddress] = useState(proxy?.address_type === "domain" ? proxy.address : "")
   const [port, setPort] = useState(String(proxy?.port ?? "24060"))
+  const [flow, setFlow] = useState<Flow>(proxy?.flow ?? "")
   const [sni, setSni] = useState(initialReality ? formatSni(initialReality.server_name, initialReality.server_port) : "www.amd.com:443")
   const [privateKey, setPrivateKey] = useState(initialReality?.private_key ?? creationPair?.privateKey ?? "")
   const [publicKey, setPublicKey] = useState(initialReality?.public_key ?? creationPair?.publicKey ?? "")
@@ -237,6 +267,7 @@ function ProxyForm({ proxy, nodes, onClose, onSaved }: {
       address: address.trim(),
       port: numericPort,
       enabled: proxy?.enabled ?? true,
+      flow,
       config: {
         reality: { ...currentReality, ...parsedSniValue },
       },
@@ -244,11 +275,10 @@ function ProxyForm({ proxy, nodes, onClose, onSaved }: {
 
     setSaving(true)
     try {
-      if (proxy) await updateProxy(proxy.id, draft, nodeId)
-      else await createProxy(nodeId, draft)
-      toast.success(proxy
-        ? "代理配置已更新，变更将在该节点下次应用配置后生效。"
-        : "代理已创建，变更将在该节点下次应用配置后生效。")
+      const saved = proxy
+        ? await updateProxy(proxy.id, draft, nodeId)
+        : await createProxy(nodeId, draft)
+      notifySync(proxy ? "代理配置已更新" : "代理已创建", saved.sync)
       onClose()
       onSaved()
     } catch (e) {
@@ -347,6 +377,12 @@ function ProxyForm({ proxy, nodes, onClose, onSaved }: {
               </button>
               {advanced && (
                 <div className="space-y-3 border-t p-4">
+                  <Field label="Flow" hint="此代理下的用户共用该 Flow；客户端订阅和节点配置会同步使用。">
+                    <Select value={flow || "none"} onValueChange={(value) => setFlow(value === "none" ? "" : value as Flow)}>
+                      <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                      <SelectContent position="popper"><SelectItem value="none">无</SelectItem><SelectItem value="xtls-rprx-vision">xtls-rprx-vision</SelectItem></SelectContent>
+                    </Select>
+                  </Field>
                   <Field label="SNI *">
                     <Input required value={sni} onChange={(event) => setSni(event.target.value)} placeholder="www.amd.com:443" />
                   </Field>
@@ -433,8 +469,8 @@ function ProxyPage({ nodes }: { nodes: Node[] }) {
     if (!deleting) return
     setRemoving(true)
     try {
-      await deleteProxy(deleting.id)
-      toast.success("代理及其授权已删除，变更将在对应节点下次应用配置后生效。")
+      const result = await deleteProxy(deleting.id)
+      notifySync("代理及其授权已删除", result.sync)
       setDeleting(null)
       reload()
     } catch (e) {
@@ -462,10 +498,8 @@ function ProxyPage({ nodes }: { nodes: Node[] }) {
   async function setProxyEnabled(proxy: Proxy, enabled: boolean) {
     setUpdatingProxyId(proxy.id)
     try {
-      await updateProxy(proxy.id, proxyDraft(proxy, enabled))
-      toast.success(enabled
-        ? "代理已启用，变更将在该节点下次应用配置后生效。"
-        : "代理已停用，变更将在该节点下次应用配置后生效。")
+      const result = await updateProxy(proxy.id, proxyDraft(proxy, enabled))
+      notifySync(enabled ? "代理已启用" : "代理已停用", result.sync)
       reload()
     } catch (error) {
       toast.error((error as Error).message)
@@ -576,7 +610,7 @@ function ProxyPage({ nodes }: { nodes: Node[] }) {
       {editing && <ProxyForm nodes={nodes} proxy={editing} onClose={() => setEditing(null)} onSaved={reload} />}
       {deleting && <ConfirmDialog
         title={`删除代理「${displayProxyName(deleting, nodeById.get(deleting.node_id))}」？`}
-        description="删除会一并解除所有关联用户授权。此操作只修改配置数据，不会自动应用到服务器。"
+        description="删除会一并解除所有关联用户授权，并自动同步对应节点的 sing-box 配置。"
         confirmLabel="删除代理"
         busy={removing}
         onClose={() => setDeleting(null)}
@@ -649,11 +683,8 @@ function UserForm({ user, go, onClose, onSaved }: {
     }
     setSaving(true)
     try {
-      if (user) await updateUser(user.id, draft)
-      else await createUser(draft)
-      toast.success(user
-        ? "用户信息已更新，变更将在相关节点下次应用配置后生效。"
-        : "用户已创建，变更将在相关节点下次应用配置后生效。")
+      const saved = user ? await updateUser(user.id, draft) : await createUser(draft)
+      notifySync(user ? "用户信息已更新" : "用户已创建", saved.sync)
       onClose()
       onSaved()
     } catch (e) {
@@ -670,11 +701,7 @@ function UserForm({ user, go, onClose, onSaved }: {
       const result = await resetUserUuid(user.id)
       setUuid(result.uuid)
       onSaved()
-      if (result.needs_sync_node_ids.length) {
-        toast.warning(`UUID 已重置；节点 ${result.needs_sync_node_ids.join(", ")} 当前未能同步，需上线后应用配置。`)
-      } else {
-        toast.success(`UUID 已重置并已向 ${result.queued_node_ids.length} 个节点下发配置。`)
-      }
+      notifySync("UUID 已重置", result.sync)
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "UUID 重置失败")
     } finally {
@@ -915,8 +942,8 @@ function UsersPage({ go }: { go: Go }) {
     if (!deleting) return
     setRemoving(true)
     try {
-      await deleteUser(deleting.id)
-      toast.success("用户及其授权已删除，变更将在相关节点下次应用配置后生效。")
+      const result = await deleteUser(deleting.id)
+      notifySync("用户及其授权已删除", result.sync)
       setDeleting(null)
       reload()
     } catch (e) {
@@ -929,8 +956,8 @@ function UsersPage({ go }: { go: Go }) {
   async function setUserEnabled(user: User, enabled: boolean) {
     setUpdatingUserId(user.id)
     try {
-      await updateUser(user.id, { username: user.username, enabled, expires_at: user.expires_at })
-      toast.success("用户状态已更新，相关代理配置将在对应节点下次应用配置后生效。")
+      const result = await updateUser(user.id, { username: user.username, enabled, expires_at: user.expires_at })
+      notifySync("用户状态已更新", result.sync)
       reload()
     } catch (e) {
       toast.error((e as Error).message)
@@ -1014,7 +1041,7 @@ function UsersPage({ go }: { go: Go }) {
       {trafficUser && <UserTrafficDialog user={trafficUser} onClose={() => setTrafficUser(null)} onChanged={() => setTrafficRevision((value) => value + 1)} />}
       {deleting && <ConfirmDialog
         title={`删除用户「${deleting.username}」？`}
-        description={`此用户的 ${deleting.proxy_count} 条代理授权也会删除。此操作只修改配置数据，不会自动应用到服务器。`}
+        description={`此用户的 ${deleting.proxy_count} 条代理授权也会删除，并自动同步相关节点。`}
         confirmLabel="删除用户"
         busy={removing}
         onClose={() => setDeleting(null)}
@@ -1066,20 +1093,13 @@ function SubscriptionForm({ mode, users, user, proxies, nodes, accesses, onClose
   const [userId, setUserId] = useState<number | null>(user?.id ?? null)
   const [proxyQuery, setProxyQuery] = useState("")
   const [expandedGroups, setExpandedGroups] = useState<Record<number, boolean>>({})
-  const [selectedIds, setSelectedIds] = useState<Set<number>>(() => new Set(accesses.map((item) => item.proxy.id)))
-  const [authSettings, setAuthSettings] = useState(() => existingAuthorizationSettings(accesses))
-  const [authOpen, setAuthOpen] = useState(false)
-  const [authProxyId, setAuthProxyId] = useState<number | null>(() => accesses[0]?.proxy.id ?? null)
+  const [selectedIds, setSelectedIds] = useState<Set<number>>(() => new Set(accesses.filter((item) => item.access.enabled).map((item) => item.proxy.id)))
   const [saving, setSaving] = useState(false)
   const userOptions = creating ? eligibleUsers : user ? [user] : []
   const selectedUser = userOptions.find((item) => item.id === userId) ?? null
   const groups = useMemo(() => groupProxiesByNode(proxies, nodes), [proxies, nodes])
-  const nodeById = useMemo(() => new Map(nodes.map((node) => [node.id, node])), [nodes])
   const selectedProxies = proxies.filter((proxy) => selectedIds.has(proxy.id))
-  const currentAuthProxy = selectedProxies.find((proxy) => proxy.id === authProxyId) ?? selectedProxies[0] ?? null
-  const currentAuth = currentAuthProxy ? authSettings[currentAuthProxy.id] : undefined
   const query = proxyQuery.trim().toLocaleLowerCase()
-  const existingById = new Map(accesses.map((item) => [item.proxy.id, item]))
 
   function setProxySelected(proxyId: number, checked: boolean) {
     setSelectedIds((current) => {
@@ -1088,78 +1108,35 @@ function SubscriptionForm({ mode, users, user, proxies, nodes, accesses, onClose
       else next.delete(proxyId)
       return next
     })
-    if (checked) {
-      setAuthSettings((current) => current[proxyId] ? current : { ...current, [proxyId]: { flow: "" as Flow, enabled: true } })
-      setAuthProxyId((current) => current ?? proxyId)
-    }
   }
 
   function selectFormUser(nextUserId: number) {
     if (nextUserId !== userId) {
       setSelectedIds(new Set())
-      setAuthSettings({})
-      setAuthProxyId(null)
     }
     setUserId(nextUserId)
   }
 
-  function setGroupSelected(proxyIds: number[], checked: boolean) {
+  function setGroupSelected(proxyIds: number[]) {
     const nextIds = toggleProxyGroup(selectedIds, proxyIds)
-    if (!checked) {
-      const selectedAfterToggle = new Set(nextIds)
-      setSelectedIds(selectedAfterToggle)
-      return
-    }
     setSelectedIds(new Set(nextIds))
-    const missing = proxyIds.filter((id) => !authSettings[id])
-    if (missing.length) {
-      setAuthSettings((current) => {
-        const next = { ...current }
-        for (const id of missing) next[id] = { flow: "", enabled: true }
-        return next
-      })
-    }
-    setAuthProxyId((current) => current ?? proxyIds[0] ?? null)
-  }
-
-  function patchAuth(proxyId: number, values: Partial<{ flow: Flow; enabled: boolean }>) {
-    setAuthSettings((current) => ({ ...current, [proxyId]: { ...current[proxyId], ...values } }))
   }
 
   async function save(event: React.FormEvent) {
     event.preventDefault()
     if (!selectedUser) return toast.error("请选择用户")
     if (!selectedIds.size) return toast.error("请至少选择一个授权节点")
-    const operations: Array<Promise<unknown>> = []
-    for (const proxy of selectedProxies) {
-      const existing = existingById.get(proxy.id)
-      const nextAuth = authSettings[proxy.id]
-      if (!existing || existing.access.auth.flow !== nextAuth.flow || existing.access.enabled !== nextAuth.enabled) {
-        operations.push(saveUserProxy(selectedUser.id, proxy.id, {
-          enabled: nextAuth.enabled,
-          auth: { flow: nextAuth.flow },
-        }))
-      }
-    }
-    if (!creating) {
-      for (const existing of accesses) {
-        if (!selectedIds.has(existing.proxy.id)) operations.push(deleteUserProxy(selectedUser.id, existing.proxy.id))
-      }
-    }
-
     setSaving(true)
     try {
-      const results = await Promise.allSettled(operations)
-      const failed = results.filter((result) => result.status === "rejected")
-      if (failed.length) {
-        toast.error(`有 ${failed.length} 项授权未能保存，已刷新当前状态。`)
-        onClose()
-        onSaved()
-        return
-      }
-      toast.success(creating ? "订阅已创建，授权将在相关节点下次应用配置后生效。" : "订阅已更新，授权将在相关节点下次应用配置后生效。")
+      const result = await replaceUserAuthorizations(
+        selectedUser.id,
+        selectedProxies.map((proxy) => ({ proxy_id: proxy.id, enabled: true })),
+      )
+      notifySync(creating ? "订阅已创建" : "订阅已更新", result.sync)
       onClose()
       onSaved()
+    } catch (error) {
+      toast.error(`订阅授权未能保存：${(error as Error).message}`)
     } finally {
       setSaving(false)
     }
@@ -1206,7 +1183,7 @@ function SubscriptionForm({ mode, users, user, proxies, nodes, accesses, onClose
                           className="size-4 shrink-0 accent-primary"
                           checked={state.checked}
                           ref={(element) => { if (element) element.indeterminate = state.indeterminate }}
-                          onChange={(event) => setGroupSelected(proxyIds, event.target.checked)}
+                          onChange={() => setGroupSelected(proxyIds)}
                           aria-label={`选择服务器 ${group.node?.name ?? `节点 ${group.nodeId}`}`}
                         />
                         <button type="button" className="flex min-w-0 flex-1 items-center justify-between gap-3 text-left text-sm" onClick={() => setExpandedGroups((current) => ({ ...current, [group.nodeId]: !isExpanded }))}>
@@ -1240,36 +1217,7 @@ function SubscriptionForm({ mode, users, user, proxies, nodes, accesses, onClose
               </div>
             </Field>
 
-            <div className="flex items-center justify-between border-t pt-3">
-              <span className="text-sm text-muted-foreground">已选择 {selectedIds.size} 个节点</span>
-              <Button type="button" variant="ghost" size="sm" disabled={!selectedIds.size} onClick={() => setAuthOpen((open) => !open)} aria-expanded={authOpen}>
-                {authOpen ? "收起认证配置" : "认证配置"}{authOpen ? <ChevronUp /> : <ChevronDown />}
-              </Button>
-            </div>
-            {authOpen && selectedProxies.length > 0 && (
-              <div className="space-y-3 rounded-md border bg-muted/20 p-3">
-                <Field label="选择授权节点">
-                  <Select value={String(currentAuthProxy?.id ?? "")} onValueChange={(value) => setAuthProxyId(Number(value))}>
-                    <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
-                    <SelectContent position="popper">
-                      {selectedProxies.map((proxy) => <SelectItem key={proxy.id} value={String(proxy.id)}>{displayProxyName(proxy, nodeById.get(proxy.node_id))}</SelectItem>)}
-                    </SelectContent>
-                  </Select>
-                </Field>
-                {currentAuthProxy && currentAuth && <div className="grid gap-3 sm:grid-cols-2">
-                  <label className="flex items-center justify-between rounded-md border bg-background px-3 py-2 sm:col-span-2">
-                    <span className="text-sm font-medium">启用该节点授权</span>
-                    <Switch checked={currentAuth.enabled} onCheckedChange={(enabled) => patchAuth(currentAuthProxy.id, { enabled })} aria-label={`启用${displayProxyName(currentAuthProxy, nodeById.get(currentAuthProxy.node_id))}授权`} />
-                  </label>
-                  <Field label="Flow">
-                    <Select value={currentAuth.flow || "none"} onValueChange={(value) => patchAuth(currentAuthProxy.id, { flow: value === "none" ? "" : value as Flow })}>
-                      <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
-                      <SelectContent position="popper"><SelectItem value="none">无</SelectItem><SelectItem value="xtls-rprx-vision">xtls-rprx-vision</SelectItem></SelectContent>
-                    </Select>
-                  </Field>
-                </div>}
-              </div>
-            )}
+            <div className="border-t pt-3 text-sm text-muted-foreground">已选择 {selectedIds.size} 个节点（勾选即启用授权）</div>
           </div>
           <DialogFooter className="shrink-0 border-t px-6 py-4">
             <Button type="button" variant="ghost" onClick={onClose}>取消</Button>
@@ -1432,8 +1380,8 @@ function SubscriptionsPage({ nodes, search }: { nodes: Node[]; search: string })
   async function setUserEnabled(user: User, enabled: boolean) {
     setUpdatingUserId(user.id)
     try {
-      await updateUser(user.id, { username: user.username, enabled, expires_at: user.expires_at })
-      toast.success(enabled ? "订阅授权已启用，变更将在相关节点下次应用配置后生效。" : "订阅授权已停用，用户与节点关联关系已保留。")
+      const result = await updateUser(user.id, { username: user.username, enabled, expires_at: user.expires_at })
+      notifySync(enabled ? "订阅授权已启用" : "订阅授权已停用", result.sync)
       setUsersRevision((value) => value + 1)
     } catch (error) {
       toast.error((error as Error).message)
@@ -1445,12 +1393,9 @@ function SubscriptionsPage({ nodes, search }: { nodes: Node[]; search: string })
   async function removeSubscription() {
     if (!deleting) return
     setRemoving(true)
-    const grants = accessCache.get(deleting.id) ?? []
     try {
-      const results = await Promise.allSettled(grants.map((item) => deleteUserProxy(deleting.id, item.proxy.id)))
-      const failed = results.filter((result) => result.status === "rejected")
-      if (failed.length) toast.error(`有 ${failed.length} 条授权未能删除，请刷新后重试。`)
-      else toast.success(`已删除 ${deleting.username} 的订阅授权关系；用户和代理节点未删除。`)
+      const result = await replaceUserAuthorizations(deleting.id, [])
+      notifySync(`已删除 ${deleting.username} 的订阅授权关系`, result.sync)
       setDeleting(null)
       reloadAll()
     } finally {

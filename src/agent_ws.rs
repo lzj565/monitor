@@ -2,7 +2,7 @@
 //! notifications. A single long-lived connection on which either end may speak
 //! first, with self-describing frames readable via curl or a browser console.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -34,6 +34,7 @@ const REPORT_SPACING: Duration = Duration::from_millis(500);
 /// Proxy accounting snapshots are more expensive than host metrics and arrive
 /// every five seconds from the Agent.
 const PROXY_TRAFFIC_SPACING: Duration = Duration::from_secs(4);
+const EXPIRED_USER_SYNC_RETRY: Duration = Duration::from_secs(30);
 
 /// Probe results admitted per window: twice what the busiest honest node sends
 /// in one -- every probe it may run, each at the shortest interval -- since a
@@ -210,6 +211,14 @@ struct Session {
     greeted: bool,
     last_report: Option<Instant>,
     last_proxy_traffic: Option<Instant>,
+    /// Last user counters from this live core, used to detect new traffic for
+    /// an expired account without scanning users on a timer.
+    last_user_counters: HashMap<String, crate::db::ProxyTrafficCounter>,
+    /// One expiry cleanup command at a time for this node session.
+    expiry_sync: Option<(String, HashSet<String>)>,
+    expiry_users_pending: HashSet<String>,
+    expiry_cleaned: HashSet<String>,
+    expiry_retry_after: Option<Instant>,
     /// Start of the current result window and the results admitted in it.
     window: Option<(Instant, u32)>,
     /// Whether a dropped or unusable frame has been logged; see [`Session::complain`].
@@ -237,6 +246,27 @@ impl Session {
         }
         self.last_proxy_traffic = Some(tick);
         true
+    }
+
+    fn users_with_new_traffic(
+        &mut self,
+        current: &HashMap<String, crate::db::ProxyTrafficCounter>,
+    ) -> HashSet<String> {
+        let mut active = HashSet::new();
+        for (username, counter) in current {
+            let previous = self.last_user_counters.insert(username.clone(), *counter);
+            let changed = previous.map_or(counter.uplink > 0 || counter.downlink > 0, |previous| {
+                counter.uplink > previous.uplink
+                    || counter.downlink > previous.downlink
+                    || (counter.uplink < previous.uplink && counter.uplink > 0)
+                    || (counter.downlink < previous.downlink && counter.downlink > 0)
+            });
+            if changed && !self.expiry_cleaned.contains(username) {
+                active.insert(username.clone());
+            }
+        }
+        self.last_user_counters.retain(|username, _| current.contains_key(username));
+        active
     }
 
     fn admit_result(&mut self, tick: Instant) -> bool {
@@ -551,6 +581,30 @@ fn dispatch(
                 .get(&node_id)
                 .is_some_and(|agent| agent.session == session.tag);
             if current {
+                let active_users = session.users_with_new_traffic(&snapshot.users);
+                if !active_users.is_empty() {
+                    let expired =
+                        app.db.expired_authorized_usernames_for_node(node_id, arrival.at.timestamp())?;
+                    session.expiry_users_pending.extend(active_users.intersection(&expired).cloned());
+                }
+                settle_expiry_sync(app, node_id, session, arrival.tick);
+                if !session.expiry_users_pending.is_empty()
+                    && session.expiry_sync.is_none()
+                    && session.expiry_retry_after.is_none_or(|until| arrival.tick >= until)
+                {
+                    let users = session.expiry_users_pending.clone();
+                    match crate::api::sync_node_config_for_expired_user(app, node_id) {
+                        Ok(command_id) => {
+                            info!("node {node_id}: removing expired user access after traffic was observed");
+                            session.expiry_sync = Some((command_id, users));
+                            session.expiry_retry_after = None;
+                        }
+                        Err(reason) => {
+                            warn!("node {node_id}: expired-user config sync could not be queued: {reason}");
+                            session.expiry_retry_after = Some(arrival.tick + EXPIRED_USER_SYNC_RETRY);
+                        }
+                    }
+                }
                 app.db.record_proxy_traffic(
                     node_id,
                     &snapshot.users,
@@ -579,6 +633,30 @@ fn dispatch(
         other => debug!("node {node_id} sent unknown method {other}"),
     }
     Ok(None)
+}
+
+fn settle_expiry_sync(app: &App, node_id: i64, session: &mut Session, now: Instant) {
+    let Some((command_id, _)) = session.expiry_sync.as_ref() else { return };
+    let Some(command) = app.commands.get(command_id, node_id) else {
+        session.expiry_sync = None;
+        session.expiry_retry_after = Some(now + EXPIRED_USER_SYNC_RETRY);
+        return;
+    };
+    match command.status {
+        "pending" => {}
+        "succeeded" => {
+            if let Some((_, users)) = session.expiry_sync.take() {
+                session.expiry_cleaned.extend(users.iter().cloned());
+                session.expiry_users_pending.retain(|username| !users.contains(username));
+            }
+            session.expiry_retry_after = None;
+        }
+        _ => {
+            session.expiry_sync = None;
+            session.expiry_retry_after = Some(now + EXPIRED_USER_SYNC_RETRY);
+            warn!("node {node_id}: expired-user config sync failed; retrying after cooldown");
+        }
+    }
 }
 
 /// Globally routable. Excluded on the v4 side: RFC 1918, CGNAT (100.64/10),
@@ -925,7 +1003,7 @@ mod tests {
     use chrono::TimeZone;
 
     use super::*;
-    use crate::db::{Node, PingTask};
+    use crate::db::{AuthorizationDraft, Node, PingTask, ProxyDraft, UserDraft};
 
     fn app() -> App {
         App::for_test(Db::open(":memory:").unwrap())
@@ -1020,6 +1098,120 @@ mod tests {
         app.commands.disconnect(id, 4);
         assert_eq!(app.commands.get(&pending, id).unwrap().error.unwrap().code, "AGENT_DISCONNECTED");
         assert!(!app.commands.complete(&pending, id, 4, Ok(serde_json::Value::Null)));
+    }
+
+    #[test]
+    fn expired_user_traffic_queues_one_current_config_and_deduplicates_after_success() {
+        let app = app();
+        let (id, mut outbound) = connect(&app);
+        let expired_at = at(0).at.timestamp() - 1;
+        let user_id = app
+            .db
+            .create_user(&UserDraft {
+                username: "expired-client".into(),
+                password_hash: Some("test-hash".into()),
+                enabled: true,
+                expires_at: Some(expired_at),
+            })
+            .unwrap()
+            .unwrap();
+        let proxy_id = app
+            .db
+            .create_proxy(
+                id,
+                &ProxyDraft {
+                    name: "vless".into(),
+                    include_node_name: false,
+                    protocol: "vless".into(),
+                    address_type: "domain".into(),
+                    address: "proxy.example.com".into(),
+                    port: 24060,
+                    enabled: true,
+                    flow: None,
+                    config: json!({"reality":{"enabled":true,"server_name":"example.com","server_port":443,
+                        "private_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","public_key":"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB","short_id":"abcdef12"}}),
+                },
+            )
+            .unwrap()
+            .unwrap();
+        app.db
+            .put_authorization(user_id, proxy_id, &AuthorizationDraft { enabled: true, auth: None })
+            .unwrap()
+            .unwrap();
+
+        let mut session = Session { tag: 1, greeted: true, ..Session::default() };
+        let snapshot = |uplink| {
+            json!({
+                "jsonrpc":"2.0", "method":"proxy.traffic",
+                "params":{"users":{"expired-client":{"uplink":uplink,"downlink":0}},"inbounds":{"proxy-1":{"uplink":uplink,"downlink":0}}}
+            })
+            .to_string()
+        };
+        send(&app, id, &mut session, 0, &snapshot(0)).unwrap();
+        assert!(outbound.try_recv().is_err(), "a zero counter is not a user connection");
+        send(&app, id, &mut session, 4, &snapshot(12)).unwrap();
+        let command: serde_json::Value = serde_json::from_str(&outbound.try_recv().unwrap()).unwrap();
+        assert_eq!(command["action"], "singbox.config.apply");
+        let content: serde_json::Value =
+            serde_json::from_str(command["params"]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(content["inbounds"][0]["users"], json!([]));
+        let command_id = command["id"].as_str().unwrap();
+
+        send(
+            &app,
+            id,
+            &mut session,
+            5,
+            &json!({"type":"command_result","id":command_id,"ok":true,"result":{"applied":true}}).to_string(),
+        )
+        .unwrap();
+        send(&app, id, &mut session, 8, &snapshot(12)).unwrap();
+        assert!(outbound.try_recv().is_err(), "successful expiry cleanup is not queued repeatedly");
+    }
+
+    #[test]
+    fn active_user_traffic_does_not_trigger_expiry_cleanup() {
+        let app = app();
+        let (id, mut outbound) = connect(&app);
+        let user_id = app
+            .db
+            .create_user(&UserDraft {
+                username: "active-client".into(),
+                password_hash: Some("test-hash".into()),
+                enabled: true,
+                expires_at: None,
+            })
+            .unwrap()
+            .unwrap();
+        let proxy_id = app
+            .db
+            .create_proxy(
+                id,
+                &ProxyDraft {
+                    name: "vless".into(),
+                    include_node_name: false,
+                    protocol: "vless".into(),
+                    address_type: "domain".into(),
+                    address: "proxy.example.com".into(),
+                    port: 24060,
+                    enabled: true,
+                    flow: None,
+                    config: json!({"reality":{"enabled":true,"server_name":"example.com","server_port":443,
+                        "private_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","public_key":"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB","short_id":"abcdef12"}}),
+                },
+            )
+            .unwrap()
+            .unwrap();
+        app.db
+            .put_authorization(user_id, proxy_id, &AuthorizationDraft { enabled: true, auth: None })
+            .unwrap()
+            .unwrap();
+        let mut session = Session { tag: 1, greeted: true, ..Session::default() };
+        let snapshot = json!({"jsonrpc":"2.0","method":"proxy.traffic","params":{
+            "users":{"active-client":{"uplink":12,"downlink":0}},"inbounds":{}}})
+        .to_string();
+        send(&app, id, &mut session, 0, &snapshot).unwrap();
+        assert!(outbound.try_recv().is_err());
     }
 
     fn report_json(boot: &str, rx: i64, tx: i64) -> String {

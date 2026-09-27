@@ -163,6 +163,7 @@ CREATE TABLE IF NOT EXISTS proxies (
   address TEXT NOT NULL,
   port INTEGER NOT NULL,
   enabled INTEGER NOT NULL DEFAULT 1,
+  flow TEXT NOT NULL DEFAULT '',
   config TEXT NOT NULL DEFAULT '{}',
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
@@ -229,7 +230,10 @@ CREATE TABLE IF NOT EXISTS proxy_node_traffic (
 ///
 /// - Additive: a new column carries a default, and no column an earlier build
 ///   reads is renamed or dropped. install-hub.sh rolls a hub that fails to start
-///   back to the previous binary, which then runs on the migrated file.
+///   back to the previous binary, which then runs on the migrated file. The
+///   version-15 migration intentionally clears user proxy authorizations once;
+///   a marker in `setting` prevents a rollback and re-upgrade from clearing new
+///   grants a second time.
 /// - Safe to run twice: an earlier build stamps its own, lower version into a
 ///   newer file, and the next upgrade runs the migration again.
 ///
@@ -237,7 +241,7 @@ CREATE TABLE IF NOT EXISTS proxy_node_traffic (
 /// cannot: `open` runs `SCHEMA` before migrating, and on an older file the
 /// column is not there yet. `an_upgraded_release_matches_a_fresh_database`
 /// holds every migration to these rules, starting from v1.0.0's schema.
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 15;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -442,6 +446,32 @@ fn migrate_to_14(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Flow now belongs to a proxy rather than to an individual authorization.
+/// The requested reset removes all old grants once; the setting marker survives
+/// a binary rollback that stamps an older `user_version` into this file.
+fn migrate_to_15(conn: &Connection, reset_authorizations: bool) -> Result<()> {
+    add_column(conn, "proxies", "flow TEXT NOT NULL DEFAULT ''")?;
+    let setting_columns = columns_of(conn, "setting")?;
+    // Backup validation compares the migrated schema after this function. Defer
+    // a malformed setting table to that gate instead of hiding its diagnosis in
+    // a migration SQL error.
+    if !setting_columns.contains("key") || !setting_columns.contains("value") {
+        return Ok(());
+    }
+    let reset: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM setting WHERE key='migration_v15_authorizations_reset')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !reset {
+        if reset_authorizations {
+            conn.execute("DELETE FROM user_proxy_authorizations", [])?;
+        }
+        conn.execute("INSERT INTO setting(key,value) VALUES('migration_v15_authorizations_reset','1')", [])?;
+    }
+    Ok(())
+}
+
 fn random_secret() -> String {
     hex::encode(rand::random::<[u8; 32]>())
 }
@@ -510,6 +540,7 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     if from < 14 {
         migrate_to_14(&tx)?;
     }
+    migrate_to_15(&tx, from < 15)?;
     seed_default_admin(&tx)?;
     tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     tx.commit()?;
@@ -590,6 +621,7 @@ pub struct Proxy {
     pub address: String,
     pub port: i64,
     pub enabled: bool,
+    pub flow: String,
     pub config: serde_json::Value,
     pub created_at: i64,
     pub updated_at: i64,
@@ -604,6 +636,7 @@ pub struct ProxyDraft {
     pub address: String,
     pub port: i64,
     pub enabled: bool,
+    pub flow: Option<String>,
     pub config: serde_json::Value,
 }
 
@@ -797,7 +830,9 @@ pub struct AuthorizationRecord {
 #[derive(Debug, Clone)]
 pub struct AuthorizationDraft {
     pub enabled: bool,
-    pub auth: serde_json::Value,
+    /// Legacy per-authorization settings are optional. New callers omit them;
+    /// doing so preserves existing values if a grant is updated in place.
+    pub auth: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1139,7 +1174,7 @@ impl Db {
     pub fn proxies_for_node(&self, node_id: i64) -> Result<Vec<Proxy>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT id,node_id,name,include_node_name,protocol,address_type,address,port,enabled,config,created_at,updated_at
+            "SELECT id,node_id,name,include_node_name,protocol,address_type,address,port,enabled,flow,config,created_at,updated_at
              FROM proxies WHERE node_id=?1 ORDER BY id",
         )?;
         let rows = stmt.query_map([node_id], row_to_proxy)?.collect::<rusqlite::Result<_>>()?;
@@ -1150,7 +1185,7 @@ impl Db {
         Ok(self
             .conn()
             .query_row(
-                "SELECT id,node_id,name,include_node_name,protocol,address_type,address,port,enabled,config,created_at,updated_at
+                "SELECT id,node_id,name,include_node_name,protocol,address_type,address,port,enabled,flow,config,created_at,updated_at
                  FROM proxies WHERE id=?1",
                 [id],
                 row_to_proxy,
@@ -1180,10 +1215,10 @@ impl Db {
         }
         let now = Utc::now().timestamp();
         conn.execute(
-            "INSERT INTO proxies(node_id,name,include_node_name,protocol,address_type,address,port,enabled,config,created_at,updated_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?10)",
+            "INSERT INTO proxies(node_id,name,include_node_name,protocol,address_type,address,port,enabled,flow,config,created_at,updated_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?11)",
             params![node_id, draft.name, draft.include_node_name, draft.protocol, draft.address_type,
-                    draft.address, draft.port, draft.enabled, config, now],
+                    draft.address, draft.port, draft.enabled, draft.flow.as_deref().unwrap_or(""), config, now],
         )?;
         Ok(Ok(conn.last_insert_rowid()))
     }
@@ -1215,7 +1250,7 @@ impl Db {
         }
         conn.execute(
             "UPDATE proxies SET node_id=?2,name=?3,include_node_name=?4,protocol=?5,address_type=?6,address=?7,port=?8,
-                                enabled=?9,config=?10,updated_at=?11 WHERE id=?1",
+                                enabled=?9,flow=COALESCE(?10,flow),config=?11,updated_at=?12 WHERE id=?1",
             params![
                 id,
                 node_id,
@@ -1226,6 +1261,7 @@ impl Db {
                 draft.address,
                 draft.port,
                 draft.enabled,
+                draft.flow,
                 config,
                 Utc::now().timestamp()
             ],
@@ -1703,7 +1739,7 @@ impl Db {
                     json_extract(p.config,'$.reality.server_name'),
                     json_extract(p.config,'$.reality.public_key'),
                     json_extract(p.config,'$.reality.short_id'),
-                    json_extract(a.auth,'$.flow')
+                    p.flow
              FROM user_proxy_authorizations a
              JOIN proxies p ON p.id=a.proxy_id
              JOIN node n ON n.id=p.node_id
@@ -1867,7 +1903,7 @@ impl Db {
         proxy_id: i64,
         draft: &AuthorizationDraft,
     ) -> Result<std::result::Result<AuthorizationRecord, AuthorizationWriteIssue>> {
-        let auth = serde_json::to_string(&draft.auth)?;
+        let auth = draft.auth.as_ref().map(serde_json::to_string).transpose()?.unwrap_or_else(|| "{}".into());
         let conn = self.conn();
         let user_exists: bool =
             conn.query_row("SELECT EXISTS(SELECT 1 FROM users WHERE id=?1)", [user_id], |r| r.get(0))?;
@@ -1884,8 +1920,9 @@ impl Db {
             "INSERT INTO user_proxy_authorizations(user_id,proxy_id,enabled,auth,created_at,updated_at)
              VALUES(?1,?2,?3,?4,?5,?5)
              ON CONFLICT(user_id,proxy_id) DO UPDATE SET enabled=excluded.enabled,
-                 auth=excluded.auth,updated_at=excluded.updated_at",
-            params![user_id, proxy_id, draft.enabled, auth, now],
+                 auth=CASE WHEN ?6 THEN excluded.auth ELSE user_proxy_authorizations.auth END,
+                 updated_at=excluded.updated_at",
+            params![user_id, proxy_id, draft.enabled, auth, now, draft.auth.is_some()],
         )?;
         let access = conn.query_row(
             "SELECT id,user_id,proxy_id,enabled,auth,created_at,updated_at
@@ -1911,6 +1948,72 @@ impl Db {
             "DELETE FROM user_proxy_authorizations WHERE user_id=?1 AND proxy_id=?2",
             params![user_id, proxy_id],
         )? > 0)
+    }
+
+    /// Replaces all authorizations for one user atomically and returns the
+    /// distinct nodes whose generated configuration may have changed.
+    pub fn replace_authorizations(
+        &self,
+        user_id: i64,
+        items: &[(i64, bool)],
+    ) -> Result<std::result::Result<Vec<i64>, AuthorizationWriteIssue>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let user_exists: bool =
+            tx.query_row("SELECT EXISTS(SELECT 1 FROM users WHERE id=?1)", [user_id], |r| r.get(0))?;
+        if !user_exists {
+            return Ok(Err(AuthorizationWriteIssue::UserNotFound));
+        }
+
+        let mut node_ids = std::collections::BTreeSet::new();
+        {
+            let mut stmt = tx.prepare(
+                "SELECT DISTINCT p.node_id FROM user_proxy_authorizations a
+                 JOIN proxies p ON p.id=a.proxy_id WHERE a.user_id=?1",
+            )?;
+            let rows = stmt.query_map([user_id], |r| r.get::<_, i64>(0))?;
+            node_ids.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
+        }
+        for (proxy_id, _) in items {
+            let node_id: Option<i64> = tx
+                .query_row("SELECT node_id FROM proxies WHERE id=?1", [proxy_id], |r| r.get(0))
+                .optional()?;
+            let Some(node_id) = node_id else {
+                return Ok(Err(AuthorizationWriteIssue::ProxyNotFound));
+            };
+            node_ids.insert(node_id);
+        }
+
+        tx.execute("DELETE FROM user_proxy_authorizations WHERE user_id=?1", [user_id])?;
+        let now = Utc::now().timestamp();
+        for (proxy_id, enabled) in items {
+            tx.execute(
+                "INSERT INTO user_proxy_authorizations(user_id,proxy_id,enabled,auth,created_at,updated_at)
+                 VALUES(?1,?2,?3,'{}',?4,?4)",
+                params![user_id, proxy_id, enabled, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(Ok(node_ids.into_iter().collect()))
+    }
+
+    /// Returns expired users still authorized on this node. The caller invokes
+    /// this only after a traffic counter changes, avoiding a periodic user scan.
+    pub fn expired_authorized_usernames_for_node(
+        &self,
+        node_id: i64,
+        now: i64,
+    ) -> Result<std::collections::HashSet<String>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT u.username FROM users u
+             JOIN user_proxy_authorizations a ON a.user_id=u.id
+             JOIN proxies p ON p.id=a.proxy_id
+             WHERE p.node_id=?1 AND p.enabled=1 AND a.enabled=1 AND u.enabled=1
+               AND u.expires_at IS NOT NULL AND u.expires_at<=?2",
+        )?;
+        let rows = stmt.query_map(params![node_id, now], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<std::collections::HashSet<_>>>()?)
     }
 
     /// Only active authorizations are materialized into a generated inbound.
@@ -3334,9 +3437,10 @@ fn row_to_proxy(r: &rusqlite::Row<'_>) -> rusqlite::Result<Proxy> {
         address: r.get(6)?,
         port: r.get(7)?,
         enabled: r.get(8)?,
-        config: parse_json(r, 9)?,
-        created_at: r.get(10)?,
-        updated_at: r.get(11)?,
+        flow: r.get(9)?,
+        config: parse_json(r, 10)?,
+        created_at: r.get(11)?,
+        updated_at: r.get(12)?,
     })
 }
 
@@ -3640,6 +3744,7 @@ mod tests {
             address: "proxy.example.com".into(),
             port: 24060,
             enabled: false,
+            flow: Some(String::new()),
             config: serde_json::json!({}),
         }
     }
@@ -3654,7 +3759,67 @@ mod tests {
     }
 
     fn access_draft(flow: &str) -> AuthorizationDraft {
-        AuthorizationDraft { enabled: true, auth: serde_json::json!({"flow":flow}) }
+        AuthorizationDraft { enabled: true, auth: Some(serde_json::json!({"flow":flow})) }
+    }
+
+    #[test]
+    fn replacing_authorizations_is_atomic_and_returns_old_and_new_nodes_once() {
+        let db = db();
+        let user_id = db.create_user(&user_draft("replace-me")).unwrap().unwrap();
+        let old_node = node(&db, 1);
+        let new_node = node(&db, 1);
+        let shared_node = node(&db, 1);
+        let mut draft = proxy_draft("old", false);
+        draft.enabled = true;
+        let old_proxy = db.create_proxy(old_node, &draft).unwrap().unwrap();
+        draft.name = "new".into();
+        draft.port += 1;
+        let new_proxy = db.create_proxy(new_node, &draft).unwrap().unwrap();
+        draft.name = "shared".into();
+        draft.port += 1;
+        let shared_proxy = db.create_proxy(shared_node, &draft).unwrap().unwrap();
+        draft.name = "shared two".into();
+        draft.port += 1;
+        let shared_proxy_two = db.create_proxy(shared_node, &draft).unwrap().unwrap();
+        db.put_authorization(user_id, old_proxy, &access_draft("")).unwrap().unwrap();
+
+        let affected = db
+            .replace_authorizations(
+                user_id,
+                &[(new_proxy, true), (shared_proxy, true), (shared_proxy_two, false)],
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(affected, vec![old_node, new_node, shared_node]);
+        let current = db.authorizations_for_user(user_id).unwrap().unwrap();
+        assert_eq!(current.len(), 3);
+        assert!(current.iter().any(|item| item.proxy.id == shared_proxy_two && !item.access.enabled));
+
+        assert_eq!(
+            db.replace_authorizations(user_id, &[(i64::MAX, true)]).unwrap(),
+            Err(AuthorizationWriteIssue::ProxyNotFound)
+        );
+        assert_eq!(db.authorizations_for_user(user_id).unwrap().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn expired_authorized_users_are_returned_only_when_enabled_on_the_node() {
+        let db = db();
+        let now = Utc::now().timestamp();
+        let mut expired = user_draft("expired-on-node");
+        expired.expires_at = Some(now - 1);
+        let user_id = db.create_user(&expired).unwrap().unwrap();
+        let node_id = node(&db, 1);
+        let mut draft = proxy_draft("active-proxy", false);
+        draft.enabled = true;
+        let proxy_id = db.create_proxy(node_id, &draft).unwrap().unwrap();
+        db.put_authorization(user_id, proxy_id, &access_draft("")).unwrap().unwrap();
+
+        assert!(db.expired_authorized_usernames_for_node(node_id, now).unwrap().contains("expired-on-node"));
+        db.put_authorization(user_id, proxy_id, &AuthorizationDraft { enabled: false, auth: None })
+            .unwrap()
+            .unwrap();
+        assert!(db.expired_authorized_usernames_for_node(node_id, now).unwrap().is_empty());
     }
 
     #[test]
@@ -3677,9 +3842,11 @@ mod tests {
         let mut draft = proxy_draft("p1", false);
         draft.enabled = true;
         draft.port = 24061;
+        draft.flow = Some("xtls-rprx-vision".into());
         let p1 = db.create_proxy(n, &draft).unwrap().unwrap();
         draft.name = "p2".into();
         draft.port = 24062;
+        draft.flow = Some(String::new());
         let p2 = db.create_proxy(n, &draft).unwrap().unwrap();
         draft.name = "unassigned".into();
         draft.port = 24063;
@@ -3701,6 +3868,10 @@ mod tests {
             db.active_user_subscription(u1, Utc::now().timestamp()).unwrap().unwrap();
         assert_eq!(subscription_uuid, uuid);
         assert_eq!(own_subscription.iter().map(|proxy| proxy.id).collect::<Vec<_>>(), vec![p1, p2]);
+        assert_eq!(
+            own_subscription.iter().map(|proxy| proxy.flow.as_str()).collect::<Vec<_>>(),
+            vec!["xtls-rprx-vision", ""]
+        );
         assert!(!own_subscription.iter().any(|proxy| proxy.id == unassigned));
         assert_eq!(db.active_user_portal_proxies(u2, Utc::now().timestamp()).unwrap()[0].id, unassigned);
         assert!(db.delete_authorization(u1, p1).unwrap());
@@ -3821,7 +3992,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_discards_old_per_proxy_uuids_but_keeps_authorizations_idempotently() {
+    fn migration_discards_old_per_proxy_uuids_and_clears_legacy_authorizations() {
         let scratch = Scratch::new();
         let old = Connection::open(&scratch.0).unwrap();
         old.execute_batch("PRAGMA foreign_keys=ON;
@@ -3845,22 +4016,46 @@ mod tests {
         assert_eq!(
             conn.query_row("SELECT COUNT(*) FROM user_proxy_authorizations", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM users WHERE id IN (1,2)", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
             2
         );
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM proxies", [], |r| r.get::<_, i64>(0)).unwrap(), 2);
         assert!(!columns_of(&conn, "user_proxy_authorizations").unwrap().contains("uuid"));
         assert!(conn
             .query_row("SELECT COUNT(*) FROM user_proxy_access", [], |r| r.get::<_, i64>(0))
             .unwrap_err()
             .to_string()
             .contains("no such table"));
-        let auth: String = conn
-            .query_row("SELECT auth FROM user_proxy_authorizations WHERE id=11", [], |r| r.get(0))
-            .unwrap();
-        assert!(!auth.contains("uuid"));
+        assert!(conn
+            .query_row("SELECT value FROM setting WHERE key='migration_v15_authorizations_reset'", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .is_ok());
         drop(conn);
+        // A downgraded binary stamps version 14 on startup. Re-upgrading must
+        // not delete grants made after the first reset.
+        db.put_authorization(1, 1, &AuthorizationDraft { enabled: true, auth: None }).unwrap().unwrap();
+        db.conn().execute_batch("PRAGMA user_version=14").unwrap();
+        migrate(&db.conn(), 14).unwrap();
+        assert_eq!(
+            db.conn()
+                .query_row("SELECT COUNT(*) FROM user_proxy_authorizations", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
         drop(db);
         let db = Db::open(&scratch.0).unwrap();
         assert_eq!(db.user(1).unwrap().unwrap().uuid, user.uuid, "rerunning migration does not rotate UUID");
+        assert_eq!(
+            db.conn()
+                .query_row("SELECT COUNT(*) FROM user_proxy_authorizations", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
@@ -3896,6 +4091,28 @@ mod tests {
             "editing to another proxy's final name is refused",
         );
         assert_eq!(db.update_proxy(id, None, &proxy_draft("REALITY", true)).unwrap(), Ok(()));
+    }
+
+    #[test]
+    fn proxy_flow_round_trips_and_omitted_legacy_updates_preserve_it() {
+        let db = db();
+        let node_id = node(&db, 1);
+        let mut draft = proxy_draft("Flow", false);
+        draft.flow = Some("xtls-rprx-vision".into());
+        let id = db.create_proxy(node_id, &draft).unwrap().unwrap();
+        assert_eq!(db.proxy(id).unwrap().unwrap().flow, "xtls-rprx-vision");
+
+        draft.flow = None;
+        db.update_proxy(id, None, &draft).unwrap().unwrap();
+        assert_eq!(
+            db.proxy(id).unwrap().unwrap().flow,
+            "xtls-rprx-vision",
+            "an old client omitting Flow does not clear it"
+        );
+
+        draft.flow = Some(String::new());
+        db.update_proxy(id, None, &draft).unwrap().unwrap();
+        assert_eq!(db.proxy(id).unwrap().unwrap().flow, "", "an explicit empty Flow clears it");
     }
 
     #[test]
@@ -4646,8 +4863,8 @@ mod tests {
         let upgraded = dump(&db.conn());
         assert_eq!(
             upgraded.len(),
-            PRE_RESOURCE_TABLES.len() + 1,
-            "every old row survives and admin is seeded: {upgraded:#?}"
+            PRE_RESOURCE_TABLES.len() + 2,
+            "every old row survives, admin is seeded, and the reset marker is recorded: {upgraded:#?}"
         );
 
         // An earlier build opening the file stamps its own version, so the next

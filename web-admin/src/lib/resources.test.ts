@@ -5,7 +5,7 @@ import { generateRealityKeyPair, generateShortId, realityKeyPairMatches } from "
 import { proxyDraft } from "./proxy-draft.ts"
 import { countryFlag, displayProxyName } from "./proxy-name.ts"
 import { formatSni, parseSni } from "./sni.ts"
-import { existingAuthorizationSettings, groupProxiesByNode, proxyGroupSelection, subscriptionSearchMatches, toggleProxyGroup } from "./subscription.ts"
+import { groupProxiesByNode, proxyGroupSelection, subscriptionSearchMatches, toggleProxyGroup } from "./subscription.ts"
 import type { Node } from "./api.ts"
 import type { Proxy } from "./resources.ts"
 
@@ -34,6 +34,7 @@ const proxy: Proxy = {
   address: "hk.example.com",
   port: 24060,
   enabled: true,
+  flow: "xtls-rprx-vision",
   config: {
     reality: {
       enabled: true,
@@ -56,6 +57,7 @@ assert.deepEqual(disabledDraft, {
   address: proxy.address,
   port: proxy.port,
   enabled: false,
+  flow: proxy.flow,
   config: proxy.config,
 })
 assert.equal(proxy.enabled, true, "building a switch PUT draft must not mutate the listed proxy")
@@ -78,8 +80,6 @@ const access = {
   proxy: { id: proxy.id, node_id: proxy.node_id, name: proxy.name, include_node_name: true, protocol: proxy.protocol, address_type: proxy.address_type, address: proxy.address, port: proxy.port, enabled: proxy.enabled },
   access: { enabled: false, auth: { flow: "xtls-rprx-vision" as const } },
 }
-const settings = existingAuthorizationSettings([access])
-assert.deepEqual(settings[proxy.id], { flow: access.access.auth.flow, enabled: false }, "edit form preserves per-authorization flow and enabled state")
 const proxyById = new Map([[proxy.id, proxy]])
 const nodeById = new Map([[hk.id, hk]])
 assert.equal(subscriptionSearchMatches("admin", [access], proxyById, nodeById, "hk服务器"), true, "subscription search includes server names")
@@ -87,4 +87,4 @@ assert.equal(subscriptionSearchMatches("admin", [access], proxyById, nodeById, "
 assert.equal(subscriptionSearchMatches("admin", [access], proxyById, nodeById, "admin"), true, "subscription search includes usernames")
 assert.equal(subscriptionSearchMatches("other", [access], proxyById, nodeById, "missing"), false)
 
-console.log("Reality, proxy drafts, subscription grouping, selection, search, and authorization preservation passed")
+console.log("Reality, proxy Flow drafts, subscription grouping, selection, and search passed")

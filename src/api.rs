@@ -10,7 +10,7 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use chrono::{Local, NaiveDate, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tracing::{debug, info, warn};
 
@@ -237,6 +237,40 @@ fn no_such_node() -> Response {
 }
 
 const MAX_COMMAND_CONFIG: usize = 1024 * 1024;
+
+#[derive(Debug, Clone, Serialize)]
+struct QueuedNodeSync {
+    node_id: i64,
+    command_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct NeedsNodeSync {
+    node_id: i64,
+    reason: &'static str,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct SyncReport {
+    queued: Vec<QueuedNodeSync>,
+    needs_sync: Vec<NeedsNodeSync>,
+}
+
+#[derive(Debug)]
+enum EnqueueFailure {
+    TooLarge,
+    Offline,
+    QueueFull,
+    Unavailable,
+}
+
+fn with_sync<T: Serialize>(value: &T, sync: &SyncReport) -> Value {
+    let mut value = serde_json::to_value(value).unwrap_or_else(|_| json!({}));
+    if let Value::Object(object) = &mut value {
+        object.insert("sync".into(), serde_json::to_value(sync).unwrap_or_else(|_| json!({})));
+    }
+    value
+}
 
 fn empty_params() -> Value {
     json!({})
@@ -474,11 +508,14 @@ pub async fn create_proxy(
         Err(error) => return api_input_error(error),
     };
     match app.db.create_proxy(node_id, &draft) {
-        Ok(Ok(id)) => match app.db.proxy(id) {
-            Ok(Some(proxy)) => (StatusCode::CREATED, Json(proxy)).into_response(),
-            Ok(None) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", INTERNAL),
-            Err(error) => api_internal(error),
-        },
+        Ok(Ok(id)) => {
+            let sync = sync_generated_nodes(&app, vec![node_id]);
+            match app.db.proxy(id) {
+                Ok(Some(proxy)) => (StatusCode::CREATED, Json(with_sync(&proxy, &sync))).into_response(),
+                Ok(None) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", INTERNAL),
+                Err(error) => api_internal(error),
+            }
+        }
         Ok(Err(issue)) => map_proxy_issue(issue),
         Err(error) => api_internal(error),
     }
@@ -507,9 +544,19 @@ pub async fn update_proxy(
         Ok(draft) => draft,
         Err(error) => return api_input_error(error),
     };
+    let previous_node_id = match app.db.proxy(id) {
+        Ok(proxy) => proxy.map(|proxy| proxy.node_id),
+        Err(error) => return api_internal(error),
+    };
     match app.db.update_proxy(id, node_id, &draft) {
         Ok(Ok(())) => match app.db.proxy(id) {
-            Ok(Some(proxy)) => Json(proxy).into_response(),
+            Ok(Some(proxy)) => {
+                let sync = sync_generated_nodes(
+                    &app,
+                    previous_node_id.into_iter().chain(std::iter::once(proxy.node_id)).collect(),
+                );
+                Json(with_sync(&proxy, &sync)).into_response()
+            }
             Ok(None) => api_error(StatusCode::NOT_FOUND, "PROXY_NOT_FOUND", "proxy does not exist"),
             Err(error) => api_internal(error),
         },
@@ -519,13 +566,14 @@ pub async fn update_proxy(
 }
 
 pub async fn delete_proxy(_: ApiAdmin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
-    let node_id = app.db.proxy(id).ok().flatten().map(|proxy| proxy.node_id);
+    let node_id = match app.db.proxy(id) {
+        Ok(proxy) => proxy.map(|proxy| proxy.node_id),
+        Err(error) => return api_internal(error),
+    };
     match app.db.delete_proxy(id) {
         Ok(true) => {
-            if let Some(node_id) = node_id {
-                let _ = sync_generated_nodes(&app, vec![node_id]);
-            }
-            StatusCode::NO_CONTENT.into_response()
+            let sync = sync_generated_nodes(&app, node_id.into_iter().collect());
+            Json(json!({"sync":sync})).into_response()
         }
         Ok(false) => api_error(StatusCode::NOT_FOUND, "PROXY_NOT_FOUND", "proxy does not exist"),
         Err(error) => api_internal(error),
@@ -580,8 +628,11 @@ pub async fn get_user(_: ApiAdmin, State(app): State<Shared>, Path(id): Path<i64
 pub async fn reset_user_uuid(_: ApiAdmin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
     match app.db.reset_user_uuid(id) {
         Ok(Some((uuid, nodes))) => {
-            let (queued, offline) = sync_generated_nodes(&app, nodes);
-            Json(json!({"uuid":uuid,"queued_node_ids":queued,"needs_sync_node_ids":offline})).into_response()
+            let sync = sync_generated_nodes(&app, nodes);
+            let queued = sync.queued.iter().map(|item| item.node_id).collect::<Vec<_>>();
+            let offline = sync.needs_sync.iter().map(|item| item.node_id).collect::<Vec<_>>();
+            Json(json!({"uuid":uuid,"queued_node_ids":queued,"needs_sync_node_ids":offline,"sync":sync}))
+                .into_response()
         }
         Ok(None) => api_error(StatusCode::NOT_FOUND, "USER_NOT_FOUND", "user does not exist"),
         Err(error) => api_internal(error),
@@ -602,13 +653,27 @@ pub async fn update_user(
         Ok(draft) => draft,
         Err(error) => return api_input_error(error),
     };
+    let old_user = match app.db.user(id) {
+        Ok(user) => user,
+        Err(error) => return api_internal(error),
+    };
+    let affects_config = old_user.as_ref().is_some_and(|user| {
+        user.username != draft.username
+            || user.enabled != draft.enabled
+            || user.expires_at != draft.expires_at
+    });
     match app.db.update_user(id, &draft) {
         Ok(Ok(())) => match app.db.user(id) {
             Ok(Some(user)) => {
-                if let Ok(nodes) = app.db.nodes_for_user(id) {
-                    let _ = sync_generated_nodes(&app, nodes);
-                }
-                Json(user).into_response()
+                let sync = if affects_config {
+                    match app.db.nodes_for_user(id) {
+                        Ok(nodes) => sync_generated_nodes(&app, nodes),
+                        Err(error) => return api_internal(error),
+                    }
+                } else {
+                    SyncReport::default()
+                };
+                Json(with_sync(&user, &sync)).into_response()
             }
             Ok(None) => api_error(StatusCode::NOT_FOUND, "USER_NOT_FOUND", "user does not exist"),
             Err(error) => api_internal(error),
@@ -619,11 +684,14 @@ pub async fn update_user(
 }
 
 pub async fn delete_user(_: ApiAdmin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
-    let nodes = app.db.nodes_for_user(id).unwrap_or_default();
+    let nodes = match app.db.nodes_for_user(id) {
+        Ok(nodes) => nodes,
+        Err(error) => return api_internal(error),
+    };
     match app.db.delete_user(id) {
         Ok(UserDeleteResult::Deleted) => {
-            let _ = sync_generated_nodes(&app, nodes);
-            StatusCode::NO_CONTENT.into_response()
+            let sync = sync_generated_nodes(&app, nodes);
+            Json(json!({"sync":sync})).into_response()
         }
         Ok(UserDeleteResult::NotFound) => {
             api_error(StatusCode::NOT_FOUND, "USER_NOT_FOUND", "user does not exist")
@@ -645,6 +713,69 @@ pub async fn get_user_authorizations(
     match app.db.authorizations_for_user(user_id) {
         Ok(Some(items)) => Json(json!({"items":items})).into_response(),
         Ok(None) => api_error(StatusCode::NOT_FOUND, "USER_NOT_FOUND", "user does not exist"),
+        Err(error) => api_internal(error),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplaceAuthorizationsRequest {
+    pub items: Vec<ReplaceAuthorizationItem>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplaceAuthorizationItem {
+    pub proxy_id: i64,
+    pub enabled: bool,
+}
+
+/// Atomically replaces a user's complete proxy authorization set. The nodes
+/// from both the old and new sets are synchronized once each after commit.
+pub async fn replace_user_authorizations(
+    _: ApiAdmin,
+    State(app): State<Shared>,
+    Path(user_id): Path<i64>,
+    body: Result<Json<ReplaceAuthorizationsRequest>, JsonRejection>,
+) -> Response {
+    let request = match api_body(body) {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    if let Err(response) = api_user(&app, user_id) {
+        return response;
+    }
+    let mut seen = std::collections::HashSet::new();
+    for item in &request.items {
+        if !seen.insert(item.proxy_id) {
+            return api_error(StatusCode::BAD_REQUEST, "DUPLICATE_PROXY", "proxy_id must be unique");
+        }
+        let proxy = match api_proxy(&app, item.proxy_id) {
+            Ok(proxy) => proxy,
+            Err(response) => return response,
+        };
+        if !proxy::vless_protocol(&proxy) {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "INVALID_PROXY_PROTOCOL",
+                "V1 only supports VLESS authorization",
+            );
+        }
+    }
+    match app.db.replace_authorizations(
+        user_id,
+        &request.items.iter().map(|item| (item.proxy_id, item.enabled)).collect::<Vec<_>>(),
+    ) {
+        Ok(Ok(node_ids)) => {
+            let sync = sync_generated_nodes(&app, node_ids);
+            Json(json!({"sync":sync})).into_response()
+        }
+        Ok(Err(AuthorizationWriteIssue::UserNotFound)) => {
+            api_error(StatusCode::NOT_FOUND, "USER_NOT_FOUND", "user does not exist")
+        }
+        Ok(Err(AuthorizationWriteIssue::ProxyNotFound)) => {
+            api_error(StatusCode::NOT_FOUND, "PROXY_NOT_FOUND", "proxy does not exist")
+        }
         Err(error) => api_internal(error),
     }
 }
@@ -685,8 +816,7 @@ pub async fn put_user_proxy(
                 "proxy_id": access.proxy_id,
                 "enabled": access.enabled,
                 "auth": access.auth,
-                "queued_node_ids": sync.0,
-                "needs_sync_node_ids": sync.1,
+                "sync": sync,
             }))
             .into_response()
         }
@@ -714,8 +844,8 @@ pub async fn delete_user_proxy(
     };
     match app.db.delete_authorization(user_id, proxy_id) {
         Ok(true) => {
-            let _ = sync_generated_nodes(&app, vec![proxy.node_id]);
-            StatusCode::NO_CONTENT.into_response()
+            let sync = sync_generated_nodes(&app, vec![proxy.node_id]);
+            Json(json!({"sync":sync})).into_response()
         }
         Ok(false) => api_error(StatusCode::NOT_FOUND, "ACCESS_NOT_FOUND", "user has no access to this proxy"),
         Err(error) => api_internal(error),
@@ -737,29 +867,33 @@ fn generated_node_config(app: &Shared, node_id: i64) -> Result<Value, Response> 
     })
 }
 
-fn sync_generated_nodes(app: &Shared, node_ids: Vec<i64>) -> (Vec<i64>, Vec<i64>) {
-    let mut queued = Vec::new();
-    let mut needs_sync = Vec::new();
+fn sync_generated_nodes(app: &Shared, node_ids: Vec<i64>) -> SyncReport {
+    let mut report = SyncReport::default();
+    let node_ids = node_ids.into_iter().collect::<std::collections::BTreeSet<_>>();
     for node_id in node_ids {
         match generated_node_config(app, node_id) {
             Ok(config) => {
-                let response =
-                    enqueue_generated_config(app, node_id, "singbox.config.apply", config.to_string());
-                if response.status().is_success() {
-                    queued.push(node_id);
-                } else {
-                    needs_sync.push(node_id);
+                match enqueue_generated_config_id(app, node_id, "singbox.config.apply", config.to_string()) {
+                    Ok(command_id) => report.queued.push(QueuedNodeSync { node_id, command_id }),
+                    Err(error) => report.needs_sync.push(NeedsNodeSync { node_id, reason: error.as_str() }),
                 }
             }
-            Err(_) => needs_sync.push(node_id),
+            Err(_) => report.needs_sync.push(NeedsNodeSync { node_id, reason: "config_error" }),
         }
     }
-    (queued, needs_sync)
+    report
 }
 
 pub(crate) fn sync_node_config_on_connect(app: &Shared, node_id: i64) -> bool {
     let Ok(config) = generated_node_config(app, node_id) else { return false };
     enqueue_generated_config(app, node_id, "singbox.config.apply", config.to_string()).status().is_success()
+}
+
+pub(crate) fn sync_node_config_for_expired_user(app: &App, node_id: i64) -> Result<String, &'static str> {
+    let config =
+        proxy::generate_config(&app.db, node_id, Utc::now().timestamp()).map_err(|_| "config_error")?;
+    enqueue_generated_config_id(app, node_id, "singbox.config.apply", config.to_string())
+        .map_err(|error| error.as_str())
 }
 
 pub async fn preview_singbox_config(
@@ -774,24 +908,54 @@ pub async fn preview_singbox_config(
 }
 
 fn enqueue_generated_config(app: &Shared, node_id: i64, method: &str, content: String) -> Response {
-    if content.len() > proxy::MAX_GENERATED_CONFIG {
-        return api_error(
+    match enqueue_generated_config_id(app, node_id, method, content) {
+        Ok(command_id) => {
+            (StatusCode::ACCEPTED, Json(json!({"command_id":command_id,"status":"pending"}))).into_response()
+        }
+        Err(EnqueueFailure::TooLarge) => api_error(
             StatusCode::PAYLOAD_TOO_LARGE,
             "SINGBOX_CONFIG_TOO_LARGE",
             "generated config exceeds 1 MiB",
-        );
+        ),
+        Err(EnqueueFailure::Offline) => {
+            api_error(StatusCode::CONFLICT, "AGENT_OFFLINE", "Agent is currently offline")
+        }
+        Err(EnqueueFailure::QueueFull) => {
+            api_error(StatusCode::SERVICE_UNAVAILABLE, "COMMAND_QUEUE_FULL", "command queue is full")
+        }
+        Err(EnqueueFailure::Unavailable) => api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "AGENT_UNAVAILABLE",
+            "Agent queue is full or disconnected",
+        ),
+    }
+}
+
+impl EnqueueFailure {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::TooLarge => "config_too_large",
+            Self::Offline => "offline",
+            Self::QueueFull => "queue_full",
+            Self::Unavailable => "agent_unavailable",
+        }
+    }
+}
+
+fn enqueue_generated_config_id(
+    app: &App,
+    node_id: i64,
+    method: &str,
+    content: String,
+) -> Result<String, EnqueueFailure> {
+    if content.len() > proxy::MAX_GENERATED_CONFIG {
+        return Err(EnqueueFailure::TooLarge);
     }
     let agents = app.agents.read().unwrap_or_else(|e| e.into_inner());
-    let Some(agent) = agents.get(&node_id) else {
-        return api_error(StatusCode::CONFLICT, "AGENT_OFFLINE", "Agent is currently offline");
-    };
+    let Some(agent) = agents.get(&node_id) else { return Err(EnqueueFailure::Offline) };
     let session = agent.session;
-    let id = match app.commands.start(node_id, session, method) {
-        Ok(id) => id,
-        Err(StartError::Full) => {
-            return api_error(StatusCode::SERVICE_UNAVAILABLE, "COMMAND_QUEUE_FULL", "command queue is full")
-        }
-    };
+    let id =
+        app.commands.start(node_id, session, method).map_err(|StartError::Full| EnqueueFailure::QueueFull)?;
     let message = json!({
         "type": "command",
         "id": id,
@@ -800,14 +964,10 @@ fn enqueue_generated_config(app: &Shared, node_id: i64, method: &str, content: S
     })
     .to_string();
     match agent.tx.try_send(message) {
-        Ok(()) => (StatusCode::ACCEPTED, Json(json!({"command_id":id,"status":"pending"}))).into_response(),
+        Ok(()) => Ok(id),
         Err(_) => {
             app.commands.cancel(&id, node_id, session);
-            api_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "AGENT_UNAVAILABLE",
-                "Agent queue is full or disconnected",
-            )
+            Err(EnqueueFailure::Unavailable)
         }
     }
 }
@@ -2891,6 +3051,29 @@ mod tests {
 
     fn app() -> App {
         App::for_test(Db::open(":memory:").unwrap())
+    }
+
+    #[test]
+    fn client_subscriptions_use_the_proxy_flow_and_omit_it_when_empty() {
+        let proxy = |id, flow: &str| crate::db::UserSubscriptionProxy {
+            id,
+            node_name: "node".into(),
+            name: format!("proxy-{id}"),
+            include_node_name: false,
+            address: "proxy.example.com".into(),
+            port: 24060 + id,
+            server_name: "www.example.com".into(),
+            public_key: "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".into(),
+            short_id: "abcdef12".into(),
+            flow: flow.into(),
+        };
+        let proxies = vec![proxy(1, "xtls-rprx-vision"), proxy(2, "")];
+        let clash = clash_subscription("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", &proxies);
+        assert!(clash.contains("flow: \"xtls-rprx-vision\""));
+        assert_eq!(clash.matches("flow:").count(), 1, "empty proxy Flow is omitted");
+        let sing_box = sing_box_subscription("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", &proxies);
+        assert_eq!(sing_box["outbounds"][0]["flow"], "xtls-rprx-vision");
+        assert!(sing_box["outbounds"][1].get("flow").is_none());
     }
 
     /// Taken by every test that calls `metrics`. `HISTORY_GATE` is process-wide,

@@ -10,6 +10,7 @@ export function proxyDraft(proxy: Proxy, enabled = proxy.enabled): ProxyDraft {
     address: proxy.address,
     port: proxy.port,
     enabled,
+    flow: proxy.flow,
     config: proxy.config,
   }
 }

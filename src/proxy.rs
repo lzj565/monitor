@@ -37,6 +37,8 @@ pub struct ProxyRequest {
     pub address: String,
     pub port: u16,
     pub enabled: bool,
+    #[serde(default)]
+    pub flow: Option<String>,
     pub config: VlessProxyConfig,
 }
 
@@ -69,6 +71,9 @@ impl ProxyRequest {
         validate_address(&self.address_type, &self.address)?;
         if self.port == 0 {
             return Err(InputError::new("INVALID_PROXY_CONFIG", "port must be between 1 and 65535"));
+        }
+        if self.flow.as_deref().is_some_and(|flow| !flow.is_empty() && flow != "xtls-rprx-vision") {
+            return Err(InputError::new("INVALID_PROXY_CONFIG", "flow must be empty or xtls-rprx-vision"));
         }
         let reality = &self.config.reality;
         if !reality.enabled {
@@ -107,6 +112,7 @@ impl ProxyRequest {
             address: self.address,
             port: i64::from(self.port),
             enabled: self.enabled,
+            flow: self.flow,
             config,
         })
     }
@@ -199,15 +205,19 @@ pub struct VlessAuthorizationSettings {
 #[serde(deny_unknown_fields)]
 pub struct AuthorizationRequest {
     pub enabled: bool,
-    pub auth: VlessAuthorizationSettings,
+    #[serde(default)]
+    pub auth: Option<VlessAuthorizationSettings>,
 }
 
 impl AuthorizationRequest {
     pub fn into_draft(self) -> Result<AuthorizationDraft, InputError> {
-        if !self.auth.flow.is_empty() && self.auth.flow != "xtls-rprx-vision" {
+        if self.auth.as_ref().is_some_and(|auth| !auth.flow.is_empty() && auth.flow != "xtls-rprx-vision") {
             return Err(InputError::new("INVALID_PROXY_AUTH", "auth.flow must be empty or xtls-rprx-vision"));
         }
-        let auth = serde_json::to_value(self.auth)
+        let auth = self
+            .auth
+            .map(serde_json::to_value)
+            .transpose()
             .map_err(|e| InputError::new("INVALID_PROXY_AUTH", e.to_string()))?;
         Ok(AuthorizationDraft { enabled: self.enabled, auth })
     }
@@ -228,8 +238,8 @@ pub fn generate_config(db: &Db, node_id: i64, now: i64) -> anyhow::Result<Value>
                     .with_context(|| format!("stored VLESS auth for proxy {} is invalid", proxy.id))?;
                 stats_users.insert(auth.name.clone());
                 let mut user = json!({"name": auth.name, "uuid": auth.uuid});
-                if !auth.flow.is_empty() {
-                    user["flow"] = Value::String(auth.flow);
+                if !proxy.flow.is_empty() {
+                    user["flow"] = Value::String(proxy.flow.clone());
                 }
                 Ok(user)
             })
@@ -280,8 +290,6 @@ pub fn generate_config(db: &Db, node_id: i64, now: i64) -> anyhow::Result<Value>
 struct VlessUser {
     name: String,
     uuid: String,
-    #[serde(default)]
-    flow: String,
 }
 
 pub fn vless_protocol(proxy: &db::Proxy) -> bool {
@@ -331,6 +339,7 @@ mod tests {
         let old = old.into_draft().unwrap();
         assert_eq!(old.name, "Reality");
         assert!(!old.include_node_name);
+        assert_eq!(old.flow, None);
 
         let current: ProxyRequest = serde_json::from_value(request_json(Some(true))).unwrap();
         assert!(current.into_draft().unwrap().include_node_name);
@@ -339,6 +348,31 @@ mod tests {
         update["node_id"] = json!(42);
         let update: ProxyRequest = serde_json::from_value(update).unwrap();
         assert_eq!(update.node_id, Some(42));
+    }
+
+    #[test]
+    fn proxy_flow_accepts_only_supported_values() {
+        let mut request = request_json(None);
+        request["flow"] = json!("xtls-rprx-vision");
+        let draft = serde_json::from_value::<ProxyRequest>(request.clone()).unwrap().into_draft().unwrap();
+        assert_eq!(draft.flow.as_deref(), Some("xtls-rprx-vision"));
+        request["flow"] = json!("unsupported");
+        assert!(serde_json::from_value::<ProxyRequest>(request).unwrap().into_draft().is_err());
+    }
+
+    #[test]
+    fn authorization_writes_can_omit_per_user_auth_settings() {
+        let request: AuthorizationRequest = serde_json::from_value(json!({"enabled": true})).unwrap();
+        let draft = request.into_draft().unwrap();
+        assert!(draft.enabled);
+        assert!(draft.auth.is_none());
+
+        let legacy: AuthorizationRequest = serde_json::from_value(json!({
+            "enabled": true,
+            "auth": {"flow": "xtls-rprx-vision"}
+        }))
+        .unwrap();
+        assert_eq!(legacy.into_draft().unwrap().auth.unwrap()["flow"], "xtls-rprx-vision");
     }
 
     #[test]
@@ -388,11 +422,13 @@ mod tests {
                 .unwrap();
             let proxy_id = db.create_proxy(node_id, &db::ProxyDraft {
                 name: name.into(), include_node_name: false, protocol: "vless".into(), address_type: "domain".into(),
-                address: "example.com".into(), port, enabled: true,
+                address: "example.com".into(), port, enabled: true, flow: Some("xtls-rprx-vision".into()),
                 config: json!({"reality":{"enabled":true,"server_name":"example.com","server_port":443,
                     "private_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","public_key":"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB","short_id":"abcdef12"}}),
             }).unwrap().unwrap();
-            let draft = AuthorizationDraft { enabled: true, auth: json!({"flow":"xtls-rprx-vision"}) };
+            // The legacy authorization value is deliberately different: proxy
+            // Flow is now the single source used by generated node configs.
+            let draft = AuthorizationDraft { enabled: true, auth: Some(json!({"flow":""})) };
             db.put_authorization(user_id, proxy_id, &draft).unwrap().unwrap();
             proxy_ids.push(proxy_id);
             node_ids.push(node_id);
