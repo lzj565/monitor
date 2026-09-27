@@ -55,6 +55,37 @@ reported() {
 	curl -fs "$URL/api/nodes" | jq -e '.nodes[0] | .online and .metrics != null'
 }
 
+# Exercises the command channel against the real Agent and real init service.
+# Opt in only on an isolated Linux host prepared with the Agent's fixed paths:
+# /opt/monitor/sing-box and /etc/sing-box/config.json. Applying the unchanged
+# config still replaces it atomically and restarts sing-box, so this is not part
+# of the default CI smoke test.
+run_singbox_command() {
+	method=$1
+	params=$2
+	body=$(jq -nc --arg method "$method" --argjson params "$params" '{method:$method,params:$params}')
+	accepted=$(curl -fsS -H "Cookie: $COOKIE" -H 'content-type: application/json' \
+		-d "$body" "$URL/api/nodes/$NODE_ID/commands") || fail "sending $method was refused"
+	command_id=$(printf '%s' "$accepted" | jq -er '.command_id') || fail "$method returned no command id"
+	i=0
+	while [ "$i" -lt 80 ]; do
+		COMMAND_RESULT=$(curl -fsS -H "Cookie: $COOKIE" \
+			"$URL/api/nodes/$NODE_ID/commands/$command_id") || fail "reading $method result failed"
+		COMMAND_STATUS=$(printf '%s' "$COMMAND_RESULT" | jq -r '.status')
+		case "$COMMAND_STATUS" in
+		succeeded) return 0 ;;
+		failed)
+			failure=$(printf '%s' "$COMMAND_RESULT" | jq -r '(.error.code // "AGENT_ERROR") + ": " + (.error.message // "command failed")')
+			fail "$method failed: $failure"
+			;;
+		pending) sleep 0.5 ;;
+		*) fail "$method returned unknown status: $COMMAND_STATUS" ;;
+		esac
+		i=$((i + 1))
+	done
+	fail "$method did not finish within 40 seconds"
+}
+
 "$HUB" --listen "${URL#http://}" --db "$DIR/hub.db" --themes "$DIR/themes" >"$DIR/hub.log" 2>&1 &
 HUB_PID=$!
 wait_for "the hub to listen" curl -fs "$URL/api/me"
@@ -79,6 +110,28 @@ wait_for "the node to report" reported
 # The panel's frame is cached for up to 1.9 s, and nothing an agent does renews
 # it, so the one taken above for the token may still predate the connection.
 sleep 2
+
+if [ "${E2E_SINGBOX:-0}" = 1 ]; then
+	[ "$(id -u)" = 0 ] || fail "E2E_SINGBOX=1 requires root to run the Agent's real service actions"
+	[ -x /opt/monitor/sing-box ] || fail "E2E_SINGBOX=1 requires /opt/monitor/sing-box"
+	[ -f /etc/sing-box/config.json ] || fail "E2E_SINGBOX=1 requires /etc/sing-box/config.json"
+	NODE_ID=$(curl -fsS -H "Cookie: $COOKIE" "$URL/api/nodes" | jq -er '.nodes[0].id')
+	run_singbox_command "singbox.status" '{}'
+	printf '%s' "$COMMAND_RESULT" | jq -e '.result.installed == true and .result.running == true' >/dev/null ||
+		fail "singbox.status did not report an installed, running service"
+	run_singbox_command "singbox.config.get" '{}'
+	CONFIG=$(printf '%s' "$COMMAND_RESULT" | jq -er '.result.content') || fail "singbox.config.get returned no config"
+	CONFIG_PARAMS=$(jq -nc --arg content "$CONFIG" '{content:$content}')
+	run_singbox_command "singbox.config.check" "$CONFIG_PARAMS"
+	printf '%s' "$COMMAND_RESULT" | jq -e '.result.valid == true' >/dev/null || fail "singbox.config.check did not validate the current config"
+	run_singbox_command "singbox.config.apply" "$CONFIG_PARAMS"
+	printf '%s' "$COMMAND_RESULT" | jq -e '.result.applied == true' >/dev/null || fail "singbox.config.apply did not apply the current config"
+	run_singbox_command "singbox.restart" '{}'
+	printf '%s' "$COMMAND_RESULT" | jq -e '.result.running == true' >/dev/null || fail "singbox.restart did not report a running service"
+	run_singbox_command "singbox.status" '{}'
+	printf '%s' "$COMMAND_RESULT" | jq -e '.result.running == true' >/dev/null || fail "singbox.status did not report the restarted service"
+	echo "e2e: real Agent sing-box command channel: ok"
+fi
 
 PUBLIC=$(curl -fsS "$URL/api/nodes")
 ADMIN=$(curl -fsS -H "Cookie: $COOKIE" "$URL/api/nodes")

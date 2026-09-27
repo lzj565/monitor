@@ -201,6 +201,9 @@ impl Minute {
 /// handshakes if it is ever observed; reissuing the token ends it meanwhile.
 #[derive(Debug, Default)]
 struct Session {
+    /// The socket identity used to complete only commands sent on this
+    /// connection. `Session::default()` keeps zero for non-socket unit tests.
+    tag: u64,
     greeted: bool,
     last_report: Option<Instant>,
     /// Start of the current result window and the results admitted in it.
@@ -294,7 +297,15 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> 
     // Online from the handshake rather than the first report: a panel reporting
     // otherwise for a whole interval would describe the hub's bookkeeping rather
     // than the machine.
-    app.agents.write().unwrap_or_else(|e| e.into_inner()).insert(node_id, Agent::new(tag, tx));
+    let replaced = {
+        let mut agents = app.agents.write().unwrap_or_else(|e| e.into_inner());
+        let previous = agents.insert(node_id, Agent::new(tag, tx));
+        if let Some(previous) = &previous {
+            app.commands.disconnect(node_id, previous.session);
+        }
+        previous
+    };
+    drop(replaced);
     info!("node {node_id} connected from {ip}");
 
     // Send the probe list before the first report arrives.
@@ -308,7 +319,7 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> 
     // connection lasts; otherwise it would wait for the next hello, which on a
     // steady link is days away.
     let mut owed: Option<String> = None;
-    let mut session = Session::default();
+    let mut session = Session { tag, ..Session::default() };
 
     let outcome = loop {
         tokio::select! {
@@ -381,7 +392,9 @@ fn release(app: &App, node_id: i64, tag: u64) -> Option<Agent> {
     if !agents.get(&node_id).is_some_and(|a| a.session == tag) {
         return None;
     }
-    agents.remove(&node_id)
+    let ended = agents.remove(&node_id);
+    app.commands.disconnect(node_id, tag);
+    ended
 }
 
 /// Files what an ended session still held: the node's held reading, the probe
@@ -421,7 +434,44 @@ fn dispatch(
     session: &mut Session,
     arrival: Arrival,
 ) -> Result<Option<String>> {
-    let rpc: Rpc = serde_json::from_str(text)?;
+    let frame: serde_json::Value = serde_json::from_str(text)?;
+    if frame.get("type").and_then(serde_json::Value::as_str) == Some("command_result") {
+        let Some(id) = frame.get("id").and_then(serde_json::Value::as_str) else {
+            session.complain(node_id, "command result omitted its string id");
+            return Ok(None);
+        };
+        let Some(ok) = frame.get("ok").and_then(serde_json::Value::as_bool) else {
+            session.complain(node_id, "command result omitted its boolean ok field");
+            return Ok(None);
+        };
+        let result = if ok {
+            frame.get("result").cloned().map(Ok).unwrap_or_else(|| {
+                Err(crate::command::CommandError {
+                    code: "AGENT_PROTOCOL_ERROR".into(),
+                    message: "successful command result omitted result".into(),
+                })
+            })
+        } else {
+            let error = frame.get("error");
+            Err(crate::command::CommandError {
+                code: error
+                    .and_then(|v| v.get("code"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("AGENT_ERROR")
+                    .to_owned(),
+                message: error
+                    .and_then(|v| v.get("message"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("agent command failed")
+                    .to_owned(),
+            })
+        };
+        if !app.commands.complete(id, node_id, session.tag, result) {
+            debug!("node {node_id}: ignored unknown, expired, or stale-session command result");
+        }
+        return Ok(None);
+    }
+    let rpc: Rpc = serde_json::from_value(frame)?;
     // Results gathered in an earlier minute are filed on the next frame of any
     // kind: reports arrive every few seconds even where every probe runs once an
     // hour. A failure is logged rather than returned, which would discard the
@@ -858,6 +908,58 @@ mod tests {
     /// One frame on `session`, `secs` into the test's clock.
     fn send(app: &App, id: i64, session: &mut Session, secs: u64, text: &str) -> Result<Option<String>> {
         dispatch(app, id, "ip", text, session, at(secs))
+    }
+
+    #[test]
+    fn command_result_is_correlated_to_its_node_and_websocket_session() {
+        let app = app();
+        let id = node(&app);
+        let command_id = app.commands.start(id, 41, "singbox.status").unwrap();
+        let mut session = Session { tag: 41, ..Session::default() };
+        let response = json!({
+            "type": "command_result", "id": command_id, "ok": true,
+            "result": {"installed": true, "running": true, "version": "1.14.1"}
+        });
+        dispatch(&app, id, "ip", &response.to_string(), &mut session, at(0)).unwrap();
+        let view = app.commands.get(&response["id"].as_str().unwrap(), id).unwrap();
+        assert_eq!(view.status, "succeeded");
+        assert_eq!(view.result.unwrap()["running"], true);
+
+        let stale_id = app.commands.start(id, 42, "singbox.restart").unwrap();
+        dispatch(
+            &app,
+            id,
+            "ip",
+            &json!({
+                "type": "command_result", "id": stale_id, "ok": true, "result": {"running": true}
+            })
+            .to_string(),
+            &mut session,
+            at(1),
+        )
+        .unwrap();
+        assert_eq!(app.commands.get(&stale_id, id).unwrap().status, "pending");
+    }
+
+    #[test]
+    fn command_error_response_is_preserved_and_reconnect_retires_old_pending_work() {
+        let app = app();
+        let id = node(&app);
+        let failed = app.commands.start(id, 4, "singbox.config.check").unwrap();
+        let mut old_session = Session { tag: 4, ..Session::default() };
+        let response = json!({
+            "type": "command_result", "id": failed, "ok": false,
+            "error": {"code": "SINGBOX_ERROR", "message": "invalid config"}
+        });
+        dispatch(&app, id, "ip", &response.to_string(), &mut old_session, at(0)).unwrap();
+        let view = app.commands.get(&failed, id).unwrap();
+        assert_eq!(view.status, "failed");
+        assert_eq!(view.error.unwrap().message, "invalid config");
+
+        let pending = app.commands.start(id, 4, "singbox.config.apply").unwrap();
+        app.commands.disconnect(id, 4);
+        assert_eq!(app.commands.get(&pending, id).unwrap().error.unwrap().code, "AGENT_DISCONNECTED");
+        assert!(!app.commands.complete(&pending, id, 4, Ok(serde_json::Value::Null)));
     }
 
     fn report_json(boot: &str, rx: i64, tx: i64) -> String {

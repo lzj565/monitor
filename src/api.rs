@@ -18,6 +18,7 @@ use crate::agent_ws::Agent;
 use crate::auth::{
     authed, client_ip, current_session, hash_password, issue_session, issued_at, random_token, with_cookies,
 };
+use crate::command::{self, StartError};
 use crate::db::{Db, Node, NodePatch, PingTask, Traffic, TrafficPatch};
 use crate::{agent_ws, App, Shared};
 
@@ -75,6 +76,100 @@ fn bad(message: &str) -> Response {
 
 fn no_such_node() -> Response {
     answer(StatusCode::NOT_FOUND, "节点不存在，可能已被删除")
+}
+
+const MAX_COMMAND_CONFIG: usize = 1024 * 1024;
+
+fn empty_params() -> Value {
+    json!({})
+}
+
+#[derive(Deserialize)]
+pub struct CommandRequest {
+    method: String,
+    #[serde(default = "empty_params")]
+    params: Value,
+}
+
+/// Enqueues one allowlisted sing-box action on the Agent's current WebSocket.
+/// The Admin extractor keeps this control path private to signed-in operators.
+pub async fn create_command(
+    _: Admin,
+    State(app): State<Shared>,
+    Path(node_id): Path<i64>,
+    body: Result<Json<CommandRequest>, JsonRejection>,
+) -> Response {
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(error) => return error.into_response(),
+    };
+    if !command::supports(&body.method) {
+        return bad("不支持的 Agent 命令");
+    }
+    if !body.params.is_object() {
+        return bad("params 必须是 JSON 对象");
+    }
+    if matches!(body.method.as_str(), "singbox.config.check" | "singbox.config.apply") {
+        let Some(content) = body.params.get("content").and_then(Value::as_str) else {
+            return bad("params.content 必须是字符串");
+        };
+        if content.len() > MAX_COMMAND_CONFIG {
+            return answer(StatusCode::PAYLOAD_TOO_LARGE, "sing-box 配置不能超过 1 MiB");
+        }
+    }
+    match app.db.node(node_id) {
+        Ok(Some(_)) => {}
+        Ok(None) => return no_such_node(),
+        Err(error) => return fail(error),
+    }
+
+    // Keep the read guard until the reservation and try_send are complete. A
+    // reconnect takes the write lock, then retires commands from the session it
+    // replaced; this closes the window where a request could be registered too
+    // late for that retirement.
+    let agents = app.agents.read().unwrap_or_else(|e| e.into_inner());
+    let Some(agent) = agents.get(&node_id) else {
+        return answer(StatusCode::SERVICE_UNAVAILABLE, "Agent 当前离线");
+    };
+    let session = agent.session;
+    let id = match app.commands.start(node_id, session, &body.method) {
+        Ok(id) => id,
+        Err(StartError::Full) => {
+            return answer(StatusCode::SERVICE_UNAVAILABLE, "命令队列已满，请稍后重试");
+        }
+    };
+    let message = json!({
+        "type": "command",
+        "id": id,
+        "action": body.method,
+        "params": body.params,
+    })
+    .to_string();
+    match agent.tx.try_send(message) {
+        Ok(()) => (StatusCode::ACCEPTED, Json(json!({"command_id": id}))).into_response(),
+        Err(_) => {
+            app.commands.cancel(&id, node_id, session);
+            answer(StatusCode::SERVICE_UNAVAILABLE, "Agent 命令队列已满或连接已关闭")
+        }
+    }
+}
+
+/// Reads a command's in-memory state. Command IDs are scoped to the node in
+/// both the registry lookup and the URL, so they cannot be used across nodes.
+pub async fn command_status(
+    _: Admin,
+    State(app): State<Shared>,
+    Path((node_id, command_id)): Path<(i64, String)>,
+) -> Response {
+    match app.db.node(node_id) {
+        Ok(Some(_)) => {}
+        Ok(None) => return no_such_node(),
+        Err(error) => return fail(error),
+    }
+    match app.commands.get(&command_id, node_id) {
+        Some(command) => Json(command).into_response(),
+        None => answer(StatusCode::NOT_FOUND, "命令不存在或已过期"),
+    }
 }
 
 /// The last step of every response. An error the hub composed passes as it is;
@@ -3455,5 +3550,78 @@ mod tests {
         assert_eq!(read(rejection).await, "请求格式不对");
         assert_eq!(read(StatusCode::UNAUTHORIZED.into_response()).await, "登录已失效，请重新登录");
         assert_eq!(read(bad("请填写节点名称")).await, "请填写节点名称");
+    }
+
+    #[tokio::test]
+    async fn command_api_enqueues_supported_action_and_returns_its_result() {
+        let app = std::sync::Arc::new(app());
+        let id = node(&app, "command-node", true);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        app.agents.write().unwrap().insert(id, crate::agent_ws::Agent::new(17, tx));
+
+        let accepted = create_command(
+            Admin,
+            State(app.clone()),
+            Path(id),
+            Ok(Json(CommandRequest { method: "singbox.status".into(), params: json!({}) })),
+        )
+        .await;
+        assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+        let accepted: Value =
+            serde_json::from_slice(&axum::body::to_bytes(accepted.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let command_id = accepted["command_id"].as_str().unwrap();
+        let outbound: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(outbound["type"], "command");
+        assert_eq!(outbound["id"], command_id);
+        assert_eq!(outbound["action"], "singbox.status");
+
+        assert!(app.commands.complete(
+            command_id,
+            id,
+            17,
+            Ok(json!({"installed": true, "running": true, "version": "1.14.1"})),
+        ));
+        let status = command_status(Admin, State(app), Path((id, command_id.to_owned()))).await;
+        assert_eq!(status.status(), StatusCode::OK);
+        let status: Value =
+            serde_json::from_slice(&axum::body::to_bytes(status.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(status["status"], "succeeded");
+        assert_eq!(status["result"]["running"], true);
+    }
+
+    #[tokio::test]
+    async fn command_api_rejects_unsupported_offline_and_full_queue_requests() {
+        let app = std::sync::Arc::new(app());
+        let id = node(&app, "command-node", true);
+        let request = |method: &str| Ok(Json(CommandRequest { method: method.into(), params: json!({}) }));
+        assert_eq!(
+            create_command(Admin, State(app.clone()), Path(id), request("singbox.start")).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            create_command(Admin, State(app.clone()), Path(id), request("singbox.status")).await.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an offline node cannot accept commands"
+        );
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send("already queued".into()).unwrap();
+        app.agents.write().unwrap().insert(id, crate::agent_ws::Agent::new(18, tx));
+        assert_eq!(
+            create_command(Admin, State(app.clone()), Path(id), request("singbox.status")).await.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a full WebSocket queue must refuse the command without claiming it was sent"
+        );
+
+        let oversized = CommandRequest {
+            method: "singbox.config.apply".into(),
+            params: json!({"content": "x".repeat(MAX_COMMAND_CONFIG + 1)}),
+        };
+        assert_eq!(
+            create_command(Admin, State(app), Path(id), Ok(Json(oversized))).await.status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
     }
 }

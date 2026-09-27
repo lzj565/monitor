@@ -5,9 +5,8 @@
 #   curl -fsSL https://hub.example.com/install.sh | sh -s -- --upgrade
 #   curl -fsSL https://hub.example.com/install.sh | sh -s -- --uninstall
 set -eu
-# useradd and rc-update reside in sbin, which a root shell entered through `su`
-# without `-` lacks on Debian: su keeps the caller's PATH unless ALWAYS_SET_PATH
-# is set, and Debian does not set it.
+# rc-update and other administrative tools reside in sbin, which a root shell
+# entered through `su` without `-` may omit from PATH.
 PATH="$PATH:/usr/sbin:/sbin"
 
 # Binary and token in one directory, the same one the hub uses, giving a node a
@@ -18,6 +17,17 @@ ENV_FILE="$ROOT/agent.env"
 UNIT_FILE="/etc/systemd/system/monitor-agent.service"
 RC_FILE="/etc/init.d/monitor-agent"
 LOG_FILE="/var/log/monitor-agent.log"
+SING_BOX_VERSION="1.14.1"
+SING_BOX="$ROOT/sing-box"
+SING_BOX_CONFIG="/etc/sing-box/config.json"
+SING_BOX_UNIT="/etc/systemd/system/sing-box.service"
+SING_BOX_RC="/etc/init.d/sing-box"
+CURRENT_STEP=""
+FAIL_REASON="command failed"
+TMP_AGENT=""
+TMP_DIR=""
+AGENT_CANDIDATE=""
+SING_BOX_STAGED=""
 SERVER=""
 TOKEN=""
 REGISTER=""
@@ -28,6 +38,100 @@ INTERVAL=""
 INSECURE=""
 UNINSTALL=""
 UPGRADE=""
+
+if [ -t 1 ] && [ -z "${NO_COLOR+x}" ]; then
+	C_BLUE=$(printf '\033[1;34m')
+	C_GREEN=$(printf '\033[32m')
+	C_YELLOW=$(printf '\033[33m')
+	C_RED=$(printf '\033[31m')
+	C_CYAN=$(printf '\033[36m')
+	C_RESET=$(printf '\033[0m')
+else
+	C_BLUE=""; C_GREEN=""; C_YELLOW=""; C_RED=""; C_CYAN=""; C_RESET=""
+fi
+
+step() { CURRENT_STEP="$2"; printf '\n%s[%s]%s %s\n' "$C_BLUE" "$1" "$C_RESET" "$2"; }
+info() { printf '• %s\n' "$*"; }
+detail() {
+	case "$1" in
+	路径 | 安装位置 | Binary | Agent\ Path | Version | 版本 | Config | 配置检查)
+		printf '    %-14s %s%s%s\n' "$1" "$C_CYAN" "$2" "$C_RESET"
+		;;
+	*) printf '    %-14s %s\n' "$1" "$2" ;;
+	esac
+}
+success() { printf '%s✓%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+warn() { printf '%s!%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
+error() { printf '%s✗%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
+cleanup() {
+	[ -z "$TMP_AGENT" ] || rm -f "$TMP_AGENT"
+	[ -z "$TMP_DIR" ] || rm -rf "$TMP_DIR"
+	[ -z "$AGENT_CANDIDATE" ] || rm -f "$AGENT_CANDIDATE"
+	[ -z "$SING_BOX_STAGED" ] || rm -f "$SING_BOX_STAGED"
+}
+on_exit() {
+	status=$?
+	cleanup
+	if [ "$status" -ne 0 ] && [ -n "$CURRENT_STEP" ]; then
+		error "安装失败"
+		detail "阶段" "$CURRENT_STEP"
+		detail "原因" "$FAIL_REASON"
+	fi
+}
+trap 'on_exit' EXIT
+trap 'exit 1' HUP INT TERM
+
+fail() { FAIL_REASON="$*"; exit 1; }
+
+print_summary() {
+	step 5 "安装完成摘要"
+	printf '\n%s========================================%s\n' "$C_GREEN" "$C_RESET"
+	printf ' %s安装完成%s\n' "$C_GREEN" "$C_RESET"
+	printf '%s========================================%s\n' "$C_GREEN" "$C_RESET"
+	printf '\n系统\n'
+	detail "OS" "$OS_NAME"
+	detail "Architecture" "$MACHINE"
+	detail "Init" "$INIT"
+	printf '\nMonitor Agent\n'
+	detail "Binary" "$BIN"
+	if [ "$INIT" = systemd ]; then SERVICE_NAME=monitor-agent.service; else SERVICE_NAME=monitor-agent; fi
+	detail "Service" "$SERVICE_NAME"
+	detail "Status" "$AGENT_STATUS"
+	printf '\nsing-box\n'
+	detail "Source" "$SING_BOX_SOURCE"
+	if [ "$SING_BOX_SOURCE" = system ]; then
+		detail "Binary" "$SING_BOX_SYSTEM_PATH"
+		if [ "$SING_BOX_SYSTEM_PATH" = "$SING_BOX" ]; then
+			detail "Agent Path" "$SING_BOX"
+		else
+			detail "Agent Path" "$SING_BOX -> $SING_BOX_SYSTEM_PATH"
+		fi
+	else
+		detail "Binary" "$SING_BOX"
+	fi
+	detail "Version" "${SING_BOX_VER:-未知}"
+	detail "Config" "$SING_BOX_CONFIG"
+	if [ "$SING_BOX_SOURCE" = installer ]; then
+		if [ "$INIT" = systemd ]; then SERVICE_NAME=sing-box.service; else SERVICE_NAME=sing-box; fi
+		detail "Service" "$SERVICE_NAME"
+	fi
+	detail "Status" "$SING_BOX_STATUS"
+	printf '\n常用命令\n'
+	if [ "$INIT" = systemd ]; then
+		detail "Agent 状态" "systemctl status monitor-agent"
+		detail "Agent 日志" "journalctl -u monitor-agent -f"
+		detail "Agent 重启" "systemctl restart monitor-agent"
+		detail "sing-box 状态" "systemctl status sing-box"
+		detail "sing-box 日志" "journalctl -u sing-box -f"
+		detail "sing-box 重启" "systemctl restart sing-box"
+	else
+		detail "Agent 状态" "rc-service monitor-agent status"
+		detail "Agent 重启" "rc-service monitor-agent restart"
+		detail "sing-box 状态" "rc-service sing-box status"
+		detail "sing-box 重启" "rc-service sing-box restart"
+	fi
+	detail "配置检查" "$SING_BOX check -c $SING_BOX_CONFIG"
+}
 
 while [ $# -gt 0 ]; do
 	# A flag with no argument: under set -u, `$2` aborts with the shell's own
@@ -50,7 +154,29 @@ while [ $# -gt 0 ]; do
 	esac
 done
 
-[ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 1; }
+step 0 "检查系统环境"
+[ "$(id -u)" = 0 ] || { CURRENT_STEP="检查系统环境"; FAIL_REASON="请使用 root 用户运行安装程序"; fail "$FAIL_REASON"; }
+if [ -r /etc/os-release ]; then
+	OS_NAME=$(sed -n 's/^PRETTY_NAME=//p' /etc/os-release | head -n 1 | tr -d '"')
+else
+	OS_NAME=$(uname -s)
+fi
+[ -n "$OS_NAME" ] || OS_NAME="未知 Linux"
+MACHINE=$(uname -m)
+if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+	INIT=systemd
+elif [ -e /run/openrc/softlevel ] && command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1; then
+	INIT=openrc
+else
+	CURRENT_STEP="检查系统环境"
+	FAIL_REASON="不支持当前 init system；目前支持 systemd 和 OpenRC"
+	exit 1
+fi
+detail "系统" "$OS_NAME"
+detail "架构" "$MACHINE"
+detail "Init" "$INIT"
+detail "用户" "$(id -un)"
+success "系统检查完成"
 
 # Removes exactly what an install writes and nothing else, for both init
 # systems: the one present now need not be the one the install found, and
@@ -66,7 +192,7 @@ if [ -n "$UNINSTALL" ]; then
 	systemctl daemon-reload 2>/dev/null || true
 	userdel monitor-agent 2>/dev/null || deluser monitor-agent 2>/dev/null || true
 	rmdir "$ROOT" 2>/dev/null || true
-	echo "monitor-agent uninstalled"
+	success "monitor-agent 已卸载"
 	exit 0
 fi
 
@@ -108,7 +234,7 @@ if [ -z "$INTERVAL" ]; then
 	INTERVAL=$(cat "$UNIT_FILE" "$RC_FILE" 2>/dev/null | sed -n \
 		-e 's/^ExecStart=.* --interval \([0-9][0-9]*\).*/\1/p' \
 		-e 's/^command_args="--interval \([0-9][0-9]*\).*/\1/p' | tail -n 1)
-	if [ -n "$INTERVAL" ]; then echo "keeping --interval $INTERVAL from the previous install"; else INTERVAL=1; fi
+	if [ -n "$INTERVAL" ]; then info "保留上次安装的 --interval $INTERVAL"; else INTERVAL=1; fi
 fi
 case "$INTERVAL" in "" | *[!0-9]*) echo "interval must be an integer from 1 to 3600" >&2; exit 2 ;; esac
 [ "$INTERVAL" -ge 1 ] && [ "$INTERVAL" -le 3600 ] || { echo "interval must be from 1 to 3600" >&2; exit 2; }
@@ -126,7 +252,7 @@ case "$INTERVAL" in "" | *[!0-9]*) echo "interval must be an integer from 1 to 3
 # keeps it inert where OpenRC sources the file as shell.
 if [ -z "$IFACE_SET" ]; then
 	IFACE=$(sed -n 's/^MONITOR_IFACE=//p' "$ENV_FILE" 2>/dev/null | tail -n 1)
-	[ -z "$IFACE" ] || echo "keeping --iface $IFACE from the previous install"
+	[ -z "$IFACE" ] || info "保留上次安装的 --iface $IFACE"
 else
 	case ",$IFACE," in
 	*[!A-Za-z0-9._,-]* | *,-,* | *,--*)
@@ -193,41 +319,15 @@ http://*)
 			echo "refusing plaintext http:// to a remote hub; use https://, or --insecure if it has no TLS" >&2
 			exit 2
 		}
-		echo "warning: --insecure over plain HTTP to $SERVER" >&2
+		warn "--insecure 将通过未加密的 HTTP 连接远程 Hub"
 		echo "         the token and every report travel in the clear, and the binary" >&2
 		echo "         installed below is fetched over the same unverified channel" >&2
 	fi
 	;;
 esac
-if command -v systemctl >/dev/null; then
-	INIT=systemd
-elif command -v rc-update >/dev/null; then
-	INIT=openrc
-else
-	echo "this installer needs systemd or OpenRC" >&2
-	exit 1
-fi
-
-# Alpine ships BusyBox adduser rather than useradd: -S system, -D no password,
-# -H no home.
-add_user() {
-	if command -v useradd >/dev/null; then
-		useradd --system --no-create-home --shell /usr/sbin/nologin monitor-agent
-	else
-		adduser -S -D -H -s /sbin/nologin monitor-agent
-	fi
-}
-
-# The service user the agent runs as under either init system, created before
-# the download and the registration, so a host where this fails keeps the agent
-# it already runs and spends no registration key. One case passes this check
-# without a user and is settled after the old agent stops; see there.
-id -u monitor-agent >/dev/null 2>&1 || add_user ||
-	{ echo "cannot create the system user monitor-agent" >&2; exit 1; }
-
 case "$(uname -m)" in
-x86_64 | amd64) ARCH=x86_64 ;;
-aarch64 | arm64) ARCH=aarch64 ;;
+x86_64 | amd64) ARCH=x86_64; SING_BOX_ARCH=amd64 ;;
+aarch64 | arm64) ARCH=aarch64; SING_BOX_ARCH=arm64 ;;
 *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
 esac
 
@@ -235,31 +335,32 @@ esac
 # to: an IPv6-only or blocked machine cannot resolve github.com. A hub unable to
 # fetch releases itself is configured with a GitHub proxy in its own settings,
 # which is why none is requested here.
+step 1 "安装 monitor-agent"
+detail "架构" "$ARCH"
+detail "安装位置" "$BIN"
 URL="${SERVER%/}/agent/$ARCH"
-TMP="$(mktemp)"
-trap 'rm -f "$TMP"' EXIT
+TMP_AGENT=$(mktemp)
 
-echo "downloading monitor-agent ($ARCH)"
+info "正在下载 monitor-agent"
 # The hub relays four downloads at once and queues the rest for 30 seconds. A
 # batch run on more machines than drain in that time is turned away with 503,
 # which is retried here rather than failing the machine. Any other refusal is
 # final and shown with the hub's own reason, which --fail would discard.
 TRIES=0
 while :; do
-	CODE=$(curl -sSL --max-time 300 -w '%{http_code}' "$URL" -o "$TMP") || exit 1
+	CODE=$(curl -sSL --max-time 300 -w '%{http_code}' "$URL" -o "$TMP_AGENT" 2>/dev/null) || { FAIL_REASON="下载 monitor-agent 失败"; exit 1; }
 	[ "$CODE" = 503 ] && [ "$TRIES" -lt 5 ] || break
 	TRIES=$((TRIES + 1))
-	echo "the hub is busy relaying to other machines; retrying in 5 seconds"
+	warn "Hub 正在处理中，5 秒后重试"
 	sleep 5
 done
-[ "$CODE" = 200 ] ||
-	{ printf 'download failed (HTTP %s): %s\n' "$CODE" "$(head -n 1 "$TMP" | cut -c1-500)" >&2; exit 1; }
+[ "$CODE" = 200 ] || { FAIL_REASON="monitor-agent 下载失败 (HTTP $CODE)"; exit 1; }
 # A relay can answer 200 with something other than the program, such as a
 # mirror's error page. Checked before the running agent is stopped, so a batch
 # run through such a relay leaves each machine on the agent it had, rather than
 # on bytes that cannot start while this script reports success.
-[ "$(head -c 4 "$TMP")" = "$(printf '\177ELF')" ] ||
-	{ echo "the download is not a Linux executable: $(head -n 1 "$TMP" | tr -cd '[:print:]' | cut -c1-200)" >&2; exit 1; }
+[ "$(head -c 4 "$TMP_AGENT")" = "$(printf '\177ELF')" ] || { FAIL_REASON="下载内容不是 Linux 可执行文件"; fail "$FAIL_REASON"; }
+success "下载完成"
 
 # Downloaded before the registration below, because that step spends a node: the
 # key returns a token and the panel gains a row, while the env file recording it
@@ -287,7 +388,7 @@ if [ -z "$TOKEN" ]; then
 	# --name as given on this machine, or else the hostname, restricted to
 	# characters a hostname may contain. The hub trims and bounds either.
 	[ -n "$NAME" ] || NAME=$(hostname 2>/dev/null | tr -cd 'A-Za-z0-9._-' | cut -c1-64)
-	echo "registering $NAME with the hub"
+	info "正在向 Hub 注册 $NAME"
 	# curl sends no header at all for an empty $HELD. The status follows the body
 	# on a line of its own, so a refusal shows the hub's own reason: a closed
 	# window, a lockout, an entry that is not an https domain and a database
@@ -295,52 +396,151 @@ if [ -z "$TOKEN" ]; then
 	# stops here, with curl's own message. The name travels on stdin: as an
 	# argument, one beginning with @ would be read as a file to send.
 	REPLY=$(printf '%s' "$NAME" | curl -sS --max-time 30 -w '\n%{http_code}' -H "Authorization: Bearer $REGISTER" \
-		-H "X-Node-Token: $HELD" --data-binary @- "${SERVER%/}/api/agent/register") || exit 1
+		-H "X-Node-Token: $HELD" --data-binary @- "${SERVER%/}/api/agent/register" 2>/dev/null) || { FAIL_REASON="向 Hub 注册 monitor-agent 失败"; exit 1; }
 	CODE=$(printf '%s\n' "$REPLY" | tail -n 1)
 	TOKEN=$(printf '%s\n' "$REPLY" | sed '$d')
 	if [ "$CODE" != 200 ]; then
 		# The hub answers in one line of text. A proxy or CDN in front may answer
 		# with a page of HTML instead, of which the first line is enough.
-		printf 'registration failed (HTTP %s): %s\n' "$CODE" "$(printf '%s\n' "$TOKEN" | head -n 1 | cut -c1-500)" >&2
-		[ -z "$HELD" ] || echo "if this machine's node was deleted or its token reissued, the token it holds no longer counts." >&2
+		printf 'registration failed (HTTP %s)\n' "$CODE" >&2
+		[ -z "$HELD" ] || warn "如果节点已删除或 token 已重新签发，本机持有的 token 将不再有效"
 		exit 1
 	fi
-	[ -n "$TOKEN" ] || { echo "the hub answered without a token" >&2; exit 1; }
+	[ -n "$TOKEN" ] || { FAIL_REASON="Hub 响应中没有 token"; fail "$FAIL_REASON"; }
 	if [ "$TOKEN" = "$HELD" ]; then
-		echo "this machine is already registered; keeping its token and the name the panel shows"
+		info "此主机已注册，保留当前 token 和面板中的名称"
 	elif [ -n "$HELD" ]; then
-		echo "the token this machine held no longer opens a node; registered as a new node."
-		echo "if that token was reissued rather than its node deleted, delete the old node in the panel."
+		warn "旧 token 已不再对应有效节点，本次已注册为新节点；如旧节点仍存在，请在面板删除"
 	fi
 fi
 
-# Stop an agent already running here before replacing its binary. The service
-# name is fixed, so a reinstall could never start a second copy, but without this
-# the new binary lands beneath a live process and only the restart at the end
-# picks it up. Stopping first also means the copy does not depend on `install`
-# unlinking rather than failing with ETXTBSY. Placed after the download, so a
-# node that cannot fetch the binary keeps running.
-if [ "$INIT" = openrc ]; then
-	rc-service monitor-agent stop 2>/dev/null || true
-else
-	systemctl stop monitor-agent 2>/dev/null || true
-	# An agent installed before the fixed user ran under DynamicUser=, and while
-	# it runs nss-systemd resolves its transient user of the same name: the check
-	# above passes, and useradd refuses the name as taken. Stopping the unit
-	# releases that user, so the fixed one is created here. Should that fail, the
-	# old binary and unit are still in place and are started again.
-	id -u monitor-agent >/dev/null 2>&1 || add_user || {
-		systemctl start monitor-agent 2>/dev/null || true
-		echo "cannot create the system user monitor-agent" >&2
-		exit 1
-	}
-fi
+# Keep the existing registration and credential flow above intact. Stage the
+# validated agent beside its destination and rename atomically so a failed copy
+# cannot truncate the currently installed executable.
 install -d -m 0755 "$ROOT"
-# Kept until the new binary has proved it starts; see not_started. Never over
-# an existing copy: a run that died before that check left an unproven binary
-# in $BIN, and the copy is the one that ran before it.
+AGENT_CANDIDATE="$ROOT/.monitor-agent.$$"
+install -m 0755 "$TMP_AGENT" "$AGENT_CANDIDATE"
 [ ! -f "$BIN" ] || [ -f "$BIN.old" ] || cp "$BIN" "$BIN.old"
-install -m 0755 "$TMP" "$BIN"
+mv -f "$AGENT_CANDIDATE" "$BIN"
+success "monitor-agent binary 安装完成"
+
+# Existing sing-box installations are never modified. The fixed Agent path is
+# supplied by a symlink only when it is free.
+step 2 "检查 sing-box"
+SING_BOX_SOURCE="installer"
+SING_BOX_SYSTEM_PATH=""
+SING_BOX_VER=""
+if SING_BOX_SYSTEM_PATH=$(command -v sing-box 2>/dev/null); then
+	SING_BOX_SOURCE="system"
+	SING_BOX_VER=$("$SING_BOX_SYSTEM_PATH" version 2>/dev/null | sed -n '1s/.*version[[:space:]]*//p')
+	detail "状态" "已安装"
+	detail "路径" "$SING_BOX_SYSTEM_PATH"
+	detail "版本" "${SING_BOX_VER:-未知}"
+	if [ -e "$SING_BOX" ] || [ -L "$SING_BOX" ]; then
+		if [ "$SING_BOX_SYSTEM_PATH" = "$SING_BOX" ] && [ -x "$SING_BOX" ]; then
+			detail "Agent 路径" "$SING_BOX"
+		elif [ -L "$SING_BOX" ] && [ "$(readlink "$SING_BOX")" = "$SING_BOX_SYSTEM_PATH" ] && [ -x "$SING_BOX" ]; then
+			detail "Agent 路径" "$SING_BOX -> $SING_BOX_SYSTEM_PATH"
+		else
+			FAIL_REASON="$SING_BOX 已存在且不是指向系统 sing-box 的正确链接"
+			fail "$FAIL_REASON"
+		fi
+	else
+		ln -s "$SING_BOX_SYSTEM_PATH" "$SING_BOX"
+		detail "Agent 路径" "$SING_BOX -> $SING_BOX_SYSTEM_PATH"
+	fi
+	warn "检测到已有 sing-box，跳过安装"
+	if [ ! -f "$SING_BOX_CONFIG" ]; then
+		warn "已检测到 sing-box，但未找到 $SING_BOX_CONFIG；Agent 配置管理默认使用该路径"
+	fi
+else
+	if [ "$INIT" = systemd ]; then
+		[ ! -e "$SING_BOX_UNIT" ] && [ ! -L "$SING_BOX_UNIT" ] || { FAIL_REASON="$SING_BOX_UNIT 已存在，为保护已有服务定义已停止"; fail "$FAIL_REASON"; }
+	else
+		[ ! -e "$SING_BOX_RC" ] && [ ! -L "$SING_BOX_RC" ] || { FAIL_REASON="$SING_BOX_RC 已存在，为保护已有服务定义已停止"; fail "$FAIL_REASON"; }
+	fi
+	SING_BOX_URL="https://github.com/SagerNet/sing-box/releases/download/v${SING_BOX_VERSION}/sing-box-${SING_BOX_VERSION}-linux-${SING_BOX_ARCH}.tar.gz"
+	TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/monitor-install.XXXXXX")
+	info "正在下载 sing-box $SING_BOX_VERSION"
+	curl -fsSL --max-time 300 "$SING_BOX_URL" -o "$TMP_DIR/sing-box.tar.gz" || { FAIL_REASON="下载 sing-box 失败"; exit 1; }
+	tar -xzf "$TMP_DIR/sing-box.tar.gz" -C "$TMP_DIR" || { FAIL_REASON="解压 sing-box 失败"; exit 1; }
+	SING_BOX_CANDIDATE="$TMP_DIR/sing-box-${SING_BOX_VERSION}-linux-${SING_BOX_ARCH}/sing-box"
+	[ -s "$SING_BOX_CANDIDATE" ] || { FAIL_REASON="sing-box archive 中未找到 binary"; fail "$FAIL_REASON"; }
+	chmod 0755 "$SING_BOX_CANDIDATE"
+	"$SING_BOX_CANDIDATE" version >/dev/null 2>&1 || { FAIL_REASON="sing-box binary 无法运行"; fail "$FAIL_REASON"; }
+	SING_BOX_VER=$("$SING_BOX_CANDIDATE" version 2>/dev/null | sed -n '1s/.*version[[:space:]]*//p')
+	[ ! -e "$SING_BOX" ] && [ ! -L "$SING_BOX" ] || { FAIL_REASON="$SING_BOX 路径冲突；为保护现有文件已停止"; fail "$FAIL_REASON"; }
+	SING_BOX_STAGED="$ROOT/.sing-box.$$"
+	install -m 0755 "$SING_BOX_CANDIDATE" "$SING_BOX_STAGED"
+	mv "$SING_BOX_STAGED" "$SING_BOX"
+	SING_BOX_STAGED=""
+	install -d -m 0755 /etc/sing-box
+	if [ ! -e "$SING_BOX_CONFIG" ] && [ ! -L "$SING_BOX_CONFIG" ]; then
+		(
+			umask 022
+			cat >"$SING_BOX_CONFIG" <<'CONFIG'
+{
+  "inbounds": [],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ]
+}
+CONFIG
+		)
+	else
+		warn "保留已有配置 $SING_BOX_CONFIG"
+	fi
+	"$SING_BOX" check -c "$SING_BOX_CONFIG" || { FAIL_REASON="sing-box 配置校验失败: $SING_BOX_CONFIG"; fail "$FAIL_REASON"; }
+	detail "状态" "本次安装"
+	detail "版本" "$SING_BOX_VER"
+	success "sing-box 安装及配置校验完成"
+fi
+
+# Existing config is never rewritten, including when sing-box itself was
+# already present. Validate it only when the standard path exists.
+if [ -f "$SING_BOX_CONFIG" ] && [ "$SING_BOX_SOURCE" = system ]; then
+	"$SING_BOX" check -c "$SING_BOX_CONFIG" || { FAIL_REASON="当前 sing-box 配置校验失败: $SING_BOX_CONFIG"; fail "$FAIL_REASON"; }
+	success "现有 sing-box 配置校验通过"
+fi
+
+step 3 "初始化系统服务"
+if [ "$SING_BOX_SOURCE" = installer ]; then
+	if [ "$INIT" = systemd ]; then
+		cat >"$SING_BOX_UNIT" <<UNIT
+[Unit]
+Description=sing-box service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$SING_BOX run -c $SING_BOX_CONFIG
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+	else
+		cat >"$SING_BOX_RC" <<'RC'
+#!/sbin/openrc-run
+description="sing-box service"
+command="/opt/monitor/sing-box"
+command_args="run -c /etc/sing-box/config.json"
+supervisor="supervise-daemon"
+respawn_delay=3
+
+depend() {
+	need net
+}
+RC
+		chmod 0755 "$SING_BOX_RC"
+	fi
+fi
+
 
 # The token lives in a root-only environment file rather than the unit, keeping
 # it out of `systemctl cat` and the world-readable journal. 0600 root is what
@@ -351,17 +551,19 @@ install -m 0755 "$TMP" "$BIN"
 	umask 077
 	cat >"$ENV_FILE" <<ENV
 MONITOR_SERVER=$SERVER
-MONITOR_TOKEN=$TOKEN
+	MONITOR_TOKEN=$TOKEN
 ENV
 	[ -z "$IFACE" ] || printf 'MONITOR_IFACE=%s\n' "$IFACE" >>"$ENV_FILE"
 )
+chmod 0600 "$ENV_FILE"
 
 # The new agent is not running. The binary it replaced is put back and started
 # again, so a failed upgrade leaves the machine reporting as before; the unit
 # and env file just written suit that binary as well, since an upgrade keeps the
 # token and the settings. A first install has nothing to put back.
 not_started() {
-	echo "monitor-agent did not start; see: $1" >&2
+	FAIL_REASON="monitor-agent 未能启动；查看 $1"
+	error "$FAIL_REASON"
 	[ -f "$BIN.old" ] || exit 1
 	mv -f "$BIN.old" "$BIN"
 	if [ "$INIT" = openrc ]; then
@@ -369,7 +571,7 @@ not_started() {
 	else
 		systemctl restart monitor-agent || true
 	fi
-	echo "the previous monitor-agent binary is back in place and was restarted" >&2
+	warn "已恢复之前的 monitor-agent binary 并尝试重新启动"
 	exit 1
 }
 
@@ -380,7 +582,6 @@ description="monitor agent"
 command="$BIN"
 command_args="--interval $INTERVAL${INSECURE:+ --insecure}"
 supervisor="supervise-daemon"
-command_user="monitor-agent"
 respawn_delay=5
 output_log="$LOG_FILE"
 error_log="$LOG_FILE"
@@ -389,20 +590,25 @@ depend() {
 	need net
 }
 
-# The token stays in the root-only env file rather than the service script;
-# this runs as root, and the agent inherits what it exports. supervise-daemon
-# opens the log only after dropping to command_user, so the file must be the
-# agent's, including one an earlier install left to root.
+# The token stays in the root-only env file rather than the service script.
 start_pre() {
-	checkpath --file --owner monitor-agent --mode 0600 $LOG_FILE
 	set -a
-	. $ENV_FILE
+	. "$ENV_FILE"
 	set +a
 }
 RC
 	chmod 0755 "$RC_FILE"
+	success "系统服务定义已初始化"
+	step 4 "启动服务"
+	if [ "$SING_BOX_SOURCE" = installer ]; then
+		rc-update add sing-box default >/dev/null
+		rc-service sing-box restart || { FAIL_REASON="sing-box 启动失败"; fail "$FAIL_REASON"; }
+		rc-service sing-box status >/dev/null 2>&1 || { FAIL_REASON="sing-box 未能进入运行状态"; fail "$FAIL_REASON"; }
+	else
+		rc-service sing-box status >/dev/null 2>&1 || warn "sing-box 已安装，但当前未检测到运行状态"
+	fi
 	rc-update add monitor-agent default >/dev/null
-	rc-service monitor-agent restart
+	rc-service monitor-agent restart || not_started "$LOG_FILE"
 	# supervise-daemon reports the service started while it respawns an agent
 	# that exits at once, so the process itself is what is looked for, inside
 	# the respawn delay. pidof rather than pgrep -x, which BusyBox matches
@@ -410,7 +616,12 @@ RC
 	sleep 3
 	pidof monitor-agent >/dev/null || not_started "$LOG_FILE"
 	rm -f "$BIN.old"
-	echo "monitor-agent installed; follow it with: tail -f $LOG_FILE"
+	AGENT_STATUS=running
+	SING_BOX_STATUS=unknown
+	if rc-service sing-box status >/dev/null 2>&1; then SING_BOX_STATUS=running; else SING_BOX_STATUS=not-running; fi
+	success "monitor-agent 安装并启动完成"
+	CURRENT_STEP=""
+	print_summary
 	exit 0
 fi
 
@@ -426,16 +637,10 @@ EnvironmentFile=$ENV_FILE
 ExecStart=$BIN --interval $INTERVAL${INSECURE:+ --insecure}
 Restart=always
 RestartSec=5
-# A fixed user rather than DynamicUser=: when the mount namespace cannot be
-# created, as in an LXC container without nesting, systemd skips ProtectSystem=
-# and the other mount sandboxing for a unit with a static User=, but refuses to
-# start one with DynamicUser= and exits 226/NAMESPACE. DynamicUser= also implied
-# RestrictSUIDSGID=, which is therefore stated below.
-User=monitor-agent
+ProtectSystem=full
+ProtectHome=yes
 NoNewPrivileges=yes
 RestrictSUIDSGID=yes
-ProtectSystem=strict
-ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
 # AF_NETLINK is how getifaddrs(3) obtains this host's own addresses from the
@@ -447,18 +652,28 @@ MemoryMax=64M
 WantedBy=multi-user.target
 UNIT
 
+success "系统服务定义已初始化"
+step 4 "启动服务"
+if [ "$SING_BOX_SOURCE" = installer ]; then
+	systemctl daemon-reload
+	systemctl enable sing-box.service >/dev/null
+	systemctl restart sing-box.service || { FAIL_REASON="sing-box 启动失败"; fail "$FAIL_REASON"; }
+	if systemctl is-active --quiet sing-box.service; then SING_BOX_STATUS=running; else FAIL_REASON="sing-box 未能进入 active 状态"; fail "$FAIL_REASON"; fi
+else
+	if systemctl is-active --quiet sing-box.service; then SING_BOX_STATUS=running; else SING_BOX_STATUS=not-running; warn "sing-box 已安装，但当前未检测到运行状态"; fi
+fi
 systemctl daemon-reload
-systemctl enable monitor-agent >/dev/null
-# restart rather than `enable --now`: --now leaves an already-running service
-# untouched, so reinstalling over a live agent would keep the old binary
-# running.
-systemctl restart monitor-agent
+systemctl enable monitor-agent.service >/dev/null
+systemctl restart monitor-agent.service || not_started "journalctl -u monitor-agent -n 20"
 # Type=simple counts the service started once it is forked, so `restart` above
 # succeeds also for one that fails at once -- a user it cannot resolve
 # (217/USER), a binary that exits -- and is then restarted every RestartSec.
 # Checked inside that window, so a batch run shows the failure on the machine
 # where it happened rather than a line reading "installed".
 sleep 3
-systemctl is-active --quiet monitor-agent || not_started "journalctl -u monitor-agent -n 20"
+systemctl is-active --quiet monitor-agent.service || not_started "journalctl -u monitor-agent -n 20"
 rm -f "$BIN.old"
-echo "monitor-agent installed; follow it with: journalctl -u monitor-agent -f"
+AGENT_STATUS=running
+success "monitor-agent 安装并启动完成"
+CURRENT_STEP=""
+print_summary

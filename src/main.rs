@@ -27,6 +27,7 @@ macro_rules! refuse {
 mod agent_ws;
 mod api;
 mod auth;
+mod command;
 mod db;
 mod frontend;
 mod notify;
@@ -58,6 +59,9 @@ pub struct App {
     /// and its latest report. A single map, since connectivity and current
     /// figures are one fact about a node rather than two. See `agent_ws`.
     pub agents: RwLock<HashMap<i64, Agent>>,
+    /// In-memory command requests and responses, bound to the agent session
+    /// that accepted each request. See `command` and `agent_ws`.
+    pub commands: command::Registry,
     /// Each node's newest traffic reading, booked about once a minute rather
     /// than with every report. Per node rather than per connection; see
     /// `agent_ws::file`.
@@ -102,6 +106,7 @@ impl App {
         Self {
             db,
             agents: RwLock::default(),
+            commands: command::Registry::default(),
             readings: Mutex::default(),
             snapshot: Mutex::new([(0, Default::default()), (0, Default::default())]),
             throttle: auth::Throttle::default(),
@@ -467,6 +472,7 @@ async fn main() -> Result<()> {
 
     let held = app.clone();
     tokio::spawn(housekeeping(app.clone()));
+    tokio::spawn(command::cleanup_loop(app.clone()));
     tokio::spawn(notify::deliver(app.clone(), inbox));
     tokio::spawn(notify::watch(app.clone()));
 
@@ -520,6 +526,16 @@ async fn main() -> Result<()> {
                 .route("/api/db/restore", post(api::db_restore))
                 .route("/api/themes", post(api::upload_theme))
                 .layer(tower_http::limit::RequestBodyLimitLayer::new(api::MAX_CHUNK))
+                .with_state(app.clone()),
+        )
+        // Command parameters may contain the Agent's 1 MiB config string. The
+        // larger bound is isolated to these routes; all other API bodies retain
+        // the 64 KiB ceiling above.
+        .merge(
+            Router::new()
+                .route("/api/nodes/{id}/commands", post(api::create_command))
+                .route("/api/nodes/{id}/commands/{command_id}", get(api::command_status))
+                .layer(tower_http::limit::RequestBodyLimitLayer::new(8 * 1024 * 1024))
                 .with_state(app.clone()),
         )
         .layer(axum::middleware::map_response(api::plain_errors))
