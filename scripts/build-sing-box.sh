@@ -22,7 +22,10 @@ esac
 	exit 1
 }
 
-BUILD_TAGS=$(cat "$SOURCE_DIR/release/DEFAULT_BUILD_TAGS")
+# Naive outbound requires the Linux Chromium/cronet toolchain (or a separate
+# libcronet.so at runtime). The released binary is a single standalone file,
+# so use sing-box's non-naive tag set when building without CGO.
+BUILD_TAGS=$(cat "$SOURCE_DIR/release/DEFAULT_BUILD_TAGS_OTHERS")
 BUILD_TAGS="$BUILD_TAGS,with_v2ray_api"
 LDFLAGS=$(cat "$SOURCE_DIR/release/LDFLAGS")
 OUTPUT_DIR=$(dirname "$OUTPUT")
