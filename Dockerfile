@@ -11,6 +11,7 @@ RUN apk add --no-cache tzdata && mkdir /data
 
 FROM scratch
 ARG TARGETARCH
+LABEL org.opencontainers.image.source="https://github.com/lzj565/monitor"
 
 # The day and billing-period boundaries are local dates on purpose (db.rs), and
 # chrono falls back to UTC in silence when the zone files are missing. Without
