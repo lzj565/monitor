@@ -37,7 +37,7 @@ OUTPUT="$(cd "$OUTPUT_DIR" && pwd)/$(basename "$OUTPUT")"
 	CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" go build \
 		-trimpath -buildvcs=false \
 		-tags "$BUILD_TAGS" \
-		-ldflags "$LDFLAGS" \
+		-ldflags "$LDFLAGS -X github.com/sagernet/sing-box/constant.Version=$VERSION" \
 		-o "$OUTPUT" ./cmd/sing-box
 )
 
