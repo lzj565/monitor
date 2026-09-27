@@ -144,8 +144,56 @@ CREATE TABLE IF NOT EXISTS ping_record (
 
 CREATE TABLE IF NOT EXISTS session (
   token_hash TEXT    PRIMARY KEY,
-  expires_at INTEGER NOT NULL
+  expires_at INTEGER NOT NULL,
+  principal_type TEXT NOT NULL DEFAULT 'admin',
+  user_id INTEGER
 );
+"#;
+
+// Desired sing-box state. `node` is this hub's existing machine table. Kept
+// separate because open() runs it before the versioned migration for old files.
+const RESOURCE_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS proxies (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  node_id INTEGER NOT NULL REFERENCES node(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  include_node_name INTEGER NOT NULL DEFAULT 0,
+  protocol TEXT NOT NULL,
+  address_type TEXT NOT NULL,
+  address TEXT NOT NULL,
+  port INTEGER NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  config TEXT NOT NULL DEFAULT '{}',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_proxies_node_id ON proxies(node_id);
+
+CREATE TABLE IF NOT EXISTS users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  username TEXT NOT NULL,
+  uuid TEXT NOT NULL UNIQUE,
+  password_hash TEXT,
+  subscription_token TEXT NOT NULL DEFAULT '',
+  enabled INTEGER NOT NULL DEFAULT 1,
+  expires_at INTEGER,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(username);
+
+CREATE TABLE IF NOT EXISTS user_proxy_authorizations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  proxy_id INTEGER NOT NULL REFERENCES proxies(id) ON DELETE CASCADE,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  auth TEXT NOT NULL DEFAULT '{}',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_user_proxy_authorizations_unique ON user_proxy_authorizations(user_id,proxy_id);
+CREATE INDEX IF NOT EXISTS idx_user_proxy_authorizations_user_id ON user_proxy_authorizations(user_id);
+CREATE INDEX IF NOT EXISTS idx_user_proxy_authorizations_proxy_id ON user_proxy_authorizations(proxy_id);
 "#;
 
 /// Schema revision this build expects, stamped into `PRAGMA user_version`.
@@ -162,7 +210,7 @@ CREATE TABLE IF NOT EXISTS session (
 /// cannot: `open` runs `SCHEMA` before migrating, and on an older file the
 /// column is not there yet. `an_upgraded_release_matches_a_fresh_database`
 /// holds every migration to these rules, starting from v1.0.0's schema.
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 13;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -294,6 +342,87 @@ fn migrate_to_9(conn: &Connection) -> Result<()> {
     add_column(conn, "ping_task", "sort INTEGER NOT NULL DEFAULT 0")
 }
 
+fn migrate_to_10(conn: &Connection) -> Result<()> {
+    conn.execute_batch(RESOURCE_SCHEMA)?;
+    Ok(())
+}
+
+fn migrate_to_11(conn: &Connection) -> Result<()> {
+    add_column(conn, "proxies", "include_node_name INTEGER NOT NULL DEFAULT 0")
+}
+
+/// User identity replaces the per-authorization UUID. Old credentials are
+/// intentionally discarded per the operator's instruction; authorization rows
+/// (including flow/enabled/timestamps) survive the table rename.
+fn migrate_to_12(conn: &Connection) -> Result<()> {
+    add_column(conn, "users", "uuid TEXT NOT NULL DEFAULT ''")?;
+    let ids = {
+        let mut stmt = conn.prepare("SELECT id FROM users WHERE uuid='' ORDER BY id")?;
+        let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for id in ids {
+        conn.execute("UPDATE users SET uuid=?2 WHERE id=?1", params![id, uuid_v4()])?;
+    }
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_uuid ON users(uuid)", [])?;
+
+    let old_exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='user_proxy_access')",
+        [],
+        |r| r.get(0),
+    )?;
+    if old_exists {
+        // Version 12's CREATE IF NOT EXISTS may already have made the target
+        // table before this migration. Preserve every relationship and its
+        // non-UUID settings, stripping uuid out of the old auth JSON.
+        conn.execute_batch(
+            "INSERT INTO user_proxy_authorizations(id,user_id,proxy_id,enabled,auth,created_at,updated_at)
+             SELECT id,user_id,proxy_id,enabled,
+                    CASE WHEN json_valid(auth) THEN json_remove(auth,'$.uuid') ELSE '{}' END,
+                    created_at,updated_at FROM user_proxy_access;
+             DROP TABLE user_proxy_access;",
+        )?;
+    }
+    Ok(())
+}
+
+/// Adds web credentials and per-user subscription capabilities. Existing users
+/// deliberately receive no password; an administrator must set one before the
+/// account can be used to sign in. Existing sessions remain administrator
+/// sessions so an upgrade does not log the operator out.
+fn migrate_to_13(conn: &Connection) -> Result<()> {
+    add_column(conn, "users", "password_hash TEXT")?;
+    add_column(conn, "users", "subscription_token TEXT NOT NULL DEFAULT ''")?;
+    add_column(conn, "session", "principal_type TEXT NOT NULL DEFAULT 'admin'")?;
+    add_column(conn, "session", "user_id INTEGER")?;
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_subscription_token
+             ON users(subscription_token) WHERE subscription_token != '';",
+    )?;
+    let ids = {
+        let mut stmt = conn.prepare("SELECT id FROM users WHERE subscription_token='' ORDER BY id")?;
+        let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for id in ids {
+        conn.execute("UPDATE users SET subscription_token=?2 WHERE id=?1", params![id, random_secret()])?;
+    }
+    Ok(())
+}
+
+fn random_secret() -> String {
+    hex::encode(rand::random::<[u8; 32]>())
+}
+
+fn uuid_v4() -> String {
+    let mut bytes = rand::random::<[u8; 16]>();
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!("{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],bytes[1],bytes[2],bytes[3],bytes[4],bytes[5],bytes[6],bytes[7],
+        bytes[8],bytes[9],bytes[10],bytes[11],bytes[12],bytes[13],bytes[14],bytes[15])
+}
+
 /// Brings a database already in service up to `SCHEMA_VERSION` and stamps it.
 /// `from` is its current version, so a fresh file passes `SCHEMA_VERSION` and
 /// receives only the stamp.
@@ -334,14 +463,234 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     if from < 9 {
         migrate_to_9(&tx)?;
     }
+    if from < 10 {
+        migrate_to_10(&tx)?;
+    }
+    if from < 11 {
+        migrate_to_11(&tx)?;
+    }
+    if from < 12 {
+        migrate_to_12(&tx)?;
+    }
+    if from < 13 {
+        migrate_to_13(&tx)?;
+    }
+    seed_default_admin(&tx)?;
     tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     tx.commit()?;
     Ok(())
 }
 
+/// The built-in `admin` resource user exists in every database. Keeping the
+/// insert in the migration transaction also covers restored backups, while
+/// leaving an existing account and its UUID untouched.
+fn seed_default_admin(conn: &Connection) -> Result<()> {
+    let columns = columns_of(conn, "users")?;
+    if !["username", "uuid", "enabled", "expires_at", "created_at", "updated_at", "subscription_token"]
+        .iter()
+        .all(|column| columns.contains(*column))
+    {
+        // Backup preflight also runs migrations before comparing table shapes.
+        // Let its schema check report malformed `users` tables rather than
+        // turning the seed query into an unrelated SQL error.
+        return Ok(());
+    }
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_subscription_token
+             ON users(subscription_token) WHERE subscription_token != '';",
+    )?;
+    let exists: bool =
+        conn.query_row("SELECT EXISTS(SELECT 1 FROM users WHERE username='admin')", [], |r| r.get(0))?;
+    if !exists {
+        let now = Utc::now().timestamp();
+        conn.execute(
+            "INSERT INTO users(username,uuid,subscription_token,enabled,expires_at,created_at,updated_at)
+             VALUES('admin',?1,?2,1,NULL,?3,?3)",
+            params![uuid_v4(), random_secret(), now],
+        )?;
+    }
+    Ok(())
+}
+
 /// Every table a backup must carry before this build will restore it.
-const TABLES: [&str; 8] =
+const TABLES: [&str; 11] = [
+    "setting",
+    "node",
+    "proxies",
+    "users",
+    "user_proxy_authorizations",
+    "traffic",
+    "metric",
+    "ping_task",
+    "ping_node",
+    "ping_record",
+    "session",
+];
+const PRE_RESOURCE_TABLES: [&str; 8] =
     ["setting", "node", "traffic", "metric", "ping_task", "ping_node", "ping_record", "session"];
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Proxy {
+    pub id: i64,
+    pub node_id: i64,
+    pub name: String,
+    pub include_node_name: bool,
+    pub protocol: String,
+    pub address_type: String,
+    pub address: String,
+    pub port: i64,
+    pub enabled: bool,
+    pub config: serde_json::Value,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProxyDraft {
+    pub name: String,
+    pub include_node_name: bool,
+    pub protocol: String,
+    pub address_type: String,
+    pub address: String,
+    pub port: i64,
+    pub enabled: bool,
+    pub config: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyWriteIssue {
+    NodeNotFound,
+    ProxyNotFound,
+    PortConflict,
+    NameConflict,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct User {
+    pub id: i64,
+    pub username: String,
+    pub uuid: String,
+    pub enabled: bool,
+    pub expires_at: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub proxy_count: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct UserDraft {
+    pub username: String,
+    /// `None` preserves the current password on update. Creation requires one.
+    pub password_hash: Option<String>,
+    pub enabled: bool,
+    pub expires_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionPrincipal {
+    Admin,
+    User(i64),
+}
+
+#[derive(Debug, Clone)]
+pub struct UserLoginRecord {
+    pub id: i64,
+    pub password_hash: Option<String>,
+    pub enabled: bool,
+    pub expires_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UserPortalProxy {
+    pub id: i64,
+    pub node_id: i64,
+    pub node_name: String,
+    pub name: String,
+    pub protocol: String,
+    pub address: String,
+    pub address_type: String,
+    pub port: i64,
+    pub server_name: String,
+    pub server_port: i64,
+    pub online: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct UserSubscriptionProxy {
+    pub id: i64,
+    pub node_name: String,
+    pub name: String,
+    pub include_node_name: bool,
+    pub address: String,
+    pub port: i64,
+    pub server_name: String,
+    pub public_key: String,
+    pub short_id: String,
+    pub flow: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserWriteIssue {
+    UserNotFound,
+    UsernameConflict,
+    AdminUsernameLocked,
+    PasswordRequired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserDeleteResult {
+    Deleted,
+    NotFound,
+    Protected,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProxySummary {
+    pub id: i64,
+    pub node_id: i64,
+    pub name: String,
+    pub include_node_name: bool,
+    pub protocol: String,
+    pub address_type: String,
+    pub address: String,
+    pub port: i64,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AuthorizationRecord {
+    pub id: i64,
+    pub user_id: i64,
+    pub proxy_id: i64,
+    pub enabled: bool,
+    pub auth: serde_json::Value,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct AuthorizationDraft {
+    pub enabled: bool,
+    pub auth: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthorizationWriteIssue {
+    UserNotFound,
+    ProxyNotFound,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UserProxyAuthorizationItem {
+    pub proxy: ProxySummary,
+    pub access: AuthorizationSummary,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AuthorizationSummary {
+    pub enabled: bool,
+    pub auth: serde_json::Value,
+}
 
 /// One node's stored configuration and last known facts.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -603,9 +952,14 @@ impl Db {
             .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table'", [], |r| r.get::<_, i64>(0))?
             == 0;
         conn.execute_batch(SCHEMA)?;
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        // Fresh/current schemas already get the idempotent declarations here.
+        // Older databases create these tables inside migrate_to_10's transaction.
+        if fresh || version >= 10 {
+            conn.execute_batch(RESOURCE_SCHEMA)?;
+        }
         restrict(path);
 
-        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         migrate(&conn, if fresh { SCHEMA_VERSION } else { version })?;
         Ok(Self(Mutex::new(conn)))
     }
@@ -652,6 +1006,471 @@ impl Db {
             .conn()
             .query_row("SELECT * FROM node WHERE id = ?1", [id], |r| Ok(row_to_node(r)))
             .optional()?)
+    }
+
+    // ---- desired proxy and user state ----
+
+    pub fn proxies_for_node(&self, node_id: i64) -> Result<Vec<Proxy>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id,node_id,name,include_node_name,protocol,address_type,address,port,enabled,config,created_at,updated_at
+             FROM proxies WHERE node_id=?1 ORDER BY id",
+        )?;
+        let rows = stmt.query_map([node_id], row_to_proxy)?.collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    pub fn proxy(&self, id: i64) -> Result<Option<Proxy>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT id,node_id,name,include_node_name,protocol,address_type,address,port,enabled,config,created_at,updated_at
+                 FROM proxies WHERE id=?1",
+                [id],
+                row_to_proxy,
+            )
+            .optional()?)
+    }
+
+    /// Port uniqueness is a service rule, but it is checked under the same
+    /// writer lock as the insert/update so concurrent requests cannot race.
+    pub fn create_proxy(
+        &self,
+        node_id: i64,
+        draft: &ProxyDraft,
+    ) -> Result<std::result::Result<i64, ProxyWriteIssue>> {
+        let config = serde_json::to_string(&draft.config)?;
+        let conn = self.conn();
+        let node_exists: bool =
+            conn.query_row("SELECT EXISTS(SELECT 1 FROM node WHERE id=?1)", [node_id], |r| r.get(0))?;
+        if !node_exists {
+            return Ok(Err(ProxyWriteIssue::NodeNotFound));
+        }
+        if proxy_name_in_use(&conn, node_id, draft, None)? {
+            return Ok(Err(ProxyWriteIssue::NameConflict));
+        }
+        if draft.enabled && port_in_use(&conn, node_id, draft.port, None)? {
+            return Ok(Err(ProxyWriteIssue::PortConflict));
+        }
+        let now = Utc::now().timestamp();
+        conn.execute(
+            "INSERT INTO proxies(node_id,name,include_node_name,protocol,address_type,address,port,enabled,config,created_at,updated_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?10)",
+            params![node_id, draft.name, draft.include_node_name, draft.protocol, draft.address_type,
+                    draft.address, draft.port, draft.enabled, config, now],
+        )?;
+        Ok(Ok(conn.last_insert_rowid()))
+    }
+
+    pub fn update_proxy(
+        &self,
+        id: i64,
+        target_node_id: Option<i64>,
+        draft: &ProxyDraft,
+    ) -> Result<std::result::Result<(), ProxyWriteIssue>> {
+        let config = serde_json::to_string(&draft.config)?;
+        let conn = self.conn();
+        let current_node_id: Option<i64> =
+            conn.query_row("SELECT node_id FROM proxies WHERE id=?1", [id], |r| r.get(0)).optional()?;
+        let Some(current_node_id) = current_node_id else {
+            return Ok(Err(ProxyWriteIssue::ProxyNotFound));
+        };
+        let node_id = target_node_id.unwrap_or(current_node_id);
+        let node_exists: bool =
+            conn.query_row("SELECT EXISTS(SELECT 1 FROM node WHERE id=?1)", [node_id], |r| r.get(0))?;
+        if !node_exists {
+            return Ok(Err(ProxyWriteIssue::NodeNotFound));
+        }
+        if proxy_name_in_use(&conn, node_id, draft, Some(id))? {
+            return Ok(Err(ProxyWriteIssue::NameConflict));
+        }
+        if draft.enabled && port_in_use(&conn, node_id, draft.port, Some(id))? {
+            return Ok(Err(ProxyWriteIssue::PortConflict));
+        }
+        conn.execute(
+            "UPDATE proxies SET node_id=?2,name=?3,include_node_name=?4,protocol=?5,address_type=?6,address=?7,port=?8,
+                                enabled=?9,config=?10,updated_at=?11 WHERE id=?1",
+            params![
+                id,
+                node_id,
+                draft.name,
+                draft.include_node_name,
+                draft.protocol,
+                draft.address_type,
+                draft.address,
+                draft.port,
+                draft.enabled,
+                config,
+                Utc::now().timestamp()
+            ],
+        )?;
+        Ok(Ok(()))
+    }
+
+    pub fn delete_proxy(&self, id: i64) -> Result<bool> {
+        Ok(self.conn().execute("DELETE FROM proxies WHERE id=?1", [id])? > 0)
+    }
+
+    pub fn users(&self, enabled: Option<bool>, query: Option<&str>) -> Result<Vec<User>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT u.id,u.username,u.uuid,u.enabled,u.expires_at,u.created_at,u.updated_at,
+                    (SELECT COUNT(*) FROM user_proxy_authorizations a WHERE a.user_id=u.id)
+             FROM users u WHERE (?1 IS NULL OR u.enabled=?1) ORDER BY u.id",
+        )?;
+        let rows = stmt.query_map([enabled], row_to_user)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let Some(query) = query.map(str::trim).filter(|q| !q.is_empty()) else { return Ok(rows) };
+        let query = query.to_lowercase();
+        Ok(rows.into_iter().filter(|u| u.username.to_lowercase().contains(&query)).collect())
+    }
+
+    pub fn user(&self, id: i64) -> Result<Option<User>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT u.id,u.username,u.uuid,u.enabled,u.expires_at,u.created_at,u.updated_at,
+                        (SELECT COUNT(*) FROM user_proxy_authorizations a WHERE a.user_id=u.id)
+                 FROM users u WHERE u.id=?1",
+                [id],
+                row_to_user,
+            )
+            .optional()?)
+    }
+
+    pub fn user_login_record(&self, username: &str) -> Result<Option<UserLoginRecord>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT id,password_hash,enabled,expires_at FROM users WHERE username=?1",
+                [username],
+                |r| {
+                    Ok(UserLoginRecord {
+                        id: r.get(0)?,
+                        password_hash: r.get(1)?,
+                        enabled: r.get(2)?,
+                        expires_at: r.get(3)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    pub fn active_user_id_for_subscription_token(&self, token: &str, now: i64) -> Result<Option<i64>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT id FROM users WHERE subscription_token=?1 AND enabled=1
+               AND (expires_at IS NULL OR expires_at>?2)",
+                params![token, now],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn user_subscription_token(&self, id: i64) -> Result<Option<String>> {
+        Ok(self
+            .conn()
+            .query_row("SELECT subscription_token FROM users WHERE id=?1", [id], |r| r.get(0))
+            .optional()?)
+    }
+
+    pub fn rotate_user_subscription_token(&self, id: i64) -> Result<Option<String>> {
+        let token = random_secret();
+        let changed = self.conn().execute(
+            "UPDATE users SET subscription_token=?2,updated_at=?3 WHERE id=?1",
+            params![id, token, Utc::now().timestamp()],
+        )?;
+        Ok((changed > 0).then_some(token))
+    }
+
+    pub fn active_user_portal_proxies(&self, id: i64, now: i64) -> Result<Vec<UserPortalProxy>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT p.id,p.node_id,n.name,p.name,p.protocol,p.address,p.address_type,p.port,
+                    json_extract(p.config,'$.reality.server_name'),
+                    json_extract(p.config,'$.reality.server_port')
+             FROM user_proxy_authorizations a
+             JOIN users u ON u.id=a.user_id
+             JOIN proxies p ON p.id=a.proxy_id
+             JOIN node n ON n.id=p.node_id
+             WHERE a.user_id=?1 AND a.enabled=1 AND p.enabled=1 AND u.enabled=1
+               AND (u.expires_at IS NULL OR u.expires_at>?2)
+             ORDER BY p.node_id,p.id",
+        )?;
+        let proxies = stmt
+            .query_map(params![id, now], |r| {
+                Ok(UserPortalProxy {
+                    id: r.get(0)?,
+                    node_id: r.get(1)?,
+                    node_name: r.get(2)?,
+                    name: r.get(3)?,
+                    protocol: r.get(4)?,
+                    address: r.get(5)?,
+                    address_type: r.get(6)?,
+                    port: r.get(7)?,
+                    server_name: r.get::<_, Option<String>>(8)?.unwrap_or_default(),
+                    server_port: r.get::<_, Option<i64>>(9)?.unwrap_or(443),
+                    online: false,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(proxies)
+    }
+
+    pub fn active_user_subscription(
+        &self,
+        id: i64,
+        now: i64,
+    ) -> Result<Option<(String, Vec<UserSubscriptionProxy>)>> {
+        let conn = self.conn();
+        let Some((uuid, enabled, expires_at)) = conn
+            .query_row("SELECT uuid,enabled,expires_at FROM users WHERE id=?1", [id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?, r.get::<_, Option<i64>>(2)?))
+            })
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        if !enabled || expires_at.is_some_and(|expires| expires <= now) {
+            return Ok(None);
+        }
+        let mut stmt = conn.prepare(
+            "SELECT p.id,n.name,p.name,p.include_node_name,p.address,p.port,
+                    json_extract(p.config,'$.reality.server_name'),
+                    json_extract(p.config,'$.reality.public_key'),
+                    json_extract(p.config,'$.reality.short_id'),
+                    json_extract(a.auth,'$.flow')
+             FROM user_proxy_authorizations a
+             JOIN proxies p ON p.id=a.proxy_id
+             JOIN node n ON n.id=p.node_id
+             WHERE a.user_id=?1 AND a.enabled=1 AND p.enabled=1
+             ORDER BY p.node_id,p.id",
+        )?;
+        let proxies = stmt
+            .query_map([id], |r| {
+                Ok(UserSubscriptionProxy {
+                    id: r.get(0)?,
+                    node_name: r.get(1)?,
+                    name: r.get(2)?,
+                    include_node_name: r.get(3)?,
+                    address: r.get(4)?,
+                    port: r.get(5)?,
+                    server_name: r.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                    public_key: r.get::<_, Option<String>>(7)?.unwrap_or_default(),
+                    short_id: r.get::<_, Option<String>>(8)?.unwrap_or_default(),
+                    flow: r.get::<_, Option<String>>(9)?.unwrap_or_default(),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(Some((uuid, proxies)))
+    }
+
+    pub fn reset_user_uuid(&self, id: i64) -> Result<Option<(String, Vec<i64>)>> {
+        let conn = self.conn();
+        let exists: bool =
+            conn.query_row("SELECT EXISTS(SELECT 1 FROM users WHERE id=?1)", [id], |r| r.get(0))?;
+        if !exists {
+            return Ok(None);
+        }
+        let uuid = uuid_v4();
+        conn.execute(
+            "UPDATE users SET uuid=?2,updated_at=?3 WHERE id=?1",
+            params![id, uuid, Utc::now().timestamp()],
+        )?;
+        let mut stmt = conn.prepare("SELECT DISTINCT p.node_id FROM user_proxy_authorizations a JOIN proxies p ON p.id=a.proxy_id WHERE a.user_id=?1 ORDER BY p.node_id")?;
+        let nodes = stmt.query_map([id], |r| r.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(Some((uuid, nodes)))
+    }
+
+    pub fn nodes_for_user(&self, id: i64) -> Result<Vec<i64>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT DISTINCT p.node_id FROM user_proxy_authorizations a JOIN proxies p ON p.id=a.proxy_id WHERE a.user_id=?1 ORDER BY p.node_id")?;
+        let rows = stmt.query_map([id], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    pub fn create_user(&self, draft: &UserDraft) -> Result<std::result::Result<i64, UserWriteIssue>> {
+        let Some(password_hash) = draft.password_hash.as_deref() else {
+            return Ok(Err(UserWriteIssue::PasswordRequired));
+        };
+        let conn = self.conn();
+        let exists: bool =
+            conn.query_row("SELECT EXISTS(SELECT 1 FROM users WHERE username=?1)", [&draft.username], |r| {
+                r.get(0)
+            })?;
+        if exists {
+            return Ok(Err(UserWriteIssue::UsernameConflict));
+        }
+        let now = Utc::now().timestamp();
+        let uuid = uuid_v4();
+        conn.execute(
+            "INSERT INTO users(username,uuid,password_hash,subscription_token,enabled,expires_at,created_at,updated_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?7)",
+            params![draft.username, uuid, password_hash, random_secret(), draft.enabled, draft.expires_at, now],
+        )?;
+        Ok(Ok(conn.last_insert_rowid()))
+    }
+
+    pub fn update_user(&self, id: i64, draft: &UserDraft) -> Result<std::result::Result<(), UserWriteIssue>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let current: Option<(String, bool, Option<i64>)> = tx
+            .query_row("SELECT username,enabled,expires_at FROM users WHERE id=?1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .optional()?;
+        let Some((current_username, current_enabled, current_expiry)) = current else {
+            return Ok(Err(UserWriteIssue::UserNotFound));
+        };
+        if current_username == "admin" && draft.username != "admin" {
+            return Ok(Err(UserWriteIssue::AdminUsernameLocked));
+        }
+        let conflict: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM users WHERE username=?1 AND id<>?2)",
+            params![draft.username, id],
+            |r| r.get(0),
+        )?;
+        if conflict {
+            return Ok(Err(UserWriteIssue::UsernameConflict));
+        }
+        tx.execute(
+            "UPDATE users SET username=?2,password_hash=COALESCE(?3,password_hash),enabled=?4,expires_at=?5,updated_at=?6 WHERE id=?1",
+            params![id, draft.username, draft.password_hash, draft.enabled, draft.expires_at, Utc::now().timestamp()],
+        )?;
+        if draft.password_hash.is_some()
+            || current_enabled != draft.enabled
+            || current_expiry != draft.expires_at
+        {
+            tx.execute("DELETE FROM session WHERE principal_type='user' AND user_id=?1", [id])?;
+        }
+        tx.commit()?;
+        Ok(Ok(()))
+    }
+
+    pub fn delete_user(&self, id: i64) -> Result<UserDeleteResult> {
+        let conn = self.conn();
+        let username: Option<String> =
+            conn.query_row("SELECT username FROM users WHERE id=?1", [id], |r| r.get(0)).optional()?;
+        match username.as_deref() {
+            None => Ok(UserDeleteResult::NotFound),
+            Some("admin") => Ok(UserDeleteResult::Protected),
+            Some(_) => {
+                conn.execute("DELETE FROM session WHERE principal_type='user' AND user_id=?1", [id])?;
+                conn.execute("DELETE FROM users WHERE id=?1", [id])?;
+                Ok(UserDeleteResult::Deleted)
+            }
+        }
+    }
+
+    pub fn authorizations_for_user(&self, user_id: i64) -> Result<Option<Vec<UserProxyAuthorizationItem>>> {
+        let conn = self.conn();
+        let exists: bool =
+            conn.query_row("SELECT EXISTS(SELECT 1 FROM users WHERE id=?1)", [user_id], |r| r.get(0))?;
+        if !exists {
+            return Ok(None);
+        }
+        let mut stmt = conn.prepare(
+            "SELECT p.id,p.node_id,p.name,p.protocol,p.address_type,p.address,p.port,p.enabled,
+                    p.include_node_name,
+                    a.enabled,a.auth
+             FROM user_proxy_authorizations a JOIN proxies p ON p.id=a.proxy_id
+             WHERE a.user_id=?1 ORDER BY p.id",
+        )?;
+        let rows = stmt
+            .query_map([user_id], |r| {
+                Ok(UserProxyAuthorizationItem {
+                    proxy: ProxySummary {
+                        id: r.get(0)?,
+                        node_id: r.get(1)?,
+                        name: r.get(2)?,
+                        protocol: r.get(3)?,
+                        address_type: r.get(4)?,
+                        address: r.get(5)?,
+                        port: r.get(6)?,
+                        enabled: r.get(7)?,
+                        include_node_name: r.get(8)?,
+                    },
+                    access: AuthorizationSummary { enabled: r.get(9)?, auth: parse_json(r, 10)? },
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(Some(rows))
+    }
+
+    pub fn put_authorization(
+        &self,
+        user_id: i64,
+        proxy_id: i64,
+        draft: &AuthorizationDraft,
+    ) -> Result<std::result::Result<AuthorizationRecord, AuthorizationWriteIssue>> {
+        let auth = serde_json::to_string(&draft.auth)?;
+        let conn = self.conn();
+        let user_exists: bool =
+            conn.query_row("SELECT EXISTS(SELECT 1 FROM users WHERE id=?1)", [user_id], |r| r.get(0))?;
+        if !user_exists {
+            return Ok(Err(AuthorizationWriteIssue::UserNotFound));
+        }
+        let proxy_exists: bool =
+            conn.query_row("SELECT EXISTS(SELECT 1 FROM proxies WHERE id=?1)", [proxy_id], |r| r.get(0))?;
+        if !proxy_exists {
+            return Ok(Err(AuthorizationWriteIssue::ProxyNotFound));
+        }
+        let now = Utc::now().timestamp();
+        conn.execute(
+            "INSERT INTO user_proxy_authorizations(user_id,proxy_id,enabled,auth,created_at,updated_at)
+             VALUES(?1,?2,?3,?4,?5,?5)
+             ON CONFLICT(user_id,proxy_id) DO UPDATE SET enabled=excluded.enabled,
+                 auth=excluded.auth,updated_at=excluded.updated_at",
+            params![user_id, proxy_id, draft.enabled, auth, now],
+        )?;
+        let access = conn.query_row(
+            "SELECT id,user_id,proxy_id,enabled,auth,created_at,updated_at
+             FROM user_proxy_authorizations WHERE user_id=?1 AND proxy_id=?2",
+            params![user_id, proxy_id],
+            |r| {
+                Ok(AuthorizationRecord {
+                    id: r.get(0)?,
+                    user_id: r.get(1)?,
+                    proxy_id: r.get(2)?,
+                    enabled: r.get(3)?,
+                    auth: parse_json(r, 4)?,
+                    created_at: r.get(5)?,
+                    updated_at: r.get(6)?,
+                })
+            },
+        )?;
+        Ok(Ok(access))
+    }
+
+    pub fn delete_authorization(&self, user_id: i64, proxy_id: i64) -> Result<bool> {
+        Ok(self.conn().execute(
+            "DELETE FROM user_proxy_authorizations WHERE user_id=?1 AND proxy_id=?2",
+            params![user_id, proxy_id],
+        )? > 0)
+    }
+
+    /// Only active authorizations are materialized into a generated inbound.
+    pub fn active_users_for_proxy(&self, proxy_id: i64, now: i64) -> Result<Vec<serde_json::Value>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT u.username,u.uuid,a.auth FROM user_proxy_authorizations a JOIN users u ON u.id=a.user_id
+             WHERE a.proxy_id=?1 AND a.enabled=1 AND u.enabled=1
+               AND (u.expires_at IS NULL OR u.expires_at>?2)
+             ORDER BY a.id",
+        )?;
+        let rows = stmt
+            .query_map(params![proxy_id, now], |r| {
+                let username: String = r.get(0)?;
+                let uuid: String = r.get(1)?;
+                let mut auth = parse_json(r, 2)?;
+                if let Some(object) = auth.as_object_mut() {
+                    object.insert("name".into(), username.into());
+                    object.insert("uuid".into(), uuid.into());
+                }
+                Ok(auth)
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
     }
 
     /// Creates a node and returns its id.
@@ -1704,7 +2523,14 @@ impl Db {
         if plotted > 0 {
             refuse!("文件里有视图或触发器，不是 hub 导出的备份");
         }
-        for table in TABLES {
+        let version: i64 = candidate.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version > SCHEMA_VERSION {
+            refuse!("备份来自更新版本的 hub（数据库版本 {version}，这台只认到 {SCHEMA_VERSION}），先升级 hub 再恢复");
+        }
+        // V1.3/schema 9 backups predate these three tables; their migration
+        // creates them. Newer backups must carry every resource table already.
+        let required_tables: &[&str] = if version < 10 { &PRE_RESOURCE_TABLES } else { &TABLES };
+        for table in required_tables {
             let found: i64 = candidate.query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
                 [table],
@@ -1713,10 +2539,6 @@ impl Db {
             if found == 0 {
                 refuse!("{NOT_A_BACKUP}：缺少 {table} 表");
             }
-        }
-        let version: i64 = candidate.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version > SCHEMA_VERSION {
-            refuse!("备份来自更新版本的 hub（数据库版本 {version}，这台只认到 {SCHEMA_VERSION}），先升级 hub 再恢复");
         }
         // The online backup API refuses a page size change while the destination
         // is in WAL mode; an explicit message is clearer than SQLITE_READONLY.
@@ -1737,7 +2559,7 @@ impl Db {
 
         // Table names are not a schema. Pages are copied verbatim, so the columns
         // the file carries become the ones this hub's statements run against, and
-        // eight correctly named tables holding the wrong columns pass every gate
+        // correctly named tables holding the wrong columns pass every gate
         // above while leaving the database unusable.
         //
         // Compared against a database this build creates for itself, so there is
@@ -1747,6 +2569,7 @@ impl Db {
         // `CREATE TABLE`. Extra columns are ignored.
         let reference = Connection::open_in_memory()?;
         reference.execute_batch(SCHEMA)?;
+        reference.execute_batch(RESOURCE_SCHEMA)?;
         migrate(&reference, SCHEMA_VERSION)?;
         for table in TABLES {
             let want = columns_of(&reference, table)?;
@@ -1779,10 +2602,59 @@ impl Db {
 
     pub fn create_session(&self, token_hash: &str, expires_at: i64) -> Result<()> {
         self.conn().execute(
-            "INSERT OR REPLACE INTO session (token_hash, expires_at) VALUES (?1, ?2)",
+            "INSERT OR REPLACE INTO session (token_hash, expires_at,principal_type,user_id) VALUES (?1, ?2,'admin',NULL)",
             params![token_hash, expires_at],
         )?;
         Ok(())
+    }
+
+    pub fn create_user_session(&self, token_hash: &str, expires_at: i64, user_id: i64) -> Result<()> {
+        self.conn().execute(
+            "INSERT OR REPLACE INTO session (token_hash,expires_at,principal_type,user_id)
+             VALUES (?1,?2,'user',?3)",
+            params![token_hash, expires_at, user_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn session_principal(&self, token_hash: &str) -> Option<SessionPrincipal> {
+        let session = {
+            let conn = self.conn();
+            conn.query_row(
+                "SELECT principal_type,user_id FROM session WHERE token_hash=?1 AND expires_at>?2",
+                params![token_hash, Utc::now().timestamp()],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?)),
+            )
+            .optional()
+            .ok()
+            .flatten()
+        }?;
+        match (session.0.as_str(), session.1) {
+            ("admin", _) => Some(SessionPrincipal::Admin),
+            ("user", Some(id)) if self.user_session_user_id(token_hash) == Some(id) => {
+                Some(SessionPrincipal::User(id))
+            }
+            _ => None,
+        }
+    }
+
+    pub fn user_session_user_id(&self, token_hash: &str) -> Option<i64> {
+        let now = Utc::now().timestamp();
+        self.conn()
+            .query_row(
+                "SELECT s.user_id FROM session s JOIN users u ON u.id=s.user_id
+             WHERE s.token_hash=?1 AND s.expires_at>?2 AND s.principal_type='user'
+               AND u.enabled=1 AND (u.expires_at IS NULL OR u.expires_at>?2)",
+                params![token_hash, now],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    pub fn admin_session_valid(&self, token_hash: &str) -> bool {
+        matches!(self.session_principal(token_hash), Some(SessionPrincipal::Admin))
     }
 
     pub fn session_valid(&self, token_hash: &str) -> bool {
@@ -1879,6 +2751,117 @@ fn close_bucket(out: &mut Vec<serde_json::Value>, open: &mut Vec<(i64, Vec<i64>,
         }
         out.push(row);
     }
+}
+
+fn country_flag(country: &str) -> String {
+    if country.len() != 2 || !country.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+        return String::new();
+    }
+    country
+        .to_ascii_uppercase()
+        .bytes()
+        .filter_map(|byte| char::from_u32(0x1f1e6 + u32::from(byte - b'A')))
+        .collect()
+}
+
+fn displayed_proxy_name(name: &str, include_node_name: bool, node_name: &str, country: &str) -> String {
+    if !include_node_name {
+        return name.trim().to_owned();
+    }
+    let flag = country_flag(country);
+    if flag.is_empty() {
+        format!("[{}] {}", node_name.trim(), name.trim())
+    } else {
+        format!("{} [{}] {}", flag, node_name.trim(), name.trim())
+    }
+}
+
+/// The final label depends on node metadata, so compare the rendered names
+/// under the connection lock rather than putting a misleading UNIQUE index on
+/// the stored base name.
+fn proxy_name_in_use(
+    conn: &Connection,
+    node_id: i64,
+    draft: &ProxyDraft,
+    except: Option<i64>,
+) -> Result<bool> {
+    let (node_name, country): (String, String) = conn.query_row(
+        "SELECT name,CASE WHEN country_pin='' THEN country ELSE country_pin END FROM node WHERE id=?1",
+        [node_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let candidate =
+        displayed_proxy_name(&draft.name, draft.include_node_name, &node_name, &country).to_lowercase();
+    let mut stmt = conn.prepare(
+        "SELECT p.id,p.name,p.include_node_name,n.name,
+                CASE WHEN n.country_pin='' THEN n.country ELSE n.country_pin END
+         FROM proxies p JOIN node n ON n.id=p.node_id",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, bool>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+        ))
+    })?;
+    for row in rows {
+        let (id, name, include_node_name, node_name, country) = row?;
+        if Some(id) == except {
+            continue;
+        }
+        if displayed_proxy_name(&name, include_node_name, &node_name, &country).to_lowercase() == candidate {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn port_in_use(conn: &Connection, node_id: i64, port: i64, except: Option<i64>) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM proxies WHERE node_id=?1 AND port=?2 AND enabled=1
+                       AND (?3 IS NULL OR id<>?3))",
+        params![node_id, port, except],
+        |r| r.get(0),
+    )?)
+}
+
+fn parse_json(r: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<serde_json::Value> {
+    let raw: String = r.get(index)?;
+    serde_json::from_str(&raw).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(index, rusqlite::types::Type::Text, Box::new(error))
+    })
+}
+
+fn row_to_proxy(r: &rusqlite::Row<'_>) -> rusqlite::Result<Proxy> {
+    Ok(Proxy {
+        id: r.get(0)?,
+        node_id: r.get(1)?,
+        name: r.get(2)?,
+        include_node_name: r.get(3)?,
+        protocol: r.get(4)?,
+        address_type: r.get(5)?,
+        address: r.get(6)?,
+        port: r.get(7)?,
+        enabled: r.get(8)?,
+        config: parse_json(r, 9)?,
+        created_at: r.get(10)?,
+        updated_at: r.get(11)?,
+    })
+}
+
+fn row_to_user(r: &rusqlite::Row<'_>) -> rusqlite::Result<User> {
+    Ok(User {
+        id: r.get(0)?,
+        username: r.get(1)?,
+        uuid: r.get(2)?,
+        enabled: r.get(3)?,
+        expires_at: r.get(4)?,
+        created_at: r.get(5)?,
+        updated_at: r.get(6)?,
+        proxy_count: r.get(7)?,
+    })
 }
 
 fn row_to_node(r: &rusqlite::Row<'_>) -> Node {
@@ -2062,9 +3045,9 @@ mod tests {
             .unwrap();
         refused("a view where a table belongs");
 
-        // Eight tables with the right names and none of the right columns. Every
+        // Required tables with the right names and none of the right columns. Every
         // gate above passes: it is a healthy SQLite file, it carries no view or
-        // trigger, all eight names are present, it stamps itself with this build's
+        // trigger, all required names are present, it stamps itself with this build's
         // version and uses the same page size. Restoring copies pages, so those
         // columns would become the ones the hub runs every statement against,
         // leaving the panel reporting a failed restore over a database already
@@ -2084,6 +3067,7 @@ mod tests {
         let _ = std::fs::remove_file(&bad);
         let newer = Connection::open(&bad).unwrap();
         newer.execute_batch(SCHEMA).unwrap();
+        newer.execute_batch(RESOURCE_SCHEMA).unwrap();
         newer.execute_batch(&format!("PRAGMA user_version = {}", SCHEMA_VERSION + 1)).unwrap();
         refused("from a newer hub");
 
@@ -2156,6 +3140,352 @@ mod tests {
         let token = format!("token-{}", rand::random::<u32>());
         db.create_node(&Node { name: "n".into(), traffic_reset_day: reset_day, ..Default::default() }, &token)
             .unwrap()
+    }
+
+    fn proxy_draft(name: &str, include_node_name: bool) -> ProxyDraft {
+        ProxyDraft {
+            name: name.into(),
+            include_node_name,
+            protocol: "vless".into(),
+            address_type: "domain".into(),
+            address: "proxy.example.com".into(),
+            port: 24060,
+            enabled: false,
+            config: serde_json::json!({}),
+        }
+    }
+
+    fn user_draft(username: &str) -> UserDraft {
+        UserDraft {
+            username: username.into(),
+            password_hash: Some("test-hash".into()),
+            enabled: true,
+            expires_at: None,
+        }
+    }
+
+    fn access_draft(flow: &str) -> AuthorizationDraft {
+        AuthorizationDraft { enabled: true, auth: serde_json::json!({"flow":flow}) }
+    }
+
+    #[test]
+    fn users_own_one_stable_uuid_across_authorizations_and_config_generation() {
+        let db = db();
+        let u1 = db.create_user(&user_draft("alice")).unwrap().unwrap();
+        let u2 = db.create_user(&user_draft("bob")).unwrap().unwrap();
+        let uuid = db.user(u1).unwrap().unwrap().uuid;
+        let uuid2 = db.user(u2).unwrap().unwrap().uuid;
+        assert_ne!(uuid, uuid2);
+        assert_eq!(uuid.len(), 36);
+        assert_eq!(uuid.as_bytes()[14], b'4');
+        assert!(
+            matches!(uuid.as_bytes()[19], b'8' | b'9' | b'a' | b'b'),
+            "variant nibble uses RFC 4122 variant"
+        );
+        assert_eq!(db.create_user(&user_draft("alice")).unwrap(), Err(UserWriteIssue::UsernameConflict));
+
+        let n = node(&db, 1);
+        let mut draft = proxy_draft("p1", false);
+        draft.enabled = true;
+        draft.port = 24061;
+        let p1 = db.create_proxy(n, &draft).unwrap().unwrap();
+        draft.name = "p2".into();
+        draft.port = 24062;
+        let p2 = db.create_proxy(n, &draft).unwrap().unwrap();
+        draft.name = "unassigned".into();
+        draft.port = 24063;
+        let unassigned = db.create_proxy(n, &draft).unwrap().unwrap();
+        db.put_authorization(u1, p1, &access_draft("xtls-rprx-vision")).unwrap().unwrap();
+        db.put_authorization(u1, p2, &access_draft("")).unwrap().unwrap();
+        db.put_authorization(u2, unassigned, &access_draft("")).unwrap().unwrap();
+        assert_eq!(db.user(u1).unwrap().unwrap().uuid, uuid, "adding authorization keeps UUID");
+        for proxy_id in [p1, p2] {
+            let users = db.active_users_for_proxy(proxy_id, Utc::now().timestamp()).unwrap();
+            assert_eq!(users[0]["uuid"], uuid);
+        }
+        let own_nodes = db.active_user_portal_proxies(u1, Utc::now().timestamp()).unwrap();
+        assert_eq!(own_nodes.iter().map(|proxy| proxy.id).collect::<Vec<_>>(), vec![p1, p2]);
+        assert!(own_nodes
+            .iter()
+            .all(|proxy| !serde_json::to_value(proxy).unwrap().to_string().contains("private_key")));
+        let (subscription_uuid, own_subscription) =
+            db.active_user_subscription(u1, Utc::now().timestamp()).unwrap().unwrap();
+        assert_eq!(subscription_uuid, uuid);
+        assert_eq!(own_subscription.iter().map(|proxy| proxy.id).collect::<Vec<_>>(), vec![p1, p2]);
+        assert!(!own_subscription.iter().any(|proxy| proxy.id == unassigned));
+        assert_eq!(db.active_user_portal_proxies(u2, Utc::now().timestamp()).unwrap()[0].id, unassigned);
+        assert!(db.delete_authorization(u1, p1).unwrap());
+        assert_eq!(db.user(u1).unwrap().unwrap().uuid, uuid, "deleting authorization keeps UUID");
+        db.put_authorization(u1, p1, &access_draft("")).unwrap().unwrap();
+        assert_eq!(db.user(u1).unwrap().unwrap().uuid, uuid, "regrant keeps UUID");
+        assert!(
+            db.conn().execute("UPDATE users SET uuid=?2 WHERE id=?1", params![u2, uuid]).is_err(),
+            "UUID has a database unique constraint"
+        );
+        let cols = columns_of(&db.conn(), "user_proxy_authorizations").unwrap();
+        assert!(!cols.contains("uuid"));
+        assert!(!cols.contains("user_proxy_access"));
+        let duplicate = db.conn().execute(
+            "INSERT INTO user_proxy_authorizations(user_id,proxy_id,enabled,auth,created_at,updated_at) VALUES(?1,?2,1,'{}',1,1)",
+            params![u1,p1],
+        );
+        assert!(duplicate.is_err(), "user/proxy authorization is unique");
+
+        let nodes = db.reset_user_uuid(u1).unwrap().unwrap().1;
+        let replacement = db.user(u1).unwrap().unwrap().uuid;
+        assert_eq!(nodes, vec![n]);
+        assert_ne!(replacement, uuid);
+        assert_eq!(db.active_users_for_proxy(p1, Utc::now().timestamp()).unwrap()[0]["uuid"], replacement);
+        db.delete_user(u1).unwrap();
+        assert_eq!(
+            db.conn()
+                .query_row("SELECT COUNT(*) FROM user_proxy_authorizations WHERE user_id=?1", [u1], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn default_admin_is_seeded_idempotently_and_cannot_be_renamed_or_deleted() {
+        let db = db();
+        let admin = db.users(None, None).unwrap().into_iter().find(|user| user.username == "admin").unwrap();
+        assert!(admin.enabled);
+        assert_eq!(admin.expires_at, None);
+        assert_eq!(admin.uuid.len(), 36);
+        let original_uuid = admin.uuid.clone();
+
+        assert_eq!(db.create_user(&user_draft("admin")).unwrap(), Err(UserWriteIssue::UsernameConflict));
+        assert_eq!(
+            db.update_user(admin.id, &user_draft("renamed")).unwrap(),
+            Err(UserWriteIssue::AdminUsernameLocked)
+        );
+        assert_eq!(db.delete_user(admin.id).unwrap(), UserDeleteResult::Protected);
+
+        let editable = user_draft("admin");
+        assert_eq!(
+            db.update_user(admin.id, &editable).unwrap(),
+            Ok(()),
+            "other admin fields remain editable"
+        );
+        assert_eq!(db.user(admin.id).unwrap().unwrap().uuid, original_uuid);
+
+        // Re-running startup migration leaves the existing built-in user intact.
+        migrate(&db.conn(), SCHEMA_VERSION).unwrap();
+        assert_eq!(db.user(admin.id).unwrap().unwrap().uuid, original_uuid);
+        assert_eq!(db.users(None, None).unwrap().iter().filter(|user| user.username == "admin").count(), 1);
+
+        // Even if a database is edited outside the API, the next startup repairs it.
+        db.conn().execute("DELETE FROM users WHERE id=?1", [admin.id]).unwrap();
+        migrate(&db.conn(), SCHEMA_VERSION).unwrap();
+        let restored =
+            db.users(None, None).unwrap().into_iter().find(|user| user.username == "admin").unwrap();
+        assert_ne!(restored.uuid, original_uuid);
+        assert_eq!(restored.expires_at, None);
+    }
+
+    #[test]
+    fn user_uuids_are_generated_and_only_reset_explicitly() {
+        let db = db();
+        let alice = db.create_user(&user_draft("alice")).unwrap().unwrap();
+        let uuid = db.user(alice).unwrap().unwrap().uuid;
+        assert_eq!(db.update_user(alice, &user_draft("alice")).unwrap(), Ok(()));
+        assert_eq!(db.user(alice).unwrap().unwrap().uuid, uuid, "omitted UUID is preserved");
+        let replacement = db.reset_user_uuid(alice).unwrap().unwrap().0;
+        assert_ne!(replacement, uuid);
+        assert_eq!(db.user(alice).unwrap().unwrap().uuid, replacement);
+    }
+
+    #[test]
+    fn user_sessions_are_role_scoped_and_revoked_on_credential_or_status_changes() {
+        let db = db();
+        let id = db.create_user(&user_draft("session-user")).unwrap().unwrap();
+        let uuid = db.user(id).unwrap().unwrap().uuid;
+        db.create_user_session("user-hash", Utc::now().timestamp() + 3600, id).unwrap();
+        assert_eq!(db.session_principal("user-hash"), Some(SessionPrincipal::User(id)));
+        assert!(!db.admin_session_valid("user-hash"));
+        db.create_session("admin-hash", Utc::now().timestamp() + 3600).unwrap();
+        assert_eq!(db.session_principal("admin-hash"), Some(SessionPrincipal::Admin));
+        assert_eq!(db.user_session_user_id("admin-hash"), None);
+
+        let before = db.user(id).unwrap().unwrap();
+        let changed_password = UserDraft {
+            username: before.username,
+            password_hash: Some("replacement-hash".into()),
+            enabled: true,
+            expires_at: None,
+        };
+        assert_eq!(db.update_user(id, &changed_password).unwrap(), Ok(()));
+        assert_eq!(db.session_principal("user-hash"), None, "password changes revoke user sessions");
+        assert_eq!(db.user(id).unwrap().unwrap().uuid, uuid, "password changes preserve VLESS identity");
+
+        db.create_user_session("user-hash-2", Utc::now().timestamp() + 3600, id).unwrap();
+        let disabled = UserDraft {
+            username: "session-user".into(),
+            password_hash: None,
+            enabled: false,
+            expires_at: None,
+        };
+        assert_eq!(db.update_user(id, &disabled).unwrap(), Ok(()));
+        assert_eq!(db.session_principal("user-hash-2"), None, "disabling revokes user sessions");
+        assert_eq!(db.user(id).unwrap().unwrap().uuid, uuid);
+    }
+
+    #[test]
+    fn migration_discards_old_per_proxy_uuids_but_keeps_authorizations_idempotently() {
+        let scratch = Scratch::new();
+        let old = Connection::open(&scratch.0).unwrap();
+        old.execute_batch("PRAGMA foreign_keys=ON;
+            CREATE TABLE users(id INTEGER PRIMARY KEY,username TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 1,expires_at INTEGER,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL);
+            CREATE TABLE proxies(id INTEGER PRIMARY KEY,node_id INTEGER NOT NULL,name TEXT NOT NULL);
+            CREATE TABLE user_proxy_access(id INTEGER PRIMARY KEY,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,proxy_id INTEGER NOT NULL REFERENCES proxies(id) ON DELETE CASCADE,enabled INTEGER NOT NULL,auth TEXT NOT NULL,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,UNIQUE(user_id,proxy_id));
+            INSERT INTO users VALUES(1,'legacy',1,NULL,1,1);
+            INSERT INTO users VALUES(2,'empty',1,NULL,1,1);
+            INSERT INTO proxies VALUES(1,1,'a'); INSERT INTO proxies VALUES(2,2,'b');
+            INSERT INTO user_proxy_access VALUES(11,1,1,1,'{\"uuid\":\"11111111-1111-4111-8111-111111111111\",\"flow\":\"\"}',10,10);
+            INSERT INTO user_proxy_access VALUES(12,1,2,1,'{\"uuid\":\"22222222-2222-4222-8222-222222222222\",\"flow\":\"xtls-rprx-vision\"}',20,20);
+            PRAGMA user_version=11;").unwrap();
+        drop(old);
+        let db = Db::open(&scratch.0).unwrap();
+        let user = db.user(1).unwrap().unwrap();
+        assert!(user.uuid.contains('-') && user.uuid.len() == 36);
+        let empty_user = db.user(2).unwrap().unwrap();
+        assert!(empty_user.uuid.len() == 36);
+        assert_ne!(empty_user.uuid, user.uuid);
+        let conn = db.conn();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM user_proxy_authorizations", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert!(!columns_of(&conn, "user_proxy_authorizations").unwrap().contains("uuid"));
+        assert!(conn
+            .query_row("SELECT COUNT(*) FROM user_proxy_access", [], |r| r.get::<_, i64>(0))
+            .unwrap_err()
+            .to_string()
+            .contains("no such table"));
+        let auth: String = conn
+            .query_row("SELECT auth FROM user_proxy_authorizations WHERE id=11", [], |r| r.get(0))
+            .unwrap();
+        assert!(!auth.contains("uuid"));
+        drop(conn);
+        drop(db);
+        let db = Db::open(&scratch.0).unwrap();
+        assert_eq!(db.user(1).unwrap().unwrap().uuid, user.uuid, "rerunning migration does not rotate UUID");
+    }
+
+    #[test]
+    fn proxy_names_are_unique_by_the_final_global_case_insensitive_label() {
+        let db = db();
+        let (hk, jp, duplicate_hk) = (node(&db, 1), node(&db, 1), node(&db, 1));
+        {
+            let conn = db.conn();
+            conn.execute("UPDATE node SET name='HK服务器',country='HK' WHERE id=?1", [hk]).unwrap();
+            conn.execute("UPDATE node SET name='JP服务器',country='JP' WHERE id=?1", [jp]).unwrap();
+            conn.execute("UPDATE node SET name='HK服务器',country='HK' WHERE id=?1", [duplicate_hk]).unwrap();
+        }
+
+        let id = db.create_proxy(hk, &proxy_draft("Reality", true)).unwrap().unwrap();
+        assert!(db.proxy(id).unwrap().unwrap().include_node_name);
+        assert!(db.create_proxy(jp, &proxy_draft("reality", true)).unwrap().is_ok());
+        assert_eq!(
+            db.create_proxy(duplicate_hk, &proxy_draft("reality", true)).unwrap(),
+            Err(ProxyWriteIssue::NameConflict),
+            "the generated HK labels collide across nodes",
+        );
+
+        let plain = node(&db, 1);
+        assert!(db.create_proxy(plain, &proxy_draft("Common", false)).unwrap().is_ok());
+        assert_eq!(
+            db.create_proxy(jp, &proxy_draft(" COMMON ", false)).unwrap(),
+            Err(ProxyWriteIssue::NameConflict),
+            "unprefixed names are compared globally after trimming and case folding",
+        );
+        assert_eq!(
+            db.update_proxy(id, None, &proxy_draft(" common ", false)).unwrap(),
+            Err(ProxyWriteIssue::NameConflict),
+            "editing to another proxy's final name is refused",
+        );
+        assert_eq!(db.update_proxy(id, None, &proxy_draft("REALITY", true)).unwrap(), Ok(()));
+    }
+
+    #[test]
+    fn updating_proxy_can_move_it_to_another_node_and_checks_target_port() {
+        let db = db();
+        let (source, target) = (node(&db, 1), node(&db, 1));
+        {
+            let conn = db.conn();
+            conn.execute("UPDATE node SET name='HK服务器',country='HK' WHERE id=?1", [source]).unwrap();
+            conn.execute("UPDATE node SET name='JP服务器',country='JP' WHERE id=?1", [target]).unwrap();
+        }
+        let mut moving = proxy_draft("Moving", true);
+        moving.enabled = true;
+        let id = db.create_proxy(source, &moving).unwrap().unwrap();
+
+        let mut occupied = proxy_draft("Occupied", false);
+        occupied.enabled = true;
+        let occupied_id = db.create_proxy(target, &occupied).unwrap().unwrap();
+        assert_eq!(db.update_proxy(id, Some(target), &moving).unwrap(), Err(ProxyWriteIssue::PortConflict));
+        assert_eq!(
+            db.proxy(id).unwrap().unwrap().node_id,
+            source,
+            "a rejected move leaves the source node intact"
+        );
+
+        {
+            let conn = db.conn();
+            conn.execute("UPDATE proxies SET name='Moving',include_node_name=1 WHERE id=?1", [occupied_id])
+                .unwrap();
+        }
+        {
+            let conn = db.conn();
+            conn.execute("UPDATE node SET name='HK服务器',country='HK' WHERE id=?1", [target]).unwrap();
+        }
+        moving.port = 24061;
+        assert_eq!(db.update_proxy(id, Some(target), &moving).unwrap(), Err(ProxyWriteIssue::NameConflict));
+        assert_eq!(
+            db.proxy(id).unwrap().unwrap().node_id,
+            source,
+            "a name collision leaves the source node intact"
+        );
+
+        {
+            let conn = db.conn();
+            conn.execute("UPDATE node SET name='JP服务器',country='JP' WHERE id=?1", [target]).unwrap();
+            conn.execute("UPDATE proxies SET name='Occupied',include_node_name=0 WHERE id=?1", [occupied_id])
+                .unwrap();
+        }
+        assert_eq!(db.update_proxy(id, Some(target), &moving).unwrap(), Ok(()));
+        assert_eq!(db.proxy(id).unwrap().unwrap().node_id, target);
+        assert_eq!(db.update_proxy(id, Some(i64::MAX), &moving).unwrap(), Err(ProxyWriteIssue::NodeNotFound));
+        assert_eq!(db.proxy(id).unwrap().unwrap().node_id, target);
+    }
+
+    #[test]
+    fn version_ten_proxies_migrate_without_changing_their_existing_names() {
+        let scratch = Scratch::new();
+        let old = Connection::open(&scratch.0).unwrap();
+        old.execute_batch(SCHEMA).unwrap();
+        old.execute_batch(
+            "CREATE TABLE proxies (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               node_id INTEGER NOT NULL REFERENCES node(id) ON DELETE CASCADE,
+               name TEXT NOT NULL, protocol TEXT NOT NULL, address_type TEXT NOT NULL,
+               address TEXT NOT NULL, port INTEGER NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
+               config TEXT NOT NULL DEFAULT '{}', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+             );
+             INSERT INTO node(id,name,token,created_at) VALUES(1,'HK服务器','token',1);
+             INSERT INTO proxies(id,node_id,name,protocol,address_type,address,port,enabled,config,created_at,updated_at)
+               VALUES(1,1,'🇭🇰 [HK服务器] Reality','vless','domain','hk.example.com',24060,1,'{}',1,1);
+             PRAGMA user_version=10;",
+        )
+        .unwrap();
+        drop(old);
+
+        let db = Db::open(&scratch.0).unwrap();
+        let migrated = db.proxy(1).unwrap().unwrap();
+        assert_eq!(migrated.name, "🇭🇰 [HK服务器] Reality");
+        assert!(!migrated.include_node_name, "pre-existing names remain unchanged after upgrade");
     }
 
     /// The country is derived from the address, so it must be dropped the moment
@@ -2763,6 +4093,16 @@ mod tests {
     fn dump(conn: &Connection) -> Vec<String> {
         let mut rows = Vec::new();
         for table in TABLES {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    [table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            if !exists {
+                continue;
+            }
             let mut stmt = conn.prepare(&format!("SELECT * FROM {table}")).unwrap();
             let width = stmt.column_count();
             let read =
@@ -2815,7 +4155,11 @@ mod tests {
             );
         }
         let upgraded = dump(&db.conn());
-        assert_eq!(upgraded.len(), TABLES.len(), "every row survives: {upgraded:#?}");
+        assert_eq!(
+            upgraded.len(),
+            PRE_RESOURCE_TABLES.len() + 1,
+            "every old row survives and admin is seeded: {upgraded:#?}"
+        );
 
         // An earlier build opening the file stamps its own version, so the next
         // upgrade runs every migration again.

@@ -31,6 +31,7 @@ mod command;
 mod db;
 mod frontend;
 mod notify;
+mod proxy;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -161,8 +162,8 @@ fn forwarded_proto(headers: &HeaderMap) -> Option<&str> {
 /// Where the agent binaries are published, and where this hub is published. Not
 /// settings: redirecting either implies a fork, which rebuilds these lines
 /// anyway.
-pub const AGENT_REPO: &str = "monitor-probe/agent";
-pub const HUB_REPO: &str = "monitor-probe/monitor";
+pub const AGENT_REPO: &str = "lzj565/agent";
+pub const HUB_REPO: &str = "lzj565/monitor";
 
 /// The one-line installer pasted onto a new VPS.
 async fn install_script() -> Response {
@@ -311,6 +312,49 @@ async fn agent_binary(State(app): State<Shared>, Path(arch): Path<String>) -> Re
         // English, as `install.sh` prints it after its own English line.
         Err(e) => {
             warn!("relaying the agent from {url} failed: {e:#}");
+            api::answer(
+                StatusCode::BAD_GATEWAY,
+                "the hub could not reach GitHub or its GitHub proxy; its log has the details",
+            )
+        }
+    }
+}
+
+/// Relays the custom V2Ray-API sing-box build from the release matching this
+/// hub binary. The installer fetches the digest sidecar separately before it
+/// replaces the node's current executable.
+fn sing_box_release_url(app: &App, asset: &str) -> Option<String> {
+    let filename = match asset {
+        "amd64" => "monitor-sing-box-amd64",
+        "arm64" => "monitor-sing-box-arm64",
+        "amd64.sha256" => "monitor-sing-box-amd64.sha256",
+        "arm64.sha256" => "monitor-sing-box-arm64.sha256",
+        _ => return None,
+    };
+    let version = env!("CARGO_PKG_VERSION");
+    Some(proxied(app, format!("https://github.com/{HUB_REPO}/releases/download/v{version}/{filename}")))
+}
+
+async fn sing_box_asset(State(app): State<Shared>, Path(asset): Path<String>) -> Response {
+    let Some(url) = sing_box_release_url(&app, &asset) else {
+        return api::answer(StatusCode::NOT_FOUND, "unknown sing-box asset");
+    };
+    let Ok(Ok(permit)) = tokio::time::timeout(RELAY_WAIT, RELAY_GATE.acquire()).await else {
+        return api::answer(StatusCode::SERVICE_UNAVAILABLE, "too many downloads in flight, try again");
+    };
+    let fetched = app.http.get(&url).timeout(std::time::Duration::from_secs(120)).send().await;
+    match fetched {
+        Ok(res) if res.status().is_success() => (
+            [(header::CONTENT_TYPE, "application/octet-stream")],
+            axum::body::Body::from_stream(metered(Box::pin(res.bytes_stream()), permit)),
+        )
+            .into_response(),
+        Ok(res) => api::answer(
+            StatusCode::BAD_GATEWAY,
+            format!("GitHub answered {} for the sing-box release", res.status()),
+        ),
+        Err(e) => {
+            warn!("relaying sing-box asset from {url} failed: {e:#}");
             api::answer(
                 StatusCode::BAD_GATEWAY,
                 "the hub could not reach GitHub or its GitHub proxy; its log has the details",
@@ -492,6 +536,8 @@ async fn main() -> Result<()> {
         .route("/api/themes/{short}/config", get(api::theme_config))
         // Sign-in.
         .route("/api/auth/login", post(auth::login))
+        .route("/api/admin/auth/login", post(auth::login))
+        .route("/api/user/auth/login", post(auth::user_login))
         .route("/api/auth/logout", post(auth::logout))
         .route("/api/auth/github", get(auth::github_start))
         .route("/api/auth/github/callback", get(auth::github_callback))
@@ -535,6 +581,17 @@ async fn main() -> Result<()> {
                 .layer(tower_http::limit::RequestBodyLimitLayer::new(api::MAX_CHUNK))
                 .with_state(app.clone()),
         )
+        .merge(
+            Router::new()
+                .route("/api/user/me", get(api::user_me))
+                .route("/api/user/me/proxies", get(api::user_proxies))
+                .route("/api/user/me/subscription", get(api::user_subscription_links))
+                .route("/api/user/me/subscription-token", post(api::rotate_user_subscription_token))
+                .route("/api/subscriptions/{token}/{format}", get(api::subscription))
+                .layer(tower_http::limit::RequestBodyLimitLayer::new(64 * 1024))
+                .layer(axum::middleware::map_response(api::api_json_errors))
+                .with_state(app.clone()),
+        )
         // Command parameters may contain the Agent's 1 MiB config string. The
         // larger bound is isolated to these routes; all other API bodies retain
         // the 64 KiB ceiling above.
@@ -543,6 +600,30 @@ async fn main() -> Result<()> {
                 .route("/api/nodes/{id}/commands", post(api::create_command))
                 .route("/api/nodes/{id}/commands/{command_id}", get(api::command_status))
                 .layer(tower_http::limit::RequestBodyLimitLayer::new(8 * 1024 * 1024))
+                .with_state(app.clone()),
+        )
+        // Resource V1 APIs have a JSON error contract. Keep their body limit
+        // and response mapper scoped so legacy endpoints retain text errors.
+        .merge(
+            Router::new()
+                .route("/api/nodes/{id}/proxies", get(api::list_proxies).post(api::create_proxy))
+                .route("/api/nodes/{id}/singbox/config/preview", get(api::preview_singbox_config))
+                .route("/api/nodes/{id}/singbox/config/check", post(api::check_singbox_config))
+                .route("/api/nodes/{id}/singbox/config/apply", post(api::apply_singbox_config))
+                .route(
+                    "/api/proxies/{id}",
+                    get(api::get_proxy).put(api::update_proxy).delete(api::delete_proxy),
+                )
+                .route("/api/users", get(api::list_users).post(api::create_user))
+                .route("/api/users/{id}", get(api::get_user).put(api::update_user).delete(api::delete_user))
+                .route("/api/users/{user_id}/proxies", get(api::get_user_authorizations))
+                .route("/api/users/{user_id}/uuid", post(api::reset_user_uuid))
+                .route(
+                    "/api/users/{user_id}/proxies/{proxy_id}",
+                    put(api::put_user_proxy).delete(api::delete_user_proxy),
+                )
+                .layer(tower_http::limit::RequestBodyLimitLayer::new(64 * 1024))
+                .layer(axum::middleware::map_response(api::api_json_errors))
                 .with_state(app.clone()),
         )
         .layer(axum::middleware::map_response(api::plain_errors))
@@ -554,6 +635,7 @@ async fn main() -> Result<()> {
                 .route("/api/agent/register", post(api::agent_register))
                 .route("/install.sh", get(install_script))
                 .route("/agent/{arch}", get(agent_binary))
+                .route("/sing-box/{asset}", get(sing_box_asset))
                 .layer(tower_http::limit::RequestBodyLimitLayer::new(64 * 1024))
                 .with_state(app.clone()),
         )
@@ -996,7 +1078,7 @@ mod tests {
     fn a_github_proxy_prefixes_the_release_url_and_an_empty_one_does_not() {
         let app = app("");
         let direct = release_url(&app, "x86_64");
-        assert!(direct.starts_with("https://github.com/monitor-probe/agent/releases/"), "{direct}");
+        assert!(direct.starts_with("https://github.com/lzj565/agent/releases/"), "{direct}");
 
         for set in ["https://ghfast.top", "https://ghfast.top/", "  https://ghfast.top/  "] {
             app.db.set("github_proxy", set).unwrap();
@@ -1006,6 +1088,26 @@ mod tests {
         // the row.
         app.db.set("github_proxy", "").unwrap();
         assert_eq!(release_url(&app, "x86_64"), direct);
+    }
+
+    #[test]
+    fn sing_box_assets_are_pinned_to_the_running_hub_release_and_proxy_setting() {
+        let app = app("");
+        let direct = sing_box_release_url(&app, "amd64").unwrap();
+        assert_eq!(
+            direct,
+            format!(
+                "https://github.com/lzj565/monitor/releases/download/v{}/monitor-sing-box-amd64",
+                env!("CARGO_PKG_VERSION")
+            )
+        );
+        assert!(sing_box_release_url(&app, "arm64.sha256")
+            .unwrap()
+            .ends_with("/monitor-sing-box-arm64.sha256"));
+        assert!(sing_box_release_url(&app, "unknown").is_none());
+
+        app.db.set("github_proxy", "https://ghfast.top/").unwrap();
+        assert_eq!(sing_box_release_url(&app, "amd64").unwrap(), format!("https://ghfast.top/{direct}"));
     }
 
     #[test]

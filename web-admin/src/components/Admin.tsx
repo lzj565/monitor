@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useId, useRef, useState } from "react"
 import { flushSync } from "react-dom"
-import { ArrowUpCircle, Bell, CalendarClock, Check, ChevronDown, ChevronRight, Copy, Database, Download, GripVertical, KeyRound, Layers, Network, Palette, Pencil, Plus, Radio, RefreshCw, Search, Send, Server, Settings, Shield, SlidersHorizontal, Trash2, Upload, Users } from "lucide-react"
+import { ArrowUpCircle, Bell, CalendarClock, Check, ChevronDown, ChevronRight, Copy, Database, Download, GripVertical, KeyRound, Layers, Network, Palette, Pencil, Plus, Radio, RefreshCw, Send, Server, Settings, Shield, SlidersHorizontal, Trash2, Upload, Users } from "lucide-react"
 import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
@@ -13,6 +13,7 @@ import { Popover, PopoverAnchor, PopoverContent } from "@/components/ui/popover"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
+import { AdminConfirmDialog as ConfirmDialog, AdminSearchInput } from "@/components/AdminShared"
 import { api, badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, outdatedAgents, provisioningSite, trafficCorrection, upload, type ConfigField, type IfaceChoice, type Node, type PingTask, type Source } from "@/lib/api"
 import { ProxiesPage, SubscriptionsResourcePage, UsersResourcePage } from "@/components/Resources"
 import { bytes, CYCLES, FOREVER, money, uptime } from "@/lib/format"
@@ -266,15 +267,6 @@ function GroupFilter({ nodes, value, onChange, className = "" }: {
   )
 }
 
-function NodeSearch({ value, onChange, className = "" }: { value: string; onChange: (value: string) => void; className?: string }) {
-  return (
-    <div className={`relative ${className}`}>
-      <Search className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
-      <Input className="pl-8" placeholder="名称/地址/地区/分组" aria-label="搜索节点" value={value} onChange={(e) => onChange(e.target.value)} />
-    </div>
-  )
-}
-
 // Ticks nodes in a searchable grid. 全选 and 全不选 act on the rows in view, so a
 // search or a group narrows what they touch: pick a group, then 全选. Offline
 // nodes are dimmed but remain selectable.
@@ -294,7 +286,7 @@ function NodePicker({ nodes, chosen, onPick, disabled = false }: {
   return (
     <div className="rounded-lg border">
       <div className="flex flex-wrap items-center gap-1 border-b p-2">
-        <NodeSearch className="min-w-0 flex-1 basis-40" value={query} onChange={setQuery} />
+        <AdminSearchInput className="min-w-0 flex-1 basis-40" ariaLabel="搜索节点" placeholder="名称/地址/地区/分组" value={query} onChange={setQuery} />
         <GroupFilter nodes={nodes} value={group} onChange={setGroup} className="w-32" />
         <Button size="sm" variant="ghost" className="px-2.5" disabled={disabled || visibleChosen === visible.length} onClick={() => onPick(visible, true)}>全选</Button>
         <Button size="sm" variant="ghost" className="px-2.5" disabled={disabled || visibleChosen === 0} onClick={() => onPick(visible, false)}>全不选</Button>
@@ -557,32 +549,6 @@ function GroupDialog({ nodes, onClose, onSaved }: { nodes: Node[]; onClose: () =
             <span className="truncate">{group ? `设为「${group}」` : "移出分组"}</span>
             {ids.length > 0 && <span className="tnum shrink-0">（{ids.length} 台）</span>}
           </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  )
-}
-
-function ConfirmDialog({ title, description, confirmLabel, busy = false, onClose, onConfirm, children }: {
-  title: string
-  description: string
-  confirmLabel: string
-  busy?: boolean
-  onClose: () => void
-  onConfirm: () => void
-  children?: React.ReactNode
-}) {
-  return (
-    <Dialog open onOpenChange={(open) => !open && onClose()}>
-      <DialogContent className="sm:max-w-md">
-        <DialogHeader>
-          <DialogTitle>{title}</DialogTitle>
-          <DialogDescription className="leading-relaxed">{description}</DialogDescription>
-        </DialogHeader>
-        {children}
-        <DialogFooter className="border-t pt-4">
-          <Button variant="ghost" onClick={onClose}>取消</Button>
-          <Button variant="destructive" onClick={onConfirm} disabled={busy}>{confirmLabel}</Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>
@@ -1265,7 +1231,7 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
       {refusal && <p className="text-sm text-muted-foreground">{refusal}</p>}
       <div className="flex flex-wrap items-center justify-end gap-2">
         <div className="mr-auto flex w-full gap-2 sm:w-auto">
-          <NodeSearch className="min-w-0 flex-1 sm:w-64 sm:flex-none" value={query} onChange={setQuery} />
+          <AdminSearchInput className="min-w-0 flex-1 sm:w-64 sm:flex-none" ariaLabel="搜索节点" placeholder="名称/地址/地区/分组" value={query} onChange={setQuery} />
           <GroupFilter nodes={nodes} value={group} onChange={setGroup} className="w-32" />
         </div>
         <Button variant="outline" disabled={!nodes.length} onClick={() => setGrouping(true)}>
@@ -2722,7 +2688,7 @@ function Data() {
   )
 }
 
-const releaseUrl = (repo: string, version: string) => `https://github.com/monitor-probe/${repo}/releases/tag/v${version}`
+const releaseUrl = (repo: string, version: string) => `https://github.com/lzj565/${repo}/releases/tag/v${version}`
 
 /** `v1.2.0 → v1.3.0` when something is published, the running version alone otherwise. */
 function VersionPair({ current, latest }: { current: string; latest: string }) {

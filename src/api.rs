@@ -19,7 +19,11 @@ use crate::auth::{
     authed, client_ip, current_session, hash_password, issue_session, issued_at, random_token, with_cookies,
 };
 use crate::command::{self, StartError};
-use crate::db::{Db, Node, NodePatch, PingTask, Traffic, TrafficPatch};
+use crate::db::{
+    AuthorizationDraft, AuthorizationWriteIssue, Db, Node, NodePatch, PingTask, Proxy, ProxyWriteIssue,
+    Traffic, TrafficPatch, User, UserDeleteResult, UserWriteIssue,
+};
+use crate::proxy::{self, AuthorizationRequest, ProxyRequest, UserRequest};
 use crate::{agent_ws, App, Shared};
 
 /// Present only on requests carrying a valid session. Handlers taking it cannot
@@ -35,6 +39,46 @@ impl FromRequestParts<Shared> for Admin {
         } else {
             Err(answer(StatusCode::UNAUTHORIZED, "登录已失效，请重新登录"))
         }
+    }
+}
+
+/// Admin-only authentication for the V1 resource API, whose errors use the
+/// structured JSON envelope instead of the legacy text response.
+pub struct ApiAdmin;
+
+impl FromRequestParts<Shared> for ApiAdmin {
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, app: &Shared) -> Result<Self, Self::Rejection> {
+        if authed(app, &parts.headers) {
+            Ok(ApiAdmin)
+        } else {
+            Err(api_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "登录已失效，请重新登录"))
+        }
+    }
+}
+
+/// The current user's id, resolved only from a live user principal in the
+/// session cookie. User endpoints never accept an id from the request path.
+pub struct UserAuth(pub i64);
+
+impl FromRequestParts<Shared> for UserAuth {
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, app: &Shared) -> Result<Self, Self::Rejection> {
+        if let Some(hash) = current_session(&parts.headers) {
+            if let Some(id) = app.db.user_session_user_id(&hash) {
+                return Ok(UserAuth(id));
+            }
+            if app.db.admin_session_valid(&hash) {
+                return Err(api_error(
+                    StatusCode::FORBIDDEN,
+                    "FORBIDDEN",
+                    "管理员身份不能代替普通用户访问用户中心",
+                ));
+            }
+        }
+        Err(api_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "登录已失效，请重新登录"))
     }
 }
 
@@ -72,6 +116,120 @@ pub(crate) fn fail(e: impl Into<anyhow::Error>) -> Response {
 
 fn bad(message: &str) -> Response {
     answer(StatusCode::BAD_REQUEST, message)
+}
+
+fn api_error(status: StatusCode, code: &str, message: impl Into<String>) -> Response {
+    let mut response =
+        (status, Json(json!({"error":{"code":code,"message":message.into()}}))).into_response();
+    response.extensions_mut().insert(Written);
+    response
+}
+
+fn api_internal(error: impl Into<anyhow::Error>) -> Response {
+    let error = error.into();
+    warn!("resource API request failed: {error:#}");
+    api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", INTERNAL)
+}
+
+fn api_body<T>(body: Result<Json<T>, JsonRejection>) -> Result<T, Response> {
+    body.map(|Json(value)| value)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "INVALID_REQUEST", "request body must be valid JSON"))
+}
+
+fn api_input_error(error: proxy::InputError) -> Response {
+    api_error(StatusCode::BAD_REQUEST, error.code, error.message)
+}
+
+fn api_node_exists(app: &Shared, node_id: i64) -> Result<(), Response> {
+    match app.db.node(node_id) {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(api_error(StatusCode::NOT_FOUND, "NODE_NOT_FOUND", "node does not exist")),
+        Err(error) => Err(api_internal(error)),
+    }
+}
+
+fn api_proxy(app: &Shared, id: i64) -> Result<Proxy, Response> {
+    match app.db.proxy(id) {
+        Ok(Some(proxy)) => Ok(proxy),
+        Ok(None) => Err(api_error(StatusCode::NOT_FOUND, "PROXY_NOT_FOUND", "proxy does not exist")),
+        Err(error) => Err(api_internal(error)),
+    }
+}
+
+fn api_user(app: &Shared, id: i64) -> Result<User, Response> {
+    match app.db.user(id) {
+        Ok(Some(user)) => Ok(user),
+        Ok(None) => Err(api_error(StatusCode::NOT_FOUND, "USER_NOT_FOUND", "user does not exist")),
+        Err(error) => Err(api_internal(error)),
+    }
+}
+
+fn map_proxy_issue(issue: ProxyWriteIssue) -> Response {
+    match issue {
+        ProxyWriteIssue::NodeNotFound => {
+            api_error(StatusCode::NOT_FOUND, "NODE_NOT_FOUND", "node does not exist")
+        }
+        ProxyWriteIssue::ProxyNotFound => {
+            api_error(StatusCode::NOT_FOUND, "PROXY_NOT_FOUND", "proxy does not exist")
+        }
+        ProxyWriteIssue::PortConflict => api_error(
+            StatusCode::CONFLICT,
+            "PROXY_PORT_CONFLICT",
+            "an enabled proxy on this node already uses the port",
+        ),
+        ProxyWriteIssue::NameConflict => {
+            api_error(StatusCode::CONFLICT, "PROXY_NAME_CONFLICT", "生成后的代理名称已被使用")
+        }
+    }
+}
+
+fn map_user_issue(issue: UserWriteIssue) -> Response {
+    match issue {
+        UserWriteIssue::UserNotFound => {
+            api_error(StatusCode::NOT_FOUND, "USER_NOT_FOUND", "user does not exist")
+        }
+        UserWriteIssue::UsernameConflict => {
+            api_error(StatusCode::CONFLICT, "USERNAME_CONFLICT", "username is already in use")
+        }
+        UserWriteIssue::AdminUsernameLocked => api_error(
+            StatusCode::CONFLICT,
+            "SYSTEM_USER_NAME_LOCKED",
+            "the default admin username cannot be changed",
+        ),
+        UserWriteIssue::PasswordRequired => {
+            api_error(StatusCode::BAD_REQUEST, "PASSWORD_REQUIRED", "请设置用户登录密码")
+        }
+    }
+}
+
+/// Converts framework errors inside the resource router to the same envelope
+/// as handler-created failures. The outer legacy mapper sees [`Written`] and
+/// leaves this JSON intact.
+pub async fn api_json_errors(response: Response) -> Response {
+    let status = response.status();
+    if !(status.is_client_error() || status.is_server_error())
+        || response.extensions().get::<Written>().is_some()
+    {
+        return response;
+    }
+    let (code, message) = match status {
+        StatusCode::UNAUTHORIZED => ("UNAUTHORIZED", "登录已失效，请重新登录"),
+        StatusCode::NOT_FOUND => ("NOT_FOUND", "请求的内容不存在"),
+        StatusCode::CONFLICT => ("CONFLICT", "请求与当前资源状态冲突"),
+        StatusCode::PAYLOAD_TOO_LARGE => ("PAYLOAD_TOO_LARGE", "提交的内容过大"),
+        StatusCode::METHOD_NOT_ALLOWED => ("METHOD_NOT_ALLOWED", "不支持该请求方法"),
+        s if s.is_server_error() => ("INTERNAL_ERROR", INTERNAL),
+        _ => ("INVALID_REQUEST", "请求格式不对"),
+    };
+    let original_headers = response.headers().clone();
+    let mut replacement = (status, Json(json!({"error":{"code":code,"message":message}}))).into_response();
+    for name in [header::ALLOW, header::RETRY_AFTER] {
+        if let Some(value) = original_headers.get(&name) {
+            replacement.headers_mut().insert(name, value.clone());
+        }
+    }
+    replacement.extensions_mut().insert(Written);
+    replacement
 }
 
 fn no_such_node() -> Response {
@@ -169,6 +327,409 @@ pub async fn command_status(
     match app.commands.get(&command_id, node_id) {
         Some(command) => Json(command).into_response(),
         None => answer(StatusCode::NOT_FOUND, "命令不存在或已过期"),
+    }
+}
+
+// ---- V1 Proxy, User and sing-box Desired State API ----
+
+pub async fn list_proxies(_: ApiAdmin, State(app): State<Shared>, Path(node_id): Path<i64>) -> Response {
+    if let Err(response) = api_node_exists(&app, node_id) {
+        return response;
+    }
+    match app.db.proxies_for_node(node_id) {
+        Ok(items) => Json(json!({"items":items})).into_response(),
+        Err(error) => api_internal(error),
+    }
+}
+
+pub async fn create_proxy(
+    _: ApiAdmin,
+    State(app): State<Shared>,
+    Path(node_id): Path<i64>,
+    body: Result<Json<ProxyRequest>, JsonRejection>,
+) -> Response {
+    let request = match api_body(body) {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    let draft = match request.into_draft() {
+        Ok(draft) => draft,
+        Err(error) => return api_input_error(error),
+    };
+    match app.db.create_proxy(node_id, &draft) {
+        Ok(Ok(id)) => match app.db.proxy(id) {
+            Ok(Some(proxy)) => (StatusCode::CREATED, Json(proxy)).into_response(),
+            Ok(None) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", INTERNAL),
+            Err(error) => api_internal(error),
+        },
+        Ok(Err(issue)) => map_proxy_issue(issue),
+        Err(error) => api_internal(error),
+    }
+}
+
+pub async fn get_proxy(_: ApiAdmin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
+    match app.db.proxy(id) {
+        Ok(Some(proxy)) => Json(proxy).into_response(),
+        Ok(None) => api_error(StatusCode::NOT_FOUND, "PROXY_NOT_FOUND", "proxy does not exist"),
+        Err(error) => api_internal(error),
+    }
+}
+
+pub async fn update_proxy(
+    _: ApiAdmin,
+    State(app): State<Shared>,
+    Path(id): Path<i64>,
+    body: Result<Json<ProxyRequest>, JsonRejection>,
+) -> Response {
+    let request = match api_body(body) {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    let node_id = request.node_id;
+    let draft = match request.into_draft() {
+        Ok(draft) => draft,
+        Err(error) => return api_input_error(error),
+    };
+    match app.db.update_proxy(id, node_id, &draft) {
+        Ok(Ok(())) => match app.db.proxy(id) {
+            Ok(Some(proxy)) => Json(proxy).into_response(),
+            Ok(None) => api_error(StatusCode::NOT_FOUND, "PROXY_NOT_FOUND", "proxy does not exist"),
+            Err(error) => api_internal(error),
+        },
+        Ok(Err(issue)) => map_proxy_issue(issue),
+        Err(error) => api_internal(error),
+    }
+}
+
+pub async fn delete_proxy(_: ApiAdmin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
+    let node_id = app.db.proxy(id).ok().flatten().map(|proxy| proxy.node_id);
+    match app.db.delete_proxy(id) {
+        Ok(true) => {
+            if let Some(node_id) = node_id {
+                let _ = sync_generated_nodes(&app, vec![node_id]);
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(false) => api_error(StatusCode::NOT_FOUND, "PROXY_NOT_FOUND", "proxy does not exist"),
+        Err(error) => api_internal(error),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct UserQuery {
+    enabled: Option<bool>,
+    q: Option<String>,
+}
+
+pub async fn list_users(_: ApiAdmin, State(app): State<Shared>, Query(query): Query<UserQuery>) -> Response {
+    match app.db.users(query.enabled, query.q.as_deref()) {
+        Ok(items) => Json(json!({"items":items})).into_response(),
+        Err(error) => api_internal(error),
+    }
+}
+
+pub async fn create_user(
+    _: ApiAdmin,
+    State(app): State<Shared>,
+    body: Result<Json<UserRequest>, JsonRejection>,
+) -> Response {
+    let request = match api_body(body) {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    let draft = match request.into_draft(true) {
+        Ok(draft) => draft,
+        Err(error) => return api_input_error(error),
+    };
+    match app.db.create_user(&draft) {
+        Ok(Ok(id)) => match app.db.user(id) {
+            Ok(Some(user)) => (StatusCode::CREATED, Json(user)).into_response(),
+            Ok(None) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", INTERNAL),
+            Err(error) => api_internal(error),
+        },
+        Ok(Err(issue)) => map_user_issue(issue),
+        Err(error) => api_internal(error),
+    }
+}
+
+pub async fn get_user(_: ApiAdmin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
+    match app.db.user(id) {
+        Ok(Some(user)) => Json(user).into_response(),
+        Ok(None) => api_error(StatusCode::NOT_FOUND, "USER_NOT_FOUND", "user does not exist"),
+        Err(error) => api_internal(error),
+    }
+}
+
+pub async fn reset_user_uuid(_: ApiAdmin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
+    match app.db.reset_user_uuid(id) {
+        Ok(Some((uuid, nodes))) => {
+            let (queued, offline) = sync_generated_nodes(&app, nodes);
+            Json(json!({"uuid":uuid,"queued_node_ids":queued,"needs_sync_node_ids":offline})).into_response()
+        }
+        Ok(None) => api_error(StatusCode::NOT_FOUND, "USER_NOT_FOUND", "user does not exist"),
+        Err(error) => api_internal(error),
+    }
+}
+
+pub async fn update_user(
+    _: ApiAdmin,
+    State(app): State<Shared>,
+    Path(id): Path<i64>,
+    body: Result<Json<UserRequest>, JsonRejection>,
+) -> Response {
+    let request = match api_body(body) {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    let draft = match request.into_draft(false) {
+        Ok(draft) => draft,
+        Err(error) => return api_input_error(error),
+    };
+    match app.db.update_user(id, &draft) {
+        Ok(Ok(())) => match app.db.user(id) {
+            Ok(Some(user)) => {
+                if let Ok(nodes) = app.db.nodes_for_user(id) {
+                    let _ = sync_generated_nodes(&app, nodes);
+                }
+                Json(user).into_response()
+            }
+            Ok(None) => api_error(StatusCode::NOT_FOUND, "USER_NOT_FOUND", "user does not exist"),
+            Err(error) => api_internal(error),
+        },
+        Ok(Err(issue)) => map_user_issue(issue),
+        Err(error) => api_internal(error),
+    }
+}
+
+pub async fn delete_user(_: ApiAdmin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
+    let nodes = app.db.nodes_for_user(id).unwrap_or_default();
+    match app.db.delete_user(id) {
+        Ok(UserDeleteResult::Deleted) => {
+            let _ = sync_generated_nodes(&app, nodes);
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(UserDeleteResult::NotFound) => {
+            api_error(StatusCode::NOT_FOUND, "USER_NOT_FOUND", "user does not exist")
+        }
+        Ok(UserDeleteResult::Protected) => api_error(
+            StatusCode::CONFLICT,
+            "SYSTEM_USER_PROTECTED",
+            "the default admin user cannot be deleted",
+        ),
+        Err(error) => api_internal(error),
+    }
+}
+
+pub async fn get_user_authorizations(
+    _: ApiAdmin,
+    State(app): State<Shared>,
+    Path(user_id): Path<i64>,
+) -> Response {
+    match app.db.authorizations_for_user(user_id) {
+        Ok(Some(items)) => Json(json!({"items":items})).into_response(),
+        Ok(None) => api_error(StatusCode::NOT_FOUND, "USER_NOT_FOUND", "user does not exist"),
+        Err(error) => api_internal(error),
+    }
+}
+
+pub async fn put_user_proxy(
+    _: ApiAdmin,
+    State(app): State<Shared>,
+    Path((user_id, proxy_id)): Path<(i64, i64)>,
+    body: Result<Json<AuthorizationRequest>, JsonRejection>,
+) -> Response {
+    let request = match api_body(body) {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    let draft: AuthorizationDraft = match request.into_draft() {
+        Ok(draft) => draft,
+        Err(error) => return api_input_error(error),
+    };
+    if let Err(response) = api_user(&app, user_id) {
+        return response;
+    }
+    let proxy = match api_proxy(&app, proxy_id) {
+        Ok(proxy) => proxy,
+        Err(response) => return response,
+    };
+    if !proxy::vless_protocol(&proxy) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "INVALID_PROXY_PROTOCOL",
+            "V1 only supports VLESS authorization",
+        );
+    }
+    match app.db.put_authorization(user_id, proxy_id, &draft) {
+        Ok(Ok(access)) => {
+            let sync = sync_generated_nodes(&app, vec![proxy.node_id]);
+            Json(json!({
+                "user_id": access.user_id,
+                "proxy_id": access.proxy_id,
+                "enabled": access.enabled,
+                "auth": access.auth,
+                "queued_node_ids": sync.0,
+                "needs_sync_node_ids": sync.1,
+            }))
+            .into_response()
+        }
+        Ok(Err(AuthorizationWriteIssue::UserNotFound)) => {
+            api_error(StatusCode::NOT_FOUND, "USER_NOT_FOUND", "user does not exist")
+        }
+        Ok(Err(AuthorizationWriteIssue::ProxyNotFound)) => {
+            api_error(StatusCode::NOT_FOUND, "PROXY_NOT_FOUND", "proxy does not exist")
+        }
+        Err(error) => api_internal(error),
+    }
+}
+
+pub async fn delete_user_proxy(
+    _: ApiAdmin,
+    State(app): State<Shared>,
+    Path((user_id, proxy_id)): Path<(i64, i64)>,
+) -> Response {
+    if let Err(response) = api_user(&app, user_id) {
+        return response;
+    }
+    let proxy = match api_proxy(&app, proxy_id) {
+        Ok(proxy) => proxy,
+        Err(response) => return response,
+    };
+    match app.db.delete_authorization(user_id, proxy_id) {
+        Ok(true) => {
+            let _ = sync_generated_nodes(&app, vec![proxy.node_id]);
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(false) => api_error(StatusCode::NOT_FOUND, "ACCESS_NOT_FOUND", "user has no access to this proxy"),
+        Err(error) => api_internal(error),
+    }
+}
+
+fn generated_node_config(app: &Shared, node_id: i64) -> Result<Value, Response> {
+    api_node_exists(app, node_id)?;
+    proxy::generate_config(&app.db, node_id, Utc::now().timestamp()).map_err(|error| {
+        if error.to_string().contains("generated config exceeds 1 MiB") {
+            api_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "SINGBOX_CONFIG_TOO_LARGE",
+                "generated config exceeds 1 MiB",
+            )
+        } else {
+            api_internal(error)
+        }
+    })
+}
+
+fn sync_generated_nodes(app: &Shared, node_ids: Vec<i64>) -> (Vec<i64>, Vec<i64>) {
+    let mut queued = Vec::new();
+    let mut needs_sync = Vec::new();
+    for node_id in node_ids {
+        match generated_node_config(app, node_id) {
+            Ok(config) => {
+                let response =
+                    enqueue_generated_config(app, node_id, "singbox.config.apply", config.to_string());
+                if response.status().is_success() {
+                    queued.push(node_id);
+                } else {
+                    needs_sync.push(node_id);
+                }
+            }
+            Err(_) => needs_sync.push(node_id),
+        }
+    }
+    (queued, needs_sync)
+}
+
+pub(crate) fn sync_node_config_on_connect(app: &Shared, node_id: i64) -> bool {
+    let Ok(config) = generated_node_config(app, node_id) else { return false };
+    enqueue_generated_config(app, node_id, "singbox.config.apply", config.to_string()).status().is_success()
+}
+
+pub async fn preview_singbox_config(
+    _: ApiAdmin,
+    State(app): State<Shared>,
+    Path(node_id): Path<i64>,
+) -> Response {
+    match generated_node_config(&app, node_id) {
+        Ok(config) => Json(json!({"node_id":node_id,"config":config})).into_response(),
+        Err(response) => response,
+    }
+}
+
+fn enqueue_generated_config(app: &Shared, node_id: i64, method: &str, content: String) -> Response {
+    if content.len() > proxy::MAX_GENERATED_CONFIG {
+        return api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "SINGBOX_CONFIG_TOO_LARGE",
+            "generated config exceeds 1 MiB",
+        );
+    }
+    let agents = app.agents.read().unwrap_or_else(|e| e.into_inner());
+    let Some(agent) = agents.get(&node_id) else {
+        return api_error(StatusCode::CONFLICT, "AGENT_OFFLINE", "Agent is currently offline");
+    };
+    let session = agent.session;
+    let id = match app.commands.start(node_id, session, method) {
+        Ok(id) => id,
+        Err(StartError::Full) => {
+            return api_error(StatusCode::SERVICE_UNAVAILABLE, "COMMAND_QUEUE_FULL", "command queue is full")
+        }
+    };
+    let message = json!({
+        "type": "command",
+        "id": id,
+        "action": method,
+        "params": {"content": content},
+    })
+    .to_string();
+    match agent.tx.try_send(message) {
+        Ok(()) => (StatusCode::ACCEPTED, Json(json!({"command_id":id,"status":"pending"}))).into_response(),
+        Err(_) => {
+            app.commands.cancel(&id, node_id, session);
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "AGENT_UNAVAILABLE",
+                "Agent queue is full or disconnected",
+            )
+        }
+    }
+}
+
+pub async fn check_singbox_config(
+    _: ApiAdmin,
+    State(app): State<Shared>,
+    Path(node_id): Path<i64>,
+    body: axum::body::Bytes,
+) -> Response {
+    if !body.is_empty() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "INVALID_REQUEST",
+            "config is generated from database state",
+        );
+    }
+    match generated_node_config(&app, node_id) {
+        Ok(config) => enqueue_generated_config(&app, node_id, "singbox.config.check", config.to_string()),
+        Err(response) => response,
+    }
+}
+
+pub async fn apply_singbox_config(
+    _: ApiAdmin,
+    State(app): State<Shared>,
+    Path(node_id): Path<i64>,
+    body: axum::body::Bytes,
+) -> Response {
+    if !body.is_empty() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "INVALID_REQUEST",
+            "config is generated from database state",
+        );
+    }
+    match generated_node_config(&app, node_id) {
+        Ok(config) => enqueue_generated_config(&app, node_id, "singbox.config.apply", config.to_string()),
+        Err(response) => response,
     }
 }
 
@@ -621,7 +1182,7 @@ fn invalidate_snapshot(app: &App) {
 /// here as well.
 fn stream_audience(app: &App, session: Option<&str>) -> Option<bool> {
     match session {
-        Some(hash) => app.db.session_valid(hash).then_some(true),
+        Some(hash) => app.db.admin_session_valid(hash).then_some(true),
         None => app.public_page().then_some(false),
     }
 }
@@ -824,8 +1385,14 @@ fn pins(node: &mut NodePatch) -> Option<&'static str> {
 }
 
 pub async fn me(State(app): State<Shared>, headers: HeaderMap) -> Json<Value> {
+    let principal = match crate::auth::principal(&app, &headers) {
+        Some(crate::db::SessionPrincipal::Admin) => "admin",
+        Some(crate::db::SessionPrincipal::User(_)) => "user",
+        None => "anonymous",
+    };
     Json(json!({
         "authed": authed(&app, &headers),
+        "principal": principal,
         "github": app.db.get("github_client_id").is_some_and(|v| !v.is_empty()),
         "site_name": app.db.get("site_name").unwrap_or_else(|| "Monitor".into()),
         "public_page": app.public_page(),
@@ -839,6 +1406,155 @@ pub async fn me(State(app): State<Shared>, headers: HeaderMap) -> Json<Value> {
         // and the panel falls back to its own origin.
         "site": app.site,
     }))
+}
+
+pub async fn user_me(UserAuth(user_id): UserAuth, State(app): State<Shared>) -> Response {
+    match app.db.user(user_id) {
+        Ok(Some(user)) => Json(json!({
+            "id": user.id,
+            "username": user.username,
+            "enabled": user.enabled,
+            "expires_at": user.expires_at,
+        }))
+        .into_response(),
+        Ok(None) => api_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "登录已失效，请重新登录"),
+        Err(error) => api_internal(error),
+    }
+}
+
+pub async fn user_proxies(UserAuth(user_id): UserAuth, State(app): State<Shared>) -> Response {
+    let now = Utc::now().timestamp();
+    match app.db.active_user_portal_proxies(user_id, now) {
+        Ok(mut proxies) => {
+            let agents = app.agents.read().unwrap_or_else(|e| e.into_inner());
+            for proxy in &mut proxies {
+                proxy.online = agents.contains_key(&proxy.node_id);
+            }
+            Json(json!({"items": proxies})).into_response()
+        }
+        Err(error) => api_internal(error),
+    }
+}
+
+pub async fn user_subscription_links(UserAuth(user_id): UserAuth, State(app): State<Shared>) -> Response {
+    match app.db.user_subscription_token(user_id) {
+        Ok(Some(token)) => Json(json!({
+            "clash": format!("/api/subscriptions/{token}/clash"),
+            "sing_box": format!("/api/subscriptions/{token}/sing-box"),
+        }))
+        .into_response(),
+        Ok(None) => api_error(StatusCode::NOT_FOUND, "USER_NOT_FOUND", "user does not exist"),
+        Err(error) => api_internal(error),
+    }
+}
+
+pub async fn rotate_user_subscription_token(
+    UserAuth(user_id): UserAuth,
+    State(app): State<Shared>,
+) -> Response {
+    match app.db.rotate_user_subscription_token(user_id) {
+        Ok(Some(_)) => StatusCode::NO_CONTENT.into_response(),
+        Ok(None) => api_error(StatusCode::NOT_FOUND, "USER_NOT_FOUND", "user does not exist"),
+        Err(error) => api_internal(error),
+    }
+}
+
+fn subscription_label(proxy: &crate::db::UserSubscriptionProxy) -> String {
+    let label = if proxy.include_node_name {
+        format!("{} - {}", proxy.node_name, proxy.name)
+    } else {
+        proxy.name.clone()
+    };
+    label
+}
+
+fn yaml_string(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "\"\"".into())
+}
+
+fn clash_subscription(uuid: &str, proxies: &[crate::db::UserSubscriptionProxy]) -> String {
+    let mut out = String::from("proxies:\n");
+    let labels: Vec<_> = proxies.iter().map(subscription_label).collect();
+    for (proxy, name) in proxies.iter().zip(&labels) {
+        out.push_str(&format!(
+            "  - name: {}\n    type: vless\n    server: {}\n    port: {}\n    uuid: {}\n    network: tcp\n    tls: true\n    udp: true\n    servername: {}\n    client-fingerprint: chrome\n    reality-opts:\n      public-key: {}\n      short-id: {}\n",
+            yaml_string(name), yaml_string(&proxy.address), proxy.port, yaml_string(uuid),
+            yaml_string(&proxy.server_name), yaml_string(&proxy.public_key), yaml_string(&proxy.short_id),
+        ));
+        if !proxy.flow.is_empty() {
+            out.push_str(&format!("    flow: {}\n", yaml_string(&proxy.flow)));
+        }
+    }
+    out.push_str("proxy-groups:\n  - name: Proxy\n    type: select\n    proxies:\n");
+    for name in &labels {
+        out.push_str(&format!("      - {}\n", yaml_string(name)));
+    }
+    out.push_str("      - DIRECT\nrules:\n  - MATCH,Proxy\n");
+    out
+}
+
+fn sing_box_subscription(uuid: &str, proxies: &[crate::db::UserSubscriptionProxy]) -> Value {
+    let mut outbounds: Vec<Value> = proxies
+        .iter()
+        .map(|proxy| {
+            let name = subscription_label(proxy);
+            let mut outbound = json!({
+                "type": "vless",
+                "tag": name,
+                "server": proxy.address,
+                "server_port": proxy.port,
+                "uuid": uuid,
+                "network": "tcp",
+                "tls": {
+                    "enabled": true,
+                    "server_name": proxy.server_name,
+                    "utls": {"enabled": true, "fingerprint": "chrome"},
+                    "reality": {"enabled": true, "public_key": proxy.public_key, "short_id": proxy.short_id}
+                }
+            });
+            if !proxy.flow.is_empty() {
+                outbound["flow"] = Value::String(proxy.flow.clone());
+            }
+            outbound
+        })
+        .collect();
+    let tags: Vec<String> = proxies.iter().map(subscription_label).collect();
+    if !tags.is_empty() {
+        outbounds.push(json!({"type":"selector","tag":"Proxy","outbounds":tags,"default":tags[0]}));
+    }
+    outbounds.push(json!({"type":"direct","tag":"direct"}));
+    let final_tag = if tags.is_empty() { "direct" } else { "Proxy" };
+    json!({
+        "$schema": "https://sing-box.sagernet.org/schema.json",
+        "outbounds": outbounds,
+        "route": {"final": final_tag}
+    })
+}
+
+pub async fn subscription(
+    State(app): State<Shared>,
+    Path((token, format)): Path<(String, String)>,
+) -> Response {
+    let user_id = match app.db.active_user_id_for_subscription_token(&token, Utc::now().timestamp()) {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            return api_error(StatusCode::NOT_FOUND, "SUBSCRIPTION_NOT_FOUND", "订阅链接无效或已过期")
+        }
+        Err(error) => return api_internal(error),
+    };
+    let (uuid, proxies) = match app.db.active_user_subscription(user_id, Utc::now().timestamp()) {
+        Ok(Some(data)) => data,
+        Ok(None) => return api_error(StatusCode::FORBIDDEN, "ACCOUNT_INACTIVE", "账号当前不可用"),
+        Err(error) => return api_internal(error),
+    };
+    let (content_type, body) = match format.as_str() {
+        "clash" => ("application/yaml; charset=utf-8", clash_subscription(&uuid, &proxies)),
+        "sing-box" => ("application/json; charset=utf-8", sing_box_subscription(&uuid, &proxies).to_string()),
+        _ => return api_error(StatusCode::NOT_FOUND, "SUBSCRIPTION_FORMAT_NOT_FOUND", "订阅格式不存在"),
+    };
+    let mut response = ([(header::CONTENT_TYPE, content_type)], body).into_response();
+    response.headers_mut().insert(header::CACHE_CONTROL, "no-store".parse().expect("static header"));
+    response
 }
 
 pub async fn create_node(
@@ -2243,10 +2959,7 @@ mod tests {
     /// whatever this accepts, the hub will fetch.
     #[test]
     fn only_a_github_repository_url_can_name_a_release_to_download() {
-        assert_eq!(
-            github_repo("https://github.com/monitor-probe/monitor"),
-            Some(("monitor-probe", "monitor"))
-        );
+        assert_eq!(github_repo("https://github.com/lzj565/monitor"), Some(("lzj565", "monitor")));
         // A link to the repository, in whatever form the author wrote it.
         assert_eq!(github_repo("https://github.com/a/b.git"), Some(("a", "b")));
         assert_eq!(github_repo("https://github.com/a/b/tree/main"), Some(("a", "b")));

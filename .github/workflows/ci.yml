@@ -57,3 +57,27 @@ jobs:
           curl -fsSL -o agent https://github.com/monitor-probe/agent/releases/latest/download/monitor-agent-x86_64-unknown-linux-musl
           chmod +x agent
       - run: scripts/e2e.sh target/debug/monitor-hub ./agent
+
+  sing-box:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with:
+          repository: SagerNet/sing-box
+          ref: v1.14.1
+          path: sing-box-source
+          persist-credentials: false
+      - uses: actions/setup-go@v6
+        with:
+          go-version: 1.25.5
+          cache: true
+          cache-dependency-path: sing-box-source/go.sum
+      - run: sh scripts/build-sing-box.sh sing-box-source "${{ matrix.arch }}" "dist/monitor-sing-box-${{ matrix.arch }}"
+      - if: matrix.arch == 'amd64'
+        run: GOBIN="$RUNNER_TEMP/bin" go install github.com/fullstorydev/grpcurl/cmd/grpcurl@v1.9.3
+      - if: matrix.arch == 'amd64'
+        run: PATH="$RUNNER_TEMP/bin:$PATH" sh scripts/check-sing-box-api.sh dist/monitor-sing-box-amd64

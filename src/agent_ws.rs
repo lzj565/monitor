@@ -310,6 +310,11 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> 
 
     // Send the probe list before the first report arrives.
     let _ = socket.send(Message::Text(ping_tasks_message(&app, node_id).into())).await;
+    // The agent may have been offline when a user's UUID or authorization
+    // changed. Always reconcile to the hub's current state on reconnect.
+    if !crate::api::sync_node_config_on_connect(&app, node_id) {
+        debug!("node {node_id}: current sing-box config will need another sync attempt");
+    }
 
     let mut heartbeat = tokio::time::interval(HEARTBEAT);
     heartbeat.tick().await; // The first tick completes immediately.

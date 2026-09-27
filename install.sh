@@ -22,6 +22,8 @@ SING_BOX="$ROOT/sing-box"
 SING_BOX_CONFIG="/etc/sing-box/config.json"
 SING_BOX_UNIT="/etc/systemd/system/sing-box.service"
 SING_BOX_RC="/etc/init.d/sing-box"
+SING_BOX_UNIT_BACKUP="$ROOT/sing-box.service.before-monitor"
+SING_BOX_RC_BACKUP="$ROOT/sing-box.openrc.before-monitor"
 CURRENT_STEP=""
 FAIL_REASON="command failed"
 TMP_AGENT=""
@@ -424,61 +426,51 @@ install -m 0755 "$TMP_AGENT" "$AGENT_CANDIDATE"
 mv -f "$AGENT_CANDIDATE" "$BIN"
 success "monitor-agent binary 安装完成"
 
-# Existing sing-box installations are never modified. The fixed Agent path is
-# supplied by a symlink only when it is free.
+# The system package binary is left in place, while the Agent and service use
+# this release's self-built binary with V2Ray API support.
 step 2 "检查 sing-box"
 SING_BOX_SOURCE="installer"
-SING_BOX_SYSTEM_PATH=""
+SING_BOX_SYSTEM_PATH=$(command -v sing-box 2>/dev/null || true)
 SING_BOX_VER=""
-if SING_BOX_SYSTEM_PATH=$(command -v sing-box 2>/dev/null); then
-	SING_BOX_SOURCE="system"
+if [ -n "$SING_BOX_SYSTEM_PATH" ]; then
 	SING_BOX_VER=$("$SING_BOX_SYSTEM_PATH" version 2>/dev/null | sed -n '1s/.*version[[:space:]]*//p')
-	detail "状态" "已安装"
-	detail "路径" "$SING_BOX_SYSTEM_PATH"
-	detail "版本" "${SING_BOX_VER:-未知}"
-	if [ -e "$SING_BOX" ] || [ -L "$SING_BOX" ]; then
-		if [ "$SING_BOX_SYSTEM_PATH" = "$SING_BOX" ] && [ -x "$SING_BOX" ]; then
-			detail "Agent 路径" "$SING_BOX"
-		elif [ -L "$SING_BOX" ] && [ "$(readlink "$SING_BOX")" = "$SING_BOX_SYSTEM_PATH" ] && [ -x "$SING_BOX" ]; then
-			detail "Agent 路径" "$SING_BOX -> $SING_BOX_SYSTEM_PATH"
-		else
-			FAIL_REASON="$SING_BOX 已存在且不是指向系统 sing-box 的正确链接"
-			fail "$FAIL_REASON"
-		fi
-	else
-		ln -s "$SING_BOX_SYSTEM_PATH" "$SING_BOX"
-		detail "Agent 路径" "$SING_BOX -> $SING_BOX_SYSTEM_PATH"
-	fi
-	warn "检测到已有 sing-box，跳过安装"
-	if [ ! -f "$SING_BOX_CONFIG" ]; then
-		warn "已检测到 sing-box，但未找到 $SING_BOX_CONFIG；Agent 配置管理默认使用该路径"
-	fi
+	detail "系统 sing-box" "$SING_BOX_SYSTEM_PATH (${SING_BOX_VER:-版本未知})，保留系统包文件"
 else
-	if [ "$INIT" = systemd ]; then
-		[ ! -e "$SING_BOX_UNIT" ] && [ ! -L "$SING_BOX_UNIT" ] || { FAIL_REASON="$SING_BOX_UNIT 已存在，为保护已有服务定义已停止"; fail "$FAIL_REASON"; }
-	else
-		[ ! -e "$SING_BOX_RC" ] && [ ! -L "$SING_BOX_RC" ] || { FAIL_REASON="$SING_BOX_RC 已存在，为保护已有服务定义已停止"; fail "$FAIL_REASON"; }
-	fi
-	SING_BOX_URL="https://github.com/SagerNet/sing-box/releases/download/v${SING_BOX_VERSION}/sing-box-${SING_BOX_VERSION}-linux-${SING_BOX_ARCH}.tar.gz"
-	TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/monitor-install.XXXXXX")
-	info "正在下载 sing-box $SING_BOX_VERSION"
-	curl -fsSL --max-time 300 "$SING_BOX_URL" -o "$TMP_DIR/sing-box.tar.gz" || { FAIL_REASON="下载 sing-box 失败"; exit 1; }
-	tar -xzf "$TMP_DIR/sing-box.tar.gz" -C "$TMP_DIR" || { FAIL_REASON="解压 sing-box 失败"; exit 1; }
-	SING_BOX_CANDIDATE="$TMP_DIR/sing-box-${SING_BOX_VERSION}-linux-${SING_BOX_ARCH}/sing-box"
-	[ -s "$SING_BOX_CANDIDATE" ] || { FAIL_REASON="sing-box archive 中未找到 binary"; fail "$FAIL_REASON"; }
-	chmod 0755 "$SING_BOX_CANDIDATE"
-	"$SING_BOX_CANDIDATE" version >/dev/null 2>&1 || { FAIL_REASON="sing-box binary 无法运行"; fail "$FAIL_REASON"; }
-	SING_BOX_VER=$("$SING_BOX_CANDIDATE" version 2>/dev/null | sed -n '1s/.*version[[:space:]]*//p')
-	[ ! -e "$SING_BOX" ] && [ ! -L "$SING_BOX" ] || { FAIL_REASON="$SING_BOX 路径冲突；为保护现有文件已停止"; fail "$FAIL_REASON"; }
-	SING_BOX_STAGED="$ROOT/.sing-box.$$"
-	install -m 0755 "$SING_BOX_CANDIDATE" "$SING_BOX_STAGED"
-	mv "$SING_BOX_STAGED" "$SING_BOX"
-	SING_BOX_STAGED=""
-	install -d -m 0755 /etc/sing-box
-	if [ ! -e "$SING_BOX_CONFIG" ] && [ ! -L "$SING_BOX_CONFIG" ]; then
-		(
-			umask 022
-			cat >"$SING_BOX_CONFIG" <<'CONFIG'
+	detail "系统 sing-box" "未安装"
+fi
+
+TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/monitor-install.XXXXXX")
+SING_BOX_CANDIDATE="$TMP_DIR/sing-box"
+SING_BOX_SHA="$TMP_DIR/sing-box.sha256"
+SING_BOX_URL="${SERVER%/}/sing-box/$SING_BOX_ARCH"
+info "正在下载自构建 sing-box $SING_BOX_VERSION（含 with_v2ray_api）"
+curl -fsSL --max-time 300 "$SING_BOX_URL" -o "$SING_BOX_CANDIDATE" || { FAIL_REASON="下载自构建 sing-box 失败"; exit 1; }
+curl -fsSL --max-time 60 "$SING_BOX_URL.sha256" -o "$SING_BOX_SHA" || { FAIL_REASON="下载 sing-box 校验和失败"; exit 1; }
+EXPECTED_SHA=$(sed -n '1{s/[[:space:]].*//;p;}' "$SING_BOX_SHA")
+case "$EXPECTED_SHA" in
+	????????????????????????????????????????????????????????????????) ;;
+	*) FAIL_REASON="sing-box 校验和格式不正确"; fail "$FAIL_REASON" ;;
+esac
+case "$EXPECTED_SHA" in *[!0-9a-fA-F]*) FAIL_REASON="sing-box 校验和格式不正确"; fail "$FAIL_REASON" ;; esac
+ACTUAL_SHA=$(sha256sum "$SING_BOX_CANDIDATE" | awk '{print $1}')
+[ "$ACTUAL_SHA" = "$EXPECTED_SHA" ] || { FAIL_REASON="自构建 sing-box 校验和不匹配"; fail "$FAIL_REASON"; }
+chmod 0755 "$SING_BOX_CANDIDATE"
+VERSION_OUTPUT=$("$SING_BOX_CANDIDATE" version 2>&1) || { FAIL_REASON="自构建 sing-box binary 无法运行"; fail "$FAIL_REASON"; }
+printf '%s\n' "$VERSION_OUTPUT" | grep -F "version $SING_BOX_VERSION" >/dev/null || {
+	FAIL_REASON="自构建 sing-box 版本不匹配"
+	fail "$FAIL_REASON"
+}
+printf '%s\n' "$VERSION_OUTPUT" | grep -F "with_v2ray_api" >/dev/null || {
+	FAIL_REASON="sing-box binary 不包含 with_v2ray_api"
+	fail "$FAIL_REASON"
+}
+SING_BOX_VER=$(printf '%s\n' "$VERSION_OUTPUT" | sed -n '1s/.*version[[:space:]]*//p')
+
+install -d -m 0755 "$ROOT" /etc/sing-box
+if [ ! -e "$SING_BOX_CONFIG" ] && [ ! -L "$SING_BOX_CONFIG" ]; then
+	(
+		umask 022
+		cat >"$SING_BOX_CONFIG" <<'CONFIG'
 {
   "inbounds": [],
   "outbounds": [
@@ -486,30 +478,42 @@ else
       "type": "direct",
       "tag": "direct"
     }
-  ]
+  ],
+  "experimental": {
+    "v2ray_api": {
+      "listen": "127.0.0.1:9001",
+      "stats": {"enabled": true, "inbounds": [], "users": []}
+    }
+  }
 }
 CONFIG
-		)
-	else
-		warn "保留已有配置 $SING_BOX_CONFIG"
-	fi
-	"$SING_BOX" check -c "$SING_BOX_CONFIG" || { FAIL_REASON="sing-box 配置校验失败: $SING_BOX_CONFIG"; fail "$FAIL_REASON"; }
-	detail "状态" "本次安装"
-	detail "版本" "$SING_BOX_VER"
-	success "sing-box 安装及配置校验完成"
+	)
 fi
-
-# Existing config is never rewritten, including when sing-box itself was
-# already present. Validate it only when the standard path exists.
-if [ -f "$SING_BOX_CONFIG" ] && [ "$SING_BOX_SOURCE" = system ]; then
-	"$SING_BOX" check -c "$SING_BOX_CONFIG" || { FAIL_REASON="当前 sing-box 配置校验失败: $SING_BOX_CONFIG"; fail "$FAIL_REASON"; }
-	success "现有 sing-box 配置校验通过"
+"$SING_BOX_CANDIDATE" check -c "$SING_BOX_CONFIG" || {
+	FAIL_REASON="当前配置不能被自构建 sing-box $SING_BOX_VERSION 校验: $SING_BOX_CONFIG"
+	fail "$FAIL_REASON"
+}
+if [ -e "$SING_BOX" ] && [ -d "$SING_BOX" ]; then
+	FAIL_REASON="$SING_BOX 是目录，无法安装 sing-box binary"
+	fail "$FAIL_REASON"
 fi
+SING_BOX_STAGED="$ROOT/.sing-box.$$"
+install -m 0755 "$SING_BOX_CANDIDATE" "$SING_BOX_STAGED"
+mv -f "$SING_BOX_STAGED" "$SING_BOX"
+SING_BOX_STAGED=""
+detail "Agent 路径" "$SING_BOX"
+detail "版本" "$SING_BOX_VER"
+success "自构建 sing-box 安装及配置校验完成"
 
 step 3 "初始化系统服务"
-if [ "$SING_BOX_SOURCE" = installer ]; then
-	if [ "$INIT" = systemd ]; then
-		cat >"$SING_BOX_UNIT" <<UNIT
+if [ "$INIT" = systemd ]; then
+	if { [ -e "$SING_BOX_UNIT" ] || [ -L "$SING_BOX_UNIT" ]; } &&
+		! grep -F "$SING_BOX" "$SING_BOX_UNIT" >/dev/null 2>&1 &&
+		[ ! -e "$SING_BOX_UNIT_BACKUP" ]; then
+		cp -p "$SING_BOX_UNIT" "$SING_BOX_UNIT_BACKUP"
+	fi
+	[ ! -L "$SING_BOX_UNIT" ] || rm -f "$SING_BOX_UNIT"
+	cat >"$SING_BOX_UNIT" <<UNIT
 [Unit]
 Description=sing-box service
 After=network-online.target
@@ -524,11 +528,18 @@ RestartSec=3
 [Install]
 WantedBy=multi-user.target
 UNIT
-	else
-		cat >"$SING_BOX_RC" <<'RC'
+	chmod 0644 "$SING_BOX_UNIT"
+else
+	if { [ -e "$SING_BOX_RC" ] || [ -L "$SING_BOX_RC" ]; } &&
+		! grep -F "$SING_BOX" "$SING_BOX_RC" >/dev/null 2>&1 &&
+		[ ! -e "$SING_BOX_RC_BACKUP" ]; then
+		cp -p "$SING_BOX_RC" "$SING_BOX_RC_BACKUP"
+	fi
+	[ ! -L "$SING_BOX_RC" ] || rm -f "$SING_BOX_RC"
+	cat >"$SING_BOX_RC" <<RC
 #!/sbin/openrc-run
 description="sing-box service"
-command="/opt/monitor/sing-box"
+command="$SING_BOX"
 command_args="run -c /etc/sing-box/config.json"
 supervisor="supervise-daemon"
 respawn_delay=3
@@ -537,8 +548,7 @@ depend() {
 	need net
 }
 RC
-		chmod 0755 "$SING_BOX_RC"
-	fi
+	chmod 0755 "$SING_BOX_RC"
 fi
 
 

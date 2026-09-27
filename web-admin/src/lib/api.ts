@@ -459,7 +459,7 @@ export async function upload<T>(
  * Live node list. Uses the WebSocket the hub pushes every two seconds, falling
  * back to polling if it cannot be established.
  */
-export function useNodes() {
+export function useNodes(enabled = true) {
   const [nodes, setNodes] = useState<Node[] | null>(null)
   // null until a frame reports it. The panel treats an explicit false as the
   // session no longer being an admin one, so an unanswered first fetch must not
@@ -469,6 +469,7 @@ export function useNodes() {
   const [reload, setReload] = useState(0)
 
   useEffect(() => {
+    if (!enabled) return
     let socket: WebSocket | null = null
     let poll: ReturnType<typeof setInterval> | null = null
     let retry: ReturnType<typeof setTimeout> | null = null
@@ -528,7 +529,7 @@ export function useNodes() {
       if (poll) clearInterval(poll)
       if (retry) clearTimeout(retry)
     }
-  }, [reload])
+  }, [enabled, reload])
 
   return { nodes, admin, error, refresh: () => setReload((n) => n + 1) }
 }

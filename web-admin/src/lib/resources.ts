@@ -16,6 +16,7 @@ export type Proxy = {
   id: number
   node_id: number
   name: string
+  include_node_name: boolean
   protocol: "vless"
   address_type: AddressType
   address: string
@@ -31,6 +32,7 @@ export type ProxyDraft = Omit<Proxy, "id" | "node_id" | "created_at" | "updated_
 export type User = {
   id: number
   username: string
+  uuid: string
   enabled: boolean
   expires_at: number | null
   created_at: number
@@ -39,10 +41,10 @@ export type User = {
   proxy_count: number
 }
 
-export type UserDraft = Pick<User, "username" | "enabled" | "expires_at">
-export type VlessAuth = { uuid: string; flow: Flow }
-export type UserProxyAccess = {
-  proxy: Pick<Proxy, "id" | "node_id" | "name" | "protocol" | "address_type" | "address" | "port" | "enabled">
+export type UserDraft = Pick<User, "username" | "enabled" | "expires_at"> & { password?: string }
+export type VlessAuth = { flow: Flow }
+export type UserProxyAuthorization = {
+  proxy: Pick<Proxy, "id" | "node_id" | "name" | "include_node_name" | "protocol" | "address_type" | "address" | "port" | "enabled">
   access: { enabled: boolean; auth: VlessAuth }
 }
 export type AccessDraft = { enabled: boolean; auth: VlessAuth }
@@ -61,8 +63,9 @@ export function createProxy(nodeId: number, draft: ProxyDraft) {
   return api<Proxy>(`/nodes/${nodeId}/proxies`, { method: "POST", body: JSON.stringify(draft) })
 }
 
-export function updateProxy(id: number, draft: ProxyDraft) {
-  return api<Proxy>(`/proxies/${id}`, { method: "PUT", body: JSON.stringify(draft) })
+export function updateProxy(id: number, draft: ProxyDraft, nodeId?: number) {
+  const body = nodeId === undefined ? draft : { ...draft, node_id: nodeId }
+  return api<Proxy>(`/proxies/${id}`, { method: "PUT", body: JSON.stringify(body) })
 }
 
 export function deleteProxy(id: number) {
@@ -82,12 +85,16 @@ export function updateUser(id: number, draft: UserDraft) {
   return api<User>(`/users/${id}`, { method: "PUT", body: JSON.stringify(draft) })
 }
 
+export function resetUserUuid(id: number) {
+  return api<{ uuid: string; queued_node_ids: number[]; needs_sync_node_ids: number[] }>(`/users/${id}/uuid`, { method: "POST" })
+}
+
 export function deleteUser(id: number) {
   return api<void>(`/users/${id}`, { method: "DELETE" })
 }
 
-export async function listUserProxies(userId: number): Promise<UserProxyAccess[]> {
-  const response = await api<{ items: UserProxyAccess[] }>(`/users/${userId}/proxies`)
+export async function listUserAuthorizations(userId: number): Promise<UserProxyAuthorization[]> {
+  const response = await api<{ items: UserProxyAuthorization[] }>(`/users/${userId}/proxies`)
   return response.items
 }
 

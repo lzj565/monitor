@@ -7,10 +7,11 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
-    "test": "node src/lib/api.test.ts",
+    "test": "node src/lib/api.test.ts && node src/lib/resources.test.ts",
     "preview": "vite preview"
   },
   "dependencies": {
+    "@noble/curves": "2.3.0",
     "@tailwindcss/vite": "^4.3.3",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",

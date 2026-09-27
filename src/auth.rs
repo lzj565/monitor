@@ -125,7 +125,11 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
 
 /// True when the request carries a live session cookie.
 pub fn authed(app: &App, headers: &HeaderMap) -> bool {
-    cookie_value(headers, COOKIE).is_some_and(|token| app.db.session_valid(&sha256(&token)))
+    cookie_value(headers, COOKIE).is_some_and(|token| app.db.admin_session_valid(&sha256(&token)))
+}
+
+pub fn principal(app: &App, headers: &HeaderMap) -> Option<crate::db::SessionPrincipal> {
+    cookie_value(headers, COOKIE).and_then(|token| app.db.session_principal(&sha256(&token)))
 }
 
 fn set_cookie(name: &str, value: &str, max_age: i64, secure: bool) -> String {
@@ -151,14 +155,34 @@ pub fn issued_at(expires_at: i64) -> i64 {
 /// The request's headers decide the Secure flag when the hub has no `--site`;
 /// see `App::secure_cookies`.
 pub fn issue_session(app: &App, headers: &HeaderMap) -> Result<String> {
+    issue_session_for(app, headers, None)
+}
+
+pub fn issue_user_session(app: &App, headers: &HeaderMap, user_id: i64) -> Result<String> {
+    issue_session_for(app, headers, Some(user_id))
+}
+
+fn issue_session_for(app: &App, headers: &HeaderMap, user_id: Option<i64>) -> Result<String> {
     let token = random_token();
-    app.db.create_session(&sha256(&token), Utc::now().timestamp() + SESSION_DAYS * 86_400)?;
+    let hash = sha256(&token);
+    let expires_at = Utc::now().timestamp() + SESSION_DAYS * 86_400;
+    if let Some(user_id) = user_id {
+        app.db.create_user_session(&hash, expires_at, user_id)?;
+    } else {
+        app.db.create_session(&hash, expires_at)?;
+    }
     Ok(set_cookie(COOKIE, &token, SESSION_DAYS * 86_400, app.secure_cookies(headers)))
 }
 
 #[derive(Deserialize)]
 pub struct LoginBody {
     password: String,
+}
+
+#[derive(Deserialize)]
+pub struct UserLoginBody {
+    pub username: String,
+    pub password: String,
 }
 
 pub async fn login(
@@ -189,6 +213,53 @@ pub async fn login(
             with_cookies(Json(serde_json::json!({"ok": true})), [cookie])
         }
         Err(e) => fail(e),
+    }
+}
+
+pub async fn user_login(
+    State(app): State<crate::Shared>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<UserLoginBody>,
+) -> Response {
+    let ip = client_ip(&headers, peer.ip());
+    if app.throttle.locked(ip) {
+        return answer(StatusCode::TOO_MANY_REQUESTS, "尝试次数过多，稍后再试");
+    }
+    let Ok(_permit) = PASSWORD_GATE.try_acquire() else {
+        return answer(StatusCode::TOO_MANY_REQUESTS, "尝试次数过多，稍后再试");
+    };
+    let username = body.username.trim();
+    let record = match app.db.user_login_record(username) {
+        Ok(record) => record,
+        Err(error) => return fail(error),
+    };
+    // Verify a hash even when the account is absent or has no password yet so
+    // those cases have the same Argon2 cost as an incorrect password.
+    static DUMMY_HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let dummy =
+        DUMMY_HASH.get_or_init(|| hash_password("monitor-user-login-dummy").expect("dummy password hash"));
+    let hash = record.as_ref().and_then(|user| user.password_hash.as_deref()).unwrap_or(dummy);
+    if !verify_password(&body.password, hash)
+        || record.is_none()
+        || record.as_ref().is_some_and(|u| u.password_hash.is_none())
+    {
+        app.throttle.record_failure(ip);
+        return answer(StatusCode::UNAUTHORIZED, "用户名或密码错误");
+    }
+    let user = record.expect("checked above");
+    app.throttle.clear(ip);
+    if !user.enabled {
+        return answer(StatusCode::FORBIDDEN, "账号已禁用");
+    }
+    if user.expires_at.is_some_and(|expires| expires <= Utc::now().timestamp()) {
+        return answer(StatusCode::FORBIDDEN, "账号已过期");
+    }
+    match issue_user_session(&app, &headers, user.id) {
+        Ok(cookie) => {
+            with_cookies(Json(serde_json::json!({"ok": true, "id": user.id, "username": username})), [cookie])
+        }
+        Err(error) => fail(error),
     }
 }
 
@@ -467,6 +538,37 @@ fn behind_local_proxy(ip: IpAddr) -> bool {
 mod tests {
     use super::*;
 
+    fn user_app(username: &str, password: &str, enabled: bool, expires_at: Option<i64>) -> crate::Shared {
+        let db = crate::db::Db::open(":memory:").unwrap();
+        let password_hash = hash_password(password).unwrap();
+        db.create_user(&crate::db::UserDraft {
+            username: username.into(),
+            password_hash: Some(password_hash),
+            enabled,
+            expires_at,
+        })
+        .unwrap()
+        .unwrap();
+        std::sync::Arc::new(crate::App::for_test(db))
+    }
+
+    async fn login_user(app: crate::Shared, username: &str, password: &str) -> Response {
+        for _ in 0..100 {
+            let response = user_login(
+                State(app.clone()),
+                ConnectInfo("203.0.113.77:1234".parse().unwrap()),
+                HeaderMap::new(),
+                Json(UserLoginBody { username: username.into(), password: password.into() }),
+            )
+            .await;
+            if response.status() != StatusCode::TOO_MANY_REQUESTS {
+                return response;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("password check gate stayed busy for too long");
+    }
+
     #[test]
     fn a_password_round_trips_fails_closed_and_never_repeats_a_salt() {
         let hash = hash_password("correct horse battery staple").unwrap();
@@ -479,6 +581,42 @@ mod tests {
         // The salt is per hash, so cracking one row does not reveal every other
         // row sharing that password.
         assert_ne!(hash_password("same").unwrap(), hash_password("same").unwrap());
+    }
+
+    #[tokio::test]
+    async fn user_login_issues_a_user_principal_and_never_returns_uuid() {
+        let app = user_app("alice", "correct horse", true, None);
+        let user_id = app.db.user_login_record("alice").unwrap().unwrap().id;
+        let response = login_user(app.clone(), "alice", "correct horse").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let set_cookie =
+            response.headers().get_all(header::SET_COOKIE).iter().next().unwrap().to_str().unwrap();
+        let token = set_cookie.split(';').next().unwrap().split_once('=').unwrap().1;
+        let hash = sha256(token);
+        assert_eq!(app.db.session_principal(&hash), Some(crate::db::SessionPrincipal::User(user_id)));
+        assert!(!app.db.admin_session_valid(&hash));
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["username"], "alice");
+        assert!(json.get("uuid").is_none());
+        assert!(json.get("password_hash").is_none());
+    }
+
+    #[tokio::test]
+    async fn user_login_hides_missing_accounts_and_rejects_disabled_or_expired_accounts() {
+        let app = user_app("alice", "correct horse", true, None);
+        let wrong = login_user(app.clone(), "alice", "wrong").await;
+        let missing = login_user(app.clone(), "nobody", "wrong").await;
+        assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+        let wrong_body = axum::body::to_bytes(wrong.into_body(), usize::MAX).await.unwrap();
+        let missing_body = axum::body::to_bytes(missing.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(wrong_body, missing_body);
+
+        let disabled = user_app("disabled", "secret", false, None);
+        assert_eq!(login_user(disabled, "disabled", "secret").await.status(), StatusCode::FORBIDDEN);
+        let expired = user_app("expired", "secret", true, Some(Utc::now().timestamp() - 1));
+        assert_eq!(login_user(expired, "expired", "secret").await.status(), StatusCode::FORBIDDEN);
     }
 
     /// One address through the full lockout lifecycle: attempts up to the limit

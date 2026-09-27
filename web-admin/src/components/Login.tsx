@@ -1,4 +1,4 @@
-import { useState } from "react"
+import { useEffect, useState } from "react"
 
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
@@ -25,18 +25,31 @@ function callbackError(): string {
   return reason ?? ""
 }
 
-export function Login({ github, onDone }: { github: boolean; onDone: () => void }) {
+export function Login({ github, userDefault, onModeChange, onDone }: {
+  github: boolean
+  userDefault: boolean
+  onModeChange: (mode: "user" | "admin") => void
+  onDone: (mode: "user" | "admin") => void
+}) {
+  const [mode, setMode] = useState<"user" | "admin">(() => userDefault ? "user" : "admin")
+  const [username, setUsername] = useState("")
   const [password, setPassword] = useState("")
   const [error, setError] = useState(callbackError)
   const [busy, setBusy] = useState(false)
+
+  useEffect(() => { setMode(userDefault ? "user" : "admin") }, [userDefault])
 
   async function submit(e: React.FormEvent) {
     e.preventDefault()
     setBusy(true)
     setError("")
     try {
-      await api("/auth/login", { method: "POST", body: JSON.stringify({ password }) })
-      onDone()
+      if (mode === "user") {
+        await api("/user/auth/login", { method: "POST", body: JSON.stringify({ username, password }) })
+      } else {
+        await api("/admin/auth/login", { method: "POST", body: JSON.stringify({ password }) })
+      }
+      onDone(mode)
     } catch (err) {
       setError((err as Error).message)
     } finally {
@@ -47,13 +60,32 @@ export function Login({ github, onDone }: { github: boolean; onDone: () => void 
   return (
     <div className="grid min-h-svh place-items-center p-6">
       <Card className="w-full max-w-sm gap-5 p-6">
-        <h1 className="text-lg font-semibold">登录后台</h1>
+        <div className="grid grid-cols-2 rounded-lg bg-muted p-1" role="tablist" aria-label="登录身份">
+          {(["user", "admin"] as const).map((next) => (
+            <button
+              key={next}
+              type="button"
+              role="tab"
+              aria-selected={mode === next}
+              onClick={() => {
+                if (mode === next) return
+                setMode(next)
+                setPassword("")
+                setError("")
+                onModeChange(next)
+              }}
+              className={`rounded-md px-3 py-2 text-sm font-medium transition-colors ${mode === next ? "bg-background text-foreground shadow-sm" : "text-muted-foreground hover:text-foreground"}`}
+            >
+              {next === "user" ? "用户登录" : "管理员登录"}
+            </button>
+          ))}
+        </div>
 
         {error && (
           <p className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</p>
         )}
 
-        {github && (
+        {mode === "admin" && github && (
           <>
             <Button asChild variant="outline" className="w-full">
               <a href="/api/auth/github">
@@ -70,19 +102,31 @@ export function Login({ github, onDone }: { github: boolean; onDone: () => void 
         )}
 
         <form onSubmit={submit} className="space-y-3">
+          {mode === "user" && (
+            <div className="space-y-1.5">
+              <Label htmlFor="username" className="text-xs">用户名</Label>
+              <Input
+                id="username"
+                autoComplete="username"
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                autoFocus
+              />
+            </div>
+          )}
           <div className="space-y-1.5">
-            <Label htmlFor="password" className="text-xs">应急密码</Label>
+            <Label htmlFor="password" className="text-xs">{mode === "user" ? "密码" : "管理员密码"}</Label>
             <Input
               id="password"
               type="password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               autoComplete="current-password"
-              autoFocus={!github}
+              autoFocus={mode === "admin" && !github}
             />
           </div>
-          <Button type="submit" className="w-full" disabled={busy || !password}>
-            登录
+          <Button type="submit" className="w-full" disabled={busy || !password || (mode === "user" && !username.trim())}>
+            {mode === "user" ? "登录用户中心" : "登录管理后台"}
           </Button>
         </form>
       </Card>

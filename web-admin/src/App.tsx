@@ -4,16 +4,19 @@ import { Toaster } from "sonner"
 
 import { Admin } from "@/components/Admin"
 import { Login } from "@/components/Login"
+import { UserCenter } from "@/components/UserCenter"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import { api, provisionRefusal, useNodes } from "@/lib/api"
 
-type Me = { authed: boolean; github: boolean; site_name: string; public_page: boolean; site: string }
+type Me = { authed: boolean; principal: "anonymous" | "admin" | "user"; github: boolean; site_name: string; public_page: boolean; site: string }
 
 // `/admin` alone is not a page; it is normalised to the first section so that a
 // bookmark and the OAuth redirect both resolve to a real route.
 function normalise(p: string) {
-  return p === "/admin" || p === "/admin/" ? "/admin/nodes" : p.replace(/\/$/, "") || "/admin/nodes"
+  if (p === "/admin" || p === "/admin/") return "/admin/nodes"
+  if (p === "/user" || p === "/user/") return "/user/center"
+  return p.replace(/\/$/, "") || "/admin/nodes"
 }
 
 function usePath() {
@@ -82,7 +85,7 @@ export default function App() {
   const [dark, toggleTheme] = useTheme()
   const [me, setMe] = useState<Me | null>(null)
   const [meError, setMeError] = useState("")
-  const { nodes, admin, error, refresh } = useNodes()
+  const { nodes, admin, error, refresh } = useNodes(me?.principal === "admin")
 
   const loadMe = useCallback(() => {
     return api<Me>("/me")
@@ -100,8 +103,10 @@ export default function App() {
   // still appears signed in. `authed` is read only at mount and after signing in,
   // so nothing else detects this. /api/me already handles signing out.
   useEffect(() => {
-    if (me?.authed && admin === false) loadMe()
-  }, [admin, me?.authed, loadMe])
+    if (me?.principal === "user" && !path.startsWith("/user/")) go("/user/center")
+    else if (me?.principal === "admin" && path.startsWith("/user/")) go("/admin/nodes")
+    else if (me?.principal === "admin" && admin === false) loadMe()
+  }, [admin, me?.principal, path, go, loadMe])
 
   // Only while there is nothing else to show. Login's onDone reloads /me, so a
   // transient failure in the second after signing in would otherwise replace the
@@ -113,13 +118,30 @@ export default function App() {
     </div>
   )
 
-  if (!me.authed) {
+  if (me.principal === "anonymous") {
     return (
       <>
-        <Login github={me.github} onDone={() => { loadMe(); refresh(); go("/admin/nodes") }} />
+        <Login
+          github={me.github}
+          userDefault={path.startsWith("/user/")}
+          onModeChange={(mode) => go(mode === "user" ? "/user/center" : "/admin/nodes")}
+          onDone={(mode) => { void loadMe(); refresh(); go(mode === "user" ? "/user/center" : "/admin/nodes") }}
+        />
         <Toaster position="top-center" theme={dark ? "dark" : "light"} />
       </>
     )
+  }
+
+  if ((me.principal === "user" && !path.startsWith("/user/"))
+    || (me.principal === "admin" && path.startsWith("/user/"))) {
+    return <div className="grid min-h-svh place-items-center p-6"><Skeleton className="h-24 w-full max-w-xl" /></div>
+  }
+
+  if (me.principal === "user") {
+    return <>
+      <UserCenter siteName={me.site_name} dark={dark} toggleTheme={toggleTheme} signOut={() => { location.href = "/user" }} />
+      <Toaster position="top-center" theme={dark ? "dark" : "light"} />
+    </>
   }
 
   const sorted = [...(nodes ?? [])].sort((a, b) => a.sort - b.sort || a.id - b.id)
