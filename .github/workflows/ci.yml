@@ -45,6 +45,8 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
 
+      - run: sh scripts/check-agent-unit.sh
+
       # Both installers run as root on the user's machine. Notes below warning
       # level are all SC2015 on `[ a ] && [ b ] || die`, which is meant to die
       # when either test fails.

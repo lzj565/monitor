@@ -466,7 +466,7 @@ printf '%s\n' "$VERSION_OUTPUT" | grep -F "with_v2ray_api" >/dev/null || {
 }
 SING_BOX_VER=$(printf '%s\n' "$VERSION_OUTPUT" | sed -n '1s/.*version[[:space:]]*//p')
 
-install -d -m 0755 "$ROOT" /etc/sing-box
+install -d -m 0755 "$ROOT" /etc/sing-box /etc/monitor-agent
 if [ ! -e "$SING_BOX_CONFIG" ] && [ ! -L "$SING_BOX_CONFIG" ]; then
 	(
 		umask 022
@@ -648,6 +648,7 @@ ExecStart=$BIN --interval $INTERVAL${INSECURE:+ --insecure}
 Restart=always
 RestartSec=5
 ProtectSystem=full
+ReadWritePaths=/etc/sing-box /etc/monitor-agent
 ProtectHome=yes
 NoNewPrivileges=yes
 RestrictSUIDSGID=yes
