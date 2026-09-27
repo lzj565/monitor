@@ -358,14 +358,23 @@ export class ApiError extends Error {
   }
 }
 
-/**
- * Every error the hub answers is one line of plain text written for the reader.
- * Anything else came from something in front of it -- a proxy's error page, a
- * CDN's challenge, an empty 502 -- and is described by its status instead.
- */
+/** Understand the legacy text errors and the resource API's structured JSON errors. */
 async function failure(res: Response): Promise<ApiError> {
-  const text = res.headers.get("content-type")?.startsWith("text/plain") ? (await res.text()).trim() : ""
-  if (text) return new ApiError(res.status, text)
+  const contentType = res.headers.get("content-type") ?? ""
+  if (contentType.startsWith("text/plain")) {
+    const text = (await res.text()).trim()
+    if (text) return new ApiError(res.status, text)
+  }
+  if (contentType.includes("application/json")) {
+    try {
+      const body = await res.json() as { error?: { message?: unknown } }
+      if (typeof body.error?.message === "string" && body.error.message) {
+        return new ApiError(res.status, body.error.message)
+      }
+    } catch {
+      // Keep the existing status-based message for malformed intermediary replies.
+    }
+  }
   return new ApiError(
     res.status,
     res.status >= 500

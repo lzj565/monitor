@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useId, useRef, useState } from "react"
 import { flushSync } from "react-dom"
-import { ArrowUpCircle, Bell, CalendarClock, Check, ChevronDown, ChevronRight, Copy, Database, Download, GripVertical, Layers, Palette, Pencil, Plus, Radio, RefreshCw, Search, Send, Server, Settings, Shield, SlidersHorizontal, Trash2, Upload } from "lucide-react"
+import { ArrowUpCircle, Bell, CalendarClock, Check, ChevronDown, ChevronRight, Copy, Database, Download, GripVertical, KeyRound, Layers, Network, Palette, Pencil, Plus, Radio, RefreshCw, Search, Send, Server, Settings, Shield, SlidersHorizontal, Trash2, Upload, Users } from "lucide-react"
 import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
@@ -14,6 +14,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { api, badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, outdatedAgents, provisioningSite, trafficCorrection, upload, type ConfigField, type IfaceChoice, type Node, type PingTask, type Source } from "@/lib/api"
+import { ProxiesPage, SubscriptionsResourcePage, UsersResourcePage } from "@/components/Resources"
 import { bytes, CYCLES, FOREVER, money, uptime } from "@/lib/format"
 
 // Counters the panel can correct after migration or an accounting error.
@@ -2897,6 +2898,9 @@ function Update({ versions, reload, nodes, site, refusal }: {
 // reload returns to the same section.
 const ADMIN_SECTIONS = [
   { path: "/admin/nodes", label: "节点", icon: Server },
+  { path: "/admin/proxies", label: "代理", icon: Network },
+  { path: "/admin/users", label: "用户", icon: Users },
+  { path: "/admin/subscriptions", label: "订阅", icon: KeyRound },
   { path: "/admin/ping", label: "延迟", icon: Radio },
   { path: "/admin/notify", label: "通知", icon: Bell },
   { path: "/admin/data", label: "数据", icon: Database },
@@ -2908,6 +2912,7 @@ const ADMIN_SECTIONS = [
 
 export function Admin({
   path,
+  search,
   go,
   nodes,
   refresh,
@@ -2915,6 +2920,7 @@ export function Admin({
   refusal,
 }: {
   path: string
+  search: string
   go: (to: string) => void
   nodes: Node[]
   refresh: () => void
@@ -2952,7 +2958,13 @@ export function Admin({
       </nav>
 
       <div className="min-w-0 flex-1">
-        {path === "/admin/ping" ? (
+        {path === "/admin/proxies" ? (
+          <ProxiesPage nodes={nodes} />
+        ) : path === "/admin/users" ? (
+          <UsersResourcePage go={go} />
+        ) : path === "/admin/subscriptions" ? (
+          <SubscriptionsResourcePage nodes={nodes} search={search} go={go} />
+        ) : path === "/admin/ping" ? (
           <Ping nodes={nodes} />
         ) : path === "/admin/notify" ? (
           <Notify nodes={nodes} refresh={refresh} />

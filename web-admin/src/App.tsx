@@ -17,22 +17,24 @@ function normalise(p: string) {
 }
 
 function usePath() {
-  const [path, setPath] = useState(() => {
+  const [route, setRoute] = useState(() => {
     const start = normalise(location.pathname)
     if (start !== location.pathname) history.replaceState({}, "", start + location.search)
-    return start
+    return { path: start, search: location.search }
   })
   useEffect(() => {
-    const sync = () => setPath(normalise(location.pathname))
+    const sync = () => setRoute({ path: normalise(location.pathname), search: location.search })
     addEventListener("popstate", sync)
     return () => removeEventListener("popstate", sync)
   }, [])
   return [
-    path,
+    route.path,
+    route.search,
     useCallback((next: string) => {
-      const to = normalise(next)
-      history.pushState({}, "", to)
-      setPath(to)
+      const target = new URL(next, location.origin)
+      const path = normalise(target.pathname)
+      history.pushState({}, "", path + target.search + target.hash)
+      setRoute({ path, search: target.search })
     }, []),
   ] as const
 }
@@ -76,7 +78,7 @@ function useTheme() {
 }
 
 export default function App() {
-  const [path, go] = usePath()
+  const [path, search, go] = usePath()
   const [dark, toggleTheme] = useTheme()
   const [me, setMe] = useState<Me | null>(null)
   const [meError, setMeError] = useState("")
@@ -160,6 +162,7 @@ export default function App() {
         ) : (
           <Admin
             path={path}
+            search={search}
             go={go}
             nodes={sorted}
             refresh={refresh}
