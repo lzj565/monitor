@@ -664,6 +664,45 @@ pub struct ProxyNodeTrafficSummary {
     pub reset_at: Option<i64>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ProxyTrafficOverview {
+    pub uplink_bytes: i64,
+    pub downlink_bytes: i64,
+    pub total_bytes: i64,
+    pub active_users: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProxyTrafficUserRow {
+    pub user_id: i64,
+    pub username: String,
+    pub node_id: i64,
+    pub node_name: String,
+    pub uplink_bytes: i64,
+    pub downlink_bytes: i64,
+    pub total_bytes: i64,
+    pub last_seen_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProxyTrafficNodeRow {
+    pub node_id: i64,
+    pub node_name: String,
+    pub protocols: Vec<String>,
+    pub uplink_bytes: i64,
+    pub downlink_bytes: i64,
+    pub total_bytes: i64,
+    pub last_seen_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProxyTrafficPage<T> {
+    pub items: Vec<T>,
+    pub page: i64,
+    pub page_size: i64,
+    pub total: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct UserDraft {
     pub username: String,
@@ -1289,6 +1328,132 @@ impl Db {
             })?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
+    }
+
+    /// Overview totals use the user table as the single business-traffic
+    /// dimension. `active_users` means sampled recently, not necessarily
+    /// transferring bytes at this instant.
+    pub fn proxy_traffic_overview(&self, active_since: i64) -> Result<ProxyTrafficOverview> {
+        let conn = self.conn();
+        let (uplink_bytes, downlink_bytes, active_users) = conn.query_row(
+            "SELECT COALESCE(SUM(uplink_bytes),0),COALESCE(SUM(downlink_bytes),0),
+                    COUNT(DISTINCT CASE WHEN last_seen_at>=?1 THEN user_id END)
+             FROM proxy_user_traffic",
+            [active_since],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)),
+        )?;
+        Ok(ProxyTrafficOverview {
+            uplink_bytes,
+            downlink_bytes,
+            total_bytes: uplink_bytes.saturating_add(downlink_bytes),
+            active_users,
+        })
+    }
+
+    /// Stored user counters at their native `(user_id,node_id)` granularity.
+    pub fn proxy_traffic_user_rows(
+        &self,
+        query: Option<&str>,
+        node_id: Option<i64>,
+        sort: &str,
+        descending: bool,
+        page: i64,
+        page_size: i64,
+    ) -> Result<ProxyTrafficPage<ProxyTrafficUserRow>> {
+        let conn = self.conn();
+        let pattern = query.map(str::trim).filter(|q| !q.is_empty()).map(|q| format!("%{q}%"));
+        let total: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM proxy_user_traffic t
+             JOIN users u ON u.id=t.user_id JOIN node n ON n.id=t.node_id
+             WHERE (?1 IS NULL OR t.node_id=?1)
+               AND (?2 IS NULL OR u.username LIKE ?2 COLLATE NOCASE OR n.name LIKE ?2 COLLATE NOCASE)",
+            params![node_id, pattern],
+            |r| r.get(0),
+        )?;
+        let order_by = traffic_order_by(sort, descending, "t.uplink_bytes", "t.downlink_bytes");
+        let sql = format!(
+            "SELECT t.user_id,u.username,t.node_id,n.name,t.uplink_bytes,t.downlink_bytes,t.last_seen_at
+             FROM proxy_user_traffic t
+             JOIN users u ON u.id=t.user_id JOIN node n ON n.id=t.node_id
+             WHERE (?1 IS NULL OR t.node_id=?1)
+               AND (?2 IS NULL OR u.username LIKE ?2 COLLATE NOCASE OR n.name LIKE ?2 COLLATE NOCASE)
+             ORDER BY {order_by},t.user_id,t.node_id LIMIT ?3 OFFSET ?4"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let offset = page.saturating_sub(1).saturating_mul(page_size);
+        let items = stmt
+            .query_map(params![node_id, pattern, page_size, offset], |r| {
+                let uplink_bytes: i64 = r.get(4)?;
+                let downlink_bytes: i64 = r.get(5)?;
+                Ok(ProxyTrafficUserRow {
+                    user_id: r.get(0)?,
+                    username: r.get(1)?,
+                    node_id: r.get(2)?,
+                    node_name: r.get(3)?,
+                    uplink_bytes,
+                    downlink_bytes,
+                    total_bytes: uplink_bytes.saturating_add(downlink_bytes),
+                    last_seen_at: r.get(6)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(ProxyTrafficPage { items, page, page_size, total })
+    }
+
+    /// One row per server hosting proxies, backed by `proxy_node_traffic`.
+    /// Protocol metadata is an aggregate of the configured proxies on that
+    /// server; traffic itself is never inferred from user counters.
+    pub fn proxy_traffic_node_rows(
+        &self,
+        query: Option<&str>,
+        node_id: Option<i64>,
+        sort: &str,
+        descending: bool,
+        page: i64,
+        page_size: i64,
+    ) -> Result<ProxyTrafficPage<ProxyTrafficNodeRow>> {
+        let conn = self.conn();
+        let pattern = query.map(str::trim).filter(|q| !q.is_empty()).map(|q| format!("%{q}%"));
+        let scope = "(EXISTS(SELECT 1 FROM proxies p0 WHERE p0.node_id=n.id) OR t.node_id IS NOT NULL)";
+        let total_sql = format!(
+            "SELECT COUNT(*) FROM node n LEFT JOIN proxy_node_traffic t ON t.node_id=n.id
+             WHERE {scope} AND (?1 IS NULL OR n.id=?1) AND (?2 IS NULL OR n.name LIKE ?2 COLLATE NOCASE)"
+        );
+        let total: i64 = conn.query_row(&total_sql, params![node_id, pattern], |r| r.get(0))?;
+        let order_by =
+            traffic_order_by(sort, descending, "COALESCE(t.uplink_bytes,0)", "COALESCE(t.downlink_bytes,0)");
+        let sql = format!(
+            "SELECT n.id,n.name,COALESCE(t.uplink_bytes,0),COALESCE(t.downlink_bytes,0),t.last_seen_at,
+                    GROUP_CONCAT(DISTINCT p.protocol)
+             FROM node n LEFT JOIN proxy_node_traffic t ON t.node_id=n.id
+             LEFT JOIN proxies p ON p.node_id=n.id AND p.enabled=1
+             WHERE {scope} AND (?1 IS NULL OR n.id=?1) AND (?2 IS NULL OR n.name LIKE ?2 COLLATE NOCASE)
+             GROUP BY n.id ORDER BY {order_by},n.sort,n.id LIMIT ?3 OFFSET ?4"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let offset = page.saturating_sub(1).saturating_mul(page_size);
+        let items = stmt
+            .query_map(params![node_id, pattern, page_size, offset], |r| {
+                let uplink_bytes: i64 = r.get(2)?;
+                let downlink_bytes: i64 = r.get(3)?;
+                let protocols: Option<String> = r.get(5)?;
+                Ok(ProxyTrafficNodeRow {
+                    node_id: r.get(0)?,
+                    node_name: r.get(1)?,
+                    protocols: protocols
+                        .unwrap_or_default()
+                        .split(',')
+                        .filter(|protocol| !protocol.is_empty())
+                        .map(str::to_owned)
+                        .collect(),
+                    uplink_bytes,
+                    downlink_bytes,
+                    total_bytes: uplink_bytes.saturating_add(downlink_bytes),
+                    last_seen_at: r.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(ProxyTrafficPage { items, page, page_size, total })
     }
 
     pub fn reset_proxy_user_traffic(&self, user_id: i64, now: i64) -> Result<bool> {
@@ -3145,6 +3310,17 @@ fn counter_delta(current: i64, last: Option<i64>) -> i64 {
         Some(previous) if current >= previous => current - previous,
         Some(_) => current,
     }
+}
+
+/// SQL fragments come only from these fixed choices, never from the request.
+fn traffic_order_by(sort: &str, descending: bool, uplink: &str, downlink: &str) -> String {
+    let column = match sort {
+        "uplink" => uplink.to_owned(),
+        "downlink" => downlink.to_owned(),
+        _ => format!("({uplink}+{downlink})"),
+    };
+    let direction = if descending { "DESC" } else { "ASC" };
+    format!("{column} {direction}")
 }
 
 fn row_to_proxy(r: &rusqlite::Row<'_>) -> rusqlite::Result<Proxy> {

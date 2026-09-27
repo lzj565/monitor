@@ -24,6 +24,20 @@ export function uptime(seconds: number): string {
   return d > 0 ? `${d} 天 ${h} 小时` : h > 0 ? `${h} 小时 ${m} 分` : `${m} 分`
 }
 
+export function relativeTime(timestamp: number | null, now = Date.now()): string {
+  if (timestamp === null) return "尚未采集"
+  const seconds = Math.max(0, Math.floor(now / 1000 - timestamp))
+  if (seconds < 5) return "刚刚"
+  if (seconds < 60) return `${seconds} 秒前`
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `${minutes} 分钟前`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `${hours} 小时前`
+  const days = Math.floor(hours / 24)
+  if (days < 30) return `${days} 天前`
+  return new Date(timestamp * 1000).toLocaleString()
+}
+
 /**
  * No expiry and no traffic cap are both rendered as the absence of a ceiling.
  * U+221E rather than the emoji, which arrives as a coloured tile from whatever

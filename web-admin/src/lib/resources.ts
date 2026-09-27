@@ -52,6 +52,62 @@ export type ProxyTrafficSummary = {
   reset_at: number | null
 }
 
+export type ProxyTrafficOverview = {
+  uplink_bytes: number
+  downlink_bytes: number
+  total_bytes: number
+  active_users: number
+}
+
+export type ProxyTrafficUserRow = {
+  user_id: number
+  username: string
+  node_id: number
+  node_name: string
+  uplink_bytes: number
+  downlink_bytes: number
+  total_bytes: number
+  last_seen_at: number | null
+}
+
+export type ProxyTrafficNodeRow = {
+  node_id: number
+  node_name: string
+  protocols: string[]
+  uplink_bytes: number
+  downlink_bytes: number
+  total_bytes: number
+  last_seen_at: number | null
+}
+
+export type ProxyTrafficPage<T> = {
+  items: T[]
+  page: number
+  page_size: number
+  total: number
+}
+
+export type ProxyTrafficListOptions = {
+  q: string
+  node_id: number | null
+  sort: "total" | "uplink" | "downlink"
+  order: "asc" | "desc"
+  page: number
+  page_size: number
+}
+
+function trafficSearch(options: ProxyTrafficListOptions): string {
+  const query = new URLSearchParams({
+    sort: options.sort,
+    order: options.order,
+    page: String(options.page),
+    page_size: String(options.page_size),
+  })
+  if (options.q.trim()) query.set("q", options.q.trim())
+  if (options.node_id !== null) query.set("node_id", String(options.node_id))
+  return query.toString()
+}
+
 export type UserDraft = Pick<User, "username" | "enabled" | "expires_at"> & { password?: string }
 export type VlessAuth = { flow: Flow }
 export type UserProxyAuthorization = {
@@ -101,6 +157,18 @@ export async function getProxyUserTraffic(userId: number): Promise<ProxyTrafficS
 export async function listProxyNodeTraffic(): Promise<ProxyTrafficSummary[]> {
   const response = await api<{ items: ProxyTrafficSummary[] }>("/proxy-traffic/nodes")
   return response.items
+}
+
+export function getProxyTrafficOverview() {
+  return api<ProxyTrafficOverview>("/proxy-traffic/summary")
+}
+
+export function listProxyTrafficUserRows(options: ProxyTrafficListOptions) {
+  return api<ProxyTrafficPage<ProxyTrafficUserRow>>(`/proxy-traffic/user-rows?${trafficSearch(options)}`)
+}
+
+export function listProxyTrafficNodeRows(options: ProxyTrafficListOptions) {
+  return api<ProxyTrafficPage<ProxyTrafficNodeRow>>(`/proxy-traffic/node-rows?${trafficSearch(options)}`)
 }
 
 export function resetProxyUserTraffic(userId: number) {

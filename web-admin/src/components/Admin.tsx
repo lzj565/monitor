@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useId, useRef, useState } from "react"
 import { flushSync } from "react-dom"
-import { ArrowUpCircle, Bell, CalendarClock, Check, ChevronDown, ChevronRight, Copy, Database, Download, GripVertical, KeyRound, Layers, Network, Palette, Pencil, Plus, Radio, RefreshCw, Send, Server, Settings, Shield, SlidersHorizontal, Trash2, Upload, Users } from "lucide-react"
+import { Activity, ArrowUpCircle, Bell, CalendarClock, Check, ChevronDown, ChevronRight, Copy, Database, Download, GripVertical, KeyRound, Layers, Network, Palette, Pencil, Plus, Radio, RefreshCw, Send, Server, Settings, Shield, SlidersHorizontal, Trash2, Upload, Users } from "lucide-react"
 import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
@@ -16,6 +16,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { AdminConfirmDialog as ConfirmDialog, AdminSearchInput } from "@/components/AdminShared"
 import { api, badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, outdatedAgents, provisioningSite, trafficCorrection, upload, type ConfigField, type IfaceChoice, type Node, type PingTask, type Source } from "@/lib/api"
 import { ProxiesPage, SubscriptionsResourcePage, UsersResourcePage } from "@/components/Resources"
+import { ProxyTrafficPage } from "@/components/ProxyTrafficPage"
 import { bytes, CYCLES, FOREVER, money, uptime } from "@/lib/format"
 
 // Counters the panel can correct after migration or an accounting error.
@@ -2865,6 +2866,7 @@ function Update({ versions, reload, nodes, site, refusal }: {
 const ADMIN_SECTIONS = [
   { path: "/admin/nodes", label: "节点", icon: Server },
   { path: "/admin/proxies", label: "代理", icon: Network },
+  { path: "/admin/traffic", label: "流量统计", icon: Activity },
   { path: "/admin/users", label: "用户", icon: Users },
   { path: "/admin/subscriptions", label: "订阅", icon: KeyRound },
   { path: "/admin/ping", label: "延迟", icon: Radio },
@@ -2924,7 +2926,9 @@ export function Admin({
       </nav>
 
       <div className="min-w-0 flex-1">
-        {path === "/admin/proxies" ? (
+        {path === "/admin/traffic" ? (
+          <ProxyTrafficPage nodes={nodes} />
+        ) : path === "/admin/proxies" ? (
           <ProxiesPage nodes={nodes} />
         ) : path === "/admin/users" ? (
           <UsersResourcePage go={go} />

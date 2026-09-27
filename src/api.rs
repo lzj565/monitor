@@ -332,6 +332,65 @@ pub async fn command_status(
 
 // ---- V1 Proxy, User and sing-box Desired State API ----
 
+const PROXY_TRAFFIC_ACTIVE_WINDOW: i64 = 60;
+
+#[derive(Deserialize, Default)]
+pub struct ProxyTrafficRowsQuery {
+    q: Option<String>,
+    node_id: Option<i64>,
+    sort: Option<String>,
+    order: Option<String>,
+    page: Option<i64>,
+    page_size: Option<i64>,
+}
+
+fn proxy_traffic_page_args(
+    query: &ProxyTrafficRowsQuery,
+) -> (Option<&str>, Option<i64>, &str, bool, i64, i64) {
+    let search = query.q.as_deref().map(str::trim).filter(|value| !value.is_empty());
+    let sort = match query.sort.as_deref() {
+        Some("uplink") => "uplink",
+        Some("downlink") => "downlink",
+        _ => "total",
+    };
+    let descending = query.order.as_deref() != Some("asc");
+    let page = query.page.unwrap_or(1).clamp(1, i64::MAX / 100);
+    let page_size = query.page_size.unwrap_or(25).clamp(1, 100);
+    (search, query.node_id.filter(|id| *id > 0), sort, descending, page, page_size)
+}
+
+pub async fn proxy_traffic_overview(_: ApiAdmin, State(app): State<Shared>) -> Response {
+    let active_since = Utc::now().timestamp().saturating_sub(PROXY_TRAFFIC_ACTIVE_WINDOW);
+    match app.db.proxy_traffic_overview(active_since) {
+        Ok(summary) => Json(summary).into_response(),
+        Err(error) => api_internal(error),
+    }
+}
+
+pub async fn proxy_traffic_user_rows(
+    _: ApiAdmin,
+    State(app): State<Shared>,
+    Query(query): Query<ProxyTrafficRowsQuery>,
+) -> Response {
+    let (search, node_id, sort, descending, page, page_size) = proxy_traffic_page_args(&query);
+    match app.db.proxy_traffic_user_rows(search, node_id, sort, descending, page, page_size) {
+        Ok(result) => Json(result).into_response(),
+        Err(error) => api_internal(error),
+    }
+}
+
+pub async fn proxy_traffic_node_rows(
+    _: ApiAdmin,
+    State(app): State<Shared>,
+    Query(query): Query<ProxyTrafficRowsQuery>,
+) -> Response {
+    let (search, node_id, sort, descending, page, page_size) = proxy_traffic_page_args(&query);
+    match app.db.proxy_traffic_node_rows(search, node_id, sort, descending, page, page_size) {
+        Ok(result) => Json(result).into_response(),
+        Err(error) => api_internal(error),
+    }
+}
+
 pub async fn proxy_user_traffic(_: ApiAdmin, State(app): State<Shared>) -> Response {
     match app.db.proxy_user_traffic() {
         Ok(items) => Json(json!({"items":items})).into_response(),

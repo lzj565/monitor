@@ -615,6 +615,9 @@ async fn main() -> Result<()> {
                     get(api::get_proxy).put(api::update_proxy).delete(api::delete_proxy),
                 )
                 .route("/api/users", get(api::list_users).post(api::create_user))
+                .route("/api/proxy-traffic/summary", get(api::proxy_traffic_overview))
+                .route("/api/proxy-traffic/user-rows", get(api::proxy_traffic_user_rows))
+                .route("/api/proxy-traffic/node-rows", get(api::proxy_traffic_node_rows))
                 .route("/api/proxy-traffic/users", get(api::proxy_user_traffic))
                 .route("/api/proxy-traffic/users/{id}", get(api::proxy_user_traffic_by_node))
                 .route("/api/proxy-traffic/users/{id}/reset", post(api::reset_proxy_user_traffic))
