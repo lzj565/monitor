@@ -358,7 +358,10 @@ fn parse_args() -> Result<Args> {
     while let Some(arg) = it.next() {
         let mut value = || it.next().unwrap_or_default();
         match arg.as_str() {
-            "--listen" => listen = Some(value()),
+            "--listen" => {
+                anyhow::ensure!(listen.is_none(), "listen address specified more than once");
+                listen = Some(value());
+            }
             "--db" => database = value(),
             "--site" => site = value(),
             "--themes" => themes = Some(PathBuf::from(value())),
@@ -366,10 +369,11 @@ fn parse_args() -> Result<Args> {
             "-h" | "--help" => {
                 println!(
                     "monitor-hub {}\n\n\
-                     Usage: monitor-hub [--listen [::]:28080] [--db monitor.db] [--themes themes] [--site https://hub.example.com]\n       \
+                     Usage: monitor-hub [LISTEN_ADDR] [--db monitor.db] [--themes themes] [--site https://hub.example.com]\n       \
+                     cargo run -- 0.0.0.0:9911\n       \
                      monitor-hub --db monitor.db --reset-password\n\n\
-                     --listen defaults to [::]:28080, one socket serving IPv6 and IPv4\n\
-                     both; where the kernel has no dual-stack sockets it is 0.0.0.0:28080.\n\
+                     LISTEN_ADDR may also be passed as --listen LISTEN_ADDR. It defaults to\n\
+                     [::]:28080, or 0.0.0.0:28080 where the kernel has no dual-stack socket.\n\
                      --themes defaults to a themes/ directory beside the database.\n\
                      --site is the https:// domain agents should use. Left out, the hub\n\
                      answers on whatever ip:port it is asked, and the panel builds install\n\
@@ -385,6 +389,10 @@ fn parse_args() -> Result<Args> {
                     env!("CARGO_PKG_VERSION")
                 );
                 std::process::exit(0);
+            }
+            address if !address.starts_with('-') => {
+                anyhow::ensure!(listen.is_none(), "listen address specified more than once");
+                listen = Some(address.to_owned());
             }
             other => anyhow::bail!("unknown argument: {other}"),
         }
@@ -429,7 +437,6 @@ async fn main() -> Result<()> {
     let (notes, inbox) = tokio::sync::mpsc::channel(notify::QUEUE);
     let app = Arc::new(App::new(Db::open(&args.database)?, args.site.clone(), args.themes, notes));
     let url = advertised_url(&args.site, args.listen);
-    first_run(&app, &url)?;
     if exposed_over_plain_http(&url) {
         warn!(
             "this hub answers plain HTTP at {url}; sessions and agent tokens travel in the clear. \
@@ -564,7 +571,7 @@ async fn main() -> Result<()> {
                     }),
             ),
         )
-        .with_state(app);
+        .with_state(app.clone());
 
     let listener = match tokio::net::TcpListener::bind(args.listen).await {
         Ok(listener) => listener,
@@ -578,6 +585,8 @@ async fn main() -> Result<()> {
         Err(e) => return Err(e.into()),
     };
     info!("listening on {} ({url})", listener.local_addr()?);
+    first_run(&app)?;
+    println!("访问地址：{url}/admin/");
     axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(shutdown())
         .await?;
@@ -668,14 +677,13 @@ fn host_is_loopback(authority: &str) -> bool {
 
 /// Prints a one-time admin password when the database is first created, since a
 /// fresh hub is otherwise inaccessible until GitHub is configured.
-fn first_run(app: &App, url: &str) -> Result<()> {
+fn first_run(app: &App) -> Result<()> {
     if app.db.get("admin_password_hash").is_some() {
         return Ok(());
     }
     let password = new_password(&app.db)?;
     println!(
         "\n  Monitor hub is ready.\n\n  \
-         Sign in at {url}/admin\n  \
          Emergency password: {password}\n\n  \
          This is shown once. Change it, and set up GitHub sign-in, under Security.\n"
     );
@@ -1003,10 +1011,10 @@ mod tests {
     #[test]
     fn first_run_sets_a_password_once_and_leaves_it_alone_after() {
         let app = app("http://x");
-        first_run(&app, "http://x").unwrap();
+        first_run(&app).unwrap();
         let hash = app.db.get("admin_password_hash").unwrap();
         assert!(hash.starts_with("$argon2"));
-        first_run(&app, "http://x").unwrap();
+        first_run(&app).unwrap();
         assert_eq!(app.db.get("admin_password_hash").unwrap(), hash, "must not rotate on restart");
 
         app.db.create_session("s", i64::MAX).unwrap();
