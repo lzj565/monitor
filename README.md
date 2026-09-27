@@ -2,6 +2,17 @@
 
 文档：[monitor-document.pages.dev](https://monitor-document.pages.dev)，安装、配置、反向代理与主题开发都在这里。
 
+## 安装
+
+先在 Linux 服务器上切换到 root 用户，再运行以下命令安装 hub：
+
+```sh
+su -
+curl -fsSL https://github.com/lzj565/monitor/releases/latest/download/install-hub.sh | sh -s -- --yes
+```
+
+安装器会使用默认端口 `28080`。如需自定义端口或查看其他配置选项，请先下载脚本再运行 `sh install-hub.sh --help`。
+
 ## 特性
 
 - 实时监控：秒级实时数据展示

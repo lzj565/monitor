@@ -112,7 +112,8 @@ jobs:
         run: |
           cp install-hub.sh bin/
           (cd bin && sha256sum monitor-hub-* monitor-sing-box-* install-hub.sh > sha256sums.txt)
-          ASSETS=(bin/monitor-hub-* bin/monitor-sing-box-* bin/monitor-sing-box-*.sha256 bin/install-hub.sh bin/sha256sums.txt)
+          # List binaries and sidecars separately; monitor-sing-box-* also matches *.sha256.
+          ASSETS=(bin/monitor-hub-* bin/monitor-sing-box-amd64 bin/monitor-sing-box-arm64 bin/monitor-sing-box-amd64.sha256 bin/monitor-sing-box-arm64.sha256 bin/install-hub.sh bin/sha256sums.txt)
           if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" "${ASSETS[@]}" --clobber --repo "$GITHUB_REPOSITORY"
           else
