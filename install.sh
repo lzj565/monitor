@@ -40,6 +40,8 @@ INTERVAL=""
 INSECURE=""
 UNINSTALL=""
 UPGRADE=""
+SINGBOX_API_PORT=""
+API_PORT_HELPER=""
 
 if [ -t 1 ] && [ -z "${NO_COLOR+x}" ]; then
 	C_BLUE=$(printf '\033[1;34m')
@@ -84,6 +86,101 @@ trap 'on_exit' EXIT
 trap 'exit 1' HUP INT TERM
 
 fail() { FAIL_REASON="$*"; exit 1; }
+
+# BEGIN sing-box API port helpers
+# `ss` reports the local endpoint in column 4. Compare its port without
+# assuming a particular bind address: a wildcard, loopback, or another local
+# address all reserve the same port for this TCP API.
+api_port_is_listening() {
+	port=$1
+	if command -v ss >/dev/null 2>&1; then
+		listeners=$(ss -H -lnt 2>/dev/null) || listeners=""
+		if [ -n "$listeners" ]; then
+			printf '%s\n' "$listeners" | awk -v port="$port" '
+				$1 == "LISTEN" && $4 ~ /:[0-9]+$/ {
+					local = $4
+					sub(/^.*:/, "", local)
+					if (local == port) found = 1
+				}
+				END { exit !found }
+			'
+			return $?
+		fi
+		# An empty, successful `ss` result means there are no TCP listeners.
+		ss -H -lnt >/dev/null 2>&1 && return 1
+	fi
+	"${API_PORT_HELPER:-$BIN}" internal tcp-port-listening "$port" >/dev/null 2>&1
+}
+
+# Keep 9001 as the preferred default. When it is occupied, inspect the rest
+# of the allocation range in a randomized order so installations do not all
+# converge on the same next port.
+random_api_port_order() {
+	seed=$(od -An -N4 -tu4 /dev/urandom 2>/dev/null | tr -d '[:space:]')
+	[ -n "$seed" ] || seed=$(date +%s)
+	awk -v seed="$seed" 'BEGIN { srand(seed); for (port = 9002; port <= 9099; port++) printf "%.12f %d\n", rand(), port }' |
+		sort -n | awk '{print $2}'
+}
+
+find_available_api_port() {
+	API_PORT_CANDIDATE=""
+	if api_port_is_listening 9001; then
+		info "port 9001 is already in use"
+	else
+		status=$?
+		[ "$status" -eq 1 ] || return "$status"
+		API_PORT_CANDIDATE=9001
+		return 0
+	fi
+
+	for port in $(random_api_port_order); do
+		if api_port_is_listening "$port"; then
+			info "port $port is already in use"
+		else
+			status=$?
+			[ "$status" -eq 1 ] || return "$status"
+			API_PORT_CANDIDATE=$port
+			return 0
+		fi
+	done
+	return 1
+}
+
+valid_api_port() {
+	case "$1" in "" | *[!0-9]*) return 1 ;; esac
+	# Strip leading zeroes before shell arithmetic (some /bin/sh implementations
+	# interpret a leading zero as octal).
+	port=$(printf '%s' "$1" | sed 's/^0*//')
+	[ -n "$port" ] || port=0
+	[ "$port" -ge 1 ] && [ "$port" -le 65535 ] || return 1
+	SINGBOX_API_PORT=$port
+}
+
+select_singbox_api_port() {
+	SAVED_API_PORT=$(sed -n 's/^SINGBOX_API_PORT=//p' "$ENV_FILE" 2>/dev/null | tail -n 1)
+	if [ -n "$SAVED_API_PORT" ]; then
+		valid_api_port "$SAVED_API_PORT" || {
+			FAIL_REASON="invalid SINGBOX_API_PORT in $ENV_FILE"
+			return 1
+		}
+		info "reusing sing-box V2Ray API port: $SINGBOX_API_PORT"
+		return 0
+	fi
+
+	LEGACY_API_PORT=$("${API_PORT_HELPER:-$BIN}" internal api-port-from-config "$SING_BOX_CONFIG" 2>/dev/null || true)
+	if [ -n "$LEGACY_API_PORT" ] && valid_api_port "$LEGACY_API_PORT"; then
+		info "reusing sing-box V2Ray API port: $SINGBOX_API_PORT"
+		return 0
+	fi
+
+	if ! find_available_api_port; then
+		FAIL_REASON="unable to find available sing-box V2Ray API port in range 9001-9099"
+		return 1
+	fi
+	SINGBOX_API_PORT=$API_PORT_CANDIDATE
+	info "selected sing-box V2Ray API port: $SINGBOX_API_PORT"
+}
+# END sing-box API port helpers
 
 print_summary() {
 	step 5 "安装完成摘要"
@@ -207,7 +304,7 @@ fi
 if [ -n "$UPGRADE" ]; then
 	[ -z "$TOKEN$REGISTER" ] ||
 		{ echo "--upgrade takes no --token or --register; it reuses what this machine holds" >&2; exit 2; }
-	TOKEN=$(sed -n 's/^MONITOR_TOKEN=//p' "$ENV_FILE" 2>/dev/null | tail -n 1)
+	TOKEN=$(sed -n 's/^[[:space:]]*MONITOR_TOKEN=//p' "$ENV_FILE" 2>/dev/null | tail -n 1)
 	[ -n "$SERVER" ] || SERVER=$(sed -n 's/^MONITOR_SERVER=//p' "$ENV_FILE" 2>/dev/null | tail -n 1)
 	[ -n "$TOKEN" ] && [ -n "$SERVER" ] || {
 		echo "no agent is installed here: $ENV_FILE holds no token and hub address." >&2
@@ -364,6 +461,13 @@ done
 [ "$(head -c 4 "$TMP_AGENT")" = "$(printf '\177ELF')" ] || { FAIL_REASON="下载内容不是 Linux 可执行文件"; fail "$FAIL_REASON"; }
 success "下载完成"
 
+# Resolve the local API port before registration or replacing the installed
+# Agent. A full range must fail without spending a registration key or leaving
+# a machine half-upgraded.
+API_PORT_HELPER=$TMP_AGENT
+info "checking sing-box V2Ray API port..."
+select_singbox_api_port || fail "$FAIL_REASON"
+
 # Downloaded before the registration below, because that step spends a node: the
 # key returns a token and the panel gains a row, while the env file recording it
 # is only written once the binary is in place. A download that fails after
@@ -385,7 +489,7 @@ if [ -z "$TOKEN" ]; then
 	HELD=""
 	CACHED=$(sed -n 's/^MONITOR_SERVER=//p' "$ENV_FILE" 2>/dev/null || true)
 	if [ "${CACHED%/}" = "${SERVER%/}" ]; then
-		HELD=$(sed -n 's/^MONITOR_TOKEN=//p' "$ENV_FILE" 2>/dev/null || true)
+		HELD=$(sed -n 's/^[[:space:]]*MONITOR_TOKEN=//p' "$ENV_FILE" 2>/dev/null || true)
 	fi
 	# --name as given on this machine, or else the hostname, restricted to
 	# characters a hostname may contain. The hub trims and bounds either.
@@ -467,10 +571,11 @@ printf '%s\n' "$VERSION_OUTPUT" | grep -F "with_v2ray_api" >/dev/null || {
 SING_BOX_VER=$(printf '%s\n' "$VERSION_OUTPUT" | sed -n '1s/.*version[[:space:]]*//p')
 
 install -d -m 0755 "$ROOT" /etc/sing-box /etc/monitor-agent
+
 if [ ! -e "$SING_BOX_CONFIG" ] && [ ! -L "$SING_BOX_CONFIG" ]; then
 	(
 		umask 022
-		cat >"$SING_BOX_CONFIG" <<'CONFIG'
+		cat >"$SING_BOX_CONFIG" <<CONFIG
 {
   "inbounds": [],
   "outbounds": [
@@ -481,7 +586,7 @@ if [ ! -e "$SING_BOX_CONFIG" ] && [ ! -L "$SING_BOX_CONFIG" ]; then
   ],
   "experimental": {
     "v2ray_api": {
-      "listen": "127.0.0.1:9001",
+      "listen": "127.0.0.1:$SINGBOX_API_PORT",
       "stats": {"enabled": true, "inbounds": [], "users": []}
     }
   }
@@ -489,6 +594,10 @@ if [ ! -e "$SING_BOX_CONFIG" ] && [ ! -L "$SING_BOX_CONFIG" ]; then
 CONFIG
 	)
 fi
+"$BIN" internal set-api-port-in-config "$SING_BOX_CONFIG" "$SINGBOX_API_PORT" || {
+	FAIL_REASON="could not set sing-box V2Ray API listen address to 127.0.0.1:$SINGBOX_API_PORT"
+	fail "$FAIL_REASON"
+}
 "$SING_BOX_CANDIDATE" check -c "$SING_BOX_CONFIG" || {
 	FAIL_REASON="当前配置不能被自构建 sing-box $SING_BOX_VERSION 校验: $SING_BOX_CONFIG"
 	fail "$FAIL_REASON"
@@ -561,7 +670,8 @@ fi
 	umask 077
 	cat >"$ENV_FILE" <<ENV
 MONITOR_SERVER=$SERVER
-	MONITOR_TOKEN=$TOKEN
+MONITOR_TOKEN=$TOKEN
+SINGBOX_API_PORT=$SINGBOX_API_PORT
 ENV
 	[ -z "$IFACE" ] || printf 'MONITOR_IFACE=%s\n' "$IFACE" >>"$ENV_FILE"
 )

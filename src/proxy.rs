@@ -272,7 +272,6 @@ pub fn generate_config(db: &Db, node_id: i64, now: i64) -> anyhow::Result<Value>
         "outbounds": [{"type": "direct", "tag": "direct"}],
         "experimental": {
             "v2ray_api": {
-                "listen": "127.0.0.1:9001",
                 "stats": {
                     "enabled": true,
                     "inbounds": stats_inbounds,
@@ -439,7 +438,7 @@ mod tests {
             assert_eq!(config["inbounds"][0]["users"][0]["uuid"], uuid);
             assert_eq!(config["inbounds"][0]["users"][0]["name"], "same");
             assert_eq!(config["inbounds"][0]["users"][0]["flow"], "xtls-rprx-vision");
-            assert_eq!(config["experimental"]["v2ray_api"]["listen"], "127.0.0.1:9001");
+            assert!(config["experimental"]["v2ray_api"].get("listen").is_none());
             assert_eq!(config["experimental"]["v2ray_api"]["stats"]["enabled"], true);
             assert_eq!(
                 config["experimental"]["v2ray_api"]["stats"]["inbounds"][0],
@@ -455,7 +454,7 @@ mod tests {
         let db = Db::open(":memory:").unwrap();
         let node_id = db.create_node(&Node { name: "empty".into(), ..Default::default() }, "token").unwrap();
         let config = generate_config(&db, node_id, chrono::Utc::now().timestamp()).unwrap();
-        assert_eq!(config["experimental"]["v2ray_api"]["listen"], "127.0.0.1:9001");
+        assert!(config["experimental"]["v2ray_api"].get("listen").is_none());
         assert_eq!(config["experimental"]["v2ray_api"]["stats"]["enabled"], true);
         assert_eq!(config["experimental"]["v2ray_api"]["stats"]["inbounds"], json!([]));
         assert_eq!(config["experimental"]["v2ray_api"]["stats"]["users"], json!([]));
