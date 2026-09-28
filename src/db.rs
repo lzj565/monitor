@@ -198,6 +198,12 @@ CREATE TABLE IF NOT EXISTS user_proxy_authorizations (
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS user_proxy_order (
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  proxy_id INTEGER NOT NULL REFERENCES proxies(id) ON DELETE CASCADE,
+  sort INTEGER NOT NULL,
+  PRIMARY KEY(user_id,proxy_id)
+);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_user_proxy_authorizations_unique ON user_proxy_authorizations(user_id,proxy_id);
 CREATE INDEX IF NOT EXISTS idx_user_proxy_authorizations_user_id ON user_proxy_authorizations(user_id);
 CREATE INDEX IF NOT EXISTS idx_user_proxy_authorizations_proxy_id ON user_proxy_authorizations(proxy_id);
@@ -247,7 +253,7 @@ CREATE TABLE IF NOT EXISTS proxy_node_traffic (
 /// cannot: `open` runs `SCHEMA` before migrating, and on an older file the
 /// column is not there yet. `an_upgraded_release_matches_a_fresh_database`
 /// holds every migration to these rules, starting from v1.0.0's schema.
-const SCHEMA_VERSION: i64 = 18;
+const SCHEMA_VERSION: i64 = 19;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -566,6 +572,14 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     if from < 18 {
         migrate_to_18(&tx)?;
     }
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS user_proxy_order (
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        proxy_id INTEGER NOT NULL REFERENCES proxies(id) ON DELETE CASCADE,
+        sort INTEGER NOT NULL,
+        PRIMARY KEY(user_id,proxy_id)
+    )",
+    )?;
     tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     tx.commit()?;
     Ok(())
@@ -603,7 +617,7 @@ fn seed_default_admin(conn: &Connection) -> Result<()> {
 }
 
 /// Every table a backup must carry before this build will restore it.
-const TABLES: [&str; 13] = [
+const TABLES: [&str; 14] = [
     "setting",
     "node",
     "proxies",
@@ -617,6 +631,7 @@ const TABLES: [&str; 13] = [
     "session",
     "proxy_user_traffic",
     "proxy_node_traffic",
+    "user_proxy_order",
 ];
 const PRE_RESOURCE_TABLES: [&str; 8] =
     ["setting", "node", "traffic", "metric", "ping_task", "ping_node", "ping_record", "session"];
@@ -809,12 +824,17 @@ pub struct UserPortalProxy {
     pub node_group: String,
     pub node_country: String,
     pub name: String,
+    pub include_node_name: bool,
     pub protocol: String,
     pub address: String,
     pub address_type: String,
     pub port: i64,
     pub server_name: String,
     pub server_port: i64,
+    pub uuid: String,
+    pub public_key: String,
+    pub short_id: String,
+    pub flow: String,
     pub online: bool,
 }
 
@@ -1759,19 +1779,73 @@ impl Db {
         Ok((changed > 0).then_some(token))
     }
 
+    pub fn reorder_user_proxies(&self, user_id: i64, ids: &[i64], now: i64) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let visible = {
+            let mut stmt = tx.prepare(
+                "SELECT p.id FROM user_proxy_authorizations a
+                JOIN users u ON u.id=a.user_id JOIN proxies p ON p.id=a.proxy_id
+                WHERE a.user_id=?1 AND a.enabled=1 AND p.enabled=1 AND u.enabled=1
+                AND (u.expires_at IS NULL OR u.expires_at>?2)",
+            )?;
+            let rows = stmt.query_map(params![user_id, now], |r| r.get::<_, i64>(0))?;
+            rows.collect::<rusqlite::Result<HashSet<_>>>()?
+        };
+        let requested: HashSet<_> = ids.iter().copied().collect();
+        if ids.len() != requested.len() || requested != visible {
+            refuse!("节点列表已变更或排序无效，请刷新后重试");
+        }
+        // Replace only this user's preference; authorization changes never mutate it.
+        tx.execute("DELETE FROM user_proxy_order WHERE user_id=?1", [user_id])?;
+        for (sort, id) in ids.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO user_proxy_order(user_id,proxy_id,sort) VALUES(?1,?2,?3)",
+                params![user_id, id, sort as i64],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn user_traffic_overview(&self, user_id: i64, reset_day: u32, now: i64) -> Result<serde_json::Value> {
+        let conn = self.conn();
+        let (up,down): (i64,i64) = conn.query_row(
+            "SELECT COALESCE(SUM(uplink_bytes),0),COALESCE(SUM(downlink_bytes),0) FROM proxy_user_traffic WHERE user_id=?1",
+            [user_id], |r| Ok((r.get(0)?,r.get(1)?)))?;
+        let today =
+            DateTime::from_timestamp(now, 0).context("invalid timestamp")?.with_timezone(&Local).date_naive();
+        let next = if reset_day == 0 {
+            None
+        } else {
+            (1..=32)
+                .map(|days| today + chrono::Days::new(days))
+                .find(|date| period_start(*date, reset_day) == *date)
+        };
+        Ok(serde_json::json!({
+            "uplink_bytes": up, "downlink_bytes": down,
+            "next_reset_date": next.map(|date| date.to_string()),
+            "reset_days_remaining": next.map(|date| (date-today).num_days()),
+        }))
+    }
+
     pub fn active_user_portal_proxies(&self, id: i64, now: i64) -> Result<Vec<UserPortalProxy>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT p.id,p.node_id,n.name,p.name,p.protocol,p.address,p.address_type,p.port,
                     json_extract(p.config,'$.reality.server_name'),
-                    json_extract(p.config,'$.reality.server_port'),n.group_name,n.country
+                    json_extract(p.config,'$.reality.server_port'),n.group_name,n.country,
+                    p.include_node_name,
+                    u.uuid,json_extract(p.config,'$.reality.public_key'),
+                    json_extract(p.config,'$.reality.short_id'),p.flow
              FROM user_proxy_authorizations a
              JOIN users u ON u.id=a.user_id
              JOIN proxies p ON p.id=a.proxy_id
              JOIN node n ON n.id=p.node_id
              WHERE a.user_id=?1 AND a.enabled=1 AND p.enabled=1 AND u.enabled=1
                AND (u.expires_at IS NULL OR u.expires_at>?2)
-             ORDER BY p.node_id,p.id",
+             ORDER BY (SELECT o.sort FROM user_proxy_order o WHERE o.user_id=a.user_id AND o.proxy_id=p.id) IS NULL,
+                      (SELECT o.sort FROM user_proxy_order o WHERE o.user_id=a.user_id AND o.proxy_id=p.id),p.node_id,p.id",
         )?;
         let proxies = stmt
             .query_map(params![id, now], |r| {
@@ -1781,6 +1855,7 @@ impl Db {
                     node_name: r.get(2)?,
                     node_group: r.get(10)?,
                     node_country: r.get(11)?,
+                    include_node_name: r.get(12)?,
                     name: r.get(3)?,
                     protocol: r.get(4)?,
                     address: r.get(5)?,
@@ -1788,6 +1863,10 @@ impl Db {
                     port: r.get(7)?,
                     server_name: r.get::<_, Option<String>>(8)?.unwrap_or_default(),
                     server_port: r.get::<_, Option<i64>>(9)?.unwrap_or(443),
+                    uuid: r.get(13)?,
+                    public_key: r.get::<_, Option<String>>(14)?.unwrap_or_default(),
+                    short_id: r.get::<_, Option<String>>(15)?.unwrap_or_default(),
+                    flow: r.get::<_, Option<String>>(16)?.unwrap_or_default(),
                     online: false,
                 })
             })?
@@ -1823,7 +1902,8 @@ impl Db {
              JOIN proxies p ON p.id=a.proxy_id
              JOIN node n ON n.id=p.node_id
              WHERE a.user_id=?1 AND a.enabled=1 AND p.enabled=1
-             ORDER BY p.node_id,p.id",
+             ORDER BY (SELECT o.sort FROM user_proxy_order o WHERE o.user_id=a.user_id AND o.proxy_id=p.id) IS NULL,
+                      (SELECT o.sort FROM user_proxy_order o WHERE o.user_id=a.user_id AND o.proxy_id=p.id),p.node_id,p.id",
         )?;
         let proxies = stmt
             .query_map([id], |r| {
@@ -3203,6 +3283,8 @@ impl Db {
             &PRE_RESOURCE_TABLES
         } else if version < 14 {
             &PRE_PROXY_TRAFFIC_TABLES
+        } else if version < 19 {
+            &TABLES[..13]
         } else {
             &TABLES
         };
@@ -3899,6 +3981,110 @@ mod tests {
             device_limit: None,
             traffic_reset_day: None,
         }
+    }
+
+    #[test]
+    fn portal_order_is_private_persistent_and_shared_with_subscriptions() {
+        let scratch = Scratch::new();
+        let db = Db::open(&scratch.0).unwrap();
+        let uid = db.create_user(&user_draft("portal-order")).unwrap().unwrap();
+        let other = db.create_user(&user_draft("portal-other")).unwrap().unwrap();
+        let nid = node(&db, 1);
+        db.conn().execute("UPDATE node SET country='HK' WHERE id=?1", [nid]).unwrap();
+        let mut draft = proxy_draft("one", true);
+        draft.enabled = true;
+        let a = db.create_proxy(nid, &draft).unwrap().unwrap();
+        draft.name = "two".into();
+        draft.port += 1;
+        let b = db.create_proxy(nid, &draft).unwrap().unwrap();
+        for uid in [uid, other] {
+            for id in [a, b] {
+                db.put_authorization(uid, id, &access_draft("")).unwrap().unwrap();
+            }
+        }
+        let now = Utc::now().timestamp();
+        db.reorder_user_proxies(uid, &[b, a], now).unwrap();
+        for invalid in [vec![a, a], vec![a], vec![a, 99999]] {
+            assert!(db.reorder_user_proxies(uid, &invalid, now).is_err());
+        }
+        assert_eq!(
+            db.active_user_portal_proxies(other, now).unwrap().iter().map(|p| p.id).collect::<Vec<_>>(),
+            vec![a, b]
+        );
+        let first = db.active_user_portal_proxies(uid, now).unwrap();
+        assert!(first.iter().all(|proxy| proxy.include_node_name));
+        assert_eq!(
+            crate::db::displayed_proxy_name(
+                &first[0].name,
+                first[0].include_node_name,
+                &first[0].node_country
+            ),
+            "🇭🇰HK-two"
+        );
+        db.replace_authorizations(uid, &[(a, true), (b, true)]).unwrap().unwrap();
+        drop(db);
+        let db = Db::open(&scratch.0).unwrap();
+        assert_eq!(
+            db.active_user_portal_proxies(uid, now).unwrap().iter().map(|p| p.id).collect::<Vec<_>>(),
+            vec![b, a]
+        );
+        assert_eq!(
+            db.active_user_subscription(uid, now)
+                .unwrap()
+                .unwrap()
+                .1
+                .iter()
+                .map(|p| p.id)
+                .collect::<Vec<_>>(),
+            vec![b, a]
+        );
+        draft.name = "three".into();
+        draft.port += 1;
+        let c = db.create_proxy(nid, &draft).unwrap().unwrap();
+        db.put_authorization(uid, c, &access_draft("")).unwrap().unwrap();
+        assert_eq!(
+            db.active_user_portal_proxies(uid, now).unwrap().iter().map(|p| p.id).collect::<Vec<_>>(),
+            vec![b, a, c]
+        );
+        assert!(db.reorder_user_proxies(other, &[c, b, a], now).is_err());
+        db.delete_authorization(uid, b).unwrap();
+        assert!(db.reorder_user_proxies(uid, &[b, a, c], now).is_err());
+    }
+
+    #[test]
+    fn portal_traffic_dates_follow_local_month_end_and_year_boundaries() {
+        use chrono::TimeZone;
+        let db = db();
+        let uid = db.create_user(&user_draft("portal-traffic")).unwrap().unwrap();
+        let stamp = |y, m, d| Local.with_ymd_and_hms(y, m, d, 12, 0, 0).unwrap().timestamp();
+        let summary = db.user_traffic_overview(uid, 31, stamp(2024, 2, 1)).unwrap();
+        assert_eq!(summary["next_reset_date"], "2024-02-29");
+        assert_eq!(summary["reset_days_remaining"], 28);
+        assert_eq!(summary["uplink_bytes"], 0);
+        assert_eq!(
+            db.user_traffic_overview(uid, 31, stamp(2025, 2, 1)).unwrap()["next_reset_date"],
+            "2025-02-28"
+        );
+        assert_eq!(
+            db.user_traffic_overview(uid, 1, stamp(2024, 12, 31)).unwrap()["next_reset_date"],
+            "2025-01-01"
+        );
+        assert!(db.user_traffic_overview(uid, 0, stamp(2024, 12, 31)).unwrap()["next_reset_date"].is_null());
+        let nid = node(&db, 1);
+        db.conn().execute("INSERT INTO proxy_user_traffic(user_id,node_id,uplink_bytes,downlink_bytes,created_at,updated_at) VALUES(?1,?2,12,34,0,0)",params![uid,nid]).unwrap();
+        let other = db.create_user(&user_draft("portal-empty")).unwrap().unwrap();
+        assert_eq!(db.user_traffic_overview(uid, 0, stamp(2024, 12, 31)).unwrap()["downlink_bytes"], 34);
+        assert_eq!(db.user_traffic_overview(other, 0, stamp(2024, 12, 31)).unwrap()["downlink_bytes"], 0);
+    }
+
+    #[test]
+    fn version_eighteen_backup_gains_portal_order_table() {
+        let scratch = Scratch::new();
+        let db = Db::open(&scratch.0).unwrap();
+        db.conn().execute_batch("DROP TABLE user_proxy_order; PRAGMA user_version=18;").unwrap();
+        drop(db);
+        let db = Db::open(&scratch.0).unwrap();
+        assert_eq!(db.stats().unwrap()["rows"]["user_proxy_order"], 0);
     }
 
     #[test]

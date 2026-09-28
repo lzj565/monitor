@@ -1715,13 +1715,17 @@ pub async fn me(State(app): State<Shared>, headers: HeaderMap) -> Json<Value> {
 
 pub async fn user_me(UserAuth(user_id): UserAuth, State(app): State<Shared>) -> Response {
     match app.db.user(user_id) {
-        Ok(Some(user)) => Json(json!({
-            "id": user.id,
-            "username": user.username,
-            "enabled": user.enabled,
-            "expires_at": user.expires_at,
-        }))
-        .into_response(),
+        Ok(Some(user)) => {
+            match app.db.user_traffic_overview(user_id, user.traffic_reset_day, Utc::now().timestamp()) {
+                Ok(traffic) => Json(json!({
+                    "id": user.id, "username": user.username, "enabled": user.enabled,
+                    "expires_at": user.expires_at, "traffic_limit": user.traffic_limit,
+                    "traffic_reset_day": user.traffic_reset_day, "traffic": traffic,
+                }))
+                .into_response(),
+                Err(error) => api_internal(error),
+            }
+        }
         Ok(None) => api_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "登录已失效，请重新登录"),
         Err(error) => api_internal(error),
     }
@@ -1735,9 +1739,61 @@ pub async fn user_proxies(UserAuth(user_id): UserAuth, State(app): State<Shared>
             for proxy in &mut proxies {
                 proxy.online = agents.contains_key(&proxy.node_id);
             }
-            Json(json!({"items": proxies})).into_response()
+            let items = proxies.into_iter().map(|proxy| {
+                let label = crate::db::displayed_proxy_name(
+                    &proxy.name,
+                    proxy.include_node_name,
+                    &proxy.node_country,
+                );
+                let flow = if proxy.flow.is_empty() { proxy::DEFAULT_FLOW } else { &proxy.flow };
+                let host = if proxy.address.parse::<std::net::Ipv6Addr>().is_ok() {
+                    format!("[{}]", proxy.address)
+                } else {
+                    proxy.address.clone()
+                };
+                let vless_url = format!(
+                    "vless://{}@{}:{}?encryption=none&security=reality&sni={}&fp=chrome&pbk={}&sid={}&type=tcp&flow={}#{}",
+                    proxy.uuid, host, proxy.port,
+                    uri_component(&proxy.server_name), proxy.public_key, proxy.short_id,
+                    uri_component(flow), uri_component(&label),
+                );
+                let mihomo_yaml = format!(
+                    "- name: {}\n  type: vless\n  server: {}\n  port: {}\n  uuid: {}\n  network: tcp\n  tls: true\n  udp: true\n  servername: {}\n  client-fingerprint: chrome\n  reality-opts:\n    public-key: {}\n    short-id: {}\n  flow: {}",
+                    yaml_string(&label), yaml_ip_or_string(&proxy.address), proxy.port,
+                    proxy.uuid, yaml_string(&proxy.server_name), yaml_string(&proxy.public_key),
+                    yaml_string(&proxy.short_id), yaml_string(flow),
+                );
+                let mut item = serde_json::to_value(proxy).expect("portal proxy serializes");
+                item["vless_url"] = json!(vless_url);
+                item["mihomo_yaml"] = json!(mihomo_yaml);
+                item
+            }).collect::<Vec<_>>();
+            Json(json!({"items": items})).into_response()
         }
         Err(error) => api_internal(error),
+    }
+}
+
+fn uri_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+pub async fn reorder_user_proxies(
+    UserAuth(user_id): UserAuth,
+    State(app): State<Shared>,
+    Json(order): Json<Order>,
+) -> Response {
+    match app.db.reorder_user_proxies(user_id, &order.ids, Utc::now().timestamp()) {
+        Ok(()) => Json(json!({"ok": true})).into_response(),
+        Err(error) => fail(error),
     }
 }
 
@@ -1769,12 +1825,46 @@ fn subscription_label(proxy: &crate::db::UserSubscriptionProxy) -> String {
 }
 
 fn yaml_string(value: &str) -> String {
+    // Block scalars may contain Unicode, spaces and digits. Quote values whose
+    // YAML implicit type or syntax could change the original string.
+    let lower = value.to_ascii_lowercase();
+    let unsigned = lower.trim_start_matches(['+', '-']);
+    let numeric = value.replace('_', "").parse::<f64>().is_ok()
+        || unsigned.starts_with("0x")
+        || unsigned.starts_with("0o")
+        || unsigned.starts_with("0b")
+        || (unsigned.chars().next().is_some_and(|c| c.is_ascii_digit())
+            && value.chars().all(|c| {
+                c.is_ascii_digit() || matches!(c, '-' | ':' | '+' | '.' | 'T' | 'Z' | 't' | 'z' | ' ')
+            }));
     let plain = !value.is_empty()
-        && value.as_bytes()[0].is_ascii_alphabetic()
-        && value.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+        && value.trim() == value
+        && !value
+            .starts_with([',', '[', ']', '{', '}', '#', '&', '*', '!', '|', '>', '\'', '"', '%', '@', '`'])
+        && !(value.starts_with(['-', '?', ':'])
+            && (value.len() == 1 || value.chars().nth(1).is_some_and(char::is_whitespace)))
+        && !matches!(value, "---" | "...")
+        && !value.chars().any(|c| c.is_control())
+        && !value.contains(": ")
+        && !value.ends_with(':')
+        && !value.contains(" #")
+        && !numeric
         && !matches!(
-            value.to_ascii_lowercase().as_str(),
-            "null" | "true" | "false" | "yes" | "no" | "on" | "off" | ".inf" | ".nan"
+            lower.as_str(),
+            "null"
+                | "~"
+                | "true"
+                | "false"
+                | "y"
+                | "n"
+                | "yes"
+                | "no"
+                | "on"
+                | "off"
+                | ".inf"
+                | "+.inf"
+                | "-.inf"
+                | ".nan"
         );
     if plain {
         value.to_owned()
@@ -3108,6 +3198,31 @@ mod tests {
 
     fn app() -> App {
         App::for_test(Db::open(":memory:").unwrap())
+    }
+
+    #[test]
+    fn yaml_strings_only_quote_when_syntax_or_type_requires_it() {
+        for value in ["香港 节点 01", "🇭🇰HK-proxy-3", "12abcdef", "-AbC_key123", "abc_def-123"] {
+            assert_eq!(yaml_string(value), value);
+        }
+        for value in [
+            "",
+            "001234",
+            "123456",
+            "true",
+            "null",
+            "a: b",
+            "a # comment",
+            "line\nbreak",
+            " leading",
+            "2026-01-01",
+            "1e3",
+            "0xff",
+            "---",
+            "...",
+        ] {
+            assert_eq!(yaml_string(value), serde_json::to_string(value).unwrap());
+        }
     }
 
     #[test]

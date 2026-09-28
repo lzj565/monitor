@@ -68,8 +68,15 @@ pub async fn serve(State(app): State<Shared>, headers: HeaderMap, uri: Uri) -> R
         return answer(StatusCode::NOT_FOUND, format!("没有这个接口：/{path}"));
     }
 
-    if path == "admin" || path.starts_with("admin/") {
-        let path = path.strip_prefix("admin").unwrap_or(path).trim_start_matches('/');
+    let panel_prefix = if path == "admin" || path.starts_with("admin/") {
+        Some("admin")
+    } else if path == "user" || path.starts_with("user/") {
+        Some("user")
+    } else {
+        None
+    };
+    if let Some(prefix) = panel_prefix {
+        let path = path.strip_prefix(prefix).unwrap_or(path).trim_start_matches('/');
         return embedded::<AdminAssets>(path, "面板没有构建，在 web-admin/ 下运行 npm run build", known);
     }
 

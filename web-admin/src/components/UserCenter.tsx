@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react"
-import { Copy, LogOut, Moon, RefreshCw, Sun } from "lucide-react"
+import { useCallback, useEffect, useState } from "react"
+import { ArrowDown, ArrowUp, CalendarDays, Copy, FileCode, Gauge, Link, LogOut, Moon, RefreshCw, Sun } from "lucide-react"
 import { toast } from "sonner"
 
 import { Button } from "@/components/ui/button"
@@ -7,6 +7,8 @@ import { Card } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { Skeleton } from "@/components/ui/skeleton"
 import { ProxyAddressTypeBadge, ProxyProtocolBadge, TooltipText } from "@/components/ProxyBadges"
+import { DragHandle, useDragOrder } from "@/components/DragOrder"
+import { bytes } from "@/lib/format"
 import { api } from "@/lib/api"
 
 type UserProfile = {
@@ -14,6 +16,9 @@ type UserProfile = {
   username: string
   enabled: boolean
   expires_at: number | null
+  traffic_limit: number
+  traffic_reset_day: number
+  traffic: { uplink_bytes: number; downlink_bytes: number; next_reset_date: string | null; reset_days_remaining: number | null }
 }
 
 type PortalProxy = {
@@ -29,6 +34,8 @@ type PortalProxy = {
   port: number
   server_name: string
   server_port: number
+  vless_url: string
+  mihomo_yaml: string
   online: boolean
 }
 
@@ -55,10 +62,21 @@ export function UserCenter({ siteName, dark, toggleTheme, signOut }: {
   const [links, setLinks] = useState<SubscriptionLinks | null>(null)
   const [error, setError] = useState("")
   const [rotating, setRotating] = useState(false)
+  const [loadAttempt, setLoadAttempt] = useState(0)
+
+  const reloadProxies = useCallback(() => {
+    void api<{ items: PortalProxy[] }>("/user/me/proxies").then((result) => setProxies(result.items)).catch((e: Error) => toast.error(e.message))
+  }, [])
+  const drag = useDragOrder(proxies ?? [], "user/me/proxies", reloadProxies)
+  const used = profile ? profile.traffic.uplink_bytes + profile.traffic.downlink_bytes : 0
+  const limit = profile?.traffic_limit ?? 0
+  const percentage = limit > 0 ? used / limit * 100 : 0
+  const exceeded = limit > 0 && used > limit
 
   useEffect(() => {
     let active = true
     async function load() {
+      setError("")
       try {
         const [nextProfile, nextProxies, nextLinks] = await Promise.all([
           api<UserProfile>("/user/me"),
@@ -76,12 +94,12 @@ export function UserCenter({ siteName, dark, toggleTheme, signOut }: {
     }
     void load()
     return () => { active = false }
-  }, [])
+  }, [loadAttempt])
 
-  async function copy(path: string) {
+  async function copy(text: string, label: string) {
     try {
-      await navigator.clipboard.writeText(absoluteLink(path))
-      toast.success("订阅链接已复制")
+      await navigator.clipboard.writeText(text)
+      toast.success(`${label}已复制`)
     } catch {
       toast.error("复制失败，请检查浏览器剪贴板权限")
     }
@@ -108,9 +126,9 @@ export function UserCenter({ siteName, dark, toggleTheme, signOut }: {
   }
 
   return (
-    <div className="min-h-svh">
+    <div className="min-h-svh bg-muted/25">
       <header className="sticky top-0 z-10 border-b bg-background/80 backdrop-blur">
-        <div className="mx-auto flex max-w-6xl items-center gap-3 px-4 py-3">
+        <div className="mx-auto flex max-w-7xl items-center gap-3 px-4 py-3">
           <a href="/" className="font-semibold transition-opacity hover:opacity-70">{siteName || "Monitor"}</a>
           <span className="text-xs text-muted-foreground">用户中心</span>
           <div className="flex-1" />
@@ -123,32 +141,46 @@ export function UserCenter({ siteName, dark, toggleTheme, signOut }: {
         </div>
       </header>
 
-      <main className="mx-auto max-w-6xl space-y-5 px-4 py-6">
-        {error && <p role="alert" className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">加载失败：{error}</p>}
+      <main className="mx-auto max-w-7xl space-y-6 px-4 py-6 sm:px-6 sm:py-8">
+        {error && <div role="alert" className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-destructive/20 bg-destructive/10 px-4 py-3 text-sm text-destructive"><span>加载失败：{error}</span><Button variant="outline" size="sm" onClick={() => setLoadAttempt((attempt) => attempt + 1)}>重新加载</Button></div>}
         {!profile ? (
-          <Skeleton className="h-32" />
+          error ? null : <Skeleton className="h-40 rounded-xl" />
         ) : (
-          <Card className="gap-4 p-5 shadow-sm md:p-6">
-            <div className="grid gap-5 sm:grid-cols-2 lg:grid-cols-4 lg:gap-6">
+          <section className="space-y-5" aria-label="账号与流量概览">
+            <div className="flex flex-wrap items-center justify-between gap-4">
               <div className="min-w-0">
-                <div className="text-xs text-muted-foreground">用户名</div>
-                <h1 className="mt-1 truncate text-lg font-semibold">{profile.username}</h1>
-                <Badge variant="outline" className={`mt-2 font-normal ${profile.enabled ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300" : "border-destructive/40 bg-destructive/10 text-destructive"}`}>{profile.enabled ? "账号正常" : "已禁用"}</Badge>
+                <p className="mb-1 text-xs font-medium tracking-wider text-muted-foreground">账户概览</p>
+                <h1 className="break-all text-2xl font-semibold tracking-tight">{profile.username}</h1>
+                <p className="mt-1 text-sm text-muted-foreground">查看用量、管理订阅与节点</p>
               </div>
-              <div>
-                <div className="text-xs text-muted-foreground">流量使用</div>
-                <div className="mt-1 text-sm font-medium">暂无流量数据</div>
-              </div>
-              <div>
-                <div className="text-xs text-muted-foreground">流量重置</div>
-                <div className="mt-1 text-sm font-medium">暂无重置信息</div>
-              </div>
-              <div>
-                <div className="text-xs text-muted-foreground">到期时间</div>
-                <div className="mt-1 text-sm font-medium">{displayDate(profile.expires_at)}</div>
-              </div>
+              <Badge variant="outline" className={`gap-2 rounded-full px-3 py-1.5 ${profile.enabled ? "border-emerald-500/25 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300" : "border-destructive/30 bg-destructive/10 text-destructive"}`}>
+                <span className={`size-1.5 rounded-full ${profile.enabled ? "bg-emerald-500" : "bg-destructive"}`} />{profile.enabled ? "账号正常" : "已禁用"}
+              </Badge>
             </div>
-          </Card>
+            <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+              <Card className="gap-4 p-5 shadow-sm md:col-span-2 sm:p-6">
+                <div className="flex items-center justify-between text-sm"><span className="flex items-center gap-2 text-muted-foreground"><Gauge className="size-4" />流量使用</span><span className={exceeded ? "text-destructive" : "text-muted-foreground"}>{limit > 0 ? `${percentage.toFixed(1)}% 已用` : "不限流量"}</span></div>
+                <div className="flex flex-wrap items-baseline gap-2"><span className="text-3xl font-semibold tabular-nums tracking-tight">{bytes(used)}</span><span className="text-sm text-muted-foreground">{limit > 0 ? `/ ${bytes(limit)}` : "累计使用"}</span></div>
+                <div className="h-2 overflow-hidden rounded-full bg-muted" role={limit > 0 ? "progressbar" : "img"} aria-label="流量使用" aria-valuemin={limit > 0 ? 0 : undefined} aria-valuemax={limit > 0 ? 100 : undefined} aria-valuenow={limit > 0 ? Math.min(100, percentage) : undefined} aria-valuetext={`${bytes(used)} / ${limit > 0 ? bytes(limit) : "不限流量"}`}>
+                  <div className={`h-full rounded-full transition-all ${exceeded ? "bg-destructive" : "bg-sky-500"}`} style={{ width: `${Math.min(100, percentage)}%` }} />
+                </div>
+                <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
+                  <span className="flex items-center gap-3"><span className="flex items-center gap-1"><ArrowUp className="size-3" />{bytes(profile.traffic.uplink_bytes)}</span><span className="flex items-center gap-1"><ArrowDown className="size-3" />{bytes(profile.traffic.downlink_bytes)}</span></span>
+                  {limit > 0 && <span className={exceeded ? "text-destructive" : ""}>{exceeded ? `已超出 ${bytes(used - limit)}` : `剩余 ${bytes(limit - used)}`}</span>}
+                </div>
+              </Card>
+              <Card className="justify-between gap-4 p-5 shadow-sm sm:p-6">
+                <div className="flex items-center gap-2 text-sm text-muted-foreground"><RefreshCw className="size-4" />流量重置</div>
+                <div><div className="text-2xl font-semibold tracking-tight">{profile.traffic_reset_day ? `每月 ${profile.traffic_reset_day} 日` : "不自动重置"}</div><p className="mt-2 text-xs text-muted-foreground">{profile.traffic.next_reset_date ? `下次 ${profile.traffic.next_reset_date}` : "流量持续累计"}</p></div>
+                <p className="text-xs text-muted-foreground">{profile.traffic.reset_days_remaining !== null ? `距下次重置 ${profile.traffic.reset_days_remaining} 天 · 服务端日期` : "由管理员设置重置周期"}</p>
+              </Card>
+              <Card className="justify-between gap-4 p-5 shadow-sm sm:p-6">
+                <div className="flex items-center gap-2 text-sm text-muted-foreground"><CalendarDays className="size-4" />到期时间</div>
+                <div className="text-2xl font-semibold tabular-nums tracking-tight">{displayDate(profile.expires_at)}</div>
+                <p className="text-xs text-muted-foreground">{profile.expires_at === null ? "账户未设置到期日期" : "请留意账户有效期"}</p>
+              </Card>
+            </div>
+          </section>
         )}
 
         <Card className="gap-4 p-5 shadow-sm md:p-6">
@@ -169,12 +201,12 @@ export function UserCenter({ siteName, dark, toggleTheme, signOut }: {
               const path = links?.[key]
               const url = path ? absoluteLink(path) : ""
               return (
-                <div key={key} className="min-w-0 rounded-lg border bg-background p-4">
+                <div key={key} className="min-w-0 rounded-xl border bg-muted/20 p-4 transition-colors hover:bg-muted/40 sm:p-5">
                   <div className="font-medium">{title}</div>
                   <div className="mt-1 text-xs text-muted-foreground">{description}</div>
                   <div className="mt-3 flex min-w-0 items-center gap-2 rounded-md border bg-muted/30 px-3 py-2">
-                    <span className="min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground" title={url}>{url || "加载中…"}</span>
-                    <Button variant="outline" size="sm" className="shrink-0" disabled={!path} onClick={() => path && void copy(path)}><Copy />复制订阅</Button>
+                    <span className="min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground" title={url}>{url || (error ? "暂时无法加载" : "加载中…")}</span>
+                    <Button variant="outline" size="sm" className="shrink-0" disabled={!path} onClick={() => path && void copy(absoluteLink(path), "订阅链接")}><Copy />复制订阅</Button>
                   </div>
                 </div>
               )
@@ -184,35 +216,38 @@ export function UserCenter({ siteName, dark, toggleTheme, signOut }: {
 
         <Card className="gap-4 p-5 shadow-sm md:p-6">
           <div>
-            <h2 className="font-semibold">我的节点</h2>
-            <p className="mt-1 text-sm text-muted-foreground">这里只显示当前账号已启用授权的节点。</p>
+            <h2 className="flex items-center gap-2 font-semibold">我的节点{proxies && <Badge variant="secondary" className="tabular-nums">{proxies.length}</Badge>}</h2>
+            <p className="mt-1 text-sm text-muted-foreground">拖动左侧手柄调整顺序，自动保存并同步到订阅。</p>
           </div>
           {!proxies ? (
-            <Skeleton className="h-24" />
+            error ? <p className="text-sm text-muted-foreground">节点暂时无法加载，请重试。</p> : <Skeleton className="h-24" />
           ) : proxies.length === 0 ? (
             <p className="rounded-md border border-dashed p-6 text-center text-sm text-muted-foreground">当前没有已启用的节点授权</p>
           ) : (
-            <div className="overflow-x-auto rounded-md border">
-              <table className="w-full min-w-max table-auto text-left text-sm">
+            <div className="overflow-hidden rounded-md border">
+              <table className="w-full table-fixed text-left text-sm">
                 <thead className="bg-muted/50 text-xs text-muted-foreground">
-                  <tr><th className="px-4 py-3">名称</th><th className="px-4 py-3">协议</th><th className="px-4 py-3">地址</th><th className="px-4 py-3">端口</th><th className="w-28 max-w-28 px-4 py-3">SNI</th><th className="px-4 py-3">状态</th></tr>
+                  <tr><th className="w-10 px-1 py-3 sm:px-2"><span className="sr-only">排序</span></th><th className="w-[30%] px-2 py-3 sm:w-[20%] sm:px-3">节点</th><th className="hidden w-[14%] px-2 py-3 sm:table-cell sm:px-3">名称</th><th className="hidden w-[13%] px-3 py-3 xl:table-cell">协议</th><th className="w-[35%] px-2 py-3 sm:w-[22%] sm:px-3">地址</th><th className="hidden w-[7%] px-3 py-3 xl:table-cell">端口</th><th className="hidden w-[12%] px-3 py-3 xl:table-cell">SNI</th><th className="hidden w-[10%] px-3 py-3 xl:table-cell">状态</th><th className="w-20 px-1 py-3 sm:w-24 sm:px-3"><span className="sr-only">复制</span></th></tr>
                 </thead>
                 <tbody>
-                  {proxies.map((proxy) => (
-                    <tr key={proxy.id} className="border-t transition-colors hover:bg-muted/30">
-                      <td className="px-4 py-3">
-                        <div className="font-medium">{proxy.name}</div>
-                        <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                          <span>{proxy.node_name}</span>
-                          {proxy.node_group && <span>{proxy.node_group}</span>}
-                          {proxy.node_country && <Badge variant="outline" className="font-normal text-muted-foreground">{proxy.node_country}</Badge>}
+                  {drag.order.map((proxy) => (
+                    <tr key={proxy.id} {...drag.row(proxy.id)} className="border-t transition-colors hover:bg-muted/30 data-[dragging]:opacity-40">
+                      <td className="px-1 py-3 sm:px-2"><DragHandle name={proxy.name} {...drag.handle(proxy.id)} /></td>
+                      <td className="whitespace-normal px-2 py-3 sm:px-3">
+                        <div className="min-w-0">
+                          <div className="font-medium text-balance break-keep">
+                            {proxy.node_name}{proxy.node_country && "\u2007"}{proxy.node_country && <Badge variant="outline" className="align-middle font-normal text-muted-foreground">{proxy.node_country}</Badge>}
+                          </div>
+                          {proxy.node_group && <div className="text-xs text-balance text-muted-foreground">{proxy.node_group}</div>}
                         </div>
                       </td>
-                      <td className="px-4 py-3"><ProxyProtocolBadge protocol={proxy.protocol} /></td>
-                      <td className="px-4 py-3"><div className="flex min-w-0 items-center gap-2"><ProxyAddressTypeBadge addressType={proxy.address_type} /><span className="truncate font-mono text-xs" title={proxy.address}>{proxy.address}</span></div></td>
-                      <td className="px-4 py-3 font-mono">{proxy.port}</td>
-                      <td className="w-28 max-w-28 px-4 py-3"><TooltipText text={proxy.server_name ? `${proxy.server_name}:${proxy.server_port}` : "—"} className="w-24 max-w-24 font-mono text-xs" /></td>
-                      <td className="px-4 py-3"><Badge variant="outline" className={`font-normal ${proxy.online ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300" : "text-muted-foreground"}`}><span className={`size-1.5 rounded-full ${proxy.online ? "bg-emerald-500" : "bg-muted-foreground/50"}`} />{proxy.online ? "在线" : "离线"}</Badge></td>
+                      <td className="hidden px-2 py-3 sm:table-cell sm:px-3"><TooltipText text={proxy.name} className="font-medium" /></td>
+                      <td className="hidden px-3 py-3 xl:table-cell"><ProxyProtocolBadge protocol={proxy.protocol} /></td>
+                      <td className="px-2 py-3 sm:px-3"><div className="flex min-w-0 items-center gap-1 sm:gap-2"><span className="hidden shrink-0 sm:inline-flex"><ProxyAddressTypeBadge addressType={proxy.address_type} /></span><span className="min-w-0 truncate font-mono text-xs" title={proxy.address}>{proxy.address}</span></div></td>
+                      <td className="hidden px-3 py-3 font-mono xl:table-cell">{proxy.port}</td>
+                      <td className="hidden px-3 py-3 xl:table-cell"><TooltipText text={proxy.server_name || "—"} className="font-mono text-xs" /></td>
+                      <td className="hidden px-3 py-3 xl:table-cell"><Badge variant="outline" className={`font-normal ${proxy.online ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300" : "text-muted-foreground"}`}><span className={`size-1.5 rounded-full ${proxy.online ? "bg-emerald-500" : "bg-muted-foreground/50"}`} />{proxy.online ? "在线" : "离线"}</Badge></td>
+                      <td className="px-1 py-3 sm:px-3"><div className="flex items-center justify-center gap-0 sm:gap-1"><Button type="button" variant="ghost" size="icon" className="size-8 shrink-0" title="复制 VLESS URL" aria-label={`复制 ${proxy.name} 的 VLESS URL`} onClick={() => void copy(proxy.vless_url, "VLESS URL")}><Link /></Button><Button type="button" variant="ghost" size="icon" className="size-8 shrink-0" title="复制 Mihomo 配置" aria-label={`复制 ${proxy.name} 的 Mihomo 配置`} onClick={() => void copy(proxy.mihomo_yaml, "Mihomo 配置")}><FileCode /></Button></div></td>
                     </tr>
                   ))}
                 </tbody>

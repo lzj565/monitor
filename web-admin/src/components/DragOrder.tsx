@@ -118,11 +118,36 @@ export function useDragOrder<T extends { id: number }>(items: T[], path: string,
   return {
     order,
     row: (id: number) => ({
-      style: { viewTransitionName: `${path}-${id}` },
+      style: { viewTransitionName: `${path.replace(/[^a-zA-Z0-9_-]/g, "-")}-${id}` },
       "data-dragging": dragging === id || undefined,
       className: "transition-opacity data-[dragging]:opacity-40",
     }),
     handle: (id: number) => ({
+      onPointerDown: (e: React.PointerEvent<HTMLButtonElement>) => {
+        if (e.pointerType === "mouse") return
+        orderBeforeDrag.current = ids()
+        body.current = e.currentTarget.closest("tbody")
+        e.currentTarget.setPointerCapture(e.pointerId)
+        setDragging(id)
+      },
+      onPointerMove: (e: React.PointerEvent<HTMLButtonElement>) => {
+        if (e.pointerType === "mouse" || !e.currentTarget.hasPointerCapture(e.pointerId)) return
+        const at = [...(body.current?.rows ?? [])].findIndex((row) => {
+          const bounds = row.getBoundingClientRect()
+          return e.clientY >= bounds.top && e.clientY < bounds.bottom
+        })
+        if (at >= 0) move(id, at)
+      },
+      onPointerUp: (e: React.PointerEvent<HTMLButtonElement>) => {
+        if (e.pointerType === "mouse" || !e.currentTarget.hasPointerCapture(e.pointerId)) return
+        e.currentTarget.releasePointerCapture(e.pointerId)
+        const bounds = body.current?.getBoundingClientRect()
+        if (bounds && e.clientX >= bounds.left && e.clientX <= bounds.right && e.clientY >= bounds.top && e.clientY <= bounds.bottom) save(ids())
+        else cancel()
+      },
+      onPointerCancel: (e: React.PointerEvent<HTMLButtonElement>) => {
+        if (e.pointerType !== "mouse") cancel()
+      },
       onDragStart: (e: React.DragEvent<HTMLElement>) => {
         orderBeforeDrag.current = ids()
         body.current = e.currentTarget.closest("tbody")

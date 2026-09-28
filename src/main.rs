@@ -585,6 +585,7 @@ async fn main() -> Result<()> {
             Router::new()
                 .route("/api/user/me", get(api::user_me))
                 .route("/api/user/me/proxies", get(api::user_proxies))
+                .route("/api/user/me/proxies/order", put(api::reorder_user_proxies))
                 .route("/api/user/me/subscription", get(api::user_subscription_links))
                 .route("/api/user/me/subscription-token", post(api::rotate_user_subscription_token))
                 .route("/api/subscriptions/{token}/{format}", get(api::subscription))
@@ -964,7 +965,17 @@ mod tests {
 
         // Client-side routes still fall through to the app.
         assert_eq!(spa("/admin").await.status(), StatusCode::OK);
-        assert_eq!(spa("/").await.status(), StatusCode::OK);
+        for path in ["/user", "/user/", "/user/center"] {
+            let response = spa(path).await;
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            let html = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let html = String::from_utf8(html.to_vec()).unwrap();
+            assert!(html.contains("/admin/assets/"), "{path} must load the user/admin SPA assets");
+        }
+        let public = spa("/").await;
+        assert_eq!(public.status(), StatusCode::OK);
+        let public_html = axum::body::to_bytes(public.into_body(), usize::MAX).await.unwrap();
+        assert!(!String::from_utf8(public_html.to_vec()).unwrap().contains("/admin/assets/"));
         // A path merely beginning with "api" is not an API path.
         assert_eq!(spa("/apiary").await.status(), StatusCode::OK);
     }
