@@ -1618,6 +1618,27 @@ fn group_error(group: &mut String) -> Option<&'static str> {
     None
 }
 
+/// Normalizes the currency and billing cycle, or names the one that cannot be
+/// stored. The currency is held to the ISO 4217 form of three letters, the only
+/// one `Intl.NumberFormat` accepts, so a theme may pass it on without guarding
+/// against a throw. Each cycle length is stored in a single spelling, see
+/// `cycle_name`.
+fn billing_error(currency: Option<&mut String>, cycle: Option<&mut String>) -> Option<&'static str> {
+    if let Some(code) = currency {
+        *code = code.trim().to_ascii_uppercase();
+        if !(code.len() == 3 && code.bytes().all(|b| b.is_ascii_uppercase())) {
+            return Some("货币要填三个字母的代码，如 USD、CNY、HKD");
+        }
+    }
+    if let Some(cycle) = cycle.filter(|c| *c != "once") {
+        let Some(months) = crate::cycle_months(cycle) else {
+            return Some("付款周期要是整月，在 1 个月到 100 年之间");
+        };
+        *cycle = crate::cycle_name(months);
+    }
+    None
+}
+
 /// Normalizes a patch, or names the first value that cannot be stored. The one
 /// check both the single and the batch write pass through, so the two accept
 /// exactly the same values.
@@ -1633,7 +1654,9 @@ fn patch_error(node: &mut NodePatch) -> Option<&'static str> {
             return Some(message);
         }
     }
-    node_limits(node.traffic_reset_day, node.price, node.traffic_limit).or_else(|| pins(node))
+    node_limits(node.traffic_reset_day, node.price, node.traffic_limit)
+        .or_else(|| billing_error(node.currency.as_mut(), node.billing_cycle.as_mut()))
+        .or_else(|| pins(node))
 }
 
 /// Normalizes the values set by hand, or names the one that cannot stand. Each
@@ -1870,6 +1893,7 @@ pub async fn create_node(
     if let Some(message) =
         node_limits(Some(node.traffic_reset_day), Some(node.price), Some(node.traffic_limit))
             .or_else(|| group_error(&mut node.group))
+            .or_else(|| billing_error(Some(&mut node.currency), Some(&mut node.billing_cycle)))
     {
         return bad(message);
     }
@@ -2836,9 +2860,8 @@ async fn update(app: &App, short: &str) -> Result<(bool, String), anyhow::Error>
     Ok((true, theme.version))
 }
 
-/// The thumbnail the theme list displays, where the theme provides one. A theme
-/// without one returns 404, on which the panel hides the image, so nothing need
-/// report whether a preview exists.
+/// The thumbnail the theme list displays, where the theme provides one; the list
+/// reports which do.
 pub async fn theme_preview(_: Admin, State(app): State<Shared>, Path(short): Path<String>) -> Response {
     match crate::frontend::preview(&app.themes, &short) {
         // Not cached: reinstalling a theme under the same name also replaces the
@@ -2922,7 +2945,14 @@ pub async fn save_theme_config(
 
 pub async fn themes(_: Admin, State(app): State<Shared>) -> Response {
     match crate::frontend::themes(&app) {
-        Ok(themes) => Json(json!({"themes": themes})).into_response(),
+        Ok(mut themes) => {
+            // Reads each image to answer, as serving it would: a handful of
+            // themes, each image capped at 8 MiB.
+            for theme in &mut themes {
+                theme.preview = crate::frontend::preview(&app.themes, &theme.short).is_some();
+            }
+            Json(json!({"themes": themes})).into_response()
+        }
         Err(e) => fail(e),
     }
 }
@@ -3530,8 +3560,15 @@ mod tests {
         let base = Utc::now().timestamp() / 120 * 120 - 120;
         // One bucket: a quiet minute and a busy one, then a probe that answered
         // once and timed out three times.
-        app.db.insert_metric(id, base + 10, &json!({"cpu": 0.0, "net_rx": 0})).unwrap();
-        app.db.insert_metric(id, base + 70, &json!({"cpu": 40.0, "net_rx": 1_000})).unwrap();
+        // The quiet minute predates the peak column, whose default is 0.
+        app.db.insert_metric(id, base + 10, &json!({"cpu": 0.0, "net_rx": 0, "net_tx": 3_000})).unwrap();
+        app.db
+            .insert_metric(
+                id,
+                base + 70,
+                &json!({"cpu": 40.0, "net_rx": 1_000, "net_rx_max": 4_000, "net_tx": 1_000, "net_tx_max": 2_000}),
+            )
+            .unwrap();
         for _ in 0..3 {
             task(&app, vec![id]);
         }
@@ -3545,6 +3582,8 @@ mod tests {
         let m = &app.db.metrics(id, base, 120).unwrap()[0];
         assert_eq!(m["cpu"], 20.0, "the bucket is its mean, not one row of it");
         assert_eq!(m["net_rx"], 500);
+        assert_eq!(m["net_rx_max"], 4_000, "the bucket peaks where its busiest minute did");
+        assert_eq!(m["net_tx_max"], 3_000, "a row without a peak counts as its own mean");
         assert_eq!(m["ts"], base, "stamped with the bucket, so every series shares a grid");
 
         // Keyed by task rather than index: the order is the panel's, which
@@ -4009,6 +4048,11 @@ mod tests {
             json!({"name": "x", "traffic_reset_day": 99}),
             json!({"name": "x", "price": -5.0}),
             json!({"name": "x", "traffic_limit": -1}),
+            json!({"name": "x", "currency": "USDT"}),
+            json!({"name": "x", "currency": "港币"}),
+            json!({"name": "x", "billing_cycle": "0m"}),
+            json!({"name": "x", "billing_cycle": "1201m"}),
+            json!({"name": "x", "billing_cycle": "weekly"}),
         ] {
             let created = create_node(
                 Admin,
@@ -4028,6 +4072,29 @@ mod tests {
             assert_eq!(updated.status(), StatusCode::BAD_REQUEST, "update accepted {bad}");
         }
         assert_eq!(app.db.nodes().unwrap().len(), 1, "nothing was created");
+    }
+
+    /// A length with a name is stored under it, so a theme built for hub 1.3.0
+    /// still labels it.
+    #[tokio::test]
+    async fn currency_and_cycle_are_stored_in_one_spelling() {
+        let app = std::sync::Arc::new(app());
+        let id = node(&app, "n", true);
+        for (sent, currency, cycle) in [
+            (json!({"currency": " hkd ", "billing_cycle": "60m"}), "HKD", "60m"),
+            (json!({"billing_cycle": "12m"}), "HKD", "yearly"),
+            (json!({"billing_cycle": "once"}), "HKD", "once"),
+        ] {
+            let put = update_node(
+                Admin,
+                State(app.clone()),
+                Path(id),
+                Ok(Json(serde_json::from_value(sent).unwrap())),
+            );
+            assert_eq!(put.await.status(), StatusCode::OK);
+            let stored = app.db.node(id).unwrap().unwrap();
+            assert_eq!((stored.currency.as_str(), stored.billing_cycle.as_str()), (currency, cycle));
+        }
     }
 
     /// A stream outlives the request that opened it, so everything the handshake
