@@ -30,7 +30,7 @@ fi
 [ -n "$API_PORT" ] || { echo "unable to find available sing-box V2Ray API port in range 9001-9099" >&2; exit 1; }
 case "$API_PORT" in "" | *[!0-9]*) echo "API_PORT must be an integer from 1 to 65535" >&2; exit 2 ;; esac
 [ "$API_PORT" -ge 1 ] && [ "$API_PORT" -le 65535 ] || { echo "API_PORT must be an integer from 1 to 65535" >&2; exit 2; }
-PROTO_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+PROTO_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/sing-box-api-smoke.XXXXXX")
 PID=""
 cleanup() {
@@ -61,7 +61,7 @@ PID=$!
 
 attempt=0
 while [ "$attempt" -lt 30 ]; do
-	if grpcurl -plaintext -proto "$PROTO_DIR/xray-stats-smoke.proto" \
+	if grpcurl -plaintext -import-path "$PROTO_DIR" -proto xray-stats-smoke.proto \
 		"127.0.0.1:$API_PORT" v2ray.core.app.stats.command.StatsService/GetSysStats \
 		>"$TMP_DIR/result.json" 2>"$TMP_DIR/grpcurl.log"; then
 		grep -Eq '"(uptime|numGoroutine)"' "$TMP_DIR/result.json" || {

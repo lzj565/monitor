@@ -47,8 +47,9 @@ TEST_LEGACY_PORT_FILE="$TMP/legacy-port"
 ENV_FILE="$TMP/agent.env"
 SING_BOX_CONFIG="$TMP/config.json"
 BIN="$TMP/agent"
-API_PORT_HELPER="$TMP/agent"
-export TEST_SS_FILE TEST_LEGACY_PORT_FILE TEST_BUSY_PORTS
+# The installer functions are loaded through eval, so export globals that
+# ShellCheck cannot trace into their definitions.
+export SING_BOX_CONFIG BIN TEST_SS_FILE TEST_LEGACY_PORT_FILE TEST_BUSY_PORTS
 
 reset_case
 select_singbox_api_port
