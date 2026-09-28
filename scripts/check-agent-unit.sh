@@ -18,6 +18,14 @@ printf '%s\n' "$UNIT" | grep -Fx 'ProtectSystem=full' >/dev/null || {
 	echo "monitor-agent unit must have one combined ReadWritePaths entry" >&2
 	exit 1
 }
+[ "$(printf '%s\n' "$UNIT" | grep -Fxc 'RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK')" -eq 1 ] || {
+	echo "monitor-agent unit must allow AF_UNIX, AF_INET, AF_INET6, and AF_NETLINK" >&2
+	exit 1
+}
+if printf '%s\n' "$UNIT" | grep -Fx 'RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK' >/dev/null; then
+	echo "monitor-agent unit must not omit AF_UNIX" >&2
+	exit 1
+fi
 
 if printf '%s\n' "$UNIT" | grep -E '^(ReadOnlyPaths|InaccessiblePaths|TemporaryFileSystem|BindReadOnlyPaths)=' >/dev/null; then
 	echo "monitor-agent unit contains a conflicting systemd path restriction" >&2

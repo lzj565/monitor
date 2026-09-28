@@ -766,7 +766,7 @@ PrivateTmp=yes
 PrivateDevices=yes
 # AF_NETLINK is how getifaddrs(3) obtains this host's own addresses from the
 # kernel; without it the agent reports none.
-RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 MemoryMax=64M
 
 [Install]
