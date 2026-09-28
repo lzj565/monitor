@@ -64,7 +64,7 @@ while [ "$attempt" -lt 30 ]; do
 	if grpcurl -plaintext -import-path "$PROTO_DIR" -proto xray-stats-smoke.proto \
 		"127.0.0.1:$API_PORT" v2ray.core.app.stats.command.StatsService/GetSysStats \
 		>"$TMP_DIR/result.json" 2>"$TMP_DIR/grpcurl.log"; then
-		grep -Eq '"(uptime|numGoroutine)"' "$TMP_DIR/result.json" || {
+		grep -Eiq '"(uptime|numgoroutine)"' "$TMP_DIR/result.json" || {
 			cat "$TMP_DIR/result.json" >&2
 			echo "StatsService returned no system statistics" >&2
 			exit 1
