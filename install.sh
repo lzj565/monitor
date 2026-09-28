@@ -577,19 +577,12 @@ if [ ! -e "$SING_BOX_CONFIG" ] && [ ! -L "$SING_BOX_CONFIG" ]; then
 		umask 022
 		cat >"$SING_BOX_CONFIG" <<CONFIG
 {
-  "inbounds": [],
   "outbounds": [
     {
       "type": "direct",
       "tag": "direct"
     }
-  ],
-  "experimental": {
-    "v2ray_api": {
-      "listen": "127.0.0.1:$SINGBOX_API_PORT",
-      "stats": {"enabled": true, "inbounds": [], "users": []}
-    }
-  }
+  ]
 }
 CONFIG
 	)

@@ -104,4 +104,20 @@ if select_singbox_api_port; then
 fi
 assert_eq "$FAIL_REASON" 'unable to find available sing-box V2Ray API port in range 9001-9099'
 
+# The install-time seed stays minimal; the following installer step injects
+# the selected loopback API port before sing-box validates the final config.
+INITIAL_CONFIG=$(sed -n '/cat >"$SING_BOX_CONFIG" <<CONFIG/,/^CONFIG$/p' "$INSTALLER" | sed '1d;$d')
+printf '%s\n' "$INITIAL_CONFIG" | grep -F '"outbounds": [' >/dev/null || {
+	echo "initial sing-box config has no outbounds" >&2
+	exit 1
+}
+if printf '%s\n' "$INITIAL_CONFIG" | grep -Eq '"(experimental|dns|inbounds|log)"'; then
+	echo "initial sing-box config contains fields beyond outbounds" >&2
+	exit 1
+fi
+grep -F 'internal set-api-port-in-config "$SING_BOX_CONFIG" "$SINGBOX_API_PORT"' "$INSTALLER" >/dev/null || {
+	echo "installer does not inject its selected API port after creating the initial config" >&2
+	exit 1
+}
+
 echo "installer sing-box API port selection: ok"

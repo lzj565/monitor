@@ -225,6 +225,8 @@ impl AuthorizationRequest {
 }
 
 pub fn generate_config(db: &Db, node_id: i64, now: i64) -> anyhow::Result<Value> {
+    let node = db.node(node_id)?.with_context(|| format!("node {node_id} not found"))?;
+    let listen = if node.ipv6.is_empty() { "0.0.0.0" } else { "::" };
     let mut inbounds = Vec::new();
     let mut stats_inbounds = Vec::new();
     let mut stats_users = BTreeSet::new();
@@ -251,11 +253,12 @@ pub fn generate_config(db: &Db, node_id: i64, now: i64) -> anyhow::Result<Value>
         inbounds.push(json!({
             "type": "vless",
             "tag": format!("proxy-{}", proxy.id),
-            "listen": "::",
+            "listen": listen,
             "listen_port": proxy.port,
             "users": users,
             "tls": {
                 "enabled": true,
+                "server_name": reality.server_name,
                 "reality": {
                     "enabled": true,
                     "handshake": {
@@ -270,7 +273,12 @@ pub fn generate_config(db: &Db, node_id: i64, now: i64) -> anyhow::Result<Value>
         stats_inbounds.push(format!("proxy-{}", proxy.id));
     }
     let config = json!({
-        "log": {"level": "info"},
+        "log": {"level": "warn"},
+        "dns": {
+            "final": "dns-local",
+            "servers": [{"prefer_go": true, "tag": "dns-local", "type": "local"}],
+            "strategy": "prefer_ipv4"
+        },
         "inbounds": inbounds,
         "outbounds": [{"type": "direct", "tag": "direct"}],
         "experimental": {
@@ -442,6 +450,21 @@ mod tests {
             assert_eq!(config["inbounds"][0]["users"][0]["uuid"], uuid);
             assert_eq!(config["inbounds"][0]["users"][0]["name"], "same");
             assert_eq!(config["inbounds"][0]["users"][0]["flow"], "xtls-rprx-vision");
+            for section in ["experimental", "dns", "inbounds", "log", "outbounds"] {
+                assert!(config.get(section).is_some(), "missing required section: {section}");
+            }
+            assert_eq!(config["log"]["level"], "warn");
+            assert_eq!(config["dns"]["final"], "dns-local");
+            assert_eq!(config["dns"]["strategy"], "prefer_ipv4");
+            assert_eq!(config["dns"]["servers"][0]["type"], "local");
+            assert_eq!(config["dns"]["servers"][0]["tag"], "dns-local");
+            assert_eq!(config["dns"]["servers"][0]["prefer_go"], true);
+            assert_eq!(config["inbounds"][0]["listen"], "0.0.0.0");
+            assert_eq!(config["inbounds"][0]["tls"]["server_name"], "example.com");
+            assert_eq!(
+                config["inbounds"][0]["tls"]["server_name"],
+                config["inbounds"][0]["tls"]["reality"]["handshake"]["server"]
+            );
             assert!(config["experimental"]["v2ray_api"].get("listen").is_none());
             assert_eq!(config["experimental"]["v2ray_api"]["stats"]["enabled"], true);
             assert_eq!(
@@ -458,9 +481,30 @@ mod tests {
         let db = Db::open(":memory:").unwrap();
         let node_id = db.create_node(&Node { name: "empty".into(), ..Default::default() }, "token").unwrap();
         let config = generate_config(&db, node_id, chrono::Utc::now().timestamp()).unwrap();
+        for section in ["experimental", "dns", "inbounds", "log", "outbounds"] {
+            assert!(config.get(section).is_some(), "missing required section: {section}");
+        }
+        assert_eq!(config["log"]["level"], "warn");
+        assert_eq!(config["inbounds"], json!([]));
         assert!(config["experimental"]["v2ray_api"].get("listen").is_none());
         assert_eq!(config["experimental"]["v2ray_api"]["stats"]["enabled"], true);
         assert_eq!(config["experimental"]["v2ray_api"]["stats"]["inbounds"], json!([]));
         assert_eq!(config["experimental"]["v2ray_api"]["stats"]["users"], json!([]));
+    }
+
+    #[test]
+    fn generated_config_uses_ipv6_wildcard_when_node_reports_ipv6() {
+        let db = Db::open(":memory:").unwrap();
+        let node_id = db.create_node(&Node { name: "ipv6".into(), ..Default::default() }, "token").unwrap();
+        db.save_facts(node_id, &json!({"ipv6":"2001:db8::1"}), "198.51.100.1", "198.51.100.1").unwrap();
+        let proxy_id = db.create_proxy(node_id, &db::ProxyDraft {
+            name: "ipv6".into(), include_node_name: false, protocol: "vless".into(), address_type: "domain".into(),
+            address: "example.com".into(), port: 24062, enabled: true, flow: None,
+            config: json!({"reality":{"enabled":true,"server_name":"example.com","server_port":443,
+                "private_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","public_key":"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB","short_id":"abcdef12"}}),
+        }).unwrap().unwrap();
+        let config = generate_config(&db, node_id, chrono::Utc::now().timestamp()).unwrap();
+        assert_eq!(config["inbounds"][0]["tag"], format!("proxy-{proxy_id}"));
+        assert_eq!(config["inbounds"][0]["listen"], "::");
     }
 }
