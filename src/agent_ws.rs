@@ -1059,7 +1059,7 @@ mod tests {
             "result": {"installed": true, "running": true, "version": "1.14.1"}
         });
         dispatch(&app, id, "ip", &response.to_string(), &mut session, at(0)).unwrap();
-        let view = app.commands.get(&response["id"].as_str().unwrap(), id).unwrap();
+        let view = app.commands.get(response["id"].as_str().unwrap(), id).unwrap();
         assert_eq!(view.status, "succeeded");
         assert_eq!(view.result.unwrap()["running"], true);
 

@@ -131,6 +131,7 @@ fn api_internal(error: impl Into<anyhow::Error>) -> Response {
     api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", INTERNAL)
 }
 
+#[allow(clippy::result_large_err)]
 fn api_body<T>(body: Result<Json<T>, JsonRejection>) -> Result<T, Response> {
     body.map(|Json(value)| value)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "INVALID_REQUEST", "request body must be valid JSON"))
@@ -140,6 +141,7 @@ fn api_input_error(error: proxy::InputError) -> Response {
     api_error(StatusCode::BAD_REQUEST, error.code, error.message)
 }
 
+#[allow(clippy::result_large_err)]
 fn api_node_exists(app: &Shared, node_id: i64) -> Result<(), Response> {
     match app.db.node(node_id) {
         Ok(Some(_)) => Ok(()),
@@ -148,6 +150,7 @@ fn api_node_exists(app: &Shared, node_id: i64) -> Result<(), Response> {
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn api_proxy(app: &Shared, id: i64) -> Result<Proxy, Response> {
     match app.db.proxy(id) {
         Ok(Some(proxy)) => Ok(proxy),
@@ -156,6 +159,7 @@ fn api_proxy(app: &Shared, id: i64) -> Result<Proxy, Response> {
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn api_user(app: &Shared, id: i64) -> Result<User, Response> {
     match app.db.user(id) {
         Ok(Some(user)) => Ok(user),
@@ -852,6 +856,7 @@ pub async fn delete_user_proxy(
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn generated_node_config(app: &Shared, node_id: i64) -> Result<Value, Response> {
     api_node_exists(app, node_id)?;
     proxy::generate_config(&app.db, node_id, Utc::now().timestamp()).map_err(|error| {
