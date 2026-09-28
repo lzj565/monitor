@@ -10,6 +10,7 @@ use serde_json::{json, Value};
 use crate::db::{self, AuthorizationDraft, Db, ProxyDraft, UserDraft};
 
 pub const MAX_GENERATED_CONFIG: usize = 1024 * 1024;
+pub const DEFAULT_FLOW: &str = "xtls-rprx-vision";
 
 #[derive(Debug)]
 pub struct InputError {
@@ -72,7 +73,7 @@ impl ProxyRequest {
         if self.port == 0 {
             return Err(InputError::new("INVALID_PROXY_CONFIG", "port must be between 1 and 65535"));
         }
-        if self.flow.as_deref().is_some_and(|flow| !flow.is_empty() && flow != "xtls-rprx-vision") {
+        if self.flow.as_deref().is_some_and(|flow| !flow.is_empty() && flow != DEFAULT_FLOW) {
             return Err(InputError::new("INVALID_PROXY_CONFIG", "flow must be empty or xtls-rprx-vision"));
         }
         let reality = &self.config.reality;
@@ -238,9 +239,11 @@ pub fn generate_config(db: &Db, node_id: i64, now: i64) -> anyhow::Result<Value>
                     .with_context(|| format!("stored VLESS auth for proxy {} is invalid", proxy.id))?;
                 stats_users.insert(auth.name.clone());
                 let mut user = json!({"name": auth.name, "uuid": auth.uuid});
-                if !proxy.flow.is_empty() {
-                    user["flow"] = Value::String(proxy.flow.clone());
-                }
+                user["flow"] = Value::String(if proxy.flow.is_empty() {
+                    DEFAULT_FLOW.to_owned()
+                } else {
+                    proxy.flow.clone()
+                });
                 Ok(user)
             })
             .collect::<anyhow::Result<_>>()?;
@@ -421,7 +424,8 @@ mod tests {
                 .unwrap();
             let proxy_id = db.create_proxy(node_id, &db::ProxyDraft {
                 name: name.into(), include_node_name: false, protocol: "vless".into(), address_type: "domain".into(),
-                address: "example.com".into(), port, enabled: true, flow: Some("xtls-rprx-vision".into()),
+                address: "example.com".into(), port, enabled: true,
+                flow: (port != 24060).then(|| DEFAULT_FLOW.to_owned()),
                 config: json!({"reality":{"enabled":true,"server_name":"example.com","server_port":443,
                     "private_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","public_key":"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB","short_id":"abcdef12"}}),
             }).unwrap().unwrap();

@@ -183,7 +183,7 @@ function ProxyForm({ proxy, nodes, onClose, onSaved }: {
   const [addressType, setAddressType] = useState<ProxyDraft["address_type"]>(proxy?.address_type ?? defaultAddressType(initialNode))
   const [customAddress, setCustomAddress] = useState(proxy?.address_type === "domain" ? proxy.address : "")
   const [port, setPort] = useState(String(proxy?.port ?? "24060"))
-  const [flow, setFlow] = useState<Flow>(proxy?.flow ?? "")
+  const [flow, setFlow] = useState<Flow>(proxy?.flow || "xtls-rprx-vision")
   const [sni, setSni] = useState(initialReality ? formatSni(initialReality.server_name, initialReality.server_port) : "www.amd.com:443")
   const [privateKey, setPrivateKey] = useState(initialReality?.private_key ?? creationPair?.privateKey ?? "")
   const [publicKey, setPublicKey] = useState(initialReality?.public_key ?? creationPair?.publicKey ?? "")
@@ -378,9 +378,9 @@ function ProxyForm({ proxy, nodes, onClose, onSaved }: {
               {advanced && (
                 <div className="space-y-3 border-t p-4">
                   <Field label="Flow" hint="此代理下的用户共用该 Flow；客户端订阅和节点配置会同步使用。">
-                    <Select value={flow || "none"} onValueChange={(value) => setFlow(value === "none" ? "" : value as Flow)}>
+                    <Select value={flow} onValueChange={(value) => setFlow(value as Flow)}>
                       <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
-                      <SelectContent position="popper"><SelectItem value="none">无</SelectItem><SelectItem value="xtls-rprx-vision">xtls-rprx-vision</SelectItem></SelectContent>
+                      <SelectContent position="popper"><SelectItem value="xtls-rprx-vision">xtls-rprx-vision</SelectItem></SelectContent>
                     </Select>
                   </Field>
                   <Field label="SNI *">

@@ -1763,9 +1763,8 @@ fn clash_subscription(uuid: &str, proxies: &[crate::db::UserSubscriptionProxy]) 
             yaml_string(name), yaml_string(&proxy.address), proxy.port, yaml_string(uuid),
             yaml_string(&proxy.server_name), yaml_string(&proxy.public_key), yaml_string(&proxy.short_id),
         ));
-        if !proxy.flow.is_empty() {
-            out.push_str(&format!("    flow: {}\n", yaml_string(&proxy.flow)));
-        }
+        let flow = if proxy.flow.is_empty() { proxy::DEFAULT_FLOW } else { &proxy.flow };
+        out.push_str(&format!("    flow: {}\n", yaml_string(flow)));
     }
     out.push_str("proxy-groups:\n  - name: Proxy\n    type: select\n    proxies:\n");
     for name in &labels {
@@ -1794,9 +1793,11 @@ fn sing_box_subscription(uuid: &str, proxies: &[crate::db::UserSubscriptionProxy
                     "reality": {"enabled": true, "public_key": proxy.public_key, "short_id": proxy.short_id}
                 }
             });
-            if !proxy.flow.is_empty() {
-                outbound["flow"] = Value::String(proxy.flow.clone());
-            }
+            outbound["flow"] = Value::String(if proxy.flow.is_empty() {
+                proxy::DEFAULT_FLOW.to_owned()
+            } else {
+                proxy.flow.clone()
+            });
             outbound
         })
         .collect();
@@ -3059,7 +3060,7 @@ mod tests {
     }
 
     #[test]
-    fn client_subscriptions_use_the_proxy_flow_and_omit_it_when_empty() {
+    fn client_subscriptions_default_empty_flow_to_vision() {
         let proxy = |id, flow: &str| crate::db::UserSubscriptionProxy {
             id,
             node_name: "node".into(),
@@ -3075,10 +3076,10 @@ mod tests {
         let proxies = vec![proxy(1, "xtls-rprx-vision"), proxy(2, "")];
         let clash = clash_subscription("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", &proxies);
         assert!(clash.contains("flow: \"xtls-rprx-vision\""));
-        assert_eq!(clash.matches("flow:").count(), 1, "empty proxy Flow is omitted");
+        assert_eq!(clash.matches("flow:").count(), 2, "all proxies receive a Flow");
         let sing_box = sing_box_subscription("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", &proxies);
         assert_eq!(sing_box["outbounds"][0]["flow"], "xtls-rprx-vision");
-        assert!(sing_box["outbounds"][1].get("flow").is_none());
+        assert_eq!(sing_box["outbounds"][1]["flow"], "xtls-rprx-vision");
     }
 
     /// Taken by every test that calls `metrics`. `HISTORY_GATE` is process-wide,
