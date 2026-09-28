@@ -18,7 +18,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { api, badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, outdatedAgents, provisioningSite, shortAddress, trafficCorrection, upload, type ConfigField, type IfaceChoice, type Node, type PingTask, type Source } from "@/lib/api"
 import { ProxiesPage, SubscriptionsResourcePage, UsersResourcePage } from "@/components/Resources"
 import { ProxyTrafficPage } from "@/components/ProxyTrafficPage"
-import { bytes, CYCLES, cycleMonths, FOREVER, money, uptime } from "@/lib/format"
+import { bytes, cycleMonths, FOREVER, money, uptime } from "@/lib/format"
 
 // Counters the panel can correct after migration or an accounting error.
 const TRAFFIC_FIELDS = [
