@@ -538,6 +538,11 @@ fn behind_local_proxy(ip: IpAddr) -> bool {
 mod tests {
     use super::*;
 
+    // These tests exercise a process-wide single-permit gate. Running them
+    // concurrently makes each other look like production traffic and can
+    // exhaust the retry window before either reaches its assertion.
+    static PASSWORD_LOGIN_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     fn user_app(username: &str, password: &str, enabled: bool, expires_at: Option<i64>) -> crate::Shared {
         let db = crate::db::Db::open(":memory:").unwrap();
         let password_hash = hash_password(password).unwrap();
@@ -585,6 +590,7 @@ mod tests {
 
     #[tokio::test]
     async fn user_login_issues_a_user_principal_and_never_returns_uuid() {
+        let _guard = PASSWORD_LOGIN_TESTS.lock().await;
         let app = user_app("alice", "correct horse", true, None);
         let user_id = app.db.user_login_record("alice").unwrap().unwrap().id;
         let response = login_user(app.clone(), "alice", "correct horse").await;
@@ -604,6 +610,7 @@ mod tests {
 
     #[tokio::test]
     async fn user_login_hides_missing_accounts_and_rejects_disabled_or_expired_accounts() {
+        let _guard = PASSWORD_LOGIN_TESTS.lock().await;
         let app = user_app("alice", "correct horse", true, None);
         let wrong = login_user(app.clone(), "alice", "wrong").await;
         let missing = login_user(app.clone(), "nobody", "wrong").await;
