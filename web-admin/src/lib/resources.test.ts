@@ -1,10 +1,12 @@
 /// <reference types="node" />
 import assert from "node:assert/strict"
+import { formatTrafficBytes, trafficUsage } from "./traffic-usage.ts"
+import { parseResetDay, parseUserLimits } from "./user-limits.ts"
 
 import { generateRealityKeyPair, generateShortId, realityKeyPairMatches } from "./reality.ts"
 import { proxyDraft } from "./proxy-draft.ts"
 import { countryFlag, displayProxyName } from "./proxy-name.ts"
-import { formatSni, parseSni } from "./sni.ts"
+import { formatSni, parseDestination, parseSni } from "./sni.ts"
 import { groupProxiesByNode, proxyGroupSelection, subscriptionSearchMatches, toggleProxyGroup } from "./subscription.ts"
 import type { Node } from "./api.ts"
 import type { Proxy } from "./resources.ts"
@@ -23,10 +25,12 @@ assert.deepEqual(parseSni("[2001:db8::1]:443"), { server_name: "2001:db8::1", se
 assert.equal(formatSni("2001:db8::1", 443), "[2001:db8::1]:443")
 assert.throws(() => parseSni("example.com:65536"), /SNI 端口/)
 assert.throws(() => parseSni("2001:db8::1"), /IPv6 SNI/)
+assert.deepEqual(parseDestination("www.amd.com:8443"), { server: "www.amd.com", server_port: 8443 })
 
 const proxy: Proxy = {
   id: 4,
   node_id: 2,
+  sort: 0,
   name: "香港 Reality",
   include_node_name: false,
   protocol: "vless",
@@ -64,8 +68,8 @@ assert.equal(proxy.enabled, true, "building a switch PUT draft must not mutate t
 
 assert.equal(countryFlag("hk"), "🇭🇰")
 assert.equal(countryFlag(""), "")
-assert.equal(displayProxyName({ ...proxy, include_node_name: true }, { name: "HK服务器", country: "HK" }), "🇭🇰 [HK服务器] 香港 Reality")
-assert.equal(displayProxyName({ ...proxy, include_node_name: true }, { name: "无地区", country: "" }), "[无地区] 香港 Reality")
+assert.equal(displayProxyName({ ...proxy, include_node_name: true }, { name: "HK服务器", country: "HK" }), "🇭🇰HK-香港 Reality")
+assert.equal(displayProxyName({ ...proxy, include_node_name: true }, { name: "无地区", country: "" }), "香港 Reality")
 
 const hk = { id: 2, name: "HK服务器", country: "HK" } as Node
 const jp = { id: 1, name: "JP服务器", country: "JP" } as Node
@@ -88,3 +92,29 @@ assert.equal(subscriptionSearchMatches("admin", [access], proxyById, nodeById, "
 assert.equal(subscriptionSearchMatches("other", [access], proxyById, nodeById, "missing"), false)
 
 console.log("Reality, proxy Flow drafts, subscription grouping, selection, and search passed")
+
+assert.deepEqual(parseUserLimits("", ""), { traffic_limit: 0, device_limit: 0 })
+assert.deepEqual(parseUserLimits("1.5", "3"), { traffic_limit: 1610612736, device_limit: 3 })
+for (const [traffic, devices] of [["-1", "0"], ["Infinity", "0"], ["999999999999", "0"], ["0", "-1"], ["0", "1.5"], ["0", "9007199254740992"]]) {
+  assert.throws(() => parseUserLimits(traffic, devices))
+}
+
+assert.equal(formatTrafficBytes(0), "0 B")
+assert.equal(formatTrafficBytes(1.49 * 1024 ** 2), "1.49 MB")
+assert.equal(formatTrafficBytes(200 * 1024 ** 3), "200.00 GB")
+assert.equal(formatTrafficBytes(1024 ** 5), "1024.00 TB")
+assert.equal(trafficUsage(0, 200 * 1024 ** 3).quotaLabel, "200.00 GB (0%)")
+assert.equal(trafficUsage(50, 100).fill, 50)
+assert.equal(trafficUsage(100, 100).fill, 100)
+assert.equal(trafficUsage(150, 100).fill, 100)
+assert.equal(trafficUsage(150, 100).percentage, 150)
+assert.equal(trafficUsage(1, 1000).fill, 0)
+assert.equal(trafficUsage(50, 0).quotaLabel, "不限量")
+assert.equal(trafficUsage(50, 0).fill, 0)
+assert.equal(trafficUsage(50).quotaLabel, "额度未知")
+assert.equal(trafficUsage(50).fill, 0)
+
+assert.equal(parseResetDay(""), 0)
+assert.equal(parseResetDay("1"), 1)
+assert.equal(parseResetDay("31"), 31)
+for (const value of ["0", "32", "1.5", "-1", "NaN"]) assert.throws(() => parseResetDay(value))

@@ -182,6 +182,102 @@ select_singbox_api_port() {
 }
 # END sing-box API port helpers
 
+# Print cgroup memory limits for this process and each visible parent cgroup.
+# cgroup limits are hierarchical, so a parent limit still applies when the
+# process's own cgroup says "max".
+emit_ancestor_memory_limits() {
+	ANCESTOR_DIR=$1
+	ANCESTOR_ROOT=$2
+	shift 2
+	case "$ANCESTOR_DIR" in
+	"$ANCESTOR_ROOT"/) ANCESTOR_DIR=$ANCESTOR_ROOT ;;
+	esac
+	case "$ANCESTOR_DIR" in
+	"$ANCESTOR_ROOT" | "$ANCESTOR_ROOT"/*) ;;
+	*) return 0 ;;
+	esac
+
+	while :; do
+		for ANCESTOR_FILE in "$@"; do
+			[ -r "$ANCESTOR_DIR/$ANCESTOR_FILE" ] || continue
+			ANCESTOR_VALUE=$(cat "$ANCESTOR_DIR/$ANCESTOR_FILE" 2>/dev/null || true)
+			case "$ANCESTOR_VALUE" in
+			"" | max | *[!0-9]*) continue ;;
+			esac
+			printf '%s\n' "$ANCESTOR_VALUE"
+		done
+		[ "$ANCESTOR_DIR" = "$ANCESTOR_ROOT" ] && break
+		ANCESTOR_PARENT=${ANCESTOR_DIR%/*}
+		[ "$ANCESTOR_PARENT" != "$ANCESTOR_DIR" ] || break
+		ANCESTOR_DIR=$ANCESTOR_PARENT
+		case "$ANCESTOR_DIR" in
+		"$ANCESTOR_ROOT" | "$ANCESTOR_ROOT"/*) ;;
+		*) break ;;
+		esac
+	done
+}
+
+emit_cgroup_memory_limits() {
+	CGROUP_V2_PATH=$(awk -F: '$1 == "0" && $2 == "" { print $3; exit }' /proc/self/cgroup 2>/dev/null || true)
+	if [ -n "$CGROUP_V2_PATH" ]; then
+		CGROUP_ROOT=/sys/fs/cgroup
+		CGROUP_DIR="${CGROUP_ROOT%/}${CGROUP_V2_PATH}"
+		[ "$CGROUP_DIR" != "$CGROUP_ROOT/" ] || CGROUP_DIR=$CGROUP_ROOT
+		[ -d "$CGROUP_DIR" ] || CGROUP_DIR=$CGROUP_ROOT
+		emit_ancestor_memory_limits "$CGROUP_DIR" "$CGROUP_ROOT" memory.max memory.high
+		return 0
+	fi
+
+	CGROUP_V1_PATH=$(awk -F: '$2 ~ /(^|,)memory(,|$)/ { print $3; exit }' /proc/self/cgroup 2>/dev/null || true)
+	[ -n "$CGROUP_V1_PATH" ] || return 0
+	CGROUP_V1_ROOT=$(awk '$3 == "cgroup" { n = split($4, opts, ","); for (i = 1; i <= n; i++) if (opts[i] == "memory") { print $2; exit } }' /proc/mounts 2>/dev/null || true)
+	[ -n "$CGROUP_V1_ROOT" ] || return 0
+	CGROUP_V1_DIR="${CGROUP_V1_ROOT%/}${CGROUP_V1_PATH}"
+	[ "$CGROUP_V1_DIR" != "$CGROUP_V1_ROOT/" ] || CGROUP_V1_DIR=$CGROUP_V1_ROOT
+	[ -d "$CGROUP_V1_DIR" ] || CGROUP_V1_DIR=$CGROUP_V1_ROOT
+	emit_ancestor_memory_limits "$CGROUP_V1_DIR" "$CGROUP_V1_ROOT" memory.limit_in_bytes memory.soft_limit_in_bytes
+}
+
+detect_effective_memory() {
+	MEMTOTAL_BYTES=$(awk '$1 == "MemTotal:" { printf "%.0f\n", $2 * 1024; exit }' /proc/meminfo 2>/dev/null || true)
+	{
+		[ -z "$MEMTOTAL_BYTES" ] || printf '%s\n' "$MEMTOTAL_BYTES"
+		emit_cgroup_memory_limits
+	} | awk '
+		$1 ~ /^[0-9]+$/ && ($1 + 0) > 0 && ($1 + 0) < 9e18 {
+			value = $1 + 0
+			if (!found || value < minimum) minimum = value
+			found = 1
+		}
+		END { if (found) printf "%.0f\n", minimum }
+	'
+}
+
+calculate_gomemlimit() {
+	awk -v bytes="$1" 'BEGIN {
+		if (bytes <= 128 * 1024 * 1024) fraction = 0.3125
+		else if (bytes <= 256 * 1024 * 1024) fraction = 0.50
+		else if (bytes <= 512 * 1024 * 1024) fraction = 0.65
+		else fraction = 0.80
+		printf "%.0fB\n", int(bytes * fraction)
+	}'
+}
+
+set_singbox_memory_limit() {
+	SINGBOX_GOMEMLIMIT=""
+	SINGBOX_SYSTEMD_MEMORY_ENV=""
+	SINGBOX_OPENRC_MEMORY_ENV=""
+	SINGBOX_EFFECTIVE_MEMORY=$(detect_effective_memory)
+	if [ -n "$SINGBOX_EFFECTIVE_MEMORY" ]; then
+		SINGBOX_GOMEMLIMIT=$(calculate_gomemlimit "$SINGBOX_EFFECTIVE_MEMORY")
+		SINGBOX_SYSTEMD_MEMORY_ENV="Environment=\"GOMEMLIMIT=$SINGBOX_GOMEMLIMIT\""
+		SINGBOX_OPENRC_MEMORY_ENV="export GOMEMLIMIT='$SINGBOX_GOMEMLIMIT'"
+		detail "sing-box 内存软限" "$SINGBOX_GOMEMLIMIT"
+	else
+		warn "无法探测有效内存，sing-box 将不设置 GOMEMLIMIT"
+	fi
+}
+
 print_summary() {
 	step 5 "安装完成摘要"
 	printf '\n%s========================================%s\n' "$C_GREEN" "$C_RESET"
@@ -533,6 +629,7 @@ success "monitor-agent binary 安装完成"
 # The system package binary is left in place, while the Agent and service use
 # this release's self-built binary with V2Ray API support.
 step 2 "检查 sing-box"
+set_singbox_memory_limit
 SING_BOX_SOURCE="installer"
 SING_BOX_SYSTEM_PATH=$(command -v sing-box 2>/dev/null || true)
 SING_BOX_VER=""
@@ -547,17 +644,27 @@ TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/monitor-install.XXXXXX")
 SING_BOX_CANDIDATE="$TMP_DIR/sing-box"
 SING_BOX_SHA="$TMP_DIR/sing-box.sha256"
 SING_BOX_URL="${SERVER%/}/sing-box/$SING_BOX_ARCH"
-info "正在下载自构建 sing-box $SING_BOX_VERSION（含 with_v2ray_api）"
-curl -fsSL --max-time 300 "$SING_BOX_URL" -o "$SING_BOX_CANDIDATE" || { FAIL_REASON="下载自构建 sing-box 失败"; exit 1; }
+info "正在检查自构建 sing-box $SING_BOX_VERSION（含 with_v2ray_api）"
 curl -fsSL --max-time 60 "$SING_BOX_URL.sha256" -o "$SING_BOX_SHA" || { FAIL_REASON="下载 sing-box 校验和失败"; exit 1; }
-EXPECTED_SHA=$(sed -n '1{s/[[:space:]].*//;p;}' "$SING_BOX_SHA")
+EXPECTED_SHA=$(sed -n '1{s/[[:space:]].*//;p;}' "$SING_BOX_SHA" | tr 'A-F' 'a-f')
 case "$EXPECTED_SHA" in
 	????????????????????????????????????????????????????????????????) ;;
 	*) FAIL_REASON="sing-box 校验和格式不正确"; fail "$FAIL_REASON" ;;
 esac
 case "$EXPECTED_SHA" in *[!0-9a-fA-F]*) FAIL_REASON="sing-box 校验和格式不正确"; fail "$FAIL_REASON" ;; esac
-ACTUAL_SHA=$(sha256sum "$SING_BOX_CANDIDATE" | awk '{print $1}')
-[ "$ACTUAL_SHA" = "$EXPECTED_SHA" ] || { FAIL_REASON="自构建 sing-box 校验和不匹配"; fail "$FAIL_REASON"; }
+if [ -f "$SING_BOX" ] && [ -x "$SING_BOX" ]; then
+	INSTALLED_SING_BOX_SHA=$(sha256sum "$SING_BOX" | awk '{print $1}')
+	if [ "$INSTALLED_SING_BOX_SHA" = "$EXPECTED_SHA" ]; then
+		SING_BOX_CANDIDATE=$SING_BOX
+		info "已安装的 sing-box 校验和匹配，跳过二进制下载"
+	fi
+fi
+if [ "$SING_BOX_CANDIDATE" != "$SING_BOX" ]; then
+	info "正在下载自构建 sing-box"
+	curl -fsSL --max-time 300 "$SING_BOX_URL" -o "$SING_BOX_CANDIDATE" || { FAIL_REASON="下载自构建 sing-box 失败"; exit 1; }
+	ACTUAL_SHA=$(sha256sum "$SING_BOX_CANDIDATE" | awk '{print $1}')
+	[ "$ACTUAL_SHA" = "$EXPECTED_SHA" ] || { FAIL_REASON="自构建 sing-box 校验和不匹配"; fail "$FAIL_REASON"; }
+fi
 chmod 0755 "$SING_BOX_CANDIDATE"
 VERSION_OUTPUT=$("$SING_BOX_CANDIDATE" version 2>&1) || { FAIL_REASON="自构建 sing-box binary 无法运行"; fail "$FAIL_REASON"; }
 printf '%s\n' "$VERSION_OUTPUT" | grep -F "version $SING_BOX_VERSION" >/dev/null || {
@@ -599,10 +706,12 @@ if [ -e "$SING_BOX" ] && [ -d "$SING_BOX" ]; then
 	FAIL_REASON="$SING_BOX 是目录，无法安装 sing-box binary"
 	fail "$FAIL_REASON"
 fi
-SING_BOX_STAGED="$ROOT/.sing-box.$$"
-install -m 0755 "$SING_BOX_CANDIDATE" "$SING_BOX_STAGED"
-mv -f "$SING_BOX_STAGED" "$SING_BOX"
-SING_BOX_STAGED=""
+if [ "$SING_BOX_CANDIDATE" != "$SING_BOX" ]; then
+	SING_BOX_STAGED="$ROOT/.sing-box.$$"
+	install -m 0755 "$SING_BOX_CANDIDATE" "$SING_BOX_STAGED"
+	mv -f "$SING_BOX_STAGED" "$SING_BOX"
+	SING_BOX_STAGED=""
+fi
 detail "Agent 路径" "$SING_BOX"
 detail "版本" "$SING_BOX_VER"
 success "自构建 sing-box 安装及配置校验完成"
@@ -623,6 +732,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+${SINGBOX_SYSTEMD_MEMORY_ENV}
 ExecStart=$SING_BOX run -c $SING_BOX_CONFIG
 Restart=on-failure
 RestartSec=3
@@ -641,6 +751,7 @@ else
 	cat >"$SING_BOX_RC" <<RC
 #!/sbin/openrc-run
 description="sing-box service"
+${SINGBOX_OPENRC_MEMORY_ENV}
 command="$SING_BOX"
 command_args="run -c /etc/sing-box/config.json"
 supervisor="supervise-daemon"

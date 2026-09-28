@@ -165,6 +165,7 @@ CREATE TABLE IF NOT EXISTS proxies (
   enabled INTEGER NOT NULL DEFAULT 1,
   flow TEXT NOT NULL DEFAULT '',
   config TEXT NOT NULL DEFAULT '{}',
+  sort INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -176,6 +177,10 @@ CREATE TABLE IF NOT EXISTS users (
   uuid TEXT NOT NULL UNIQUE,
   password_hash TEXT,
   subscription_token TEXT NOT NULL DEFAULT '',
+  traffic_limit INTEGER NOT NULL DEFAULT 0,
+  device_limit INTEGER NOT NULL DEFAULT 0,
+  traffic_reset_day INTEGER NOT NULL DEFAULT 0,
+  traffic_reset_period TEXT NOT NULL DEFAULT '',
   enabled INTEGER NOT NULL DEFAULT 1,
   expires_at INTEGER,
   created_at INTEGER NOT NULL,
@@ -241,7 +246,7 @@ CREATE TABLE IF NOT EXISTS proxy_node_traffic (
 /// cannot: `open` runs `SCHEMA` before migrating, and on an older file the
 /// column is not there yet. `an_upgraded_release_matches_a_fresh_database`
 /// holds every migration to these rules, starting from v1.0.0's schema.
-const SCHEMA_VERSION: i64 = 15;
+const SCHEMA_VERSION: i64 = 17;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -541,6 +546,15 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
         migrate_to_14(&tx)?;
     }
     migrate_to_15(&tx, from < 15)?;
+    add_column(&tx, "proxies", "sort INTEGER NOT NULL DEFAULT 0")?;
+    for column in [
+        "traffic_limit INTEGER NOT NULL DEFAULT 0",
+        "device_limit INTEGER NOT NULL DEFAULT 0",
+        "traffic_reset_day INTEGER NOT NULL DEFAULT 0",
+        "traffic_reset_period TEXT NOT NULL DEFAULT ''",
+    ] {
+        add_column(&tx, "users", column)?;
+    }
     seed_default_admin(&tx)?;
     tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     tx.commit()?;
@@ -625,6 +639,7 @@ pub struct Proxy {
     pub config: serde_json::Value,
     pub created_at: i64,
     pub updated_at: i64,
+    pub sort: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -658,6 +673,9 @@ pub struct User {
     pub created_at: i64,
     pub updated_at: i64,
     pub proxy_count: i64,
+    pub traffic_limit: i64,
+    pub device_limit: i64,
+    pub traffic_reset_day: u32,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
@@ -674,6 +692,7 @@ pub struct ProxyUserTrafficSummary {
     pub downlink_bytes: i64,
     pub last_seen_at: Option<i64>,
     pub reset_at: Option<i64>,
+    pub traffic_limit: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -718,10 +737,20 @@ pub struct ProxyTrafficUserRow {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct TrafficProxySummary {
+    pub id: i64,
+    pub name: String,
+    pub protocol: String,
+    pub enabled: bool,
+    pub include_node_name: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ProxyTrafficNodeRow {
     pub node_id: i64,
     pub node_name: String,
     pub protocols: Vec<String>,
+    pub proxies: Vec<TrafficProxySummary>,
     pub uplink_bytes: i64,
     pub downlink_bytes: i64,
     pub total_bytes: i64,
@@ -743,6 +772,9 @@ pub struct UserDraft {
     pub password_hash: Option<String>,
     pub enabled: bool,
     pub expires_at: Option<i64>,
+    pub traffic_limit: Option<i64>,
+    pub device_limit: Option<i64>,
+    pub traffic_reset_day: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -764,6 +796,8 @@ pub struct UserPortalProxy {
     pub id: i64,
     pub node_id: i64,
     pub node_name: String,
+    pub node_group: String,
+    pub node_country: String,
     pub name: String,
     pub protocol: String,
     pub address: String,
@@ -778,6 +812,7 @@ pub struct UserPortalProxy {
 pub struct UserSubscriptionProxy {
     pub id: i64,
     pub node_name: String,
+    pub node_country: String,
     pub name: String,
     pub include_node_name: bool,
     pub address: String,
@@ -1174,8 +1209,8 @@ impl Db {
     pub fn proxies_for_node(&self, node_id: i64) -> Result<Vec<Proxy>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT id,node_id,name,include_node_name,protocol,address_type,address,port,enabled,flow,config,created_at,updated_at
-             FROM proxies WHERE node_id=?1 ORDER BY id",
+            "SELECT id,node_id,name,include_node_name,protocol,address_type,address,port,enabled,flow,config,created_at,updated_at,sort
+             FROM proxies WHERE node_id=?1 ORDER BY sort,id",
         )?;
         let rows = stmt.query_map([node_id], row_to_proxy)?.collect::<rusqlite::Result<_>>()?;
         Ok(rows)
@@ -1185,7 +1220,7 @@ impl Db {
         Ok(self
             .conn()
             .query_row(
-                "SELECT id,node_id,name,include_node_name,protocol,address_type,address,port,enabled,flow,config,created_at,updated_at
+                "SELECT id,node_id,name,include_node_name,protocol,address_type,address,port,enabled,flow,config,created_at,updated_at,sort
                  FROM proxies WHERE id=?1",
                 [id],
                 row_to_proxy,
@@ -1214,11 +1249,13 @@ impl Db {
             return Ok(Err(ProxyWriteIssue::PortConflict));
         }
         let now = Utc::now().timestamp();
+        let sort: i64 =
+            conn.query_row("SELECT COALESCE(MAX(sort),-1)+1 FROM proxies", [], |row| row.get(0))?;
         conn.execute(
-            "INSERT INTO proxies(node_id,name,include_node_name,protocol,address_type,address,port,enabled,flow,config,created_at,updated_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?11)",
+            "INSERT INTO proxies(node_id,name,include_node_name,protocol,address_type,address,port,enabled,flow,config,created_at,updated_at,sort)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?11,?12)",
             params![node_id, draft.name, draft.include_node_name, draft.protocol, draft.address_type,
-                    draft.address, draft.port, draft.enabled, draft.flow.as_deref().unwrap_or(""), config, now],
+                    draft.address, draft.port, draft.enabled, draft.flow.as_deref().unwrap_or(""), config, now, sort],
         )?;
         Ok(Ok(conn.last_insert_rowid()))
     }
@@ -1277,7 +1314,8 @@ impl Db {
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT u.id,u.username,u.uuid,u.enabled,u.expires_at,u.created_at,u.updated_at,
-                    (SELECT COUNT(*) FROM user_proxy_authorizations a WHERE a.user_id=u.id)
+                    (SELECT COUNT(*) FROM user_proxy_authorizations a WHERE a.user_id=u.id),
+                    u.traffic_limit,u.device_limit,u.traffic_reset_day
              FROM users u WHERE (?1 IS NULL OR u.enabled=?1) ORDER BY u.id",
         )?;
         let rows = stmt.query_map([enabled], row_to_user)?.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1291,7 +1329,8 @@ impl Db {
             .conn()
             .query_row(
                 "SELECT u.id,u.username,u.uuid,u.enabled,u.expires_at,u.created_at,u.updated_at,
-                        (SELECT COUNT(*) FROM user_proxy_authorizations a WHERE a.user_id=u.id)
+                        (SELECT COUNT(*) FROM user_proxy_authorizations a WHERE a.user_id=u.id),
+                    u.traffic_limit,u.device_limit,u.traffic_reset_day
                  FROM users u WHERE u.id=?1",
                 [id],
                 row_to_user,
@@ -1303,7 +1342,7 @@ impl Db {
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT u.id,u.username,COALESCE(SUM(t.uplink_bytes),0),COALESCE(SUM(t.downlink_bytes),0),
-                    MAX(t.last_seen_at),MAX(t.reset_at)
+                    MAX(t.last_seen_at),MAX(t.reset_at),u.traffic_limit
              FROM users u LEFT JOIN proxy_user_traffic t ON t.user_id=u.id
              GROUP BY u.id ORDER BY u.id",
         )?;
@@ -1316,6 +1355,7 @@ impl Db {
                     downlink_bytes: r.get(3)?,
                     last_seen_at: r.get(4)?,
                     reset_at: r.get(5)?,
+                    traffic_limit: r.get(6)?,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -1468,12 +1508,13 @@ impl Db {
         );
         let mut stmt = conn.prepare(&sql)?;
         let offset = page.saturating_sub(1).saturating_mul(page_size);
-        let items = stmt
+        let mut items: Vec<ProxyTrafficNodeRow> = stmt
             .query_map(params![node_id, pattern, page_size, offset], |r| {
                 let uplink_bytes: i64 = r.get(2)?;
                 let downlink_bytes: i64 = r.get(3)?;
                 let protocols: Option<String> = r.get(5)?;
                 Ok(ProxyTrafficNodeRow {
+                    proxies: Vec::new(),
                     node_id: r.get(0)?,
                     node_name: r.get(1)?,
                     protocols: protocols
@@ -1489,7 +1530,31 @@ impl Db {
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
+        let mut proxies = conn.prepare(
+            "SELECT id,name,protocol,enabled,include_node_name FROM proxies WHERE node_id=?1 ORDER BY id",
+        )?;
+        for row in &mut items {
+            row.proxies = proxies
+                .query_map([row.node_id], |r| {
+                    Ok(TrafficProxySummary {
+                        id: r.get(0)?,
+                        name: r.get(1)?,
+                        protocol: r.get(2)?,
+                        enabled: r.get(3)?,
+                        include_node_name: r.get(4)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+        }
         Ok(ProxyTrafficPage { items, page, page_size, total })
+    }
+
+    pub fn reset_due_user_traffic(&self, now: i64) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        reset_due_user_traffic(&tx, now)?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn reset_proxy_user_traffic(&self, user_id: i64, now: i64) -> Result<bool> {
@@ -1542,6 +1607,7 @@ impl Db {
         );
         let mut conn = self.conn();
         let tx = conn.transaction()?;
+        reset_due_user_traffic(&tx, now)?;
         let proxy_ids = {
             let mut stmt = tx.prepare("SELECT id FROM proxies WHERE node_id=?1 AND enabled=1 ORDER BY id")?;
             let rows = stmt.query_map([node_id], |r| r.get::<_, i64>(0))?;
@@ -1688,7 +1754,7 @@ impl Db {
         let mut stmt = conn.prepare(
             "SELECT p.id,p.node_id,n.name,p.name,p.protocol,p.address,p.address_type,p.port,
                     json_extract(p.config,'$.reality.server_name'),
-                    json_extract(p.config,'$.reality.server_port')
+                    json_extract(p.config,'$.reality.server_port'),n.group_name,n.country
              FROM user_proxy_authorizations a
              JOIN users u ON u.id=a.user_id
              JOIN proxies p ON p.id=a.proxy_id
@@ -1703,6 +1769,8 @@ impl Db {
                     id: r.get(0)?,
                     node_id: r.get(1)?,
                     node_name: r.get(2)?,
+                    node_group: r.get(10)?,
+                    node_country: r.get(11)?,
                     name: r.get(3)?,
                     protocol: r.get(4)?,
                     address: r.get(5)?,
@@ -1735,7 +1803,8 @@ impl Db {
             return Ok(None);
         }
         let mut stmt = conn.prepare(
-            "SELECT p.id,n.name,p.name,p.include_node_name,p.address,p.port,
+            "SELECT p.id,n.name,CASE WHEN n.country_pin='' THEN n.country ELSE n.country_pin END,
+                    p.name,p.include_node_name,p.address,p.port,
                     json_extract(p.config,'$.reality.server_name'),
                     json_extract(p.config,'$.reality.public_key'),
                     json_extract(p.config,'$.reality.short_id'),
@@ -1751,14 +1820,15 @@ impl Db {
                 Ok(UserSubscriptionProxy {
                     id: r.get(0)?,
                     node_name: r.get(1)?,
-                    name: r.get(2)?,
-                    include_node_name: r.get(3)?,
-                    address: r.get(4)?,
-                    port: r.get(5)?,
-                    server_name: r.get::<_, Option<String>>(6)?.unwrap_or_default(),
-                    public_key: r.get::<_, Option<String>>(7)?.unwrap_or_default(),
-                    short_id: r.get::<_, Option<String>>(8)?.unwrap_or_default(),
-                    flow: r.get::<_, Option<String>>(9)?.unwrap_or_default(),
+                    node_country: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    name: r.get(3)?,
+                    include_node_name: r.get(4)?,
+                    address: r.get(5)?,
+                    port: r.get(6)?,
+                    server_name: r.get::<_, Option<String>>(7)?.unwrap_or_default(),
+                    public_key: r.get::<_, Option<String>>(8)?.unwrap_or_default(),
+                    short_id: r.get::<_, Option<String>>(9)?.unwrap_or_default(),
+                    flow: r.get::<_, Option<String>>(10)?.unwrap_or_default(),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1804,9 +1874,11 @@ impl Db {
         let now = Utc::now().timestamp();
         let uuid = uuid_v4();
         conn.execute(
-            "INSERT INTO users(username,uuid,password_hash,subscription_token,enabled,expires_at,created_at,updated_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?7)",
-            params![draft.username, uuid, password_hash, random_secret(), draft.enabled, draft.expires_at, now],
+            "INSERT INTO users(username,uuid,password_hash,subscription_token,enabled,expires_at,created_at,updated_at,traffic_limit,device_limit,traffic_reset_day,traffic_reset_period)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?7,?8,?9,?10,?11)",
+            params![draft.username, uuid, password_hash, random_secret(), draft.enabled, draft.expires_at, now,
+                draft.traffic_limit.unwrap_or(0), draft.device_limit.unwrap_or(0), draft.traffic_reset_day.unwrap_or(0),
+                user_reset_period(now, draft.traffic_reset_day.unwrap_or(0))?],
         )?;
         Ok(Ok(conn.last_insert_rowid()))
     }
@@ -1834,8 +1906,13 @@ impl Db {
             return Ok(Err(UserWriteIssue::UsernameConflict));
         }
         tx.execute(
-            "UPDATE users SET username=?2,password_hash=COALESCE(?3,password_hash),enabled=?4,expires_at=?5,updated_at=?6 WHERE id=?1",
-            params![id, draft.username, draft.password_hash, draft.enabled, draft.expires_at, Utc::now().timestamp()],
+            "UPDATE users SET username=?2,password_hash=COALESCE(?3,password_hash),enabled=?4,expires_at=?5,updated_at=?6,
+                traffic_limit=COALESCE(?7,traffic_limit),device_limit=COALESCE(?8,device_limit),
+                traffic_reset_period=CASE WHEN ?9 IS NOT NULL AND ?9<>traffic_reset_day THEN ?10 ELSE traffic_reset_period END,
+                traffic_reset_day=COALESCE(?9,traffic_reset_day) WHERE id=?1",
+            params![id, draft.username, draft.password_hash, draft.enabled, draft.expires_at, Utc::now().timestamp(),
+                draft.traffic_limit, draft.device_limit, draft.traffic_reset_day,
+                user_reset_period(Utc::now().timestamp(), draft.traffic_reset_day.unwrap_or(0))?],
         )?;
         if draft.password_hash.is_some()
             || current_enabled != draft.enabled
@@ -2173,6 +2250,10 @@ impl Db {
 
     pub fn reorder_nodes(&self, ids: &[i64]) -> Result<()> {
         self.reorder("node", ids)
+    }
+
+    pub fn reorder_proxies(&self, ids: &[i64]) -> Result<()> {
+        self.reorder("proxies", ids)
     }
 
     pub fn reorder_ping_tasks(&self, ids: &[i64]) -> Result<()> {
@@ -3337,15 +3418,15 @@ fn country_flag(country: &str) -> String {
         .collect()
 }
 
-fn displayed_proxy_name(name: &str, include_node_name: bool, node_name: &str, country: &str) -> String {
+pub(crate) fn displayed_proxy_name(name: &str, include_node_name: bool, country: &str) -> String {
     if !include_node_name {
         return name.trim().to_owned();
     }
     let flag = country_flag(country);
     if flag.is_empty() {
-        format!("[{}] {}", node_name.trim(), name.trim())
+        name.trim().to_owned()
     } else {
-        format!("{} [{}] {}", flag, node_name.trim(), name.trim())
+        format!("{}{}-{}", flag, country.to_ascii_uppercase(), name.trim())
     }
 }
 
@@ -3358,15 +3439,14 @@ fn proxy_name_in_use(
     draft: &ProxyDraft,
     except: Option<i64>,
 ) -> Result<bool> {
-    let (node_name, country): (String, String) = conn.query_row(
-        "SELECT name,CASE WHEN country_pin='' THEN country ELSE country_pin END FROM node WHERE id=?1",
+    let country: String = conn.query_row(
+        "SELECT CASE WHEN country_pin='' THEN country ELSE country_pin END FROM node WHERE id=?1",
         [node_id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        |row| row.get(0),
     )?;
-    let candidate =
-        displayed_proxy_name(&draft.name, draft.include_node_name, &node_name, &country).to_lowercase();
+    let candidate = displayed_proxy_name(&draft.name, draft.include_node_name, &country).to_lowercase();
     let mut stmt = conn.prepare(
-        "SELECT p.id,p.name,p.include_node_name,n.name,
+        "SELECT p.id,p.name,p.include_node_name,
                 CASE WHEN n.country_pin='' THEN n.country ELSE n.country_pin END
          FROM proxies p JOIN node n ON n.id=p.node_id",
     )?;
@@ -3376,15 +3456,14 @@ fn proxy_name_in_use(
             row.get::<_, String>(1)?,
             row.get::<_, bool>(2)?,
             row.get::<_, String>(3)?,
-            row.get::<_, String>(4)?,
         ))
     })?;
     for row in rows {
-        let (id, name, include_node_name, node_name, country) = row?;
+        let (id, name, include_node_name, country) = row?;
         if Some(id) == except {
             continue;
         }
-        if displayed_proxy_name(&name, include_node_name, &node_name, &country).to_lowercase() == candidate {
+        if displayed_proxy_name(&name, include_node_name, &country).to_lowercase() == candidate {
             return Ok(true);
         }
     }
@@ -3441,6 +3520,7 @@ fn row_to_proxy(r: &rusqlite::Row<'_>) -> rusqlite::Result<Proxy> {
         config: parse_json(r, 10)?,
         created_at: r.get(11)?,
         updated_at: r.get(12)?,
+        sort: r.get(13)?,
     })
 }
 
@@ -3454,6 +3534,9 @@ fn row_to_user(r: &rusqlite::Row<'_>) -> rusqlite::Result<User> {
         created_at: r.get(5)?,
         updated_at: r.get(6)?,
         proxy_count: r.get(7)?,
+        traffic_limit: r.get(8)?,
+        device_limit: r.get(9)?,
+        traffic_reset_day: r.get(10)?,
     })
 }
 
@@ -3497,6 +3580,41 @@ fn row_to_node(r: &rusqlite::Row<'_>) -> Node {
         down_since: n("down_since"),
         token: s("token"),
     }
+}
+
+fn user_reset_period(now: i64, day: u32) -> Result<String> {
+    if day == 0 {
+        return Ok(String::new());
+    }
+    let today = DateTime::from_timestamp(now, 0)
+        .context("invalid reset timestamp")?
+        .with_timezone(&Local)
+        .date_naive();
+    Ok(period_start(today, day).to_string())
+}
+
+// Called inside the writer transaction so ingestion and maintenance cannot
+// clear the same period twice. Counter baselines intentionally survive resets.
+fn reset_due_user_traffic(conn: &Connection, now: i64) -> Result<()> {
+    let users = {
+        let mut stmt = conn.prepare(
+            "SELECT id,traffic_reset_day,traffic_reset_period FROM users WHERE traffic_reset_day>0",
+        )?;
+        let rows =
+            stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, u32>(1)?, r.get::<_, String>(2)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (id, day, previous) in users {
+        let period = user_reset_period(now, day)?;
+        if period <= previous {
+            continue;
+        }
+        if !previous.is_empty() {
+            conn.execute("UPDATE proxy_user_traffic SET uplink_bytes=0,downlink_bytes=0,reset_at=?2,updated_at=?2 WHERE user_id=?1", params![id,now])?;
+        }
+        conn.execute("UPDATE users SET traffic_reset_period=?2 WHERE id=?1", params![id, period])?;
+    }
+    Ok(())
 }
 
 /// Start of the billing period containing `today`, given a reset day of month.
@@ -3755,7 +3873,193 @@ mod tests {
             password_hash: Some("test-hash".into()),
             enabled: true,
             expires_at: None,
+            traffic_limit: None,
+            device_limit: None,
+            traffic_reset_day: None,
         }
+    }
+
+    #[test]
+    fn proxies_keep_global_order_append_new_rows_and_reject_stale_orders() {
+        let db = db();
+        let node_id = node(&db, 1);
+        let a = db.create_proxy(node_id, &proxy_draft("order-a", false)).unwrap().unwrap();
+        let b = db.create_proxy(node_id, &proxy_draft("order-b", false)).unwrap().unwrap();
+        let c = db.create_proxy(node_id, &proxy_draft("order-c", false)).unwrap().unwrap();
+        assert_eq!(
+            db.proxies_for_node(node_id).unwrap().iter().map(|p| p.id).collect::<Vec<_>>(),
+            vec![a, b, c]
+        );
+        assert_eq!(
+            (
+                db.proxy(a).unwrap().unwrap().sort,
+                db.proxy(b).unwrap().unwrap().sort,
+                db.proxy(c).unwrap().unwrap().sort
+            ),
+            (0, 1, 2)
+        );
+        db.reorder_proxies(&[c, a, b]).unwrap();
+        assert_eq!(
+            db.proxies_for_node(node_id).unwrap().iter().map(|p| p.id).collect::<Vec<_>>(),
+            vec![c, a, b]
+        );
+        let appended = db.create_proxy(node_id, &proxy_draft("order-appended", false)).unwrap().unwrap();
+        assert_eq!(db.proxy(appended).unwrap().unwrap().sort, 3);
+        assert_eq!(
+            db.proxies_for_node(node_id).unwrap().iter().map(|p| p.id).collect::<Vec<_>>(),
+            vec![c, a, b, appended]
+        );
+        assert!(db.reorder_proxies(&[c, a, a, appended]).is_err(), "duplicate IDs must be rejected");
+        assert!(db.reorder_proxies(&[c, a, b]).is_err(), "a stale list missing a proxy must be rejected");
+        assert!(db.reorder_proxies(&[c, a, b, 999_999]).is_err(), "unknown IDs must be rejected");
+        assert_eq!(
+            db.proxies_for_node(node_id).unwrap().iter().map(|p| p.id).collect::<Vec<_>>(),
+            vec![c, a, b, appended]
+        );
+    }
+
+    #[test]
+    fn version_sixteen_proxy_order_migration_preserves_existing_id_order() {
+        let db = db();
+        let node_id = node(&db, 1);
+        let a = db.create_proxy(node_id, &proxy_draft("legacy-a", false)).unwrap().unwrap();
+        let b = db.create_proxy(node_id, &proxy_draft("legacy-b", false)).unwrap().unwrap();
+        db.conn().execute_batch("ALTER TABLE proxies DROP COLUMN sort").unwrap();
+        migrate(&db.conn(), 16).unwrap();
+        assert_eq!(
+            db.proxies_for_node(node_id).unwrap().iter().map(|p| p.id).collect::<Vec<_>>(),
+            vec![a, b]
+        );
+        assert_eq!((db.proxy(a).unwrap().unwrap().sort, db.proxy(b).unwrap().unwrap().sort), (0, 0));
+    }
+
+    #[test]
+    fn traffic_node_rows_include_all_proxy_names_without_multiplying_traffic() {
+        let db = db();
+        let node_id = node(&db, 1);
+        let mut first = proxy_draft("first", true);
+        first.enabled = true;
+        let first_id = db.create_proxy(node_id, &first).unwrap().unwrap();
+        let mut second = proxy_draft("second", false);
+        second.port = first.port + 1;
+        second.enabled = false;
+        let second_id = db.create_proxy(node_id, &second).unwrap().unwrap();
+        db.conn().execute("INSERT INTO proxy_node_traffic(node_id,uplink_bytes,downlink_bytes,last_uplink_counter,last_downlink_counter,created_at,updated_at) VALUES(?1,50,70,100,200,0,0)", [node_id]).unwrap();
+        let page = db.proxy_traffic_node_rows(None, None, "total", true, 1, 100).unwrap();
+        assert_eq!(page.total, 1);
+        let row = &page.items[0];
+        assert_eq!(row.total_bytes, 120);
+        assert_eq!(row.proxies.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), vec!["first", "second"]);
+        assert!(row.proxies[0].enabled);
+        assert!(row.proxies[0].include_node_name);
+        assert!(!row.proxies[1].enabled);
+        assert_eq!(row.proxies[0].protocol, "vless");
+        db.reset_proxy_node_traffic(node_id, 123).unwrap();
+        let page = db.proxy_traffic_node_rows(None, None, "total", true, 1, 100).unwrap();
+        assert_eq!(page.items[0].total_bytes, 0);
+        let baseline: i64 = db
+            .conn()
+            .query_row(
+                "SELECT last_uplink_counter FROM proxy_node_traffic WHERE node_id=?1",
+                [node_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(baseline, 100);
+        db.delete_proxy(first_id).unwrap();
+        db.delete_proxy(second_id).unwrap();
+        let page = db.proxy_traffic_node_rows(None, None, "total", true, 1, 100).unwrap();
+        assert_eq!(page.total, 1);
+        assert!(page.items[0].proxies.is_empty());
+    }
+
+    #[test]
+    fn user_limits_survive_legacy_updates_and_schedule_changes_do_not_reset_usage() {
+        let db = db();
+        let mut draft = user_draft("limits");
+        draft.traffic_limit = Some(1_610_612_736);
+        draft.device_limit = Some(3);
+        draft.traffic_reset_day = Some(31);
+        let id = db.create_user(&draft).unwrap().unwrap();
+        let user = db.user(id).unwrap().unwrap();
+        assert_eq!((user.traffic_limit, user.device_limit, user.traffic_reset_day), (1_610_612_736, 3, 31));
+        let summary = db.proxy_user_traffic().unwrap().into_iter().find(|row| row.user_id == id).unwrap();
+        assert_eq!(summary.traffic_limit, 1_610_612_736);
+        assert_eq!(serde_json::to_value(&summary).unwrap()["traffic_limit"], 1_610_612_736_i64);
+        let mut legacy = user_draft("limits");
+        legacy.enabled = false;
+        db.update_user(id, &legacy).unwrap().unwrap();
+        let user = db.user(id).unwrap().unwrap();
+        assert!(!user.enabled);
+        assert_eq!((user.traffic_limit, user.device_limit, user.traffic_reset_day), (1_610_612_736, 3, 31));
+        let node_id = node(&db, 1);
+        db.conn().execute("INSERT INTO proxy_user_traffic(user_id,node_id,uplink_bytes,downlink_bytes,created_at,updated_at) VALUES(?1,?2,50,70,0,0)", params![id,node_id]).unwrap();
+        legacy.traffic_reset_day = Some(1);
+        legacy.traffic_limit = Some(0);
+        db.update_user(id, &legacy).unwrap().unwrap();
+        db.reset_due_user_traffic(Utc::now().timestamp()).unwrap();
+        assert_eq!(db.proxy_user_traffic_by_node(id).unwrap()[0].uplink_bytes, 50);
+        assert_eq!(db.user(id).unwrap().unwrap().traffic_limit, 0);
+    }
+
+    #[test]
+    fn scheduled_user_reset_is_atomic_idempotent_and_keeps_counter_baselines() {
+        use chrono::TimeZone;
+        let db = db();
+        let id = db.create_user(&user_draft("monthly")).unwrap().unwrap();
+        let node_id = node(&db, 1);
+        let mut proxy = proxy_draft("monthly", false);
+        proxy.enabled = true;
+        let proxy_id = db.create_proxy(node_id, &proxy).unwrap().unwrap();
+        db.put_authorization(id, proxy_id, &access_draft("")).unwrap().unwrap();
+        db.conn()
+            .execute(
+                "UPDATE users SET traffic_reset_day=31,traffic_reset_period='2024-01-31' WHERE id=?1",
+                [id],
+            )
+            .unwrap();
+        db.conn().execute("INSERT INTO proxy_user_traffic(user_id,node_id,uplink_bytes,downlink_bytes,last_uplink_counter,last_downlink_counter,created_at,updated_at) VALUES(?1,?2,50,70,100,200,0,0)", params![id,node_id]).unwrap();
+        let stamp =
+            |month, day| Local.with_ymd_and_hms(2024, month, day, 12, 0, 0).single().unwrap().timestamp();
+        db.reset_due_user_traffic(stamp(2, 28)).unwrap();
+        assert_eq!(db.proxy_user_traffic_by_node(id).unwrap()[0].uplink_bytes, 50);
+        let counters =
+            HashMap::from([("monthly".into(), ProxyTrafficCounter { uplink: 110, downlink: 225 })]);
+        db.record_proxy_traffic(node_id, &counters, &HashMap::new(), stamp(2, 29)).unwrap();
+        let row = &db.proxy_user_traffic_by_node(id).unwrap()[0];
+        assert_eq!((row.uplink_bytes, row.downlink_bytes), (10, 25));
+        db.reset_due_user_traffic(stamp(2, 29)).unwrap();
+        assert_eq!(db.proxy_user_traffic_by_node(id).unwrap()[0].uplink_bytes, 10);
+        db.reset_proxy_user_traffic(id, stamp(3, 1)).unwrap();
+        let period: String = db
+            .conn()
+            .query_row("SELECT traffic_reset_period FROM users WHERE id=?1", [id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(period, "2024-02-29");
+        // A restart after multiple missed periods clears once on the next pass.
+        db.conn().execute("UPDATE proxy_user_traffic SET uplink_bytes=90 WHERE user_id=?1", [id]).unwrap();
+        db.reset_due_user_traffic(stamp(5, 5)).unwrap();
+        assert_eq!(db.proxy_user_traffic_by_node(id).unwrap()[0].uplink_bytes, 0);
+        assert_eq!(period_start(NaiveDate::from_ymd_opt(2025, 2, 28).unwrap(), 31).to_string(), "2025-02-28");
+        // Disabling the schedule preserves traffic across future periods.
+        db.conn().execute("UPDATE users SET traffic_reset_day=0 WHERE id=?1", [id]).unwrap();
+        db.conn().execute("UPDATE proxy_user_traffic SET uplink_bytes=90 WHERE user_id=?1", [id]).unwrap();
+        db.reset_due_user_traffic(stamp(6, 30)).unwrap();
+        assert_eq!(db.proxy_user_traffic_by_node(id).unwrap()[0].uplink_bytes, 90);
+    }
+
+    #[test]
+    fn version_fifteen_users_gain_unlimited_defaults_without_losing_identity() {
+        let db = db();
+        let id = db.create_user(&user_draft("migrated-limits")).unwrap().unwrap();
+        let uuid = db.user(id).unwrap().unwrap().uuid;
+        for name in ["traffic_limit", "device_limit", "traffic_reset_day", "traffic_reset_period"] {
+            db.conn().execute_batch(&format!("ALTER TABLE users DROP COLUMN {name}")).unwrap();
+        }
+        migrate(&db.conn(), 15).unwrap();
+        let user = db.user(id).unwrap().unwrap();
+        assert_eq!(user.uuid, uuid);
+        assert_eq!((user.traffic_limit, user.device_limit, user.traffic_reset_day), (0, 0, 0));
     }
 
     fn access_draft(flow: &str) -> AuthorizationDraft {
@@ -3839,6 +4143,7 @@ mod tests {
         assert_eq!(db.create_user(&user_draft("alice")).unwrap(), Err(UserWriteIssue::UsernameConflict));
 
         let n = node(&db, 1);
+        db.conn().execute("UPDATE node SET group_name='Asia',country='HK' WHERE id=?1", [n]).unwrap();
         let mut draft = proxy_draft("p1", false);
         draft.enabled = true;
         draft.port = 24061;
@@ -3861,6 +4166,8 @@ mod tests {
         }
         let own_nodes = db.active_user_portal_proxies(u1, Utc::now().timestamp()).unwrap();
         assert_eq!(own_nodes.iter().map(|proxy| proxy.id).collect::<Vec<_>>(), vec![p1, p2]);
+        assert_eq!(own_nodes[0].node_group, "Asia");
+        assert_eq!(own_nodes[0].node_country, "HK");
         assert!(own_nodes
             .iter()
             .all(|proxy| !serde_json::to_value(proxy).unwrap().to_string().contains("private_key")));
@@ -3974,6 +4281,9 @@ mod tests {
             password_hash: Some("replacement-hash".into()),
             enabled: true,
             expires_at: None,
+            traffic_limit: None,
+            device_limit: None,
+            traffic_reset_day: None,
         };
         assert_eq!(db.update_user(id, &changed_password).unwrap(), Ok(()));
         assert_eq!(db.session_principal("user-hash"), None, "password changes revoke user sessions");
@@ -3985,6 +4295,9 @@ mod tests {
             password_hash: None,
             enabled: false,
             expires_at: None,
+            traffic_limit: None,
+            device_limit: None,
+            traffic_reset_day: None,
         };
         assert_eq!(db.update_user(id, &disabled).unwrap(), Ok(()));
         assert_eq!(db.session_principal("user-hash-2"), None, "disabling revokes user sessions");

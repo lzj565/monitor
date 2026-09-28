@@ -606,6 +606,7 @@ async fn main() -> Result<()> {
         // and response mapper scoped so legacy endpoints retain text errors.
         .merge(
             Router::new()
+                .route("/api/proxies/order", put(api::reorder_proxies))
                 .route("/api/nodes/{id}/proxies", get(api::list_proxies).post(api::create_proxy))
                 .route("/api/nodes/{id}/singbox/config/preview", get(api::preview_singbox_config))
                 .route("/api/nodes/{id}/singbox/config/check", post(api::check_singbox_config))
@@ -848,6 +849,9 @@ fn renew_online_nodes(app: &App) -> Result<()> {
 /// next hour.
 async fn housekeeping(app: Shared) {
     loop {
+        if let Err(e) = app.db.reset_due_user_traffic(chrono::Utc::now().timestamp()) {
+            warn!("resetting scheduled user traffic failed: {e:#}");
+        }
         // First, so the midnight pass does not wait on pruning.
         if let Err(e) = renew_online_nodes(&app) {
             warn!("rolling expiry dates failed: {e:#}");

@@ -54,6 +54,9 @@ pub struct VlessProxyConfig {
 pub struct RealityConfig {
     pub enabled: bool,
     pub server_name: String,
+    /// Handshake destination host; empty for older saved configurations.
+    #[serde(default)]
+    pub server: String,
     pub server_port: u16,
     pub private_key: String,
     pub public_key: String,
@@ -80,10 +83,12 @@ impl ProxyRequest {
         if !reality.enabled {
             return Err(InputError::new("INVALID_PROXY_CONFIG", "V1 requires VLESS Reality to be enabled"));
         }
-        if !valid_host(&reality.server_name) || reality.server_port == 0 {
+        let handshake_server =
+            if reality.server.trim().is_empty() { &reality.server_name } else { &reality.server };
+        if !valid_host(&reality.server_name) || !valid_host(handshake_server) || reality.server_port == 0 {
             return Err(InputError::new(
                 "INVALID_PROXY_CONFIG",
-                "Reality requires a valid handshake server and port",
+                "Reality requires a valid SNI, handshake server, and port",
             ));
         }
         if !valid_reality_key(&reality.private_key) || !valid_reality_key(&reality.public_key) {
@@ -163,10 +168,22 @@ pub struct UserRequest {
     pub password: Option<String>,
     pub enabled: bool,
     pub expires_at: Option<i64>,
+    pub traffic_limit: Option<i64>,
+    pub device_limit: Option<i64>,
+    pub traffic_reset_day: Option<u32>,
 }
 
 impl UserRequest {
     pub fn into_draft(self, creating: bool) -> Result<UserDraft, InputError> {
+        if self.traffic_limit.is_some_and(|n| !(0..=9_007_199_254_740_991).contains(&n))
+            || self.device_limit.is_some_and(|n| !(0..=9_007_199_254_740_991).contains(&n))
+            || self.traffic_reset_day.is_some_and(|n| n > 31)
+        {
+            return Err(InputError::new(
+                "INVALID_USER",
+                "流量限额和设备数必须为非负安全整数，重置日必须为 0–31",
+            ));
+        }
         let username = self.username.trim();
         if username.is_empty() || username.chars().count() > 128 {
             return Err(InputError::new("INVALID_USER", "username must contain 1 to 128 characters"));
@@ -191,6 +208,9 @@ impl UserRequest {
             password_hash,
             enabled: self.enabled,
             expires_at: self.expires_at,
+            traffic_limit: self.traffic_limit,
+            device_limit: self.device_limit,
+            traffic_reset_day: self.traffic_reset_day,
         })
     }
 }
@@ -250,6 +270,11 @@ pub fn generate_config(db: &Db, node_id: i64, now: i64) -> anyhow::Result<Value>
             })
             .collect::<anyhow::Result<_>>()?;
         let reality = config.reality;
+        let handshake_server = if reality.server.trim().is_empty() {
+            reality.server_name.clone()
+        } else {
+            reality.server.clone()
+        };
         inbounds.push(json!({
             "type": "vless",
             "tag": format!("proxy-{}", proxy.id),
@@ -262,7 +287,7 @@ pub fn generate_config(db: &Db, node_id: i64, now: i64) -> anyhow::Result<Value>
                 "reality": {
                     "enabled": true,
                     "handshake": {
-                        "server": reality.server_name,
+                        "server": handshake_server,
                         "server_port": reality.server_port
                     },
                     "private_key": reality.private_key,
@@ -386,6 +411,38 @@ mod tests {
     }
 
     #[test]
+    fn user_limits_reject_invalid_values_and_preserve_omitted_fields() {
+        let base = json!({"username":"limits","enabled":true,"expires_at":null});
+        let draft = serde_json::from_value::<UserRequest>(base.clone()).unwrap().into_draft(false).unwrap();
+        assert_eq!((draft.traffic_limit, draft.device_limit, draft.traffic_reset_day), (None, None, None));
+        for (field, value) in [
+            ("traffic_limit", json!(-1)),
+            ("device_limit", json!(-1)),
+            ("device_limit", json!(1.5)),
+            ("traffic_reset_day", json!(32)),
+            ("traffic_reset_day", json!(-1)),
+            ("traffic_limit", json!(9_007_199_254_740_992_i64)),
+        ] {
+            let mut input = base.clone();
+            input[field] = value;
+            let invalid = match serde_json::from_value::<UserRequest>(input) {
+                Ok(request) => request.into_draft(false).is_err(),
+                Err(_) => true,
+            };
+            assert!(invalid, "{field} must reject invalid limits");
+        }
+        let mut valid = base;
+        valid["traffic_limit"] = json!(1_610_612_736_i64);
+        valid["device_limit"] = json!(3);
+        valid["traffic_reset_day"] = json!(31);
+        let draft = serde_json::from_value::<UserRequest>(valid).unwrap().into_draft(false).unwrap();
+        assert_eq!(
+            (draft.traffic_limit, draft.device_limit, draft.traffic_reset_day),
+            (Some(1_610_612_736), Some(3), Some(31))
+        );
+    }
+
+    #[test]
     fn user_password_is_required_on_create_and_optional_on_update() {
         let request = |password: Option<&str>| {
             let mut value = json!({"username":" client ","enabled":true,"expires_at":null});
@@ -421,6 +478,9 @@ mod tests {
                 password_hash: Some("hash".into()),
                 enabled: true,
                 expires_at: None,
+                traffic_limit: None,
+                device_limit: None,
+                traffic_reset_day: None,
             })
             .unwrap()
             .unwrap();
@@ -434,7 +494,7 @@ mod tests {
                 name: name.into(), include_node_name: false, protocol: "vless".into(), address_type: "domain".into(),
                 address: "example.com".into(), port, enabled: true,
                 flow: (port != 24060).then(|| DEFAULT_FLOW.to_owned()),
-                config: json!({"reality":{"enabled":true,"server_name":"example.com","server_port":443,
+                config: json!({"reality":{"enabled":true,"server_name":"example.com","server":if port == 24061 { "handshake.example.net" } else { "" },"server_port":443,
                     "private_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","public_key":"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB","short_id":"abcdef12"}}),
             }).unwrap().unwrap();
             // The legacy authorization value is deliberately different: proxy
@@ -445,7 +505,7 @@ mod tests {
             node_ids.push(node_id);
         }
         let uuid = db.user(user_id).unwrap().unwrap().uuid;
-        for node_id in node_ids {
+        for (index, node_id) in node_ids.iter().copied().enumerate() {
             let config = generate_config(&db, node_id, chrono::Utc::now().timestamp()).unwrap();
             assert_eq!(config["inbounds"][0]["users"][0]["uuid"], uuid);
             assert_eq!(config["inbounds"][0]["users"][0]["name"], "same");
@@ -462,8 +522,8 @@ mod tests {
             assert_eq!(config["inbounds"][0]["listen"], "0.0.0.0");
             assert_eq!(config["inbounds"][0]["tls"]["server_name"], "example.com");
             assert_eq!(
-                config["inbounds"][0]["tls"]["server_name"],
-                config["inbounds"][0]["tls"]["reality"]["handshake"]["server"]
+                config["inbounds"][0]["tls"]["reality"]["handshake"]["server"],
+                if index == 0 { "example.com" } else { "handshake.example.net" }
             );
             assert!(config["experimental"]["v2ray_api"].get("listen").is_none());
             assert_eq!(config["experimental"]["v2ray_api"]["stats"]["enabled"], true);

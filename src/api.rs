@@ -1742,16 +1742,30 @@ pub async fn rotate_user_subscription_token(
 }
 
 fn subscription_label(proxy: &crate::db::UserSubscriptionProxy) -> String {
-    let label = if proxy.include_node_name {
-        format!("{} - {}", proxy.node_name, proxy.name)
-    } else {
-        proxy.name.clone()
-    };
-    label
+    crate::db::displayed_proxy_name(&proxy.name, proxy.include_node_name, &proxy.node_country)
 }
 
 fn yaml_string(value: &str) -> String {
-    serde_json::to_string(value).unwrap_or_else(|_| "\"\"".into())
+    let plain = !value.is_empty()
+        && value.as_bytes()[0].is_ascii_alphabetic()
+        && value.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+        && !matches!(
+            value.to_ascii_lowercase().as_str(),
+            "null" | "true" | "false" | "yes" | "no" | "on" | "off" | ".inf" | ".nan"
+        );
+    if plain {
+        value.to_owned()
+    } else {
+        serde_json::to_string(value).unwrap_or_else(|_| "\"\"".into())
+    }
+}
+
+fn yaml_ip_or_string(value: &str) -> String {
+    if value.parse::<std::net::IpAddr>().is_ok() {
+        value.to_owned()
+    } else {
+        yaml_string(value)
+    }
 }
 
 fn clash_subscription(uuid: &str, proxies: &[crate::db::UserSubscriptionProxy]) -> String {
@@ -1760,7 +1774,7 @@ fn clash_subscription(uuid: &str, proxies: &[crate::db::UserSubscriptionProxy]) 
     for (proxy, name) in proxies.iter().zip(&labels) {
         out.push_str(&format!(
             "  - name: {}\n    type: vless\n    server: {}\n    port: {}\n    uuid: {}\n    network: tcp\n    tls: true\n    udp: true\n    servername: {}\n    client-fingerprint: chrome\n    reality-opts:\n      public-key: {}\n      short-id: {}\n",
-            yaml_string(name), yaml_string(&proxy.address), proxy.port, yaml_string(uuid),
+            yaml_string(name), yaml_ip_or_string(&proxy.address), proxy.port, uuid,
             yaml_string(&proxy.server_name), yaml_string(&proxy.public_key), yaml_string(&proxy.short_id),
         ));
         let flow = if proxy.flow.is_empty() { proxy::DEFAULT_FLOW } else { &proxy.flow };
@@ -2104,6 +2118,13 @@ pub async fn reorder_nodes(_: Admin, State(app): State<Shared>, Json(order): Jso
             invalidate_snapshot(&app);
             Json(json!({"ok": true})).into_response()
         }
+        Err(e) => fail(e),
+    }
+}
+
+pub async fn reorder_proxies(_: Admin, State(app): State<Shared>, Json(order): Json<Order>) -> Response {
+    match app.db.reorder_proxies(&order.ids) {
+        Ok(()) => Json(json!({"ok": true})).into_response(),
         Err(e) => fail(e),
     }
 }
@@ -3064,6 +3085,7 @@ mod tests {
         let proxy = |id, flow: &str| crate::db::UserSubscriptionProxy {
             id,
             node_name: "node".into(),
+            node_country: "".into(),
             name: format!("proxy-{id}"),
             include_node_name: false,
             address: "proxy.example.com".into(),
@@ -3074,9 +3096,26 @@ mod tests {
             flow: flow.into(),
         };
         let proxies = vec![proxy(1, "xtls-rprx-vision"), proxy(2, "")];
-        let clash = clash_subscription("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", &proxies);
-        assert!(clash.contains("flow: \"xtls-rprx-vision\""));
+        let mut regional_proxy = proxy(3, "");
+        regional_proxy.include_node_name = true;
+        regional_proxy.node_country = "HK".into();
+        assert_eq!(subscription_label(&regional_proxy), "🇭🇰HK-proxy-3");
+        let uuid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let clash = clash_subscription(uuid, &proxies);
+        assert!(clash.contains("flow: xtls-rprx-vision"));
         assert_eq!(clash.matches("flow:").count(), 2, "all proxies receive a Flow");
+        assert!(clash.contains(&format!("uuid: {uuid}\n")), "UUID is an unquoted YAML scalar");
+        assert!(!clash.contains(&format!("uuid: \"{uuid}\"")));
+        let mut ipv4 = proxy(4, "");
+        ipv4.address = "192.0.2.1".into();
+        let mut ipv6 = proxy(5, "");
+        ipv6.address = "2001:db8::1".into();
+        let mut domain = proxy(6, "");
+        domain.address = "proxy.example.com".into();
+        let ip_yaml = clash_subscription(uuid, &[ipv4, ipv6, domain]);
+        assert!(ip_yaml.contains("server: 192.0.2.1\n"));
+        assert!(ip_yaml.contains("server: 2001:db8::1\n"));
+        assert!(ip_yaml.contains("server: proxy.example.com\n"));
         let sing_box = sing_box_subscription("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", &proxies);
         assert_eq!(sing_box["outbounds"][0]["flow"], "xtls-rprx-vision");
         assert_eq!(sing_box["outbounds"][1]["flow"], "xtls-rprx-vision");

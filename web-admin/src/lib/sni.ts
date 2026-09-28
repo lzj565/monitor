@@ -1,4 +1,5 @@
 export type ParsedSni = { server_name: string; server_port: number }
+export type ParsedDestination = { server: string; server_port: number }
 
 /** Parse the modal's host[:port] SNI value into the existing Reality fields. */
 export function parseSni(value: string): ParsedSni {
@@ -34,4 +35,10 @@ export function parseSni(value: string): ParsedSni {
 export function formatSni(serverName: string, serverPort: number): string {
   const host = serverName.includes(":") && !serverName.startsWith("[") ? `[${serverName}]` : serverName
   return `${host}:${serverPort}`
+}
+
+/** Parse Reality's independent handshake destination in host[:port] form. */
+export function parseDestination(value: string): ParsedDestination {
+  const parsed = parseSni(value)
+  return { server: parsed.server_name, server_port: parsed.server_port }
 }

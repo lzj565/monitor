@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react"
+import { useEffect, useState } from "react"
 import { Copy, LogOut, Moon, RefreshCw, Sun } from "lucide-react"
 import { toast } from "sonner"
 
@@ -6,7 +6,7 @@ import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { Skeleton } from "@/components/ui/skeleton"
-import { ProxyAddressTypeBadge, ProxyProtocolBadge } from "@/components/ProxyBadges"
+import { ProxyAddressTypeBadge, ProxyProtocolBadge, TooltipText } from "@/components/ProxyBadges"
 import { api } from "@/lib/api"
 
 type UserProfile = {
@@ -20,6 +20,8 @@ type PortalProxy = {
   id: number
   node_id: number
   node_name: string
+  node_group: string
+  node_country: string
   name: string
   protocol: string
   address: string
@@ -54,23 +56,27 @@ export function UserCenter({ siteName, dark, toggleTheme, signOut }: {
   const [error, setError] = useState("")
   const [rotating, setRotating] = useState(false)
 
-  const load = useCallback(async () => {
-    setError("")
-    try {
-      const [nextProfile, nextProxies, nextLinks] = await Promise.all([
-        api<UserProfile>("/user/me"),
-        api<{ items: PortalProxy[] }>("/user/me/proxies"),
-        api<SubscriptionLinks>("/user/me/subscription"),
-      ])
-      setProfile(nextProfile)
-      setProxies(nextProxies.items)
-      setLinks(nextLinks)
-    } catch (e) {
-      setError((e as Error).message)
+  useEffect(() => {
+    let active = true
+    async function load() {
+      try {
+        const [nextProfile, nextProxies, nextLinks] = await Promise.all([
+          api<UserProfile>("/user/me"),
+          api<{ items: PortalProxy[] }>("/user/me/proxies"),
+          api<SubscriptionLinks>("/user/me/subscription"),
+        ])
+        if (!active) return
+        setError("")
+        setProfile(nextProfile)
+        setProxies(nextProxies.items)
+        setLinks(nextLinks)
+      } catch (e) {
+        if (active) setError((e as Error).message)
+      }
     }
+    void load()
+    return () => { active = false }
   }, [])
-
-  useEffect(() => { void load() }, [load])
 
   async function copy(path: string) {
     try {
@@ -187,18 +193,25 @@ export function UserCenter({ siteName, dark, toggleTheme, signOut }: {
             <p className="rounded-md border border-dashed p-6 text-center text-sm text-muted-foreground">当前没有已启用的节点授权</p>
           ) : (
             <div className="overflow-x-auto rounded-md border">
-              <table className="w-full min-w-[760px] table-fixed text-left text-sm">
+              <table className="w-full min-w-max table-auto text-left text-sm">
                 <thead className="bg-muted/50 text-xs text-muted-foreground">
-                  <tr><th className="w-[22%] px-4 py-3">名称</th><th className="w-[19%] px-4 py-3">协议</th><th className="w-[25%] px-4 py-3">地址</th><th className="w-[9%] px-4 py-3">端口</th><th className="w-[17%] px-4 py-3">SNI</th><th className="w-[8%] px-4 py-3">状态</th></tr>
+                  <tr><th className="px-4 py-3">名称</th><th className="px-4 py-3">协议</th><th className="px-4 py-3">地址</th><th className="px-4 py-3">端口</th><th className="w-28 max-w-28 px-4 py-3">SNI</th><th className="px-4 py-3">状态</th></tr>
                 </thead>
                 <tbody>
                   {proxies.map((proxy) => (
                     <tr key={proxy.id} className="border-t transition-colors hover:bg-muted/30">
-                      <td className="px-4 py-3"><div className="truncate font-medium" title={proxy.name}>{proxy.name}</div><div className="truncate text-xs text-muted-foreground" title={proxy.node_name}>{proxy.node_name}</div></td>
+                      <td className="px-4 py-3">
+                        <div className="font-medium">{proxy.name}</div>
+                        <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                          <span>{proxy.node_name}</span>
+                          {proxy.node_group && <span>{proxy.node_group}</span>}
+                          {proxy.node_country && <Badge variant="outline" className="font-normal text-muted-foreground">{proxy.node_country}</Badge>}
+                        </div>
+                      </td>
                       <td className="px-4 py-3"><ProxyProtocolBadge protocol={proxy.protocol} /></td>
                       <td className="px-4 py-3"><div className="flex min-w-0 items-center gap-2"><ProxyAddressTypeBadge addressType={proxy.address_type} /><span className="truncate font-mono text-xs" title={proxy.address}>{proxy.address}</span></div></td>
                       <td className="px-4 py-3 font-mono">{proxy.port}</td>
-                      <td className="px-4 py-3"><span className="block truncate font-mono text-xs" title={proxy.server_name ? `${proxy.server_name}:${proxy.server_port}` : "—"}>{proxy.server_name ? `${proxy.server_name}:${proxy.server_port}` : "—"}</span></td>
+                      <td className="w-28 max-w-28 px-4 py-3"><TooltipText text={proxy.server_name ? `${proxy.server_name}:${proxy.server_port}` : "—"} className="w-24 max-w-24 font-mono text-xs" /></td>
                       <td className="px-4 py-3"><Badge variant="outline" className={`font-normal ${proxy.online ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300" : "text-muted-foreground"}`}><span className={`size-1.5 rounded-full ${proxy.online ? "bg-emerald-500" : "bg-muted-foreground/50"}`} />{proxy.online ? "在线" : "离线"}</Badge></td>
                     </tr>
                   ))}

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react"
+import { useState } from "react"
 
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
@@ -31,13 +31,12 @@ export function Login({ github, userDefault, onModeChange, onDone }: {
   onModeChange: (mode: "user" | "admin") => void
   onDone: (mode: "user" | "admin") => void
 }) {
-  const [mode, setMode] = useState<"user" | "admin">(() => userDefault ? "user" : "admin")
+  const mode = userDefault ? "user" : "admin"
   const [username, setUsername] = useState("")
   const [password, setPassword] = useState("")
   const [error, setError] = useState(callbackError)
   const [busy, setBusy] = useState(false)
 
-  useEffect(() => { setMode(userDefault ? "user" : "admin") }, [userDefault])
 
   async function submit(e: React.FormEvent) {
     e.preventDefault()
@@ -69,7 +68,6 @@ export function Login({ github, userDefault, onModeChange, onDone }: {
               aria-selected={mode === next}
               onClick={() => {
                 if (mode === next) return
-                setMode(next)
                 setPassword("")
                 setError("")
                 onModeChange(next)

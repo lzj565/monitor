@@ -1112,6 +1112,9 @@ mod tests {
                 password_hash: Some("test-hash".into()),
                 enabled: true,
                 expires_at: Some(expired_at),
+                traffic_limit: None,
+                device_limit: None,
+                traffic_reset_day: None,
             })
             .unwrap()
             .unwrap();
@@ -1180,6 +1183,9 @@ mod tests {
                 password_hash: Some("test-hash".into()),
                 enabled: true,
                 expires_at: None,
+                traffic_limit: None,
+                device_limit: None,
+                traffic_reset_day: None,
             })
             .unwrap()
             .unwrap();

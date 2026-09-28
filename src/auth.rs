@@ -551,6 +551,9 @@ mod tests {
             password_hash: Some(password_hash),
             enabled,
             expires_at,
+            traffic_limit: None,
+            device_limit: None,
+            traffic_reset_day: None,
         })
         .unwrap()
         .unwrap();

@@ -6,6 +6,7 @@ export type Flow = "" | "xtls-rprx-vision"
 export type RealityConfig = {
   enabled: boolean
   server_name: string
+  server?: string
   server_port: number
   private_key: string
   public_key: string
@@ -15,6 +16,7 @@ export type RealityConfig = {
 export type Proxy = {
   id: number
   node_id: number
+  sort: number
   name: string
   include_node_name: boolean
   protocol: "vless"
@@ -29,7 +31,7 @@ export type Proxy = {
   sync?: SyncReport
 }
 
-export type ProxyDraft = Omit<Proxy, "id" | "node_id" | "created_at" | "updated_at">
+export type ProxyDraft = Omit<Proxy, "id" | "node_id" | "sort" | "created_at" | "updated_at">
 
 export type User = {
   id: number
@@ -41,6 +43,9 @@ export type User = {
   updated_at: number
   /** Number of assigned proxy records, including disabled authorizations. */
   proxy_count: number
+  traffic_limit: number
+  device_limit: number
+  traffic_reset_day: number
   sync?: SyncReport
 }
 
@@ -117,6 +122,7 @@ export type ProxyTrafficNodeRow = {
   node_id: number
   node_name: string
   protocols: string[]
+  proxies: Array<Pick<Proxy, "id" | "name" | "protocol" | "enabled" | "include_node_name">>
   uplink_bytes: number
   downlink_bytes: number
   total_bytes: number
@@ -151,7 +157,7 @@ function trafficSearch(options: ProxyTrafficListOptions): string {
   return query.toString()
 }
 
-export type UserDraft = Pick<User, "username" | "enabled" | "expires_at"> & { password?: string }
+export type UserDraft = Pick<User, "username" | "enabled" | "expires_at"> & Partial<Pick<User, "traffic_limit" | "device_limit" | "traffic_reset_day">> & { password?: string }
 export type VlessAuth = { flow: Flow }
 export type UserProxyAuthorization = {
   proxy: Pick<Proxy, "id" | "node_id" | "name" | "include_node_name" | "protocol" | "address_type" | "address" | "port" | "enabled">
@@ -166,7 +172,11 @@ export async function listProxiesForNode(nodeId: number): Promise<Proxy[]> {
 
 export async function listAllProxies(nodeIds: number[]): Promise<Proxy[]> {
   const responses = await Promise.all(nodeIds.map(listProxiesForNode))
-  return responses.flat().sort((a, b) => a.node_id - b.node_id || a.id - b.id)
+  return responses.flat().sort((a, b) => a.sort - b.sort || a.id - b.id)
+}
+
+export function reorderProxies(ids: number[]) {
+  return api<{ ok: true }>("/proxies/order", { method: "PUT", body: JSON.stringify({ ids }) })
 }
 
 export function createProxy(nodeId: number, draft: ProxyDraft) {
@@ -187,18 +197,15 @@ export async function listUsers(): Promise<User[]> {
   return response.items
 }
 
-export async function listProxyUserTraffic(): Promise<Array<Pick<ProxyTrafficSummary, "user_id" | "username" | "uplink_bytes" | "downlink_bytes" | "last_seen_at" | "reset_at">>> {
-  const response = await api<{ items: Array<Pick<ProxyTrafficSummary, "user_id" | "username" | "uplink_bytes" | "downlink_bytes" | "last_seen_at" | "reset_at">> }>("/proxy-traffic/users")
+export type ProxyUserTrafficSummary = Pick<ProxyTrafficSummary, "user_id" | "username" | "uplink_bytes" | "downlink_bytes" | "last_seen_at" | "reset_at"> & { traffic_limit: number }
+
+export async function listProxyUserTraffic(): Promise<ProxyUserTrafficSummary[]> {
+  const response = await api<{ items: ProxyUserTrafficSummary[] }>("/proxy-traffic/users")
   return response.items
 }
 
 export async function getProxyUserTraffic(userId: number): Promise<ProxyTrafficSummary[]> {
   const response = await api<{ items: ProxyTrafficSummary[] }>(`/proxy-traffic/users/${userId}`)
-  return response.items
-}
-
-export async function listProxyNodeTraffic(): Promise<ProxyTrafficSummary[]> {
-  const response = await api<{ items: ProxyTrafficSummary[] }>("/proxy-traffic/nodes")
   return response.items
 }
 
@@ -214,12 +221,12 @@ export function listProxyTrafficNodeRows(options: ProxyTrafficListOptions) {
   return api<ProxyTrafficPage<ProxyTrafficNodeRow>>(`/proxy-traffic/node-rows?${trafficSearch(options)}`)
 }
 
-export function resetProxyUserTraffic(userId: number) {
-  return api<void>(`/proxy-traffic/users/${userId}/reset`, { method: "POST" })
-}
-
 export function resetProxyNodeTraffic(nodeId: number) {
   return api<void>(`/proxy-traffic/nodes/${nodeId}/reset`, { method: "POST" })
+}
+
+export function resetProxyUserTraffic(userId: number) {
+  return api<void>(`/proxy-traffic/users/${userId}/reset`, { method: "POST" })
 }
 
 export function createUser(draft: UserDraft) {

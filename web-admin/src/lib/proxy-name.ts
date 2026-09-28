@@ -9,7 +9,7 @@ export function countryFlag(country: string | undefined): string {
 
 export function displayProxyName(proxy: NamedProxy, node?: Pick<Node, "name" | "country">): string {
   if (!proxy.include_node_name) return proxy.name.trim()
-  const nodeName = node?.name.trim() ?? `节点 ${proxy.node_id}`
-  const flag = countryFlag(node?.country)
-  return `${flag ? `${flag} ` : ""}[${nodeName}] ${proxy.name.trim()}`
+  const country = node?.country?.trim().toUpperCase() ?? ""
+  if (!/^[A-Z]{2}$/.test(country)) return proxy.name.trim()
+  return `${countryFlag(country)}${country}-${proxy.name.trim()}`
 }

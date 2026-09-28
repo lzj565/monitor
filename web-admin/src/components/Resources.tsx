@@ -1,27 +1,29 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { AlertTriangle, ChevronDown, ChevronRight, ChevronUp, Copy, Eye, EyeOff, KeyRound, Pencil, Plus, RefreshCw, Settings2, Trash2 } from "lucide-react"
+import { AlertTriangle, ChevronDown, ChevronRight, ChevronUp, Copy, Eye, EyeOff, Pencil, Plus, RefreshCw, Settings2, Trash2 } from "lucide-react"
 import { toast } from "sonner"
 
+import { TrafficUsage } from "@/components/TrafficUsage"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
 import { AdminConfirmDialog as ConfirmDialog, AdminSearchInput } from "@/components/AdminShared"
+import { DragHandle, useDragOrder } from "@/components/DragOrder"
 import type { Node } from "@/lib/api"
 import { bytes } from "@/lib/format"
+import { parseResetDay, parseUserLimits } from "@/lib/user-limits"
 import { proxyDraft } from "@/lib/proxy-draft"
 import { countryFlag, displayProxyName } from "@/lib/proxy-name"
-import { ProxyAddressTypeBadge, ProxyProtocolBadge } from "@/components/ProxyBadges"
+import { ProxyAddressTypeBadge, ProxyProtocolBadge, TooltipText } from "@/components/ProxyBadges"
 import { generateRealityKeyPair, generateShortId, realityKeyPairMatches } from "@/lib/reality"
-import { formatSni, parseSni } from "@/lib/sni"
+import { formatSni, parseDestination, parseSni } from "@/lib/sni"
 import { groupProxiesByNode, proxyGroupSelection, subscriptionSearchMatches, toggleProxyGroup } from "@/lib/subscription"
 import {
   createProxy,
@@ -30,14 +32,12 @@ import {
   deleteUser,
   listAllProxies,
   getProxyUserTraffic,
-  listProxyNodeTraffic,
   listProxyUserTraffic,
   listUserAuthorizations,
   listUsers,
   replaceUserAuthorizations,
   resolveSync,
   resetUserUuid,
-  resetProxyNodeTraffic,
   resetProxyUserTraffic,
   updateProxy,
   updateUser,
@@ -184,7 +184,8 @@ function ProxyForm({ proxy, nodes, onClose, onSaved }: {
   const [customAddress, setCustomAddress] = useState(proxy?.address_type === "domain" ? proxy.address : "")
   const [port, setPort] = useState(String(proxy?.port ?? "24060"))
   const [flow, setFlow] = useState<Flow>(proxy?.flow || "xtls-rprx-vision")
-  const [sni, setSni] = useState(initialReality ? formatSni(initialReality.server_name, initialReality.server_port) : "www.amd.com:443")
+  const [sni, setSni] = useState(initialReality?.server_name ?? "www.amd.com")
+  const [destination, setDestination] = useState(initialReality ? formatSni(initialReality.server || initialReality.server_name, initialReality.server_port) : "www.amd.com:443")
   const [privateKey, setPrivateKey] = useState(initialReality?.private_key ?? creationPair?.privateKey ?? "")
   const [publicKey, setPublicKey] = useState(initialReality?.public_key ?? creationPair?.publicKey ?? "")
   const [shortId, setShortId] = useState(() => initialReality?.short_id ?? (proxy ? "" : generateShortId()))
@@ -200,6 +201,7 @@ function ProxyForm({ proxy, nodes, onClose, onSaved }: {
   const currentReality = {
     enabled: true,
     server_name: initialReality?.server_name ?? "",
+    server: initialReality?.server ?? initialReality?.server_name ?? "",
     server_port: initialReality?.server_port ?? 443,
     private_key: privateKey.trim(),
     public_key: publicKey.trim(),
@@ -211,7 +213,9 @@ function ProxyForm({ proxy, nodes, onClose, onSaved }: {
   } catch {
     // Validation is reported on submit so the user can finish editing the field.
   }
-  const completeReality = Boolean(parsedSni && realityKeyPairMatches(privateKey.trim(), publicKey.trim())
+  let parsedDestination: ReturnType<typeof parseDestination> | null = null
+  try { parsedDestination = parseDestination(destination) } catch { /* Report on submit. */ }
+  const completeReality = Boolean(parsedSni && parsedDestination && realityKeyPairMatches(privateKey.trim(), publicKey.trim())
     && /^[0-9a-fA-F]{1,8}$/.test(shortId.trim()))
 
   function changeNode(value: string) {
@@ -246,11 +250,16 @@ function ProxyForm({ proxy, nodes, onClose, onSaved }: {
     const numericPort = Number(port)
     if (!Number.isInteger(numericPort) || numericPort < 1 || numericPort > 65535) return toast.error("监听端口必须在 1 到 65535 之间")
     let parsedSniValue: ReturnType<typeof parseSni>
+    let parsedDestinationValue: ReturnType<typeof parseDestination>
     try {
       parsedSniValue = parseSni(sni)
     } catch (error) {
       setAdvanced(true)
       return toast.error((error as Error).message)
+    }
+    try { parsedDestinationValue = parseDestination(destination) } catch (error) {
+      setAdvanced(true)
+      return toast.error((error as Error).message.replace("SNI", "DEST"))
     }
     if (!/^[0-9a-fA-F]{1,8}$/.test(shortId.trim())) return toast.error("Short ID 必须为 1 到 8 位十六进制字符")
     if (!realityKeyPairMatches(privateKey.trim(), publicKey.trim())) {
@@ -269,7 +278,7 @@ function ProxyForm({ proxy, nodes, onClose, onSaved }: {
       enabled: proxy?.enabled ?? true,
       flow,
       config: {
-        reality: { ...currentReality, ...parsedSniValue },
+        reality: { ...currentReality, ...parsedSniValue, ...parsedDestinationValue },
       },
     }
 
@@ -290,21 +299,21 @@ function ProxyForm({ proxy, nodes, onClose, onSaved }: {
 
   return (
     <Dialog open onOpenChange={(open) => !open && onClose()}>
-      <DialogContent onOpenAutoFocus={(event) => event.preventDefault()} className="flex max-h-[90vh] w-full max-w-[calc(100%-2rem)] flex-col gap-0 overflow-hidden p-0 sm:max-w-[960px]">
+      <DialogContent onOpenAutoFocus={(event) => event.preventDefault()} className="flex max-h-[90vh] w-full max-w-[calc(100%-2rem)] flex-col gap-0 overflow-hidden p-0 sm:max-w-md">
         <form className="flex min-h-0 flex-1 flex-col" onSubmit={save}>
           <DialogHeader className="shrink-0 px-6 pt-5 pb-3">
-            <DialogTitle>{proxy ? `编辑代理：${displayProxyName(proxy, initialNode)}` : "新增代理"}</DialogTitle>
+            <DialogTitle className="pr-6 [overflow-wrap:anywhere]">{proxy ? `编辑代理：${displayProxyName(proxy, initialNode)}` : "新增代理"}</DialogTitle>
             <DialogDescription>配置服务器上的 VLESS Reality 代理。</DialogDescription>
           </DialogHeader>
           <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-6 pb-4">
-            <div className="grid gap-3 sm:grid-cols-[minmax(0,3fr)_minmax(12rem,2fr)]">
+            <div className="grid grid-cols-1 gap-3">
               <Field label="代理名称 *">
                 <Input autoFocus={!proxy} required maxLength={128} value={name} onChange={(event) => setName(event.target.value)} placeholder="Reality" />
               </Field>
               <Field label="协议 *">
                 <Select value="vless">
                   <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
-                  <SelectContent position="popper"><SelectItem value="vless">VLESS + Reality</SelectItem></SelectContent>
+                <SelectContent position="popper"><SelectItem value="vless">vless+reality</SelectItem></SelectContent>
                 </Select>
               </Field>
             </div>
@@ -312,12 +321,12 @@ function ProxyForm({ proxy, nodes, onClose, onSaved }: {
             <div className="flex flex-wrap items-start gap-x-3 gap-y-1 text-sm">
               <label className="inline-flex shrink-0 cursor-pointer items-center gap-2">
                 <input type="checkbox" className="size-4 accent-primary" checked={includeNodeName} onChange={(event) => setIncludeNodeName(event.target.checked)} />
-                名称附带节点名称
+                附加节点地区前缀
               </label>
               <span className="text-muted-foreground">将自动生成：{name.trim() ? displayName : "代理名称"}</span>
             </div>
 
-            <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_10rem]">
+            <div className="grid grid-cols-1 gap-3">
               <Field label="所属节点 *">
                 <Select value={String(nodeId || "")} onValueChange={changeNode} disabled={!nodes.length}>
                   <SelectTrigger className="w-full"><SelectValue placeholder="选择节点" /></SelectTrigger>
@@ -329,24 +338,15 @@ function ProxyForm({ proxy, nodes, onClose, onSaved }: {
                 </Select>
               </Field>
               <Field label="端口 *">
-                <Input required type="number" min="1" max="65535" step="1" value={port} onChange={(event) => setPort(event.target.value)} />
+                <div className="flex gap-2"><Input required type="number" min="1" max="65535" step="1" value={port} onChange={(event) => setPort(event.target.value)} /><Button type="button" variant="outline" onClick={() => setPort(String(20000 + Math.floor(Math.random() * 45536)))}>随机</Button></div>
               </Field>
             </div>
 
             <section className="space-y-2 border-t pt-3">
-              <h3 className="text-sm font-medium">连接地址</h3>
-              <div className="grid gap-3 sm:grid-cols-[13rem_minmax(0,1fr)]">
-                <Field label="地址类型 *">
-                  <Select value={addressType} onValueChange={(value) => changeAddressType(value as ProxyDraft["address_type"])}>
-                    <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
-                    <SelectContent position="popper">
-                      <SelectItem value="ipv4" disabled={!nodeAddress(selectedNode, "ipv4")}>IPv4{!nodeAddress(selectedNode, "ipv4") && "（不可用）"}</SelectItem>
-                      <SelectItem value="ipv6" disabled={!nodeAddress(selectedNode, "ipv6")}>IPv6{!nodeAddress(selectedNode, "ipv6") && "（不可用）"}</SelectItem>
-                      <SelectItem value="domain">自定义</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </Field>
-                <Field label="连接地址 *" hint={addressType === "domain" ? undefined : "自动采用所属节点的可连接地址。"}>
+              <Field label="连接地址 *" hint={addressType === "domain" ? undefined : "自动采用所属节点的可连接地址。"}>
+                  <div className="mb-2 flex gap-1">
+                    {([["ipv4", "IPv4"], ["ipv6", "IPv6"], ["domain", "自定义"]] as const).map(([type, label]) => <Button key={type} type="button" size="sm" variant={addressType === type ? "default" : "outline"} disabled={type !== "domain" && !nodeAddress(selectedNode, type)} onClick={() => changeAddressType(type)}>{label}</Button>)}
+                  </div>
                   <div className="flex gap-2">
                     <Input
                       required
@@ -359,8 +359,7 @@ function ProxyForm({ proxy, nodes, onClose, onSaved }: {
                       {addressType === "domain" ? "自定义" : addressType.toUpperCase()}
                     </Badge>
                   </div>
-                </Field>
-              </div>
+              </Field>
             </section>
 
             <Card className="gap-0 overflow-hidden p-0">
@@ -369,7 +368,7 @@ function ProxyForm({ proxy, nodes, onClose, onSaved }: {
                 <span className="min-w-0 flex-1">
                   <span className="block text-sm font-medium">高级配置</span>
                   <span className={`block text-xs ${completeReality ? "text-muted-foreground" : "text-amber-700 dark:text-amber-400"}`}>
-                    {completeReality ? (proxy ? "SNI / Reality 密钥 · 配置完整" : "SNI / Reality 密钥 · 已自动生成") : "Reality 配置未完成"}
+                    {completeReality ? (proxy ? "SNI / DEST / Reality 密钥 · 配置完整" : "SNI / DEST / Reality 密钥 · 已自动生成") : "Reality 配置未完成"}
                   </span>
                 </span>
                 {!completeReality && <Badge variant="outline" className="border-amber-500/40 text-amber-700 dark:text-amber-400"><AlertTriangle /> 检查配置</Badge>}
@@ -377,34 +376,27 @@ function ProxyForm({ proxy, nodes, onClose, onSaved }: {
               </button>
               {advanced && (
                 <div className="space-y-3 border-t p-4">
+                  <h3 className="text-sm font-medium">Reality 伪装与 x25519 密钥</h3>
+                  <div className="grid grid-cols-1 gap-3">
+                  <Field label="SNI *"><Input required value={sni} onChange={(event) => setSni(event.target.value)} placeholder="www.amd.com" /></Field>
+                  <Field label="DEST *"><Input required value={destination} onChange={(event) => setDestination(event.target.value)} placeholder="www.amd.com:443" /></Field>
+                  </div>
+                  <Field label="Public Key *">
+                    <div className="flex gap-2"><Input className="min-w-0 flex-1 font-mono" required autoComplete="off" pattern="[A-Za-z0-9_-]{43}" value={publicKey} onChange={(event) => setPublicKey(event.target.value)} /><Button className="shrink-0" type="button" variant="outline" onClick={requestPairRegeneration}><RefreshCw /> 重新生成</Button><Button className="shrink-0" type="button" variant="outline" size="icon" title="复制公钥" aria-label="复制公钥" onClick={() => copyText(publicKey)}><Copy /></Button></div>
+                  </Field>
+                  <Field label="Private Key *">
+                    <div className="flex gap-2"><Input className="min-w-0 flex-1 font-mono" required autoComplete="off" pattern="[A-Za-z0-9_-]{43}" type={showPrivateKey ? "text" : "password"} value={privateKey} onChange={(event) => setPrivateKey(event.target.value)} /><Button className="shrink-0" type="button" variant="outline" size="icon" title={showPrivateKey ? "隐藏私钥" : "显示私钥"} aria-label={showPrivateKey ? "隐藏私钥" : "显示私钥"} onClick={() => setShowPrivateKey((shown) => !shown)}>{showPrivateKey ? <EyeOff /> : <Eye />}</Button><Button className="shrink-0" type="button" variant="outline" size="icon" title="复制私钥" aria-label="复制私钥" onClick={() => copyText(privateKey)}><Copy /></Button></div>
+                  </Field>
                   <Field label="Flow" hint="此代理下的用户共用该 Flow；客户端订阅和节点配置会同步使用。">
                     <Select value={flow} onValueChange={(value) => setFlow(value as Flow)}>
                       <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
                       <SelectContent position="popper"><SelectItem value="xtls-rprx-vision">xtls-rprx-vision</SelectItem></SelectContent>
                     </Select>
                   </Field>
-                  <Field label="SNI *">
-                    <Input required value={sni} onChange={(event) => setSni(event.target.value)} placeholder="www.amd.com:443" />
-                  </Field>
                   <Field label="Short ID *">
                     <div className="flex gap-2">
                       <Input className="min-w-0 flex-1" required maxLength={8} pattern="[0-9a-fA-F]{1,8}" value={shortId} onChange={(event) => setShortId(event.target.value)} placeholder="abcdef12" />
                       <Button className="shrink-0" type="button" variant="outline" onClick={() => setShortId(generateShortId())}><RefreshCw /> 重新生成</Button>
-                    </div>
-                  </Field>
-                  <Field label="Private Key *">
-                    <div className="flex gap-2">
-                      <Input className="min-w-0 flex-1 font-mono" required autoComplete="off" pattern="[A-Za-z0-9_-]{43}" type={showPrivateKey ? "text" : "password"} value={privateKey} onChange={(event) => setPrivateKey(event.target.value)} />
-                      <Button className="shrink-0" type="button" variant="outline" onClick={requestPairRegeneration}><RefreshCw /> 重新生成</Button>
-                      <Button className="shrink-0" type="button" variant="outline" size="icon" title={showPrivateKey ? "隐藏私钥" : "显示私钥"} aria-label={showPrivateKey ? "隐藏私钥" : "显示私钥"} onClick={() => setShowPrivateKey((shown) => !shown)}>{showPrivateKey ? <EyeOff /> : <Eye />}</Button>
-                      <Button className="shrink-0" type="button" variant="outline" size="icon" title="复制私钥" aria-label="复制私钥" onClick={() => copyText(privateKey)}><Copy /></Button>
-                    </div>
-                  </Field>
-                  <Field label="Public Key *">
-                    <div className="flex gap-2">
-                      <Input className="min-w-0 flex-1 font-mono" required autoComplete="off" pattern="[A-Za-z0-9_-]{43}" value={publicKey} onChange={(event) => setPublicKey(event.target.value)} />
-                      <Button className="shrink-0" type="button" variant="outline" onClick={requestPairRegeneration}><RefreshCw /> 重新生成</Button>
-                      <Button className="shrink-0" type="button" variant="outline" size="icon" title="复制公钥" aria-label="复制公钥" onClick={() => copyText(publicKey)}><Copy /></Button>
                     </div>
                   </Field>
                 </div>
@@ -430,11 +422,6 @@ function ProxyForm({ proxy, nodes, onClose, onSaved }: {
 
 function ProxyPage({ nodes }: { nodes: Node[] }) {
   const { items, error, loading, reload } = useAllProxies(nodes)
-  const [trafficItems, setTrafficItems] = useState<ProxyTrafficSummary[] | null>(null)
-  const [trafficError, setTrafficError] = useState("")
-  const [trafficRevision, setTrafficRevision] = useState(0)
-  const [trafficResetNode, setTrafficResetNode] = useState<ProxyTrafficSummary | null>(null)
-  const [resettingTraffic, setResettingTraffic] = useState(false)
   const [query, setQuery] = useState("")
   const [nodeFilter, setNodeFilter] = useState("all")
   const [statusFilter, setStatusFilter] = useState("all")
@@ -443,27 +430,17 @@ function ProxyPage({ nodes }: { nodes: Node[] }) {
   const [deleting, setDeleting] = useState<Proxy | null>(null)
   const [removing, setRemoving] = useState(false)
   const [updatingProxyId, setUpdatingProxyId] = useState<number | null>(null)
-  useEffect(() => {
-    let active = true
-    const load = () => listProxyNodeTraffic().then((next) => {
-      if (active) { setTrafficItems(next); setTrafficError("") }
-    }).catch((e: Error) => {
-      if (active) { setTrafficItems(null); setTrafficError(e.message) }
-    })
-    void load()
-    const timer = window.setInterval(() => void load(), 5_000)
-    return () => { active = false; window.clearInterval(timer) }
-  }, [trafficRevision])
+  const drag = useDragOrder(items ?? [], "proxies", reload)
   const nodeById = new Map(nodes.map((node) => [node.id, node]))
-  const nodeOrder = new Map(nodes.map((node, index) => [node.id, index]))
-  const visible = (items ?? []).filter((proxy) => {
+  const visible = drag.order.filter((proxy) => {
     const node = nodeById.get(proxy.node_id)
     const needle = query.trim().toLowerCase()
     const matchesQuery = !needle || [displayProxyName(proxy, node), proxy.name, proxy.address, node?.name, String(proxy.port)].some((value) => value?.toLowerCase().includes(needle))
     const matchesNode = nodeFilter === "all" || String(proxy.node_id) === nodeFilter
     const matchesStatus = statusFilter === "all" || (statusFilter === "enabled" ? proxy.enabled : !proxy.enabled)
     return matchesQuery && matchesNode && matchesStatus
-  }).sort((a, b) => (nodeOrder.get(a.node_id) ?? Number.MAX_SAFE_INTEGER) - (nodeOrder.get(b.node_id) ?? Number.MAX_SAFE_INTEGER) || a.id - b.id)
+  })
+  const searching = query.trim() !== "" || nodeFilter !== "all" || statusFilter !== "all"
 
   async function remove() {
     if (!deleting) return
@@ -477,21 +454,6 @@ function ProxyPage({ nodes }: { nodes: Node[] }) {
       toast.error((e as Error).message)
     } finally {
       setRemoving(false)
-    }
-  }
-
-  async function resetNodeTraffic() {
-    if (!trafficResetNode) return
-    setResettingTraffic(true)
-    try {
-      await resetProxyNodeTraffic(trafficResetNode.node_id)
-      toast.success(`已清空节点「${trafficResetNode.node_name}」的业务流量。`)
-      setTrafficResetNode(null)
-      setTrafficRevision((value) => value + 1)
-    } catch (e) {
-      toast.error((e as Error).message)
-    } finally {
-      setResettingTraffic(false)
     }
   }
 
@@ -525,30 +487,19 @@ function ProxyPage({ nodes }: { nodes: Node[] }) {
         <Button disabled={!nodes.length} onClick={() => setCreating(true)}><Plus /> 新增代理</Button>
       </div>
 
-      {trafficError && <p role="alert" className="text-sm text-destructive">节点业务流量读取失败：{trafficError}</p>}
-      {trafficItems && trafficItems.length > 0 && <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-        {trafficItems.map((traffic) => <Card key={traffic.node_id} className="flex flex-row items-center justify-between gap-4 py-3">
-          <div className="min-w-0">
-            <div className="truncate font-medium">{traffic.node_name}</div>
-            <div className="mt-1 text-xs text-muted-foreground">上行 {bytes(traffic.uplink_bytes)} · 下行 {bytes(traffic.downlink_bytes)}</div>
-            <div className="mt-1 text-xs text-muted-foreground">最近采集：{traffic.last_seen_at ? new Date(traffic.last_seen_at * 1000).toLocaleString() : "尚未采集"}</div>
-          </div>
-          <Button variant="outline" size="sm" onClick={() => setTrafficResetNode(traffic)}>清零</Button>
-        </Card>)}
-      </div>}
-
       <Card className="overflow-x-auto p-0">
-        <Table className="table-fixed">
+        <Table className="table-auto min-w-max">
           <TableHeader className="bg-muted/50">
             <TableRow>
-              <TableHead className="w-[12%] max-md:w-[9%] px-1 md:px-3">节点</TableHead>
-              <TableHead className="w-[12%] max-md:w-[11%] px-1 md:px-3">名称</TableHead>
-              <TableHead className="hidden w-[16%] px-3 md:table-cell">协议</TableHead>
-              <TableHead className="hidden w-[16%] px-3 md:table-cell">地址</TableHead>
-              <TableHead className="w-[8%] max-md:w-[14%] px-1 md:px-3">端口</TableHead>
-              <TableHead className="w-[22%] max-md:w-[28%] px-1 md:px-3">SNI</TableHead>
-              <TableHead className="w-[6%] max-md:w-[12%] px-0 md:px-3 text-center">状态</TableHead>
-              <TableHead className="w-[8%] max-md:w-[26%] px-1 md:px-3 text-right">操作</TableHead>
+              <TableHead className="w-10 px-2" aria-label="排序" />
+              <TableHead className="px-3">节点</TableHead>
+              <TableHead className="px-3">名称</TableHead>
+              <TableHead className="px-3">协议</TableHead>
+              <TableHead className="px-3">地址</TableHead>
+              <TableHead className="px-3">端口</TableHead>
+              <TableHead className="w-28 max-w-28 px-3">SNI</TableHead>
+              <TableHead className="px-3 text-center">状态</TableHead>
+              <TableHead className="px-3 text-right">操作</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -557,33 +508,40 @@ function ProxyPage({ nodes }: { nodes: Node[] }) {
               const proxyName = displayProxyName(proxy, node)
               const reality = proxy.config.reality
               return (
-                <TableRow key={proxy.id} className="h-14">
-                  <TableCell className="px-1 md:px-3">
-                    <div className="flex min-w-0 items-center gap-2">
+                <TableRow key={proxy.id} {...drag.row(proxy.id)} className="h-14">
+                  <TableCell className="px-2">
+                    <DragHandle {...drag.handle(proxy.id)} name={proxyName} disabled={searching} title={searching ? "清空搜索和筛选后可拖动排序" : undefined} />
+                  </TableCell>
+                  <TableCell className="px-3">
+                    <div className="flex items-center gap-2">
                       <span aria-hidden="true" title={node?.online ? "在线" : "离线"} className={`size-2 shrink-0 rounded-full ${node?.online ? "bg-emerald-500" : "bg-muted-foreground/40"}`} />
-                      <span className="truncate font-medium">{node?.name ?? `节点 ${proxy.node_id}`}</span>
+                      <div>
+                        <div className="font-medium">{node?.name ?? `节点 ${proxy.node_id}`}</div>
+                        {node?.group && <div className="text-xs text-muted-foreground">{node.group}</div>}
+                      </div>
+                      {node?.country && <Badge variant="outline" title={node.country_pin ? "手动指定" : undefined} className="shrink-0 font-normal text-muted-foreground">{node.country}</Badge>}
                     </div>
                   </TableCell>
-                  <TableCell className="max-w-0 px-1 md:px-3">
-                    <div className="truncate font-medium" title={proxyName}>{proxyName}</div>
+                  <TableCell className="px-3 font-medium">
+                    <span className="min-w-0">{proxyName}</span>
                   </TableCell>
-                  <TableCell className="hidden px-3 md:table-cell">
+                  <TableCell className="px-3">
                     <ProxyProtocolBadge protocol={proxy.protocol} />
                   </TableCell>
-                  <TableCell className="hidden max-w-0 px-3 md:table-cell">
+                  <TableCell className="max-w-64 px-3">
                     <div className="flex min-w-0 items-center gap-2">
                       <ProxyAddressTypeBadge addressType={proxy.address_type} />
-                      <span className="truncate text-sm" title={proxy.address}>{proxy.address}</span>
+                      <span className="max-w-48 truncate text-sm" title={proxy.address}>{proxy.address}</span>
                     </div>
                   </TableCell>
-                  <TableCell className="tnum px-1 text-xs md:px-3 md:text-sm">{proxy.port}</TableCell>
-                  <TableCell className="max-w-0 px-1 md:px-3">
-                    <span className="block truncate text-sm" title={`${reality.server_name}:${reality.server_port}`}>{reality.server_name}:{reality.server_port}</span>
+                  <TableCell className="tnum px-3 text-sm">{proxy.port}</TableCell>
+                  <TableCell className="w-28 max-w-28 px-3">
+                    <TooltipText text={reality.server_name} className="w-24 max-w-24 text-sm" />
                   </TableCell>
-                  <TableCell className="px-0 text-center md:px-3">
+                  <TableCell className="px-3 text-center">
                     <Switch checked={proxy.enabled} disabled={updatingProxyId !== null} onCheckedChange={(enabled) => setProxyEnabled(proxy, enabled)} aria-label={`${proxy.enabled ? "停用" : "启用"}代理 ${proxyName}`} />
                   </TableCell>
-                  <TableCell className="whitespace-nowrap px-1 text-right md:px-3">
+                  <TableCell className="whitespace-nowrap px-3 text-right">
                     <div className="flex items-center justify-end gap-1">
                       <Button variant="ghost" size="icon" className="max-md:size-8" title="编辑代理" aria-label="编辑代理" onClick={() => setEditing(proxy)}><Pencil /></Button>
                       <Button variant="ghost" size="icon" className="max-md:size-8 text-destructive hover:text-destructive" title="删除代理" aria-label="删除代理" onClick={() => setDeleting(proxy)}><Trash2 /></Button>
@@ -616,14 +574,6 @@ function ProxyPage({ nodes }: { nodes: Node[] }) {
         onClose={() => setDeleting(null)}
         onConfirm={remove}
       />}
-      {trafficResetNode && <ConfirmDialog
-        title={`清空节点「${trafficResetNode.node_name}」的业务流量？`}
-        description="只清空 Hub 累计量并保留 Core counter baseline，下一次采集只会累计之后新增的流量。"
-        confirmLabel="清空流量"
-        busy={resettingTraffic}
-        onClose={() => setTrafficResetNode(null)}
-        onConfirm={() => void resetNodeTraffic()}
-      />}
     </div>
   )
 }
@@ -655,31 +605,42 @@ function expired(user: User): boolean {
   return user.expires_at !== null && user.expires_at * 1000 <= Date.now()
 }
 
-function UserForm({ user, go, onClose, onSaved }: {
+function UserForm({ user, onClose, onSaved }: {
   user: User | null
-  go: Go
   onClose: () => void
   onSaved: () => void
 }) {
   const [username, setUsername] = useState(user?.username ?? "")
   const [password, setPassword] = useState("")
-  const [enabled, setEnabled] = useState(user?.enabled ?? true)
-  const [forever, setForever] = useState(user?.expires_at === null || !user)
+  const [trafficLimit, setTrafficLimit] = useState(user?.traffic_limit ? String(user.traffic_limit / 1024 ** 3) : "")
+  const [deviceLimit, setDeviceLimit] = useState(user?.device_limit ? String(user.device_limit) : "")
+  const [resetDay, setResetDay] = useState(user?.traffic_reset_day ? String(user.traffic_reset_day) : "")
   const [expires, setExpires] = useState(localDate(user?.expires_at ?? null))
   const [saving, setSaving] = useState(false)
+  const [confirmUuid, setConfirmUuid] = useState(false)
+  const uuidBusy = useRef(false)
   const [resettingUuid, setResettingUuid] = useState(false)
   const [uuid, setUuid] = useState(user?.uuid ?? "")
 
   async function save(event: React.FormEvent) {
     event.preventDefault()
     if (!username.trim()) return toast.error("请填写用户名")
-    if (!forever && !expires) return toast.error("请选择到期日期")
     if (!user && !password) return toast.error("请设置用户登录密码")
+    let day: number
+    let limits: ReturnType<typeof parseUserLimits>
+    try {
+      limits = parseUserLimits(trafficLimit, deviceLimit)
+      day = parseResetDay(resetDay)
+    } catch (error) {
+      return toast.error((error as Error).message)
+    }
     const draft: UserDraft = {
       username: username.trim(),
       ...(password ? { password } : {}),
-      enabled,
-      expires_at: forever ? null : localExpiryBoundary(expires),
+      enabled: user?.enabled ?? true,
+      expires_at: localExpiryBoundary(expires),
+      ...limits,
+      traffic_reset_day: day,
     }
     setSaving(true)
     try {
@@ -695,29 +656,33 @@ function UserForm({ user, go, onClose, onSaved }: {
   }
 
   async function resetUuid() {
-    if (!user) return
+    if (!user || uuidBusy.current) return
+    uuidBusy.current = true
     setResettingUuid(true)
     try {
       const result = await resetUserUuid(user.id)
       setUuid(result.uuid)
+      setConfirmUuid(false)
       onSaved()
       notifySync("UUID 已重置", result.sync)
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "UUID 重置失败")
     } finally {
+      uuidBusy.current = false
       setResettingUuid(false)
     }
   }
 
   return (
-    <Dialog open onOpenChange={(open) => !open && onClose()}>
-      <DialogContent onOpenAutoFocus={(e) => e.preventDefault()} className="flex max-h-[85vh] w-full max-w-[calc(100%-2rem)] flex-col gap-0 overflow-hidden p-0 sm:max-w-3xl">
+    <>
+    <Dialog open onOpenChange={(open) => !open && !uuidBusy.current && onClose()}>
+      <DialogContent onOpenAutoFocus={(e) => e.preventDefault()} className="flex max-h-[85vh] w-full max-w-[calc(100%-2rem)] flex-col gap-0 overflow-hidden p-0 sm:max-w-2xl">
         <form className="flex min-h-0 flex-1 flex-col" onSubmit={save}>
           <DialogHeader className="shrink-0 px-6 pt-6 pb-4">
-            <DialogTitle>{user ? `编辑用户：${user.username}` : "新建用户"}</DialogTitle>
-            <DialogDescription>{user ? "修改用户信息、有效期和账户状态。" : "创建代理用户，并设置账户状态和有效期。"}</DialogDescription>
+            <DialogTitle className="pr-6 [overflow-wrap:anywhere]">{user ? `编辑用户：${user.username}` : "新建用户"}</DialogTitle>
+            <DialogDescription>{user ? "修改用户信息、限额和有效期限。" : "创建代理用户，并设置限额和有效期限。"}</DialogDescription>
           </DialogHeader>
-          <div className="min-h-0 flex-1 space-y-6 overflow-y-auto px-6 pb-5">
+          <div className="grid min-h-0 flex-1 grid-cols-1 gap-5 overflow-y-auto px-6 pb-5 sm:grid-cols-2">
           <Field label="用户名 *">
             <Input autoFocus={!user} required maxLength={128} placeholder="如：client_01" value={username} readOnly={user?.username === "admin"} onChange={(e) => setUsername(e.target.value)} />
             {user?.username === "admin" && <p className="text-xs text-muted-foreground">默认用户名称固定为 admin。</p>}
@@ -735,77 +700,49 @@ function UserForm({ user, go, onClose, onSaved }: {
             />
           </Field>
 
-          <Field label="VLESS UUID" hint={user ? "UUID只用于代理认证；密码、资料和授权变更不会修改它。" : "系统创建用户时自动生成。"}>
-            {user ? (
-              <div className="flex flex-wrap items-center justify-between gap-3 rounded-md border bg-muted/30 px-3 py-2">
+          <Field label="流量限额（GiB）" hint="留空或填写 0 表示不限。">
+            <Input type="number" min="0" step="any" aria-label="流量限额（GiB）" placeholder="不限" value={trafficLimit} onChange={(e) => setTrafficLimit(e.target.value)} />
+          </Field>
+
+          <Field label="设备数" hint="留空或填写 0 表示不限。">
+            <Input type="number" min="0" step="1" aria-label="设备数" placeholder="不限" value={deviceLimit} onChange={(e) => setDeviceLimit(e.target.value)} />
+          </Field>
+
+          <Field label="流量重置日" hint="输入 1–31，留空不自动重置；短月份取月末，下次重置日生效。">
+            <Input type="number" min="1" max="31" step="1" aria-label="流量重置日" placeholder="不自动重置" value={resetDay} onChange={(e) => setResetDay(e.target.value)} />
+          </Field>
+
+          <Field label="有效期限" hint="留空则永久有效。">
+            <Input type="date" aria-label="有效期限" value={expires} onChange={(e) => setExpires(e.target.value)} />
+            {expires && <p className="text-xs text-muted-foreground">所选日期当天结束时到期，按当前浏览器时区计算。</p>}
+          </Field>
+
+          {user && (
+            <Field className="sm:col-span-2" label="UUID" hint="UUID 只用于代理认证；密码、资料和授权变更不会修改它。">
+              <div className="flex flex-wrap items-center gap-3 rounded-md border bg-muted/30 px-3 py-2">
                 <code className="min-w-0 flex-1 break-all font-mono text-sm select-all">{uuid}</code>
-                <div className="flex shrink-0 items-center gap-2">
-                  <Button type="button" variant="outline" disabled={!uuid} onClick={() => copyText(uuid)}><Copy />复制 UUID</Button>
-                  <Button type="button" variant="outline" disabled={resettingUuid} onClick={() => void resetUuid()}><RefreshCw />重置 UUID</Button>
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button type="button" variant="ghost" size="icon" className="size-7" title="复制 UUID" aria-label="复制 UUID" disabled={!uuid} onClick={() => copyText(uuid)}><Copy className="size-3.5" /></Button>
+                  <Button type="button" variant="ghost" size="icon" className="size-7" title="重置 UUID" aria-label="重置 UUID" disabled={resettingUuid || saving} onClick={() => setConfirmUuid(true)}><RefreshCw className="size-3.5" /></Button>
                 </div>
               </div>
-            ) : (
-              <div className="rounded-md border bg-muted/30 px-3 py-2 text-sm text-muted-foreground">创建时自动生成</div>
-            )}
-          </Field>
+            </Field>
+          )}
 
-          <Field label={user ? "到期时间（留空为永久有效）" : "有效期限"}>
-            {!user && (
-              <div className="grid gap-3 sm:grid-cols-2">
-                <label className={`flex cursor-pointer items-center gap-3 rounded-lg border p-4 transition-colors ${forever ? "border-primary bg-primary/5" : "hover:bg-muted/50"}`}>
-                  <input type="radio" name="expiry" className="accent-primary" checked={forever} onChange={() => setForever(true)} />
-                  <span className="text-sm font-medium">永久有效</span>
-                </label>
-                <label className={`flex cursor-pointer items-center gap-3 rounded-lg border p-4 transition-colors ${!forever ? "border-primary bg-primary/5" : "hover:bg-muted/50"}`}>
-                  <input type="radio" name="expiry" className="accent-primary" checked={!forever} onChange={() => setForever(false)} />
-                  <span className="text-sm font-medium">指定到期时间</span>
-                </label>
-              </div>
-            )}
-            <Input
-              className="mt-3"
-              type="date"
-              aria-label="到期时间"
-              disabled={!user && forever}
-              value={expires}
-              onChange={(e) => {
-                setExpires(e.target.value)
-                if (user) setForever(!e.target.value)
-              }}
-            />
-            {(!user ? !forever : Boolean(expires)) && <p className="text-xs text-muted-foreground">所选日期当天结束时到期，按当前浏览器时区计算。</p>}
-          </Field>
-
-          <div className="space-y-2">
-            <Label className="text-sm font-medium">账户状态</Label>
-            <label className="flex items-center justify-between rounded-lg border bg-muted/30 px-4 py-3">
-              <span className="text-sm font-medium">启用用户</span>
-              <Switch checked={enabled} onCheckedChange={setEnabled} aria-label="启用用户" />
-            </label>
-          </div>
-
-          {user ? (
-            <section className="space-y-2 border-t pt-5">
-              <Label className="text-sm font-medium">代理授权</Label>
-              <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border bg-muted/30 px-4 py-3">
-                <span className="text-sm">已授权 {user.proxy_count} 个代理</span>
-                <Button type="button" variant="outline" size="sm" onClick={() => go(`/admin/subscriptions?user_id=${user.id}`)}>
-                  管理授权 <KeyRound />
-                </Button>
-              </div>
-            </section>
-          ) : (
-            <p className="rounded-lg border bg-muted/30 px-4 py-3 text-sm text-muted-foreground">创建用户后，可在「订阅」中为用户配置代理授权。</p>
+          {!user && (
+            <p className="rounded-lg border bg-muted/30 px-4 py-3 text-sm text-muted-foreground sm:col-span-2">创建用户后，可在「订阅」中为用户配置代理授权。</p>
           )}
 
           </div>
           <DialogFooter className="shrink-0 border-t px-6 py-4">
             <Button type="button" variant="ghost" onClick={onClose}>取消</Button>
-            <Button type="submit" disabled={saving}>{user ? "保存修改" : "确认创建"}</Button>
+            <Button type="submit" disabled={saving || resettingUuid}>{user ? "保存修改" : "确认创建"}</Button>
           </DialogFooter>
         </form>
       </DialogContent>
     </Dialog>
+    {confirmUuid && <ConfirmDialog title="确认重置 UUID？" description="原 UUID 将失效，使用该用户的客户端需要更新订阅后重新连接。" confirmLabel="重置 UUID" busy={resettingUuid} onClose={() => { if (!uuidBusy.current) setConfirmUuid(false) }} onConfirm={() => void resetUuid()} />}
+    </>
   )
 }
 
@@ -885,7 +822,7 @@ function UserTrafficDialog({ user, onClose, onChanged }: { user: User; onClose: 
   )
 }
 
-function UsersPage({ go }: { go: Go }) {
+function UsersPage() {
   const [revision, setRevision] = useState(0)
   const [result, setResult] = useState<{ revision: number; items: User[] | null; error: string } | null>(null)
   const [trafficResult, setTrafficResult] = useState<{ revision: number; items: Awaited<ReturnType<typeof listProxyUserTraffic>> | null; error: string } | null>(null)
@@ -984,20 +921,30 @@ function UsersPage({ go }: { go: Go }) {
       <Card className="overflow-x-auto p-0">
         <Table>
           <TableHeader className="bg-muted/50"><TableRow>
-            <TableHead className="w-[8%] px-4">ID</TableHead>
-            <TableHead className="w-[22%] px-4">用户名</TableHead>
-            <TableHead className="w-[18%] px-4">代理授权</TableHead>
-            <TableHead className="w-[20%] px-4">到期时间</TableHead>
-            <TableHead className="w-[17%] px-4">账户状态</TableHead>
-            <TableHead className="w-[20%] px-4">业务流量</TableHead>
+            <TableHead className="w-[7%] px-4">ID</TableHead>
+            <TableHead className="w-[19%] px-4">用户名</TableHead>
+            <TableHead className="w-[26%] min-w-68 px-4">流量使用情况</TableHead>
+            <TableHead className="w-[12%] px-4">设备</TableHead>
+            <TableHead className="w-[14%] px-4">到期时间</TableHead>
+            <TableHead className="w-[14%] px-4">账户状态</TableHead>
             <TableHead className="text-right">操作</TableHead>
           </TableRow></TableHeader>
           <TableBody>
             {visible.map((user) => (
               <TableRow key={user.id} className="h-14">
                 <TableCell className="tnum px-4 text-sm text-muted-foreground">{user.id}</TableCell>
-                <TableCell className="px-4"><div className="font-semibold">{user.username}</div></TableCell>
-                <TableCell className="px-4 text-sm">{user.proxy_count} 个代理</TableCell>
+                <TableCell className="px-4">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="font-semibold">{user.username}</span>
+                    <Badge variant={user.username === "admin" ? "default" : "secondary"} className="font-normal">
+                      {user.username === "admin" ? "管理员" : "普通用户"}
+                    </Badge>
+                  </div>
+                </TableCell>
+                <TableCell className="min-w-68 px-4 py-2">
+                  <TrafficUsage used={(trafficByUser.get(user.id)?.uplink_bytes ?? 0) + (trafficByUser.get(user.id)?.downlink_bytes ?? 0)} limit={user.traffic_limit} />
+                </TableCell>
+                <TableCell className="tnum px-4 text-sm" title="暂未统计在线设备数">— / {user.device_limit || "不限"}</TableCell>
                 <TableCell className="tnum px-4 text-sm">{displayDate(user.expires_at)}</TableCell>
                 <TableCell className="px-4">
                   <div className="flex flex-wrap items-center gap-2">
@@ -1011,18 +958,11 @@ function UsersPage({ go }: { go: Go }) {
                     {expired(user) && <Badge variant="destructive" className="font-normal">已过期</Badge>}
                   </div>
                 </TableCell>
-                <TableCell className="px-4">
-                  <div className="space-y-1 text-xs text-muted-foreground">
-                    <div>上行 {bytes(trafficByUser.get(user.id)?.uplink_bytes ?? 0)}</div>
-                    <div>下行 {bytes(trafficByUser.get(user.id)?.downlink_bytes ?? 0)}</div>
-                  </div>
-                  <Button variant="link" size="sm" className="h-7 px-0" onClick={() => setTrafficUser(user)}>明细 / 清零</Button>
-                </TableCell>
                 <TableCell className="whitespace-nowrap text-right">
                   <div className="flex items-center justify-end gap-1">
-                    <Button variant="ghost" size="sm" onClick={() => setEditing(user)}><Pencil /> 编辑</Button>
-                    <Button variant="ghost" size="sm" className="text-primary hover:text-primary" onClick={() => go(`/admin/subscriptions?user_id=${user.id}`)}><KeyRound /> 管理授权</Button>
-                    <Button variant="ghost" size="sm" disabled={user.username === "admin"} title={user.username === "admin" ? "默认用户 admin 不可删除" : undefined} className="text-destructive hover:text-destructive" onClick={() => setDeleting(user)}><Trash2 /> 删除</Button>
+                    <Tooltip><TooltipTrigger asChild><Button type="button" variant="ghost" size="icon" className="size-8" aria-label={`重置用户 ${user.username} 的流量`} onClick={() => setTrafficUser(user)}><RefreshCw /></Button></TooltipTrigger><TooltipContent>重置流量</TooltipContent></Tooltip>
+                    <Button type="button" variant="ghost" size="icon" className="size-8" title="编辑用户" aria-label={`编辑用户 ${user.username}`} onClick={() => setEditing(user)}><Pencil /></Button>
+                    <Button type="button" variant="ghost" size="icon" disabled={user.username === "admin"} title={user.username === "admin" ? "管理员不可删除" : "删除用户"} aria-label={user.username === "admin" ? "管理员不可删除" : `删除用户 ${user.username}`} className="size-8 text-destructive hover:text-destructive" onClick={() => setDeleting(user)}><Trash2 /></Button>
                   </div>
                 </TableCell>
               </TableRow>
@@ -1036,8 +976,8 @@ function UsersPage({ go }: { go: Go }) {
           </TableBody>
         </Table>
       </Card>
-      {creating && <UserForm user={null} go={go} onClose={() => setCreating(false)} onSaved={reload} />}
-      {editing && <UserForm user={editing} go={go} onClose={() => setEditing(null)} onSaved={reload} />}
+      {creating && <UserForm user={null} onClose={() => setCreating(false)} onSaved={reload} />}
+      {editing && <UserForm user={editing} onClose={() => setEditing(null)} onSaved={reload} />}
       {trafficUser && <UserTrafficDialog user={trafficUser} onClose={() => setTrafficUser(null)} onChanged={() => setTrafficRevision((value) => value + 1)} />}
       {deleting && <ConfirmDialog
         title={`删除用户「${deleting.username}」？`}
@@ -1051,52 +991,20 @@ function UsersPage({ go }: { go: Go }) {
   )
 }
 
-function SubscriptionUserPicker({ users, value, onChange }: { users: User[]; value: number | null; onChange: (userId: number) => void }) {
-  const [open, setOpen] = useState(false)
-  const [query, setQuery] = useState("")
-  const selected = users.find((user) => user.id === value)
-  const visible = users.filter((user) => user.username.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase()))
-  return (
-    <Popover open={open} onOpenChange={(next) => { setOpen(next); if (!next) setQuery("") }}>
-      <PopoverTrigger asChild>
-        <Button type="button" variant="outline" className="w-full justify-between font-normal" aria-label="搜索并选择用户">
-          <span className="truncate">{selected?.username ?? "搜索 / 选择用户"}</span><ChevronDown className="size-4 opacity-50" />
-        </Button>
-      </PopoverTrigger>
-      <PopoverContent align="start" className="w-[var(--radix-popover-trigger-width)] p-2">
-        <Input autoFocus value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索用户名" aria-label="搜索用户名" />
-        <div className="mt-2 max-h-56 overflow-y-auto">
-          {visible.map((user) => (
-            <button key={user.id} type="button" className={`flex w-full items-center justify-between rounded-sm px-2 py-2 text-left text-sm hover:bg-accent ${user.id === value ? "bg-accent" : ""}`} onClick={() => { onChange(user.id); setOpen(false); setQuery("") }}>
-              <span>{user.username}</span>
-            </button>
-          ))}
-          {!visible.length && <p className="px-2 py-3 text-sm text-muted-foreground">没有匹配的用户</p>}
-        </div>
-      </PopoverContent>
-    </Popover>
-  )
-}
-
-function SubscriptionForm({ mode, users, user, proxies, nodes, accesses, onClose, onSaved }: {
-  mode: "create" | "edit"
-  users: User[]
-  user: User | null
+function SubscriptionForm({ user, proxies, nodes, accesses, ready, onClose, onSaved }: {
+  ready: boolean
+  user: User
   proxies: Proxy[]
   nodes: Node[]
   accesses: UserProxyAuthorization[]
   onClose: () => void
   onSaved: () => void
 }) {
-  const creating = mode === "create"
-  const eligibleUsers = users.filter((item) => item.proxy_count === 0)
-  const [userId, setUserId] = useState<number | null>(user?.id ?? null)
   const [proxyQuery, setProxyQuery] = useState("")
   const [expandedGroups, setExpandedGroups] = useState<Record<number, boolean>>({})
   const [selectedIds, setSelectedIds] = useState<Set<number>>(() => new Set(accesses.filter((item) => item.access.enabled).map((item) => item.proxy.id)))
   const [saving, setSaving] = useState(false)
-  const userOptions = creating ? eligibleUsers : user ? [user] : []
-  const selectedUser = userOptions.find((item) => item.id === userId) ?? null
+  const savingRef = useRef(false)
   const groups = useMemo(() => groupProxiesByNode(proxies, nodes), [proxies, nodes])
   const selectedProxies = proxies.filter((proxy) => selectedIds.has(proxy.id))
   const query = proxyQuery.trim().toLocaleLowerCase()
@@ -1110,13 +1018,6 @@ function SubscriptionForm({ mode, users, user, proxies, nodes, accesses, onClose
     })
   }
 
-  function selectFormUser(nextUserId: number) {
-    if (nextUserId !== userId) {
-      setSelectedIds(new Set())
-    }
-    setUserId(nextUserId)
-  }
-
   function setGroupSelected(proxyIds: number[]) {
     const nextIds = toggleProxyGroup(selectedIds, proxyIds)
     setSelectedIds(new Set(nextIds))
@@ -1124,45 +1025,38 @@ function SubscriptionForm({ mode, users, user, proxies, nodes, accesses, onClose
 
   async function save(event: React.FormEvent) {
     event.preventDefault()
-    if (!selectedUser) return toast.error("请选择用户")
-    if (!selectedIds.size) return toast.error("请至少选择一个授权节点")
+    if (!ready || savingRef.current) return
+    savingRef.current = true
     setSaving(true)
     try {
       const result = await replaceUserAuthorizations(
-        selectedUser.id,
+        user.id,
         selectedProxies.map((proxy) => ({ proxy_id: proxy.id, enabled: true })),
       )
-      notifySync(creating ? "订阅已创建" : "订阅已更新", result.sync)
+      notifySync("订阅已更新", result.sync)
       onClose()
       onSaved()
     } catch (error) {
       toast.error(`订阅授权未能保存：${(error as Error).message}`)
     } finally {
+      savingRef.current = false
       setSaving(false)
     }
   }
 
   return (
-    <Dialog open onOpenChange={(open) => !open && onClose()}>
-      <DialogContent onOpenAutoFocus={(event) => event.preventDefault()} className="flex max-h-[80vh] w-full max-w-[calc(100%-2rem)] flex-col gap-0 overflow-hidden p-0 sm:max-w-3xl">
+    <Dialog open onOpenChange={(open) => !open && !savingRef.current && onClose()}>
+      <DialogContent onOpenAutoFocus={(event) => event.preventDefault()} className="flex h-[min(42rem,85dvh)] w-full max-w-[calc(100%-2rem)] flex-col gap-0 overflow-hidden p-0 sm:max-w-3xl">
         <form className="flex min-h-0 flex-1 flex-col" onSubmit={save}>
           <DialogHeader className="shrink-0 px-6 pt-6 pb-4">
-            <DialogTitle>{creating ? "新增订阅" : `编辑订阅：${user?.username ?? ""}`}</DialogTitle>
-            <DialogDescription>{creating ? "为用户选择可使用的代理节点。" : "调整该用户的代理节点授权。"}</DialogDescription>
+            <DialogTitle className="pr-6 [overflow-wrap:anywhere]">{`编辑订阅：${user.username}`}</DialogTitle>
+            <DialogDescription>勾选需要授权的节点；取消全部勾选并保存可清空授权。</DialogDescription>
           </DialogHeader>
-          <div className="min-h-0 flex-1 space-y-4 overflow-hidden px-6 pb-5">
-            <Field label="选择用户 *">
-              {creating ? (
-                <SubscriptionUserPicker users={eligibleUsers} value={userId} onChange={selectFormUser} />
-              ) : (
-                <Input value={user?.username ?? ""} disabled readOnly />
-              )}
-              {creating && !eligibleUsers.length && <p className="text-xs text-muted-foreground">所有用户都已有订阅授权，或尚未创建用户。</p>}
-            </Field>
-
-            <Field label="选择授权节点 *">
-              <AdminSearchInput value={proxyQuery} onChange={setProxyQuery} placeholder="搜索节点名称或所属服务器..." className="w-full" />
-              <div className="max-h-[34vh] min-h-28 overflow-y-auto rounded-md border">
+          <div className="shrink-0 px-6 pb-4">
+            <AdminSearchInput value={proxyQuery} onChange={setProxyQuery} placeholder="搜索节点名称或所属服务器..." className="w-full" />
+          </div>
+          <div className="min-h-0 flex-1 overflow-y-auto px-6 pb-4">
+            <div className="rounded-md border">
                 {groups.map((group) => {
                   const proxyIds = group.proxies.map((proxy) => proxy.id)
                   const state = proxyGroupSelection(selectedIds, proxyIds)
@@ -1187,7 +1081,11 @@ function SubscriptionForm({ mode, users, user, proxies, nodes, accesses, onClose
                           aria-label={`选择服务器 ${group.node?.name ?? `节点 ${group.nodeId}`}`}
                         />
                         <button type="button" className="flex min-w-0 flex-1 items-center justify-between gap-3 text-left text-sm" onClick={() => setExpandedGroups((current) => ({ ...current, [group.nodeId]: !isExpanded }))}>
-                          <span className="truncate font-medium">{group.node?.name ?? `节点 ${group.nodeId}`}</span>
+                          <span className="flex min-w-0 flex-wrap items-baseline gap-x-2">
+                            <span className="min-w-0 [overflow-wrap:anywhere] font-medium">{group.node?.name ?? `节点 ${group.nodeId}`}</span>
+                            {group.node?.group && <span className="min-w-0 text-xs text-muted-foreground [overflow-wrap:anywhere]">{group.node.group}</span>}
+                            {group.node?.country && <Badge variant="outline" title={group.node.country_pin ? "手动指定" : undefined} className="font-normal text-muted-foreground">{group.node.country}</Badge>}
+                          </span>
                           <span className="tnum shrink-0 text-xs text-muted-foreground">{state.selected} / {state.total}</span>
                         </button>
                       </div>
@@ -1198,7 +1096,7 @@ function SubscriptionForm({ mode, users, user, proxies, nodes, accesses, onClose
                             <input type="checkbox" className="mt-1 size-4 shrink-0 accent-primary" checked={selectedIds.has(proxy.id)} onChange={(event) => setProxySelected(proxy.id, event.target.checked)} />
                             <span className="min-w-0 flex-1">
                               <span className="flex min-w-0 flex-wrap items-center gap-2">
-                                <span className="truncate text-sm font-medium">{displayProxyName(proxy, node)}</span>
+                                <span className="min-w-0 text-sm font-medium [overflow-wrap:anywhere]">{displayProxyName(proxy, node)}</span>
                                 <ProxyProtocolBadge protocol={proxy.protocol} />
                               </span>
                               <span className="mt-1 flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
@@ -1215,13 +1113,12 @@ function SubscriptionForm({ mode, users, user, proxies, nodes, accesses, onClose
                 {!groups.length && <p className="p-4 text-center text-sm text-muted-foreground">目前没有可授权的代理节点</p>}
                 {!!groups.length && query && !groups.some((group) => group.proxies.some((proxy) => [proxy.name, displayProxyName(proxy, group.node), group.node?.name, proxy.address].some((value) => value?.toLocaleLowerCase().includes(query)))) && <p className="p-4 text-center text-sm text-muted-foreground">没有匹配的代理节点</p>}
               </div>
-            </Field>
 
-            <div className="border-t pt-3 text-sm text-muted-foreground">已选择 {selectedIds.size} 个节点（勾选即启用授权）</div>
           </div>
-          <DialogFooter className="shrink-0 border-t px-6 py-4">
-            <Button type="button" variant="ghost" onClick={onClose}>取消</Button>
-            <Button type="submit" disabled={saving || !selectedUser || !selectedIds.size || !proxies.length}>{saving ? "保存中..." : creating ? "创建订阅" : "保存修改"}</Button>
+          <DialogFooter className="shrink-0 items-center border-t px-6 py-4">
+            <span className="mr-auto text-sm text-muted-foreground">已选择 {selectedProxies.length} 个节点</span>
+            <Button type="button" variant="ghost" disabled={saving} onClick={onClose}>取消</Button>
+            <Button type="submit" disabled={saving || !ready}>{saving ? "保存中..." : "保存修改"}</Button>
           </DialogFooter>
         </form>
       </DialogContent>
@@ -1235,14 +1132,14 @@ function SubscriptionProxyRows({ accesses, proxies, nodes }: { accesses: UserPro
   const nodeOrder = new Map(nodes.map((node, index) => [node.id, index]))
   const ordered = accesses.slice().sort((a, b) => (nodeOrder.get(a.proxy.node_id) ?? Number.MAX_SAFE_INTEGER) - (nodeOrder.get(b.proxy.node_id) ?? Number.MAX_SAFE_INTEGER) || a.proxy.id - b.proxy.id)
   return (
-    <Table className="table-fixed">
+    <Table className="table-auto min-w-max">
       <TableHeader className="bg-muted/30"><TableRow>
-        <TableHead className="w-[17%] max-md:w-[20%] px-1 md:px-3">节点</TableHead>
-        <TableHead className="w-[14%] max-md:w-[22%] px-1 md:px-3">名称</TableHead>
-        <TableHead className="hidden w-[16%] px-3 md:table-cell">协议</TableHead>
-        <TableHead className="hidden w-[20%] px-3 md:table-cell">地址</TableHead>
-        <TableHead className="w-[8%] max-md:w-[12%] px-1 md:px-3">端口</TableHead>
-        <TableHead className="w-[25%] max-md:w-[46%] px-1 md:px-3">SNI</TableHead>
+        <TableHead className="px-3">节点</TableHead>
+        <TableHead className="px-3">名称</TableHead>
+        <TableHead className="px-3">协议</TableHead>
+        <TableHead className="px-3">地址</TableHead>
+        <TableHead className="px-3">端口</TableHead>
+        <TableHead className="w-28 max-w-28 px-3">SNI</TableHead>
       </TableRow></TableHeader>
       <TableBody>
         {ordered.map((access) => {
@@ -1250,12 +1147,20 @@ function SubscriptionProxyRows({ accesses, proxies, nodes }: { accesses: UserPro
           const node = nodeById.get(access.proxy.node_id)
           const reality = proxy?.config.reality
           return <TableRow key={access.proxy.id} className="h-12">
-            <TableCell className="max-w-0 px-1 md:px-3"><span className="block truncate font-medium" title={node?.name}>{node?.name ?? `节点 ${access.proxy.node_id}`}</span></TableCell>
-            <TableCell className="max-w-0 px-1 md:px-3"><span className="block truncate font-medium" title={displayProxyName(access.proxy, node)}>{displayProxyName(access.proxy, node)}</span></TableCell>
-            <TableCell className="hidden px-3 md:table-cell"><ProxyProtocolBadge protocol={access.proxy.protocol} /></TableCell>
-            <TableCell className="hidden max-w-0 px-3 md:table-cell"><div className="flex min-w-0 items-center gap-2"><ProxyAddressTypeBadge addressType={access.proxy.address_type} /><span className="truncate text-sm" title={access.proxy.address}>{access.proxy.address}</span></div></TableCell>
-            <TableCell className="tnum px-1 text-xs md:px-3 md:text-sm">{access.proxy.port}</TableCell>
-            <TableCell className="max-w-0 px-1 md:px-3"><span className="block truncate text-sm" title={reality ? `${reality.server_name}:${reality.server_port}` : ""}>{reality ? `${reality.server_name}:${reality.server_port}` : "—"}</span></TableCell>
+            <TableCell className="px-3">
+              <div>
+                <div className="flex w-max flex-nowrap items-center gap-2 whitespace-nowrap font-medium">
+                  <span>{node?.name ?? `节点 ${access.proxy.node_id}`}</span>
+                  {node?.country && <Badge variant="outline" title={node.country_pin ? "手动指定" : undefined} className="font-normal text-muted-foreground">{node.country}</Badge>}
+                </div>
+                {node?.group && <div className="text-xs text-muted-foreground">{node.group}</div>}
+              </div>
+            </TableCell>
+            <TableCell className="px-3 font-medium">{displayProxyName(access.proxy, node)}</TableCell>
+            <TableCell className="px-3"><ProxyProtocolBadge protocol={access.proxy.protocol} /></TableCell>
+            <TableCell className="max-w-64 px-3"><div className="flex min-w-0 items-center gap-2"><ProxyAddressTypeBadge addressType={access.proxy.address_type} /><span className="max-w-48 truncate text-sm" title={access.proxy.address}>{access.proxy.address}</span></div></TableCell>
+            <TableCell className="tnum px-3 text-sm">{access.proxy.port}</TableCell>
+            <TableCell className="w-28 max-w-28 px-3"><TooltipText text={reality?.server_name ?? "—"} className="w-24 max-w-24 text-sm" /></TableCell>
           </TableRow>
         })}
         {!ordered.length && <TableRow><TableCell colSpan={6} className="py-5 text-center text-sm text-muted-foreground">该用户还没有代理节点授权</TableCell></TableRow>}
@@ -1274,14 +1179,13 @@ function SubscriptionsPage({ nodes, search }: { nodes: Node[]; search: string })
   const [status, setStatus] = useState("all")
   const [accessCache, setAccessCache] = useState<Map<number, UserProxyAuthorization[]>>(() => new Map())
   const accessCacheRef = useRef(accessCache)
+  const accessGeneration = useRef(0)
+  const editOpening = useRef(false)
   const accessRequests = useRef(new Map<number, Promise<UserProxyAuthorization[]>>())
   const [accessLoading, setAccessLoading] = useState<Set<number>>(() => new Set())
   const [accessErrors, setAccessErrors] = useState<Record<number, string>>({})
   const [expandedUsers, setExpandedUsers] = useState<Set<number>>(() => requestedUserId === null ? new Set() : new Set([requestedUserId]))
-  const [creating, setCreating] = useState(false)
   const [editing, setEditing] = useState<User | null>(null)
-  const [deleting, setDeleting] = useState<User | null>(null)
-  const [removing, setRemoving] = useState(false)
   const [updatingUserId, setUpdatingUserId] = useState<number | null>(null)
   const currentUsers = usersResult?.revision === usersRevision
   const users = currentUsers ? usersResult?.items ?? null : null
@@ -1298,7 +1202,6 @@ function SubscriptionsPage({ nodes, search }: { nodes: Node[]; search: string })
     return accesses ? subscriptionSearchMatches(user.username, accesses, proxyById, nodeById, needle) : false
   })
   const matchingAccessesPending = Boolean(needle && users?.some((user) => !accessCache.has(user.id) && !accessErrors[user.id]))
-  const eligibleUsers = (users ?? []).filter((user) => user.proxy_count === 0)
 
   const loadAccesses = useCallback((userId: number): Promise<UserProxyAuthorization[]> => {
     const cached = accessCacheRef.current.get(userId)
@@ -1307,16 +1210,20 @@ function SubscriptionsPage({ nodes, search }: { nodes: Node[]; search: string })
     if (pending) return pending
     setAccessLoading((current) => new Set(current).add(userId))
     setAccessErrors((current) => { const next = { ...current }; delete next[userId]; return next })
+    const generation = accessGeneration.current
     const request = listUserAuthorizations(userId).then((items) => {
+      if (generation !== accessGeneration.current) return items
       const next = new Map(accessCacheRef.current)
       next.set(userId, items)
       accessCacheRef.current = next
       setAccessCache(next)
       return items
     }).catch((error: Error) => {
+      if (generation !== accessGeneration.current) throw error
       setAccessErrors((current) => ({ ...current, [userId]: error.message }))
       throw error
     }).finally(() => {
+      if (generation !== accessGeneration.current) return
       accessRequests.current.delete(userId)
       setAccessLoading((current) => { const next = new Set(current); next.delete(userId); return next })
     })
@@ -1340,6 +1247,13 @@ function SubscriptionsPage({ nodes, search }: { nodes: Node[]; search: string })
     }
   }, [requestedUserId, users, loadAccesses])
 
+  useEffect(() => {
+    if (!users) return
+    for (const id of expandedUsers) {
+      if (users.some((user) => user.id === id)) void loadAccesses(id).catch(() => {})
+    }
+  }, [users, expandedUsers, loadAccesses])
+
   const userKey = (users ?? []).map((user) => user.id).join(",")
   useEffect(() => {
     if (!needle || !userKey) return
@@ -1351,7 +1265,7 @@ function SubscriptionsPage({ nodes, search }: { nodes: Node[]; search: string })
       }
     })()
     return () => { active = false }
-  }, [needle, userKey, loadAccesses])
+  }, [needle, userKey, usersRevision, loadAccesses])
 
   async function toggleExpanded(user: User) {
     const isOpen = expandedUsers.has(user.id)
@@ -1360,20 +1274,15 @@ function SubscriptionsPage({ nodes, search }: { nodes: Node[]; search: string })
   }
 
   async function openEdit(user: User) {
+    if (editOpening.current || proxiesLoading || proxyError || proxies === null) return
+    editOpening.current = true
     try {
       await loadAccesses(user.id)
       setEditing(user)
     } catch (error) {
       toast.error(`加载 ${user.username} 的授权失败：${(error as Error).message}`)
-    }
-  }
-
-  async function openDelete(user: User) {
-    try {
-      await loadAccesses(user.id)
-      setDeleting(user)
-    } catch (error) {
-      toast.error(`加载 ${user.username} 的授权失败：${(error as Error).message}`)
+    } finally {
+      editOpening.current = false
     }
   }
 
@@ -1390,20 +1299,10 @@ function SubscriptionsPage({ nodes, search }: { nodes: Node[]; search: string })
     }
   }
 
-  async function removeSubscription() {
-    if (!deleting) return
-    setRemoving(true)
-    try {
-      const result = await replaceUserAuthorizations(deleting.id, [])
-      notifySync(`已删除 ${deleting.username} 的订阅授权关系`, result.sync)
-      setDeleting(null)
-      reloadAll()
-    } finally {
-      setRemoving(false)
-    }
-  }
-
   function reloadAll() {
+    accessGeneration.current += 1
+    accessRequests.current.clear()
+    setAccessLoading(new Set())
     accessCacheRef.current = new Map()
     setAccessCache(new Map())
     setAccessErrors({})
@@ -1422,16 +1321,14 @@ function SubscriptionsPage({ nodes, search }: { nodes: Node[]; search: string })
               <SelectContent position="popper"><SelectItem value="all">全部状态</SelectItem><SelectItem value="enabled">已启用</SelectItem><SelectItem value="disabled">已禁用</SelectItem></SelectContent>
             </Select>
           </div>
-          <Button disabled={usersLoading || !eligibleUsers.length || proxiesLoading || !proxies?.length || !!usersError || !!proxyError} onClick={() => setCreating(true)}><Plus /> 新增订阅</Button>
         </div>
 
         <Card className="overflow-x-auto p-0">
           <Table>
             <TableHeader className="bg-muted/50"><TableRow>
-              <TableHead className="w-[38%] px-3">用户</TableHead>
-              <TableHead className="w-[34%] px-3">授权节点</TableHead>
-              <TableHead className="w-[12%] px-3 text-center">状态</TableHead>
-              <TableHead className="w-[16%] px-3 text-right">操作</TableHead>
+              <TableHead className="w-[45%] px-3">用户</TableHead>
+              <TableHead className="w-[40%] px-3">授权节点</TableHead>
+              <TableHead className="w-[15%] px-3 text-center">状态</TableHead>
             </TableRow></TableHeader>
             <TableBody>
               {visibleUsers.map((user) => {
@@ -1448,40 +1345,25 @@ function SubscriptionsPage({ nodes, search }: { nodes: Node[]; search: string })
                         <span className="truncate font-semibold">{user.username}</span>
                       </div>
                     </TableCell>
-                    <TableCell className="px-3 text-sm">{user.proxy_count} 个节点</TableCell>
+                    <TableCell className="px-3 text-sm"><Button type="button" variant="link" className="h-auto p-0" disabled={accessLoading.has(user.id) || proxiesLoading || !!proxyError} aria-label={`编辑 ${user.username} 的授权节点`} onClick={() => void openEdit(user)}>{accessLoading.has(user.id) ? "加载中..." : `${user.proxy_count} 个节点`}</Button></TableCell>
                     <TableCell className="px-3 text-center"><Switch checked={user.enabled} disabled={updatingUserId !== null} onCheckedChange={(enabled) => void setUserEnabled(user, enabled)} aria-label={`${user.enabled ? "停用" : "启用"}${user.username}的订阅授权`} /></TableCell>
-                    <TableCell className="whitespace-nowrap px-3 text-right">
-                      <div className="flex items-center justify-end gap-1">
-                        <Tooltip><TooltipTrigger asChild><Button type="button" variant="ghost" size="icon" aria-label="编辑订阅" onClick={() => void openEdit(user)}><Pencil /></Button></TooltipTrigger><TooltipContent>编辑订阅</TooltipContent></Tooltip>
-                        <Tooltip><TooltipTrigger asChild><Button type="button" variant="ghost" size="icon" disabled={!user.proxy_count} className="text-destructive hover:text-destructive" aria-label="删除订阅授权" onClick={() => void openDelete(user)}><Trash2 /></Button></TooltipTrigger><TooltipContent>{user.proxy_count ? "删除订阅授权" : "当前没有授权节点"}</TooltipContent></Tooltip>
-                      </div>
-                    </TableCell>
                   </TableRow>
-                  {isExpanded && <TableRow className="bg-muted/20 hover:bg-muted/20"><TableCell colSpan={4} className="p-0">
+                  {isExpanded && <TableRow className="bg-muted/20 hover:bg-muted/20"><TableCell colSpan={3} className="p-0">
                     {rowError ? <div className="p-4 text-sm text-destructive" role="alert">加载授权节点失败：{rowError}<Button variant="link" className="h-auto p-0 pl-2" onClick={() => void loadAccesses(user.id).catch(() => {})}>重试</Button></div>
                       : accessLoading.has(user.id) || proxiesLoading ? <div className="p-4"><Skeleton className="h-9 w-full" /></div>
                       : accesses ? <SubscriptionProxyRows accesses={accesses} proxies={proxies ?? []} nodes={nodes} /> : null}
                   </TableCell></TableRow>}
                 </Fragment>
               })}
-              {!usersLoading && !usersError && !visibleUsers.length && <TableRow><TableCell colSpan={4} className="py-10 text-center text-sm text-muted-foreground">{matchingAccessesPending ? "正在搜索授权节点..." : users?.length ? "没有匹配的用户或节点" : "还没有用户"}</TableCell></TableRow>}
-              {usersLoading && <TableRow><TableCell colSpan={4} className="p-4"><Skeleton className="h-10 w-full" /></TableCell></TableRow>}
-              {usersError && <TableRow><TableCell colSpan={4} className="py-8 text-center text-sm text-destructive"><div role="alert">加载用户失败：{usersError}</div><Button variant="outline" size="sm" className="mt-3" onClick={() => setUsersRevision((value) => value + 1)}>重试</Button></TableCell></TableRow>}
-              {proxyError && <TableRow><TableCell colSpan={4} className="py-8 text-center text-sm text-destructive"><div role="alert">加载代理失败：{proxyError}</div><Button variant="outline" size="sm" className="mt-3" onClick={reloadProxies}>重试</Button></TableCell></TableRow>}
+              {!usersLoading && !usersError && !visibleUsers.length && <TableRow><TableCell colSpan={3} className="py-10 text-center text-sm text-muted-foreground">{matchingAccessesPending ? "正在搜索授权节点..." : users?.length ? "没有匹配的用户或节点" : "还没有用户"}</TableCell></TableRow>}
+              {usersLoading && <TableRow><TableCell colSpan={3} className="p-4"><Skeleton className="h-10 w-full" /></TableCell></TableRow>}
+              {usersError && <TableRow><TableCell colSpan={3} className="py-8 text-center text-sm text-destructive"><div role="alert">加载用户失败：{usersError}</div><Button variant="outline" size="sm" className="mt-3" onClick={() => setUsersRevision((value) => value + 1)}>重试</Button></TableCell></TableRow>}
+              {proxyError && <TableRow><TableCell colSpan={3} className="py-8 text-center text-sm text-destructive"><div role="alert">加载代理失败：{proxyError}</div><Button variant="outline" size="sm" className="mt-3" onClick={reloadProxies}>重试</Button></TableCell></TableRow>}
             </TableBody>
           </Table>
         </Card>
 
-        {creating && <SubscriptionForm key="create" mode="create" users={users ?? []} user={null} proxies={proxies ?? []} nodes={nodes} accesses={[]} onClose={() => setCreating(false)} onSaved={reloadAll} />}
-        {editing && <SubscriptionForm key={`edit-${editing.id}`} mode="edit" users={users ?? []} user={editing} proxies={proxies ?? []} nodes={nodes} accesses={accessCache.get(editing.id) ?? []} onClose={() => setEditing(null)} onSaved={reloadAll} />}
-        {deleting && <ConfirmDialog
-          title={`确认删除 ${deleting.username} 的订阅？`}
-          description={`删除后该用户将失去当前全部 ${deleting.proxy_count} 个代理节点授权，但不会删除用户、代理节点或服务器。`}
-          confirmLabel="删除"
-          busy={removing}
-          onClose={() => setDeleting(null)}
-          onConfirm={() => void removeSubscription()}
-        />}
+        {editing && <SubscriptionForm key={`edit-${editing.id}`} user={editing} proxies={proxies ?? []} nodes={nodes} accesses={accessCache.get(editing.id) ?? []} ready={!proxiesLoading && !proxyError && proxies !== null} onClose={() => setEditing(null)} onSaved={reloadAll} />}
       </div>
     </TooltipProvider>
   )
@@ -1491,8 +1373,8 @@ export function ProxiesPage({ nodes }: { nodes: Node[] }) {
   return <ProxyPage nodes={nodes} />
 }
 
-export function UsersResourcePage({ go }: { go: Go }) {
-  return <UsersPage go={go} />
+export function UsersResourcePage() {
+  return <UsersPage />
 }
 
 export function SubscriptionsResourcePage({ nodes, search }: { nodes: Node[]; search: string; go: Go }) {
