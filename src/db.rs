@@ -182,6 +182,7 @@ CREATE TABLE IF NOT EXISTS users (
   device_limit INTEGER NOT NULL DEFAULT 0,
   traffic_reset_day INTEGER NOT NULL DEFAULT 0,
   traffic_reset_period TEXT NOT NULL DEFAULT '',
+  auto_authorize_new_proxies INTEGER NOT NULL DEFAULT 0,
   enabled INTEGER NOT NULL DEFAULT 1,
   expires_at INTEGER,
   created_at INTEGER NOT NULL,
@@ -253,7 +254,7 @@ CREATE TABLE IF NOT EXISTS proxy_node_traffic (
 /// cannot: `open` runs `SCHEMA` before migrating, and on an older file the
 /// column is not there yet. `an_upgraded_release_matches_a_fresh_database`
 /// holds every migration to these rules, starting from v1.0.0's schema.
-const SCHEMA_VERSION: i64 = 19;
+const SCHEMA_VERSION: i64 = 20;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -514,6 +515,10 @@ fn migrate_to_18(conn: &Connection) -> Result<()> {
 ///
 /// Restoring a backup also arrives here: the copy carries its own version and
 /// requires the same migrations a restart would have run.
+fn migrate_to_20(conn: &Connection) -> Result<()> {
+    add_column(conn, "users", "auto_authorize_new_proxies INTEGER NOT NULL DEFAULT 0")
+}
+
 fn migrate(conn: &Connection, from: i64) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
     if from < 1 {
@@ -568,6 +573,7 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     ] {
         add_column(&tx, "users", column)?;
     }
+    migrate_to_20(&tx)?;
     seed_default_admin(&tx)?;
     if from < 18 {
         migrate_to_18(&tx)?;
@@ -698,6 +704,7 @@ pub struct User {
     pub created_at: i64,
     pub updated_at: i64,
     pub proxy_count: i64,
+    pub auto_authorize_new_proxies: bool,
     pub traffic_limit: i64,
     pub device_limit: i64,
     pub traffic_reset_day: u32,
@@ -1276,28 +1283,36 @@ impl Db {
         draft: &ProxyDraft,
     ) -> Result<std::result::Result<i64, ProxyWriteIssue>> {
         let config = serde_json::to_string(&draft.config)?;
-        let conn = self.conn();
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
         let node_exists: bool =
-            conn.query_row("SELECT EXISTS(SELECT 1 FROM node WHERE id=?1)", [node_id], |r| r.get(0))?;
+            tx.query_row("SELECT EXISTS(SELECT 1 FROM node WHERE id=?1)", [node_id], |r| r.get(0))?;
         if !node_exists {
             return Ok(Err(ProxyWriteIssue::NodeNotFound));
         }
-        if proxy_name_in_use(&conn, node_id, draft, None)? {
+        if proxy_name_in_use(&tx, node_id, draft, None)? {
             return Ok(Err(ProxyWriteIssue::NameConflict));
         }
-        if draft.enabled && port_in_use(&conn, node_id, draft.port, None)? {
+        if draft.enabled && port_in_use(&tx, node_id, draft.port, None)? {
             return Ok(Err(ProxyWriteIssue::PortConflict));
         }
         let now = Utc::now().timestamp();
         let sort: i64 =
-            conn.query_row("SELECT COALESCE(MAX(sort),-1)+1 FROM proxies", [], |row| row.get(0))?;
-        conn.execute(
+            tx.query_row("SELECT COALESCE(MAX(sort),-1)+1 FROM proxies", [], |row| row.get(0))?;
+        tx.execute(
             "INSERT INTO proxies(node_id,name,include_node_name,protocol,address_type,address,port,enabled,flow,config,created_at,updated_at,sort)
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?11,?12)",
             params![node_id, draft.name, draft.include_node_name, draft.protocol, draft.address_type,
                     draft.address, draft.port, draft.enabled, draft.flow.as_deref().unwrap_or(""), config, now, sort],
         )?;
-        Ok(Ok(conn.last_insert_rowid()))
+        let id = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO user_proxy_authorizations(user_id,proxy_id,enabled,auth,created_at,updated_at)
+             SELECT id,?1,1,'{}',?2,?2 FROM users WHERE auto_authorize_new_proxies=1",
+            params![id, now],
+        )?;
+        tx.commit()?;
+        Ok(Ok(id))
     }
 
     pub fn update_proxy(
@@ -1355,7 +1370,7 @@ impl Db {
         let mut stmt = conn.prepare(
             "SELECT u.id,u.username,u.uuid,u.enabled,u.expires_at,u.created_at,u.updated_at,
                     (SELECT COUNT(*) FROM user_proxy_authorizations a WHERE a.user_id=u.id),
-                    u.traffic_limit,u.device_limit,u.traffic_reset_day
+                    u.traffic_limit,u.device_limit,u.traffic_reset_day,u.auto_authorize_new_proxies
              FROM users u WHERE (?1 IS NULL OR u.enabled=?1) ORDER BY u.id",
         )?;
         let rows = stmt.query_map([enabled], row_to_user)?.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1370,7 +1385,7 @@ impl Db {
             .query_row(
                 "SELECT u.id,u.username,u.uuid,u.enabled,u.expires_at,u.created_at,u.updated_at,
                         (SELECT COUNT(*) FROM user_proxy_authorizations a WHERE a.user_id=u.id),
-                    u.traffic_limit,u.device_limit,u.traffic_reset_day
+                    u.traffic_limit,u.device_limit,u.traffic_reset_day,u.auto_authorize_new_proxies
                  FROM users u WHERE u.id=?1",
                 [id],
                 row_to_user,
@@ -2134,6 +2149,15 @@ impl Db {
         user_id: i64,
         items: &[(i64, bool)],
     ) -> Result<std::result::Result<Vec<i64>, AuthorizationWriteIssue>> {
+        self.replace_authorizations_with_policy(user_id, items, None)
+    }
+
+    pub fn replace_authorizations_with_policy(
+        &self,
+        user_id: i64,
+        items: &[(i64, bool)],
+        auto_authorize_new_proxies: Option<bool>,
+    ) -> Result<std::result::Result<Vec<i64>, AuthorizationWriteIssue>> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let user_exists: bool =
@@ -2168,6 +2192,12 @@ impl Db {
                 "INSERT INTO user_proxy_authorizations(user_id,proxy_id,enabled,auth,created_at,updated_at)
                  VALUES(?1,?2,?3,'{}',?4,?4)",
                 params![user_id, proxy_id, enabled, now],
+            )?;
+        }
+        if let Some(enabled) = auto_authorize_new_proxies {
+            tx.execute(
+                "UPDATE users SET auto_authorize_new_proxies=?2,updated_at=?3 WHERE id=?1",
+                params![user_id, enabled, now],
             )?;
         }
         tx.commit()?;
@@ -3651,6 +3681,7 @@ fn row_to_user(r: &rusqlite::Row<'_>) -> rusqlite::Result<User> {
         traffic_limit: r.get(8)?,
         device_limit: r.get(9)?,
         traffic_reset_day: r.get(10)?,
+        auto_authorize_new_proxies: r.get(11)?,
     })
 }
 
@@ -4302,6 +4333,62 @@ mod tests {
 
     fn access_draft(flow: &str) -> AuthorizationDraft {
         AuthorizationDraft { enabled: true, auth: Some(serde_json::json!({"flow":flow})) }
+    }
+
+    #[test]
+    fn auto_authorize_new_proxies_is_opt_in_and_preserves_manual_selection() {
+        let db = db();
+        let uid = db.create_user(&user_draft("auto-proxies")).unwrap().unwrap();
+        let other = db.create_user(&user_draft("manual-proxies")).unwrap().unwrap();
+        let nid = node(&db, 1);
+        let old = db.create_proxy(nid, &proxy_draft("existing", false)).unwrap().unwrap();
+        assert!(!db.user(uid).unwrap().unwrap().auto_authorize_new_proxies);
+        db.replace_authorizations_with_policy(uid, &[], Some(true)).unwrap().unwrap();
+        assert_eq!(db.user(uid).unwrap().unwrap().proxy_count, 0);
+        db.conn().execute("UPDATE users SET enabled=0,expires_at=1 WHERE id=?1", [uid]).unwrap();
+        let added = db.create_proxy(nid, &proxy_draft("new-disabled", false)).unwrap().unwrap();
+        let accesses = db.authorizations_for_user(uid).unwrap().unwrap();
+        assert_eq!(accesses.len(), 1);
+        assert_eq!(accesses[0].proxy.id, added);
+        assert!(accesses[0].access.enabled);
+        assert_eq!(db.user(other).unwrap().unwrap().proxy_count, 0);
+        db.replace_authorizations(uid, &[(old, true), (added, true)]).unwrap().unwrap();
+        assert!(db.user(uid).unwrap().unwrap().auto_authorize_new_proxies, "legacy writes preserve the policy");
+        assert!(matches!(db.replace_authorizations_with_policy(uid, &[(i64::MAX, true)], Some(false)).unwrap(),
+            Err(AuthorizationWriteIssue::ProxyNotFound)));
+        assert!(db.user(uid).unwrap().unwrap().auto_authorize_new_proxies);
+        assert_eq!(db.user(uid).unwrap().unwrap().proxy_count, 2);
+        db.replace_authorizations_with_policy(uid, &[(old, true), (added, true)], Some(false)).unwrap().unwrap();
+        db.create_proxy(nid, &proxy_draft("after-off", false)).unwrap().unwrap();
+        assert_eq!(db.user(uid).unwrap().unwrap().proxy_count, 2);
+    }
+
+    #[test]
+    fn auto_authorize_new_proxies_rolls_back_proxy_and_policy_on_failure() {
+        let db = db();
+        let uid = db.create_user(&user_draft("atomic-auto")).unwrap().unwrap();
+        let nid = node(&db, 1);
+        let old = db.create_proxy(nid, &proxy_draft("atomic-existing", false)).unwrap().unwrap();
+        db.replace_authorizations_with_policy(uid, &[(old, true)], Some(true)).unwrap().unwrap();
+        db.conn().execute_batch("CREATE TRIGGER fail_auto BEFORE INSERT ON user_proxy_authorizations
+            BEGIN SELECT RAISE(ABORT, 'test failure'); END;").unwrap();
+        assert!(db.create_proxy(nid, &proxy_draft("atomic-new", false)).is_err());
+        assert_eq!(db.all_proxies().unwrap().len(), 1);
+        assert!(db.replace_authorizations_with_policy(uid, &[(old, true)], Some(false)).is_err());
+        assert_eq!(db.user(uid).unwrap().unwrap().proxy_count, 1);
+        assert!(db.user(uid).unwrap().unwrap().auto_authorize_new_proxies);
+    }
+
+    #[test]
+    fn version_twenty_auto_authorize_migration_defaults_off_and_is_repeatable() {
+        let db = db();
+        let uid = db.create_user(&user_draft("migrated-auto")).unwrap().unwrap();
+        db.conn().execute_batch("ALTER TABLE users DROP COLUMN auto_authorize_new_proxies; PRAGMA user_version=19;").unwrap();
+        migrate(&db.conn(), 19).unwrap();
+        assert!(!db.user(uid).unwrap().unwrap().auto_authorize_new_proxies);
+        db.replace_authorizations_with_policy(uid, &[], Some(true)).unwrap().unwrap();
+        migrate(&db.conn(), 19).unwrap();
+        assert!(db.user(uid).unwrap().unwrap().auto_authorize_new_proxies);
     }
 
     #[test]

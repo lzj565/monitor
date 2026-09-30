@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react"
-import { ArrowDown, ArrowUp, CalendarDays, Copy, FileCode, Gauge, Link, LogOut, Moon, RefreshCw, Sun } from "lucide-react"
+import { ArrowDown, ArrowUp, CalendarDays, Copy, FileCode, Gauge, Link, LogOut, Moon, RefreshCw, Shield, Sun } from "lucide-react"
 import { toast } from "sonner"
 
 import { Button } from "@/components/ui/button"
@@ -51,11 +51,12 @@ function absoluteLink(path: string): string {
   return new URL(path, location.origin).toString()
 }
 
-export function UserCenter({ siteName, dark, toggleTheme, signOut }: {
+export function UserCenter({ siteName, dark, toggleTheme, signOut, returnToAdmin }: {
   siteName: string
   dark: boolean
   toggleTheme: () => void
   signOut: () => void
+  returnToAdmin?: () => void
 }) {
   const [profile, setProfile] = useState<UserProfile | null>(null)
   const [proxies, setProxies] = useState<PortalProxy[] | null>(null)
@@ -132,6 +133,7 @@ export function UserCenter({ siteName, dark, toggleTheme, signOut }: {
           <a href="/" className="font-semibold transition-opacity hover:opacity-70">{siteName || "Monitor"}</a>
           <span className="text-xs text-muted-foreground">用户中心</span>
           <div className="flex-1" />
+          {returnToAdmin && <Button variant="ghost" size="sm" onClick={returnToAdmin}><Shield /> 返回后台</Button>}
           <Button variant="ghost" size="icon" onClick={toggleTheme} title="切换主题">
             {dark ? <Sun /> : <Moon />}
           </Button>

@@ -970,6 +970,7 @@ function SubscriptionForm({ user, proxies, nodes, accesses, ready, onClose, onSa
   onClose: () => void
   onSaved: () => void
 }) {
+  const [autoAuthorizeNewProxies, setAutoAuthorizeNewProxies] = useState(user.auto_authorize_new_proxies)
   const [proxyQuery, setProxyQuery] = useState("")
   const [expandedGroups, setExpandedGroups] = useState<Record<number, boolean>>({})
   const [selectedIds, setSelectedIds] = useState<Set<number>>(() => new Set(accesses.filter((item) => item.access.enabled).map((item) => item.proxy.id)))
@@ -1002,6 +1003,7 @@ function SubscriptionForm({ user, proxies, nodes, accesses, ready, onClose, onSa
       const result = await replaceUserAuthorizations(
         user.id,
         selectedProxies.map((proxy) => ({ proxy_id: proxy.id, enabled: true })),
+        autoAuthorizeNewProxies,
       )
       notifySync("订阅已更新", result.sync)
       onClose()
@@ -1022,7 +1024,15 @@ function SubscriptionForm({ user, proxies, nodes, accesses, ready, onClose, onSa
             <DialogTitle className="pr-6 [overflow-wrap:anywhere]">{`编辑订阅：${user.username}`}</DialogTitle>
             <DialogDescription>勾选需要授权的节点；取消全部勾选并保存可清空授权。</DialogDescription>
           </DialogHeader>
-          <div className="shrink-0 px-6 pb-4">
+          <div className="shrink-0 space-y-3 px-6 pb-4">
+            <div className="flex flex-wrap items-center gap-2">
+              <Button type="button" variant="outline" size="sm" disabled={!ready || saving} onClick={() => setSelectedIds(new Set(proxies.map((proxy) => proxy.id)))}>全选代理</Button>
+              <Button type="button" variant="outline" size="sm" disabled={!ready || saving} onClick={() => setSelectedIds(new Set())}>清空选择</Button>
+            </div>
+            <label className="flex items-center justify-between gap-3">
+              <span className="space-y-1"><span className="block text-sm font-medium">自动授权新增代理</span><span className="block text-xs text-muted-foreground">保存后新建的代理会自动加入此用户订阅，已有代理仍按勾选结果授权。</span></span>
+              <Switch checked={autoAuthorizeNewProxies} disabled={!ready || saving} onCheckedChange={setAutoAuthorizeNewProxies} />
+            </label>
             <AdminSearchInput value={proxyQuery} onChange={setProxyQuery} placeholder="搜索节点名称或所属服务器..." className="w-full" />
           </div>
           <div className="min-h-0 flex-1 overflow-y-auto px-6 pb-4">

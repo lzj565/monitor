@@ -1,6 +1,6 @@
 import { AdminResourcesProvider } from "@/components/AdminResources"
 import { useCallback, useEffect, useState, useSyncExternalStore } from "react"
-import { ExternalLink, LogOut, Moon, Sun } from "lucide-react"
+import { ExternalLink, LogOut, Moon, Sun, UserRound } from "lucide-react"
 import { Toaster } from "sonner"
 
 import { Admin } from "@/components/Admin"
@@ -116,7 +116,6 @@ export default function App() {
   // so nothing else detects this. /api/me already handles signing out.
   useEffect(() => {
     if (me?.principal === "user" && !path.startsWith("/user/")) go("/user/center")
-    else if (me?.principal === "admin" && path.startsWith("/user/")) go("/admin/nodes")
     else if (me?.principal === "admin" && admin === false) loadMe()
   }, [admin, me?.principal, path, go, loadMe])
 
@@ -144,14 +143,19 @@ export default function App() {
     )
   }
 
-  if ((me.principal === "user" && !path.startsWith("/user/"))
-    || (me.principal === "admin" && path.startsWith("/user/"))) {
+  if (me.principal === "user" && !path.startsWith("/user/")) {
     return <div className="grid min-h-svh place-items-center p-6"><Skeleton className="h-24 w-full max-w-xl" /></div>
   }
 
-  if (me.principal === "user") {
+  if (me.principal === "user" || path.startsWith("/user/")) {
     return <>
-      <UserCenter siteName={me.site_name} dark={dark} toggleTheme={toggleTheme} signOut={() => { location.href = "/user" }} />
+      <UserCenter
+        siteName={me.site_name}
+        dark={dark}
+        toggleTheme={toggleTheme}
+        signOut={() => { location.href = me.principal === "admin" ? "/admin" : "/user" }}
+        returnToAdmin={me.principal === "admin" ? () => go("/admin/nodes") : undefined}
+      />
       <Toaster position="top-center" theme={dark ? "dark" : "light"} />
     </>
   }
@@ -177,6 +181,9 @@ export default function App() {
             </a>
             <span className="text-xs text-muted-foreground">后台</span>
             <div className="flex-1" />
+            <Button variant="ghost" size="sm" onClick={() => go("/user/center")}>
+              <UserRound /> 用户中心
+            </Button>
             {/* The status page is a separate app, so this is a navigation. */}
             <Button variant="ghost" size="sm" asChild>
               <a href="/">

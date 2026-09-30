@@ -43,6 +43,7 @@ export type User = {
   updated_at: number
   /** Number of assigned proxy records, including disabled authorizations. */
   proxy_count: number
+  auto_authorize_new_proxies: boolean
   traffic_limit: number
   device_limit: number
   traffic_reset_day: number
@@ -261,9 +262,9 @@ export function deleteUserProxy(userId: number, proxyId: number) {
   return api<{ sync: SyncReport }>(`/users/${userId}/proxies/${proxyId}`, { method: "DELETE" })
 }
 
-export function replaceUserAuthorizations(userId: number, items: Array<{ proxy_id: number; enabled: boolean }>) {
+export function replaceUserAuthorizations(userId: number, items: Array<{ proxy_id: number; enabled: boolean }>, autoAuthorizeNewProxies?: boolean) {
   return api<{ sync: SyncReport }>(`/users/${userId}/proxies`, {
     method: "PUT",
-    body: JSON.stringify({ items }),
+    body: JSON.stringify({ items, auto_authorize_new_proxies: autoAuthorizeNewProxies }),
   })
 }

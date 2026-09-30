@@ -58,8 +58,8 @@ impl FromRequestParts<Shared> for ApiAdmin {
     }
 }
 
-/// The current user's id, resolved only from a live user principal in the
-/// session cookie. User endpoints never accept an id from the request path.
+/// The current user's id, resolved from a live session. Administrators access
+/// only the built-in `admin` user; endpoints never accept a user id from the caller.
 pub struct UserAuth(pub i64);
 
 impl FromRequestParts<Shared> for UserAuth {
@@ -71,11 +71,13 @@ impl FromRequestParts<Shared> for UserAuth {
                 return Ok(UserAuth(id));
             }
             if app.db.admin_session_valid(&hash) {
-                return Err(api_error(
-                    StatusCode::FORBIDDEN,
-                    "FORBIDDEN",
-                    "管理员身份不能代替普通用户访问用户中心",
-                ));
+                return match app.db.user_login_record("admin") {
+                    Ok(Some(user)) => Ok(UserAuth(user.id)),
+                    Ok(None) => {
+                        Err(api_error(StatusCode::NOT_FOUND, "USER_NOT_FOUND", "内置 admin 用户不存在"))
+                    }
+                    Err(error) => Err(api_internal(error)),
+                };
             }
         }
         Err(api_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "登录已失效，请重新登录"))
@@ -732,6 +734,7 @@ pub async fn get_user_authorizations(
 #[serde(deny_unknown_fields)]
 pub struct ReplaceAuthorizationsRequest {
     pub items: Vec<ReplaceAuthorizationItem>,
+    pub auto_authorize_new_proxies: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -773,9 +776,10 @@ pub async fn replace_user_authorizations(
             );
         }
     }
-    match app.db.replace_authorizations(
+    match app.db.replace_authorizations_with_policy(
         user_id,
         &request.items.iter().map(|item| (item.proxy_id, item.enabled)).collect::<Vec<_>>(),
+        request.auto_authorize_new_proxies,
     ) {
         Ok(Ok(node_ids)) => {
             let sync = sync_generated_nodes(&app, node_ids);
@@ -3205,6 +3209,146 @@ mod tests {
 
     fn app() -> App {
         App::for_test(Db::open(":memory:").unwrap())
+    }
+
+    async fn portal_auth(app: &Shared, token: Option<&str>) -> Result<UserAuth, Response> {
+        let mut request = axum::http::Request::builder();
+        if let Some(token) = token {
+            request = request.header(header::COOKIE, format!("monitor_session={token}"));
+        }
+        let (mut parts, _) = request.body(()).unwrap().into_parts();
+        UserAuth::from_request_parts(&mut parts, app).await
+    }
+
+    async fn portal_json(response: Response) -> Value {
+        assert_eq!(response.status(), StatusCode::OK);
+        serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn portal_admin_session_maps_only_to_builtin_admin() {
+        let app = std::sync::Arc::new(app());
+        let now = Utc::now().timestamp();
+        let admin_id = app.db.user_login_record("admin").unwrap().unwrap().id;
+        let draft = crate::db::UserDraft {
+            username: "alice".into(),
+            password_hash: Some("hash".into()),
+            enabled: true,
+            expires_at: None,
+            traffic_limit: None,
+            device_limit: None,
+            traffic_reset_day: None,
+        };
+        let alice = app.db.create_user(&draft).unwrap().unwrap();
+        app.db.create_session(&sha256("admin-token"), now + 60).unwrap();
+        app.db.create_user_session(&sha256("alice-token"), now + 60, alice).unwrap();
+        app.db.create_session(&sha256("expired-token"), now - 1).unwrap();
+        for token in [None, Some("unknown"), Some("expired-token")] {
+            assert_eq!(portal_auth(&app, token).await.err().unwrap().status(), StatusCode::UNAUTHORIZED);
+        }
+        assert_eq!(portal_auth(&app, Some("alice-token")).await.unwrap().0, alice);
+        assert_eq!(portal_auth(&app, Some("admin-token")).await.unwrap().0, admin_id);
+        let profile = portal_json(
+            user_me(portal_auth(&app, Some("admin-token")).await.unwrap(), State(app.clone())).await,
+        )
+        .await;
+        assert_eq!(profile["username"], "admin");
+        assert_eq!(profile["id"], admin_id);
+
+        let node_id = node(&app, "portal", false);
+        let mut proxies = Vec::new();
+        for port in [24401, 24402] {
+            let proxy = app
+                .db
+                .create_proxy(
+                    node_id,
+                    &crate::db::ProxyDraft {
+                        name: format!("p-{port}"),
+                        include_node_name: false,
+                        protocol: "vless".into(),
+                        address_type: "ipv4".into(),
+                        address: "127.0.0.1".into(),
+                        port,
+                        enabled: true,
+                        flow: None,
+                        config: json!({}),
+                    },
+                )
+                .unwrap()
+                .unwrap();
+            for id in [admin_id, alice] {
+                app.db
+                    .put_authorization(id, proxy, &AuthorizationDraft { enabled: true, auth: None })
+                    .unwrap()
+                    .unwrap();
+            }
+            proxies.push(proxy);
+        }
+        let reversed = vec![proxies[1], proxies[0]];
+        assert_eq!(
+            reorder_user_proxies(
+                portal_auth(&app, Some("admin-token")).await.unwrap(),
+                State(app.clone()),
+                Json(Order { ids: reversed.clone() }),
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        let ids = |id| {
+            app.db.active_user_portal_proxies(id, now).unwrap().into_iter().map(|p| p.id).collect::<Vec<_>>()
+        };
+        assert_eq!(ids(admin_id), reversed);
+        assert_eq!(ids(alice), proxies);
+        let alice_token = app.db.user_subscription_token(alice).unwrap();
+        let admin_token = app.db.user_subscription_token(admin_id).unwrap();
+        assert_eq!(
+            rotate_user_subscription_token(
+                portal_auth(&app, Some("admin-token")).await.unwrap(),
+                State(app.clone()),
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        assert_ne!(app.db.user_subscription_token(admin_id).unwrap(), admin_token);
+        assert_eq!(app.db.user_subscription_token(alice).unwrap(), alice_token);
+        assert_eq!(
+            app.db.session_principal(&sha256("admin-token")),
+            Some(crate::db::SessionPrincipal::Admin)
+        );
+
+        for (enabled, expires_at) in [(false, None), (true, Some(now - 1))] {
+            app.db
+                .update_user(
+                    admin_id,
+                    &crate::db::UserDraft {
+                        username: "admin".into(),
+                        enabled,
+                        expires_at,
+                        password_hash: None,
+                        traffic_limit: None,
+                        device_limit: None,
+                        traffic_reset_day: None,
+                    },
+                )
+                .unwrap()
+                .unwrap();
+            let auth = portal_auth(&app, Some("admin-token")).await.unwrap();
+            let profile = portal_json(user_me(auth, State(app.clone())).await).await;
+            assert_eq!(profile["enabled"], enabled);
+            let list = portal_json(user_proxies(UserAuth(admin_id), State(app.clone())).await).await;
+            assert_eq!(list["items"], json!([]));
+            assert!(app.db.active_user_subscription(admin_id, now).unwrap().is_none());
+            let links =
+                portal_json(user_subscription_links(UserAuth(admin_id), State(app.clone())).await).await;
+            assert!(links["clash"].as_str().unwrap().starts_with("/api/subscriptions/"));
+            assert_eq!(
+                rotate_user_subscription_token(UserAuth(admin_id), State(app.clone())).await.status(),
+                StatusCode::NO_CONTENT
+            );
+        }
     }
 
     #[test]
