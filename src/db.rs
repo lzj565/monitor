@@ -1236,6 +1236,16 @@ impl Db {
 
     // ---- desired proxy and user state ----
 
+    pub fn all_proxies(&self) -> Result<Vec<Proxy>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id,node_id,name,include_node_name,protocol,address_type,address,port,enabled,flow,config,created_at,updated_at,sort
+             FROM proxies ORDER BY sort,id",
+        )?;
+        let rows = stmt.query_map([], row_to_proxy)?.collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
     pub fn proxies_for_node(&self, node_id: i64) -> Result<Vec<Proxy>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
@@ -4085,6 +4095,26 @@ mod tests {
         drop(db);
         let db = Db::open(&scratch.0).unwrap();
         assert_eq!(db.stats().unwrap()["rows"]["user_proxy_order"], 0);
+    }
+
+    #[test]
+    fn all_proxies_include_disabled_rows_across_nodes_in_global_order() {
+        let db = db();
+        assert!(db.all_proxies().unwrap().is_empty());
+        let first_node = node(&db, 1);
+        let second_node = node(&db, 2);
+        let a = db.create_proxy(first_node, &proxy_draft("all-a", false)).unwrap().unwrap();
+        let b = db.create_proxy(second_node, &proxy_draft("all-b", false)).unwrap().unwrap();
+        let c = db.create_proxy(first_node, &proxy_draft("all-c", false)).unwrap().unwrap();
+        db.reorder_proxies(&[c, b, a]).unwrap();
+        let items = db.all_proxies().unwrap();
+        assert_eq!(items.iter().map(|p| (p.id, p.node_id)).collect::<Vec<_>>(),
+            vec![(c, first_node), (b, second_node), (a, first_node)]);
+        assert!(items.iter().all(|p| !p.enabled));
+        db.conn().execute("UPDATE proxies SET sort=0", []).unwrap();
+        assert_eq!(db.all_proxies().unwrap().iter().map(|p| p.id).collect::<Vec<_>>(), vec![a, b, c]);
+        db.delete_proxy(b).unwrap();
+        assert_eq!(db.all_proxies().unwrap().iter().map(|p| p.id).collect::<Vec<_>>(), vec![a, c]);
     }
 
     #[test]

@@ -1,3 +1,4 @@
+import { useAdminResources, useSharedProxies, useSharedUsers } from "@/components/AdminResources"
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { AlertTriangle, ChevronDown, ChevronRight, ChevronUp, Copy, Eye, EyeOff, Pencil, Plus, RefreshCw, Settings2, Trash2 } from "lucide-react"
 import { toast } from "sonner"
@@ -30,11 +31,9 @@ import {
   createUser,
   deleteProxy,
   deleteUser,
-  listAllProxies,
   getProxyUserTraffic,
   listProxyUserTraffic,
   listUserAuthorizations,
-  listUsers,
   replaceUserAuthorizations,
   resolveSync,
   resetUserUuid,
@@ -104,31 +103,15 @@ function Field({ label, hint, children, className = "" }: {
   )
 }
 
-function useAllProxies(nodes: Node[]) {
-  // Nodes stream every two seconds. Depend only on their IDs so ordinary metric
-  // frames do not fan out into another request per node.
-  const nodeKey = nodes.map((node) => node.id).join(",")
-  const nodeIds = useMemo(() => nodeKey ? nodeKey.split(",").map(Number) : [], [nodeKey])
-  const [revision, setRevision] = useState(0)
-  const [result, setResult] = useState<{ nodeKey: string; revision: number; items: Proxy[] | null; error: string } | null>(null)
-
-  useEffect(() => {
-    let active = true
-    listAllProxies(nodeIds).then((next) => {
-      if (active) setResult({ nodeKey, revision, items: next, error: "" })
-    }).catch((e: Error) => {
-      if (active) setResult({ nodeKey, revision, items: null, error: e.message })
-    })
-    return () => { active = false }
-  }, [nodeKey, nodeIds, revision])
-
-  const current = result?.nodeKey === nodeKey && result.revision === revision
-  return {
-    items: current ? result.items : null,
-    error: current ? result.error : "",
-    loading: !current,
-    reload: () => setRevision((value) => value + 1),
-  }
+function useAllProxies() {
+  const result = useSharedProxies()
+  const { proxies, users, invalidateAuthorizations } = useAdminResources()
+  const reload = useCallback(() => {
+    invalidateAuthorizations()
+    void proxies.refresh(true)
+    void users.refresh(true)
+  }, [proxies, users, invalidateAuthorizations])
+  return { ...result, reload }
 }
 
 function StatusFilter({ value, onChange, labels }: {
@@ -421,7 +404,7 @@ function ProxyForm({ proxy, nodes, onClose, onSaved }: {
 }
 
 function ProxyPage({ nodes }: { nodes: Node[] }) {
-  const { items, error, loading, reload } = useAllProxies(nodes)
+  const { items, error, loading, reload } = useAllProxies()
   const [query, setQuery] = useState("")
   const [nodeFilter, setNodeFilter] = useState("all")
   const [statusFilter, setStatusFilter] = useState("all")
@@ -823,8 +806,8 @@ function UserTrafficDialog({ user, onClose, onChanged }: { user: User; onClose: 
 }
 
 function UsersPage() {
-  const [revision, setRevision] = useState(0)
-  const [result, setResult] = useState<{ revision: number; items: User[] | null; error: string } | null>(null)
+  const { items, error, loading, reload: refreshUsers } = useSharedUsers()
+  const resources = useAdminResources()
   const [trafficResult, setTrafficResult] = useState<{ revision: number; items: Awaited<ReturnType<typeof listProxyUserTraffic>> | null; error: string } | null>(null)
   const [query, setQuery] = useState("")
   const [status, setStatus] = useState("all")
@@ -838,16 +821,6 @@ function UsersPage() {
 
   useEffect(() => {
     let active = true
-    listUsers().then((users) => {
-      if (active) setResult({ revision, items: users, error: "" })
-    }).catch((e: Error) => {
-      if (active) setResult({ revision, items: null, error: e.message })
-    })
-    return () => { active = false }
-  }, [revision])
-
-  useEffect(() => {
-    let active = true
     const load = () => listProxyUserTraffic().then((items) => {
       if (active) setTrafficResult({ revision: trafficRevision, items, error: "" })
     }).catch((e: Error) => {
@@ -858,10 +831,6 @@ function UsersPage() {
     return () => { active = false; window.clearInterval(timer) }
   }, [trafficRevision])
 
-  const current = result?.revision === revision
-  const items = current ? result.items : null
-  const error = current ? result.error : ""
-  const loading = !current
   const trafficItems = trafficResult?.revision === trafficRevision ? trafficResult.items : null
   const trafficError = trafficResult?.revision === trafficRevision ? trafficResult.error : ""
   const trafficByUser = new Map((trafficItems ?? []).map((item) => [item.user_id, item]))
@@ -904,7 +873,8 @@ function UsersPage() {
   }
 
   function reload() {
-    setRevision((value) => value + 1)
+    resources.invalidateAuthorizations()
+    void resources.users.refresh(true)
     setTrafficRevision((value) => value + 1)
   }
 
@@ -971,7 +941,7 @@ function UsersPage() {
             {loading && <TableRow><TableCell colSpan={7} className="p-4"><Skeleton className="h-10 w-full" /></TableCell></TableRow>}
             {error && <TableRow><TableCell colSpan={7} className="py-8 text-center text-sm text-destructive">
               <div role="alert">加载用户失败：{error}</div>
-              <Button variant="outline" size="sm" className="mt-3" onClick={reload}>重试</Button>
+              <Button variant="outline" size="sm" className="mt-3" onClick={refreshUsers}>重试</Button>
             </TableCell></TableRow>}
           </TableBody>
         </Table>
@@ -1170,11 +1140,12 @@ function SubscriptionProxyRows({ accesses, proxies, nodes }: { accesses: UserPro
 }
 
 function SubscriptionsPage({ nodes, search }: { nodes: Node[]; search: string }) {
-  const { items: proxies, error: proxyError, loading: proxiesLoading, reload: reloadProxies } = useAllProxies(nodes)
+  const { items: proxies, error: proxyError, loading: proxiesLoading, reload: reloadProxies } = useAllProxies()
   const requestedId = new URLSearchParams(search).get("user_id")
   const requestedUserId = requestedId && /^\d+$/.test(requestedId) ? Number(requestedId) : null
-  const [usersRevision, setUsersRevision] = useState(0)
-  const [usersResult, setUsersResult] = useState<{ revision: number; items: User[] | null; error: string } | null>(null)
+  const { items: users, error: usersError, loading: usersLoading, reload: refreshUsers } = useSharedUsers()
+  const resources = useAdminResources()
+  const usersRevision = resources.authorizationRevision
   const [userQuery, setUserQuery] = useState("")
   const [status, setStatus] = useState("all")
   const [accessCache, setAccessCache] = useState<Map<number, UserProxyAuthorization[]>>(() => new Map())
@@ -1187,10 +1158,6 @@ function SubscriptionsPage({ nodes, search }: { nodes: Node[]; search: string })
   const [expandedUsers, setExpandedUsers] = useState<Set<number>>(() => requestedUserId === null ? new Set() : new Set([requestedUserId]))
   const [editing, setEditing] = useState<User | null>(null)
   const [updatingUserId, setUpdatingUserId] = useState<number | null>(null)
-  const currentUsers = usersResult?.revision === usersRevision
-  const users = currentUsers ? usersResult?.items ?? null : null
-  const usersLoading = !currentUsers
-  const usersError = currentUsers ? usersResult?.error ?? "" : ""
   const needle = userQuery.trim().toLocaleLowerCase()
   const proxyById = useMemo(() => new Map((proxies ?? []).map((proxy) => [proxy.id, proxy])), [proxies])
   const nodeById = useMemo(() => new Map(nodes.map((node) => [node.id, node])), [nodes])
@@ -1232,27 +1199,33 @@ function SubscriptionsPage({ nodes, search }: { nodes: Node[]; search: string })
   }, [])
 
   useEffect(() => {
-    let active = true
-    listUsers().then((items) => {
-      if (active) setUsersResult({ revision: usersRevision, items, error: "" })
-    }).catch((error: Error) => {
-      if (active) setUsersResult({ revision: usersRevision, items: null, error: error.message })
-    })
-    return () => { active = false }
+    const requests = accessRequests.current
+    accessGeneration.current += 1
+    requests.clear()
+    // Synchronize the page-local authorization cache with shared invalidations.
+    // eslint-disable-next-line react/set-state-in-effect
+    setAccessLoading(new Set())
+    accessCacheRef.current = new Map()
+    setAccessCache(new Map())
+    setAccessErrors({})
+    return () => {
+      accessGeneration.current += 1
+      requests.clear()
+    }
   }, [usersRevision])
 
   useEffect(() => {
     if (requestedUserId !== null && users?.some((user) => user.id === requestedUserId)) {
       void loadAccesses(requestedUserId).catch(() => {})
     }
-  }, [requestedUserId, users, loadAccesses])
+  }, [requestedUserId, users, usersRevision, loadAccesses])
 
   useEffect(() => {
     if (!users) return
     for (const id of expandedUsers) {
       if (users.some((user) => user.id === id)) void loadAccesses(id).catch(() => {})
     }
-  }, [users, expandedUsers, loadAccesses])
+  }, [users, expandedUsers, usersRevision, loadAccesses])
 
   const userKey = (users ?? []).map((user) => user.id).join(",")
   useEffect(() => {
@@ -1291,7 +1264,7 @@ function SubscriptionsPage({ nodes, search }: { nodes: Node[]; search: string })
     try {
       const result = await updateUser(user.id, { username: user.username, enabled, expires_at: user.expires_at })
       notifySync(enabled ? "订阅授权已启用" : "订阅授权已停用", result.sync)
-      setUsersRevision((value) => value + 1)
+      void resources.users.refresh(true)
     } catch (error) {
       toast.error((error as Error).message)
     } finally {
@@ -1300,14 +1273,8 @@ function SubscriptionsPage({ nodes, search }: { nodes: Node[]; search: string })
   }
 
   function reloadAll() {
-    accessGeneration.current += 1
-    accessRequests.current.clear()
-    setAccessLoading(new Set())
-    accessCacheRef.current = new Map()
-    setAccessCache(new Map())
-    setAccessErrors({})
-    setUsersRevision((value) => value + 1)
-    reloadProxies()
+    resources.invalidateAuthorizations()
+    void resources.users.refresh(true)
   }
 
   return (
@@ -1357,7 +1324,7 @@ function SubscriptionsPage({ nodes, search }: { nodes: Node[]; search: string })
               })}
               {!usersLoading && !usersError && !visibleUsers.length && <TableRow><TableCell colSpan={3} className="py-10 text-center text-sm text-muted-foreground">{matchingAccessesPending ? "正在搜索授权节点..." : users?.length ? "没有匹配的用户或节点" : "还没有用户"}</TableCell></TableRow>}
               {usersLoading && <TableRow><TableCell colSpan={3} className="p-4"><Skeleton className="h-10 w-full" /></TableCell></TableRow>}
-              {usersError && <TableRow><TableCell colSpan={3} className="py-8 text-center text-sm text-destructive"><div role="alert">加载用户失败：{usersError}</div><Button variant="outline" size="sm" className="mt-3" onClick={() => setUsersRevision((value) => value + 1)}>重试</Button></TableCell></TableRow>}
+              {usersError && <TableRow><TableCell colSpan={3} className="py-8 text-center text-sm text-destructive"><div role="alert">加载用户失败：{usersError}</div><Button variant="outline" size="sm" className="mt-3" onClick={refreshUsers}>重试</Button></TableCell></TableRow>}
               {proxyError && <TableRow><TableCell colSpan={3} className="py-8 text-center text-sm text-destructive"><div role="alert">加载代理失败：{proxyError}</div><Button variant="outline" size="sm" className="mt-3" onClick={reloadProxies}>重试</Button></TableCell></TableRow>}
             </TableBody>
           </Table>

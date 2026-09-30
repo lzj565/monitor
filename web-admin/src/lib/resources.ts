@@ -170,9 +170,9 @@ export async function listProxiesForNode(nodeId: number): Promise<Proxy[]> {
   return response.items
 }
 
-export async function listAllProxies(nodeIds: number[]): Promise<Proxy[]> {
-  const responses = await Promise.all(nodeIds.map(listProxiesForNode))
-  return responses.flat().sort((a, b) => a.sort - b.sort || a.id - b.id)
+export async function listAllProxies(): Promise<Proxy[]> {
+  const response = await api<{ items: Proxy[] }>("/proxies")
+  return response.items
 }
 
 export function reorderProxies(ids: number[]) {

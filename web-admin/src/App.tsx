@@ -1,3 +1,4 @@
+import { AdminResourcesProvider } from "@/components/AdminResources"
 import { useCallback, useEffect, useState, useSyncExternalStore } from "react"
 import { ExternalLink, LogOut, Moon, Sun } from "lucide-react"
 import { Toaster } from "sonner"
@@ -196,21 +197,23 @@ export default function App() {
         {!nodes ? (
           <Skeleton className="h-64" />
         ) : (
-          <Admin
-            path={path}
-            search={search}
-            go={go}
-            nodes={sorted}
-            refresh={refresh}
-            // The hub's own public URL rather than this browser's address: the
-            // panel is frequently reached over a loopback port behind a proxy,
-            // while the install command and OAuth callback need the real one.
-            site={me.site || location.origin}
-            // Why this page cannot add nodes, measured by the rule the hub applies
-            // to the `Origin` it receives; empty when it can.
-            refusal={provisionRefusal(location.origin, me.site)}
-            reloadMe={loadMe}
-          />
+          <AdminResourcesProvider nodes={sorted}>
+            <Admin
+              path={path}
+              search={search}
+              go={go}
+              nodes={sorted}
+              refresh={refresh}
+              // The hub's own public URL rather than this browser's address: the
+              // panel is frequently reached over a loopback port behind a proxy,
+              // while the install command and OAuth callback need the real one.
+              site={me.site || location.origin}
+              // Why this page cannot add nodes, measured by the rule the hub applies
+              // to the `Origin` it receives; empty when it can.
+              refusal={provisionRefusal(location.origin, me.site)}
+              reloadMe={loadMe}
+            />
+          </AdminResourcesProvider>
         )}
       </main>
 

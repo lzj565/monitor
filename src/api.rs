@@ -487,6 +487,13 @@ pub async fn reset_proxy_node_traffic(
     }
 }
 
+pub async fn list_all_proxies(_: ApiAdmin, State(app): State<Shared>) -> Response {
+    match app.db.all_proxies() {
+        Ok(items) => Json(json!({"items":items})).into_response(),
+        Err(error) => api_internal(error),
+    }
+}
+
 pub async fn list_proxies(_: ApiAdmin, State(app): State<Shared>, Path(node_id): Path<i64>) -> Response {
     if let Err(response) = api_node_exists(&app, node_id) {
         return response;

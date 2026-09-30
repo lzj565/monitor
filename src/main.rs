@@ -607,6 +607,7 @@ async fn main() -> Result<()> {
         // and response mapper scoped so legacy endpoints retain text errors.
         .merge(
             Router::new()
+                .route("/api/proxies", get(api::list_all_proxies))
                 .route("/api/proxies/order", put(api::reorder_proxies))
                 .route("/api/nodes/{id}/proxies", get(api::list_proxies).post(api::create_proxy))
                 .route("/api/nodes/{id}/singbox/config/preview", get(api::preview_singbox_config))
