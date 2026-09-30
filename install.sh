@@ -9,17 +9,17 @@ set -eu
 # entered through `su` without `-` may omit from PATH.
 PATH="$PATH:/usr/sbin:/sbin"
 
-# Binary and token in one directory, the same one the hub uses, giving a node a
-# single path to inspect and a single path to remove.
+# Keep binaries, component configuration, and hub data under one root.
 ROOT="/opt/monitor"
 BIN="$ROOT/monitor-agent"
-ENV_FILE="$ROOT/agent.env"
+CONFIG_DIR="$ROOT/config"
+ENV_FILE="$CONFIG_DIR/agent.env"
 UNIT_FILE="/etc/systemd/system/monitor-agent.service"
 RC_FILE="/etc/init.d/monitor-agent"
 LOG_FILE="/var/log/monitor-agent.log"
 SING_BOX_VERSION="1.14.1"
 SING_BOX="$ROOT/sing-box"
-SING_BOX_CONFIG="/etc/sing-box/config.json"
+SING_BOX_CONFIG="$CONFIG_DIR/sb.json"
 SING_BOX_UNIT="/etc/systemd/system/sing-box.service"
 SING_BOX_RC="/etc/init.d/sing-box"
 SING_BOX_UNIT_BACKUP="$ROOT/sing-box.service.before-monitor"
@@ -383,13 +383,33 @@ if [ -n "$UNINSTALL" ]; then
 	rc-service monitor-agent stop 2>/dev/null || true
 	rc-update del monitor-agent default >/dev/null 2>&1 || true
 	systemctl disable --now monitor-agent 2>/dev/null || true
-	rm -f "$UNIT_FILE" "$RC_FILE" "$LOG_FILE" "$BIN" "$BIN.old" "$ENV_FILE"
+	rm -f "$UNIT_FILE" "$RC_FILE" "$LOG_FILE" "$BIN" "$BIN.old" "$ENV_FILE" "$ROOT/agent.env"
 	systemctl daemon-reload 2>/dev/null || true
 	userdel monitor-agent 2>/dev/null || deluser monitor-agent 2>/dev/null || true
-	rmdir "$ROOT" 2>/dev/null || true
+	rmdir "$CONFIG_DIR" "$ROOT" 2>/dev/null || true
 	success "monitor-agent 已卸载"
 	exit 0
 fi
+
+# BEGIN config migration
+# Copy legacy files without overwriting the new configuration or removing the
+# originals: an interrupted upgrade can still run the previous service.
+migrate_config() {
+	install -d -m 0755 "$CONFIG_DIR"
+	if [ ! -e "$ENV_FILE" ] && [ ! -L "$ENV_FILE" ] && [ -f "$ROOT/agent.env" ]; then
+		install -m 0600 "$ROOT/agent.env" "$ENV_FILE"
+	fi
+	if [ ! -e "$SING_BOX_CONFIG" ] && [ ! -L "$SING_BOX_CONFIG" ]; then
+		for legacy in "$ROOT/sb.json" /etc/sing-box/config.json; do
+			[ -f "$legacy" ] || continue
+			install -m 0600 "$legacy" "$SING_BOX_CONFIG"
+			info "已复制 $legacy 到 ${SING_BOX_CONFIG}，原文件保留"
+			break
+		done
+	fi
+}
+# END config migration
+migrate_config
 
 # Reinstalls the binary with what this machine already holds. It is the one
 # command a whole fleet can be upgraded with, because it carries no credential
@@ -677,11 +697,11 @@ printf '%s\n' "$VERSION_OUTPUT" | grep -F "with_v2ray_api" >/dev/null || {
 }
 SING_BOX_VER=$(printf '%s\n' "$VERSION_OUTPUT" | sed -n '1s/.*version[[:space:]]*//p')
 
-install -d -m 0755 "$ROOT" /etc/sing-box /etc/monitor-agent
+install -d -m 0755 "$ROOT" "$CONFIG_DIR"
 
 if [ ! -e "$SING_BOX_CONFIG" ] && [ ! -L "$SING_BOX_CONFIG" ]; then
 	(
-		umask 022
+		umask 077
 		cat >"$SING_BOX_CONFIG" <<CONFIG
 {
   "outbounds": [
@@ -753,7 +773,7 @@ else
 description="sing-box service"
 ${SINGBOX_OPENRC_MEMORY_ENV}
 command="$SING_BOX"
-command_args="run -c /etc/sing-box/config.json"
+command_args="run -c $SING_BOX_CONFIG"
 supervisor="supervise-daemon"
 respawn_delay=3
 
@@ -862,7 +882,7 @@ ExecStart=$BIN --interval $INTERVAL${INSECURE:+ --insecure}
 Restart=always
 RestartSec=5
 ProtectSystem=full
-ReadWritePaths=/etc/sing-box /etc/monitor-agent
+ReadWritePaths=$CONFIG_DIR
 ProtectHome=yes
 NoNewPrivileges=yes
 RestrictSUIDSGID=yes

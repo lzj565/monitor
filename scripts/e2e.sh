@@ -57,7 +57,7 @@ reported() {
 
 # Exercises the command channel against the real Agent and real init service.
 # Opt in only on an isolated Linux host prepared with the Agent's fixed paths:
-# /opt/monitor/sing-box and /etc/sing-box/config.json. Applying the unchanged
+# /opt/monitor/sing-box and /opt/monitor/config/sb.json. Applying the unchanged
 # config still replaces it atomically and restarts sing-box, so this is not part
 # of the default CI smoke test.
 run_singbox_command() {
@@ -114,7 +114,7 @@ sleep 2
 if [ "${E2E_SINGBOX:-0}" = 1 ]; then
 	[ "$(id -u)" = 0 ] || fail "E2E_SINGBOX=1 requires root to run the Agent's real service actions"
 	[ -x /opt/monitor/sing-box ] || fail "E2E_SINGBOX=1 requires /opt/monitor/sing-box"
-	[ -f /etc/sing-box/config.json ] || fail "E2E_SINGBOX=1 requires /etc/sing-box/config.json"
+	[ -f /opt/monitor/config/sb.json ] || fail "E2E_SINGBOX=1 requires /opt/monitor/config/sb.json"
 	NODE_ID=$(curl -fsS -H "Cookie: $COOKIE" "$URL/api/nodes" | jq -er '.nodes[0].id')
 	run_singbox_command "singbox.status" '{}'
 	printf '%s' "$COMMAND_RESULT" | jq -e '.result.installed == true and .result.running == true' >/dev/null ||

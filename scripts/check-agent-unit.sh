@@ -1,6 +1,6 @@
 #!/bin/sh
 # Guard the systemd unit emitted by install.sh against losing the write access
-# needed by sing-box config replacement and the agent config directory.
+# needed by sing-box config replacement and the agent environment file.
 set -eu
 
 INSTALLER=${1:-install.sh}
@@ -14,7 +14,7 @@ printf '%s\n' "$UNIT" | grep -Fx 'ProtectSystem=full' >/dev/null || {
 	echo "monitor-agent unit must retain ProtectSystem=full" >&2
 	exit 1
 }
-[ "$(printf '%s\n' "$UNIT" | grep -Fxc 'ReadWritePaths=/etc/sing-box /etc/monitor-agent')" -eq 1 ] || {
+[ "$(printf '%s\n' "$UNIT" | grep -Fxc 'ReadWritePaths=$CONFIG_DIR')" -eq 1 ] || {
 	echo "monitor-agent unit must have one combined ReadWritePaths entry" >&2
 	exit 1
 }

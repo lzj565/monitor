@@ -31,3 +31,18 @@ curl -fsSL https://github.com/lzj565/monitor/releases/latest/download/install-hu
 ```
 agent (Linux)  ──WebSocket / JSON-RPC 2.0──▶  hub (axum + SQLite)  ──▶  后台 + 状态页
 ```
+
+## 配置目录
+
+程序保留在 `/opt/monitor/`，配置集中在 `/opt/monitor/config/`：
+
+| 文件 | 用途 |
+|---|---|
+| `agent.env` | hub 地址、Token、网卡和 sing-box API 端口 |
+| `sb.json` | sing-box 配置 |
+
+hub 数据库和主题仍在 `/opt/monitor/data/`；hub 启动参数仍在 systemd 服务中。后续接入 mieru 时，其配置也放入 `config/`。
+
+安装器会在新配置不存在时复制旧配置：`agent.env` 从 `/opt/monitor/agent.env` 迁移；`sb.json` 优先从 `/opt/monitor/sb.json`，其次从 `/etc/sing-box/config.json` 迁移。原文件保留，新位置已有的配置优先。迁移及新建配置使用 `0600` 权限。服务名保持不变，仍接管现有 sing-box 服务。
+
+agent 卸载会删除新旧位置的 `agent.env`，保留 sing-box 配置。升级需配套使用更新后的 agent 二进制与安装器。
