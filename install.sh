@@ -42,6 +42,13 @@ UNINSTALL=""
 UPGRADE=""
 SINGBOX_API_PORT=""
 API_PORT_HELPER=""
+REALM_OPTION=""
+REALM="$ROOT/realm"
+REALM_CONFIG="$CONFIG_DIR/realm.json"
+REALM_UNIT="/etc/systemd/system/monitor-realm.service"
+REALM_RC="/etc/init.d/monitor-realm"
+REALM_STATE="unchanged"
+REALM_STAGED=""
 
 if [ -t 1 ] && [ -z "${NO_COLOR+x}" ]; then
 	C_BLUE=$(printf '\033[1;34m')
@@ -72,6 +79,7 @@ cleanup() {
 	[ -z "$TMP_DIR" ] || rm -rf "$TMP_DIR"
 	[ -z "$AGENT_CANDIDATE" ] || rm -f "$AGENT_CANDIDATE"
 	[ -z "$SING_BOX_STAGED" ] || rm -f "$SING_BOX_STAGED"
+	[ -z "$REALM_STAGED" ] || rm -f "$REALM_STAGED"
 }
 on_exit() {
 	status=$?
@@ -311,6 +319,20 @@ print_summary() {
 		detail "Service" "$SERVICE_NAME"
 	fi
 	detail "Status" "$SING_BOX_STATUS"
+	printf '\nRealm\n'
+	detail "Status" "$REALM_STATE"
+	if [ "$REALM_STATE" != unchanged ]; then
+		detail "Config" "$REALM_CONFIG"
+		if [ "$REALM_STATE" != uninstalled ]; then
+			detail "Version" "2.9.6"
+			detail "Binary" "$REALM"
+			if [ "$INIT" = systemd ]; then
+				detail "配置后启动" "systemctl enable --now monitor-realm"
+			else
+				detail "配置后启动" "rc-update add monitor-realm default; rc-service monitor-realm start"
+			fi
+		fi
+	fi
 	printf '\n常用命令\n'
 	if [ "$INIT" = systemd ]; then
 		detail "Agent 状态" "systemctl status monitor-agent"
@@ -327,6 +349,122 @@ print_summary() {
 	fi
 	detail "配置检查" "$SING_BOX check -c $SING_BOX_CONFIG"
 }
+
+# BEGIN Realm helpers
+realm_owned() {
+	[ ! -L "$REALM" ] && [ ! -L "$REALM_UNIT" ] && [ ! -L "$REALM_RC" ] &&
+	[ -f "$ROOT/.realm-managed" ] &&
+		{ [ ! -e "$REALM_UNIT" ] || grep -F '# Managed by monitor installer' "$REALM_UNIT" >/dev/null; } &&
+		{ [ ! -e "$REALM_RC" ] || grep -F '# Managed by monitor installer' "$REALM_RC" >/dev/null; }
+}
+
+manage_realm() {
+	[ -n "$REALM_OPTION" ] || return 0
+	CURRENT_STEP="Realm"
+	if ! realm_owned; then
+		if [ -e "$REALM" ] || [ -L "$REALM" ] || [ -e "$REALM_UNIT" ] || [ -L "$REALM_UNIT" ] || [ -e "$REALM_RC" ] || [ -L "$REALM_RC" ]; then
+			fail "Realm paths are not owned by monitor; refusing to overwrite or remove them"
+		fi
+		if [ "$REALM_OPTION" = --no-realm ]; then REALM_STATE=uninstalled; return 0; fi
+	fi
+	REALM_RUNNING=""
+	if [ "$INIT" = systemd ]; then
+		systemctl is-active --quiet monitor-realm && REALM_RUNNING=1
+	else
+		rc-service monitor-realm status >/dev/null 2>&1 && REALM_RUNNING=1
+	fi
+	if [ "$REALM_OPTION" = --no-realm ]; then
+		if [ "$INIT" = systemd ]; then
+			if [ -e "$REALM_UNIT" ]; then
+				systemctl disable --now monitor-realm || fail "cannot stop/disable Realm"
+			fi
+		else
+			if [ -e "$REALM_RC" ]; then
+				rc-service monitor-realm stop || fail "cannot stop Realm"
+				if rc-update show default | grep -E '^[[:space:]]*monitor-realm[[:space:]]' >/dev/null; then
+					rc-update del monitor-realm default || fail "cannot disable Realm"
+				fi
+			fi
+		fi
+		rm -f "$REALM" "$REALM_UNIT" "$REALM_RC" "$ROOT/.realm-managed"
+		[ "$INIT" != systemd ] || systemctl daemon-reload
+		REALM_STATE=uninstalled
+		return 0
+	fi
+	case "$ARCH" in
+	x86_64) REALM_SHA=b1cc335547bea8bb2a88178bef12ec7f2363e36200e7ea1d4e1e67627929bf65 ;;
+	aarch64) REALM_SHA=f4c0318dd86854da483dcb7645b4f39cae2cc3f91c688fef969d53220b949488 ;;
+	*) fail "unsupported Realm architecture" ;;
+	esac
+	mkdir -p "$TMP_DIR/realm"
+	REALM_ARCHIVE="$TMP_DIR/realm.tar.gz"
+	TRIES=0
+	while :; do
+		CODE=$(curl -sSL --max-time 300 -w '%{http_code}' "${SERVER%/}/realm/$ARCH" -o "$REALM_ARCHIVE") || fail "Realm download failed"
+		[ "$CODE" = 503 ] && [ "$TRIES" -lt 5 ] || break
+		TRIES=$((TRIES + 1))
+		sleep 5
+	done
+	[ "$CODE" = 200 ] || fail "Realm download failed (HTTP $CODE)"
+	[ "$(sha256sum "$REALM_ARCHIVE" | awk '{print $1}')" = "$REALM_SHA" ] || fail "Realm checksum mismatch"
+	# Extract only the executable, never arbitrary archive paths.
+	REALM_MEMBER=$(tar -tzf "$REALM_ARCHIVE" | sed -n '/^\(\.\/\)\{0,1\}realm$/p' | head -n 1)
+	[ -n "$REALM_MEMBER" ] || fail "Realm archive has no executable"
+	tar -xOzf "$REALM_ARCHIVE" "$REALM_MEMBER" > "$TMP_DIR/realm/realm" || fail "cannot extract Realm"
+	chmod 0755 "$TMP_DIR/realm/realm"
+	"$TMP_DIR/realm/realm" --version | grep -F '2.9.6' >/dev/null || fail "Realm version check failed"
+	if [ ! -e "$REALM_CONFIG" ] && [ ! -L "$REALM_CONFIG" ]; then
+		printf '%s\n' '{"log":{"level":"warn"},"endpoints":[]}' > "$REALM_CONFIG"
+		chmod 0600 "$REALM_CONFIG"
+	fi
+	REALM_STAGED="$ROOT/.realm.$$"
+	install -m 0755 "$TMP_DIR/realm/realm" "$REALM_STAGED"
+	mv -f "$REALM_STAGED" "$REALM"
+	REALM_STAGED=""
+	touch "$ROOT/.realm-managed"
+	if [ "$INIT" = systemd ]; then
+		cat > "$REALM_UNIT" <<UNIT
+# Managed by monitor installer
+[Unit]
+Description=Monitor Realm relay
+After=network-online.target
+Wants=network-online.target
+[Service]
+ExecStart=$REALM -c $REALM_CONFIG
+Restart=on-failure
+RestartSec=5
+[Install]
+WantedBy=multi-user.target
+UNIT
+		chmod 0644 "$REALM_UNIT"
+		systemctl daemon-reload
+	else
+		cat > "$REALM_RC" <<RC
+#!/sbin/openrc-run
+# Managed by monitor installer
+command="$REALM"
+command_args="-c $REALM_CONFIG"
+command_background=true
+pidfile="/run/monitor-realm.pid"
+output_log="/var/log/monitor-realm.log"
+error_log="/var/log/monitor-realm.log"
+depend() {
+    need net
+}
+RC
+		chmod 0755 "$REALM_RC"
+	fi
+	REALM_STATE="installed; configure before starting"
+	if [ -n "$REALM_RUNNING" ]; then
+		if [ "$INIT" = systemd ]; then
+			systemctl restart monitor-realm && systemctl is-active --quiet monitor-realm || fail "Realm restart failed"
+		else
+			rc-service monitor-realm restart && rc-service monitor-realm status >/dev/null || fail "Realm restart failed"
+		fi
+		REALM_STATE=running
+	fi
+}
+# END Realm helpers
 
 while [ $# -gt 0 ]; do
 	# A flag with no argument: under set -u, `$2` aborts with the shell's own
@@ -345,6 +483,9 @@ while [ $# -gt 0 ]; do
 	--insecure) INSECURE=1; shift ;;
 	--uninstall) UNINSTALL=1; shift ;;
 	--upgrade) UPGRADE=1; shift ;;
+	--realm | --no-realm)
+		[ -z "$REALM_OPTION" ] || [ "$REALM_OPTION" = "$1" ] || { echo "--realm and --no-realm are mutually exclusive" >&2; exit 2; }
+		REALM_OPTION=$1; shift ;;
 	*) echo "unknown option: $1" >&2; exit 2 ;;
 	esac
 done
@@ -430,8 +571,8 @@ if [ -n "$UPGRADE" ]; then
 fi
 
 [ -n "$SERVER" ] && { [ -n "$TOKEN" ] || [ -n "$REGISTER" ]; } || {
-	echo "usage: install.sh --server URL (--token TOKEN | --register KEY) [--interval SECONDS] [--iface LIST] [--insecure]" >&2
-	echo "       install.sh --upgrade [--iface LIST] [--interval SECONDS]" >&2
+	echo "usage: install.sh --server URL (--token TOKEN | --register KEY) [--interval SECONDS] [--iface LIST] [--insecure] [--realm | --no-realm]" >&2
+	echo "       install.sh --upgrade [--iface LIST] [--interval SECONDS] [--realm | --no-realm]" >&2
 	echo "       install.sh --uninstall" >&2
 	echo "--name NAME names the node --register creates; the hostname otherwise" >&2
 	exit 2
@@ -735,6 +876,8 @@ fi
 detail "Agent 路径" "$SING_BOX"
 detail "版本" "$SING_BOX_VER"
 success "自构建 sing-box 安装及配置校验完成"
+
+manage_realm
 
 step 3 "初始化系统服务"
 if [ "$INIT" = systemd ]; then

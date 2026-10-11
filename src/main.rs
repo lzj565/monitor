@@ -363,6 +363,44 @@ async fn sing_box_asset(State(app): State<Shared>, Path(asset): Path<String>) ->
     }
 }
 
+fn realm_release_url(app: &App, arch: &str) -> Option<String> {
+    if !matches!(arch, "x86_64" | "aarch64") {
+        return None;
+    }
+    Some(proxied(
+        app,
+        format!("https://github.com/zhboner/realm/releases/download/v2.9.6/realm-{arch}-unknown-linux-musl.tar.gz"),
+    ))
+}
+
+async fn realm_asset(State(app): State<Shared>, Path(asset): Path<String>) -> Response {
+    let Some(url) = realm_release_url(&app, &asset) else {
+        return api::answer(StatusCode::NOT_FOUND, "unknown Realm asset");
+    };
+    let Ok(Ok(permit)) = tokio::time::timeout(RELAY_WAIT, RELAY_GATE.acquire()).await else {
+        return api::answer(StatusCode::SERVICE_UNAVAILABLE, "too many downloads in flight, try again");
+    };
+    let fetched = app.http.get(&url).timeout(std::time::Duration::from_secs(120)).send().await;
+    match fetched {
+        Ok(res) if res.status().is_success() => (
+            [(header::CONTENT_TYPE, "application/octet-stream")],
+            axum::body::Body::from_stream(metered(Box::pin(res.bytes_stream()), permit)),
+        )
+            .into_response(),
+        Ok(res) => api::answer(
+            StatusCode::BAD_GATEWAY,
+            format!("GitHub answered {} for the Realm release", res.status()),
+        ),
+        Err(e) => {
+            warn!("relaying Realm asset from {url} failed: {e:#}");
+            api::answer(
+                StatusCode::BAD_GATEWAY,
+                "the hub could not reach GitHub or its GitHub proxy; its log has the details",
+            )
+        }
+    }
+}
+
 // ---- startup ----
 
 struct Args {
@@ -650,6 +688,7 @@ async fn main() -> Result<()> {
                 .route("/install.sh", get(install_script))
                 .route("/agent/{arch}", get(agent_binary))
                 .route("/sing-box/{asset}", get(sing_box_asset))
+                .route("/realm/{asset}", get(realm_asset))
                 .layer(tower_http::limit::RequestBodyLimitLayer::new(64 * 1024))
                 .with_state(app.clone()),
         )
@@ -1134,6 +1173,17 @@ mod tests {
         // the row.
         app.db.set("github_proxy", "").unwrap();
         assert_eq!(release_url(&app, "x86_64"), direct);
+    }
+
+    #[test]
+    fn realm_assets_are_pinned_and_use_the_hub_proxy() {
+        let app = app("");
+        let direct = realm_release_url(&app, "x86_64").unwrap();
+        assert!(direct.ends_with("/v2.9.6/realm-x86_64-unknown-linux-musl.tar.gz"));
+        assert!(realm_release_url(&app, "aarch64").unwrap().contains("aarch64-unknown-linux-musl"));
+        assert!(realm_release_url(&app, "../unknown").is_none());
+        app.db.set("github_proxy", "https://ghfast.top").unwrap();
+        assert_eq!(realm_release_url(&app, "x86_64").unwrap(), format!("https://ghfast.top/{direct}"));
     }
 
     #[test]

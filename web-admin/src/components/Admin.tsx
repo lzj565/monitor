@@ -18,6 +18,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { api, badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, outdatedAgents, provisioningSite, shortAddress, trafficCorrection, upload, type ConfigField, type IfaceChoice, type Node, type PingTask, type Source } from "@/lib/api"
 import { ProxiesPage, SubscriptionsResourcePage, UsersResourcePage } from "@/components/Resources"
 import { ProxyTrafficPage } from "@/components/ProxyTrafficPage"
+import { realmArg } from "@/lib/realm"
 import { bytes, cycleMonths, FOREVER, money, uptime } from "@/lib/format"
 
 // Counters the panel can correct after migration or an accounting error.
@@ -838,12 +839,18 @@ function scriptCommand(site: string, args: (site: string) => string[]) {
 // Built here rather than fetched: the node list already carries the token, so
 // viewing an install command is a read rather than an action. Reissuing one to
 // display it would take the running agent offline.
-function installCommand(site: string, token: string, seconds: number | undefined, iface: string | undefined) {
-  return scriptCommand(site, (s) => [`--server ${s}`, `--token ${token}`, ...intervalArg(seconds), ...ifaceArg(iface)])
+function installCommand(site: string, token: string, seconds: number | undefined, iface: string | undefined, realm?: boolean) {
+  return scriptCommand(site, (s) => [`--server ${s}`, `--token ${token}`, ...intervalArg(seconds), ...ifaceArg(iface), ...realmArg(realm)])
 }
 
 // Left out untouched, as an untouched --iface is: a rerun then keeps what the
 // machine already has.
+function RealmOption({ on, setOn }: { on: boolean; setOn: (on: boolean) => void }) {
+  return <OptionRow title="安装 Realm" hint="开启后安装，配置转发规则后手动启动。关闭后执行命令会卸载本安装程序管理的 Realm，配置保留。">
+    <Switch checked={on} onCheckedChange={setOn} aria-label="安装 Realm" />
+  </OptionRow>
+}
+
 function intervalArg(seconds: number | undefined) {
   return seconds === undefined ? [] : [`--interval ${seconds}`]
 }
@@ -858,8 +865,8 @@ function ifaceArg(iface: string | undefined) {
 // within the window it opened, and each machine exchanges it for a token of its
 // own, so unlike an install command this text is no one's credential and can be
 // sent to every machine as it is.
-function registerCommand(site: string, key: string, seconds: number | undefined, iface: string | undefined) {
-  return scriptCommand(site, (s) => [`--server ${s}`, `--register ${key}`, ...intervalArg(seconds), ...ifaceArg(iface)])
+function registerCommand(site: string, key: string, seconds: number | undefined, iface: string | undefined, realm?: boolean) {
+  return scriptCommand(site, (s) => [`--server ${s}`, `--register ${key}`, ...intervalArg(seconds), ...ifaceArg(iface), ...realmArg(realm)])
 }
 
 // Carries no token, so it is the same for every node and remains valid after the
@@ -938,7 +945,8 @@ function RegisterDialog({ site, reg, onClose }: {
 }) {
   const iface = useIfaceOption(undefined)
   const interval = useIntervalOption()
-  const command = reg.left > 0 && iface.valid ? registerCommand(site, reg.key, interval.flag, iface.flag) : ""
+  const [realm, setRealm] = useState(false)
+  const command = reg.left > 0 && iface.valid ? registerCommand(site, reg.key, interval.flag, iface.flag, realm) : ""
   const clock = `${Math.floor(reg.left / 60)}:${String(reg.left % 60).padStart(2, "0")}`
 
   return (
@@ -957,6 +965,7 @@ function RegisterDialog({ site, reg, onClose }: {
             <h3 className="text-sm font-medium">安装选项</h3>
             <IntervalOption option={interval} batch />
             <IfaceOption option={iface} batch />
+            <RealmOption on={realm} setOn={setRealm} />
           </section>
           {reg.left > 0 ? (
             <section className="space-y-2 border-t pt-5">
@@ -1103,8 +1112,9 @@ function InstallDialog({ node, site, onClose, onRotated }: {
   const [confirmRotate, setConfirmRotate] = useState(false)
   const iface = useIfaceOption(currentIface(node))
   const interval = useIntervalOption(node.interval)
+  const [realm, setRealm] = useState(false)
 
-  const command = token && iface.valid ? installCommand(site, token, interval.flag, iface.flag) : ""
+  const command = token && iface.valid ? installCommand(site, token, interval.flag, iface.flag, realm) : ""
 
   async function rotate() {
     setRotating(true)
@@ -1135,6 +1145,7 @@ function InstallDialog({ node, site, onClose, onRotated }: {
             <h3 className="text-sm font-medium">安装选项</h3>
             <IntervalOption option={interval} />
             <IfaceOption option={iface} />
+            <RealmOption on={realm} setOn={setRealm} />
           </section>
           <section className="space-y-2 border-t pt-5">
             <h3 className="text-sm font-medium">安装命令</h3>

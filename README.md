@@ -46,3 +46,11 @@ hub 数据库和主题仍在 `/opt/monitor/data/`；hub 启动参数仍在 syste
 安装器会在新配置不存在时复制旧配置：`agent.env` 从 `/opt/monitor/agent.env` 迁移；`sb.json` 优先从 `/opt/monitor/sb.json`，其次从 `/etc/sing-box/config.json` 迁移。原文件保留，新位置已有的配置优先。迁移及新建配置使用 `0600` 权限。服务名保持不变，仍接管现有 sing-box 服务。
 
 agent 卸载会删除新旧位置的 `agent.env`，保留 sing-box 配置。升级需配套使用更新后的 agent 二进制与安装器。
+
+### 可选安装 Realm
+
+单节点安装和批量添加中的“安装 Realm”开关默认关闭。开启生成 `--realm`，安装固定版本 2.9.6；关闭生成 `--no-realm`，执行后卸载本安装脚本管理的 Realm 程序和服务，保留配置。页面开关表示本次安装选择，不表示节点当前状态。
+
+Realm 程序位于 `/opt/monitor/realm`，配置位于 `/opt/monitor/config/realm.json`，服务名为 `monitor-realm`。首次安装创建空转发规则，不启动、不设置开机启动。编辑配置添加 `endpoints` 后，systemd 使用 `systemctl enable --now monitor-realm`；OpenRC 使用 `rc-update add monitor-realm default` 和 `rc-service monitor-realm start`。配置说明见 [Realm 官方文档](https://github.com/zhboner/realm#configuration)。
+
+重复安装保留配置及开机启动状态，正在运行的 Realm 在程序替换后重启。安装包由 Hub 通过已有 GitHub 代理中转，安装脚本校验固定 SHA-256，支持 x86_64、aarch64 Linux。未传 Realm 参数的旧安装命令和 `--upgrade` 不改变 Realm；升级时也可显式附加 `--realm` 或 `--no-realm`。`--uninstall` 仍仅卸载 Agent。第三方 Realm 安装不属于此开关管理范围。
