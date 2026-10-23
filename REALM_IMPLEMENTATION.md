@@ -13,7 +13,7 @@
 ## 已验证
 
 - Hub：fmt、Clippy（warnings 为错误）、225 项测试及 Linux debug build。
-- Agent：fmt、Clippy、56 项测试及 Linux debug build。测试容器安装 systemd-detect-virt，未跳过现有环境交叉校验。
+- Agent：fmt、Clippy、57 项测试及 Linux debug build。测试容器安装 systemd-detect-virt，未跳过现有环境交叉校验。
 - 前端：lint、六组测试和 TypeScript/Vite 构建；Realm 页面单独加载。
 - 安装脚本：Realm 生命周期、Agent unit、API 端口选择检查。
 - 真实联调：官方 Realm v2.9.6 aarch64 包的 SHA-256 与安装器固定摘要一致。隔离容器内启动新 Hub、新 Agent 和真实 Realm，通过 API 保存规则后自动启动并完成真实 TCP echo 转发；测试用户的用户中心、Clash/sing-box 出现额外入口，停用后立即撤回且确认服务停止。
@@ -24,3 +24,8 @@
 - 浏览器登录跳转后自动化连接失效；未完成表单逐项交互验收。API 联调与前端构建不能替代该项。
 - 真实多机器 VLESS Reality 认证链路、真实 systemd/OpenRC 主机部署未验收；实际字节转发测试使用本地 TCP echo 目标。
 - 发布核对发现已有不匹配：Hub 使用上游固定公钥验签，fork Agent 发布流程未生成 `.sig`。未移除或绕过验签；签名发布须另行接通，或暂只交付源码并在受控环境安装构建产物。未将源码 push 当作二进制已发布或生产已部署。
+
+
+## 交付时远程状态
+
+本地功能与复核修复已分别提交。Hub SSH 22/443 推送连接超时，HTTPS 回退无可用凭据；只读核对远程 dev 仍为 `911e63a`，未将本地提交误报为已推送。Agent 未创建发布 tag，避免在签名配套未确定前发布安装链路无法验签的新包。
