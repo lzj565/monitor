@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 
 use axum::extract::State;
 use axum::http::{header, HeaderMap, StatusCode, Uri};
-use axum::response::{IntoResponse, Response};
+use axum::response::{IntoResponse, Redirect, Response};
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -62,31 +62,150 @@ pub struct Theme {
 }
 
 pub async fn serve(State(app): State<Shared>, headers: HeaderMap, uri: Uri) -> Response {
-    let path = uri.path().trim_start_matches('/');
     let known = headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok());
+    respond(&app, uri.path().trim_start_matches('/'), uri.query(), known, &|html| stamp_icons(&app, html))
+}
+
+/// What `serve` answers for `path`. `shell` rewrites the HTML shell on its way
+/// out; [`stamp_icons`] resolves each icon through here with the shell left
+/// as it is, which also keeps an icon a theme lacks, answered with the shell,
+/// from recursing.
+fn respond(app: &App, path: &str, query: Option<&str>, known: Option<&str>, shell: Shell) -> Response {
     if is_api_path(path) {
         return answer(StatusCode::NOT_FOUND, format!("没有这个接口：/{path}"));
     }
+    // `?theme` asks past the site icon for the theme's own, which the panel
+    // shows as what clearing the setting returns to.
+    let setting = ICON_PATHS.iter().find(|(icon, _)| *icon == path).map(|&(_, key)| key);
+    if let Some(key) = setting.filter(|_| query != Some("theme")) {
+        if let Some(Ok((mime, data))) = app.db.get(key).filter(|v| !v.is_empty()).as_deref().map(site_icon) {
+            return icon(path, mime, data, known);
+        }
+    }
 
-    let panel_prefix = if path == "admin" || path.starts_with("admin/") {
-        Some("admin")
-    } else if path == "user" || path.starts_with("user/") {
-        Some("user")
-    } else {
-        None
-    };
-    if let Some(prefix) = panel_prefix {
-        let path = path.strip_prefix(prefix).unwrap_or(path).trim_start_matches('/');
-        return embedded::<AdminAssets>(path, "面板没有构建，在 web-admin/ 下运行 npm run build", known);
+    // The panel's entry is an alias for its first page, and said so here rather
+    // than by the panel renaming its address once loaded: Chrome files a tab's
+    // icon under the URL the page had when the icon arrived, and shows what it
+    // filed the moment a navigation starts. Renamed first, the entry kept the
+    // icon it last had and flashed it on every visit.
+    if path == "admin" || path == "admin/" {
+        let first = "/admin/nodes";
+        return Redirect::to(&query.map_or(first.to_owned(), |q| format!("{first}?{q}"))).into_response();
+    }
+    if let Some(path) = path.strip_prefix("admin/") {
+        return embedded::<AdminAssets>(
+            path,
+            "面板没有构建，在 web-admin/ 下运行 npm run build",
+            known,
+            shell,
+        );
+    }
+    if path == "user" || path.starts_with("user/") {
+        let path = path.strip_prefix("user").unwrap().trim_start_matches('/');
+        return embedded::<AdminAssets>(
+            path,
+            "面板没有构建，在 web-admin/ 下运行 npm run build",
+            known,
+            shell,
+        );
     }
 
     let theme = app.db.get("theme").unwrap_or_default();
     if let Some(root) = external_theme(&app.themes, &theme) {
-        if let Some(response) = disk(&root, path, known) {
+        if let Some(response) = disk(&root, path, known, shell) {
             return response;
         }
     }
-    embedded::<DefaultThemeAssets>(path, "默认主题缺失，运行 scripts/theme.sh", known)
+    embedded::<DefaultThemeAssets>(path, "默认主题缺失，运行 scripts/theme.sh", known, shell)
+}
+
+/// Names each icon in an HTML shell after the bytes served for it -- the ETag,
+/// which is their digest -- as the build already names everything under
+/// `assets/`. The URL a theme writes is fixed while what it serves is not: a
+/// site icon set or cleared, a theme switched or updated. Chrome keeps a tab's
+/// icon by its URL and, on an ordinary navigation, shows the one it holds
+/// without asking again, whatever the cache headers say; only a reload fetches
+/// it anew.
+fn stamp_icons(app: &App, html: Vec<u8>) -> Vec<u8> {
+    let mut text = match String::from_utf8(html) {
+        Ok(text) => text,
+        Err(e) => return e.into_bytes(),
+    };
+    for path in ["favicon.svg", "admin/favicon.svg", "apple-touch-icon.png", "admin/apple-touch-icon.png"] {
+        let quoted = format!("\"/{path}\"");
+        if !text.contains(&quoted) {
+            continue;
+        }
+        let served = respond(app, path, None, None, &|html| html);
+        let Some(etag) = served.headers().get(header::ETAG).and_then(|v| v.to_str().ok()) else { continue };
+        text = text
+            .replace(&quoted, &format!("\"/{path}?v={}\"", etag.trim_matches('"').get(..8).unwrap_or(etag)));
+    }
+    text.into_bytes()
+}
+
+/// Where the panel and the themes name their icons, plus the ones browsers ask
+/// for unprompted, each with the setting that replaces it. With a site icon
+/// set, all of them answer with it, so the icon follows the site across theme
+/// switches. iOS takes neither SVG nor the tab icon for a bookmark or the home
+/// screen, only `apple-touch-icon`, which the panel renders as a separate image.
+const ICON_PATHS: &[(&str, &str)] = &[
+    ("favicon.svg", "favicon"),
+    ("favicon.ico", "favicon"),
+    ("admin/favicon.svg", "favicon"),
+    ("apple-touch-icon.png", "touch_icon"),
+    ("apple-touch-icon-precomposed.png", "touch_icon"),
+    ("admin/apple-touch-icon.png", "touch_icon"),
+];
+
+/// The largest of either icon. Both are stored as data URLs in the settings
+/// rows and saved together through the settings route's 64 KiB body limit,
+/// which their base64 forms (a third larger) fit beneath with room for the
+/// rest of the form. The panel scales whatever it is given down to fit.
+pub const MAX_ICON: usize = 20 * 1024;
+
+/// Decodes the `favicon` or `touch_icon` setting, a `data:image/...;base64,` URL, into the
+/// bytes and the type they actually are. The declared type is not trusted: the
+/// browser takes it from the file name, and the response's type comes from the
+/// bytes.
+pub fn site_icon(value: &str) -> Result<(&'static str, Vec<u8>), &'static str> {
+    use base64::Engine;
+    const NOT_IMAGE: &str = "站点图标只支持 PNG、ICO、SVG、WebP、JPEG、GIF";
+    let payload = value
+        .strip_prefix("data:image/")
+        .and_then(|rest| rest.split_once(";base64,"))
+        .map(|(_, payload)| payload)
+        .ok_or(NOT_IMAGE)?;
+    let data = base64::engine::general_purpose::STANDARD.decode(payload).map_err(|_| NOT_IMAGE)?;
+    if data.len() > MAX_ICON {
+        return Err("站点图标不能超过 20 KiB");
+    }
+    let mime = match data.as_slice() {
+        [0x89, b'P', b'N', b'G', ..] => "image/png",
+        [0, 0, 1, 0, ..] => "image/x-icon",
+        [0xff, 0xd8, 0xff, ..] => "image/jpeg",
+        [b'G', b'I', b'F', b'8', ..] => "image/gif",
+        [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => "image/webp",
+        _ if std::str::from_utf8(&data).is_ok_and(|text| text.contains("<svg")) => "image/svg+xml",
+        _ => return Err(NOT_IMAGE),
+    };
+    Ok((mime, data))
+}
+
+/// The site icon under the shell's caching policy: the URL stays while the
+/// bytes change. An SVG opened directly is a document at the hub's origin, so
+/// the sandbox keeps any script in it from running there; as an icon or `<img>`
+/// it never runs scripts anyway.
+fn icon(path: &str, mime: &'static str, data: Vec<u8>, known: Option<&str>) -> Response {
+    let mut response = asset(path, data, known);
+    let headers = response.headers_mut();
+    headers.insert(header::CONTENT_TYPE, header::HeaderValue::from_static(mime));
+    headers.insert(header::X_CONTENT_TYPE_OPTIONS, header::HeaderValue::from_static("nosniff"));
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        header::HeaderValue::from_static("default-src 'none'; style-src 'unsafe-inline'; sandbox"),
+    );
+    response
 }
 
 fn is_api_path(path: &str) -> bool {
@@ -102,31 +221,38 @@ fn is_asset(path: &str) -> bool {
     path.starts_with("assets/")
 }
 
-fn embedded<T: RustEmbed>(requested: &str, remedy: &str, known: Option<&str>) -> Response {
+/// Rewrites the shell, `index.html`, on its way out; see [`stamp_icons`].
+type Shell<'a> = &'a dyn Fn(Vec<u8>) -> Vec<u8>;
+
+fn page(path: &str, data: Vec<u8>, known: Option<&str>, shell: Shell) -> Response {
+    asset(path, if path == "index.html" { shell(data) } else { data }, known)
+}
+
+fn embedded<T: RustEmbed>(requested: &str, remedy: &str, known: Option<&str>, shell: Shell) -> Response {
     let path = if requested.is_empty() { "index.html" } else { requested };
     if let Some(file) = T::get(path) {
-        return asset(path, file.data.into_owned(), known);
+        return page(path, file.data.into_owned(), known, shell);
     }
     if is_asset(path) {
         return answer(StatusCode::NOT_FOUND, format!("没有这个文件：/{path}"));
     }
     match T::get("index.html") {
-        Some(index) => asset("index.html", index.data.into_owned(), known),
+        Some(index) => page("index.html", index.data.into_owned(), known, shell),
         None => answer(StatusCode::NOT_FOUND, remedy),
     }
 }
 
-fn disk(root: &Path, requested: &str, known: Option<&str>) -> Option<Response> {
+fn disk(root: &Path, requested: &str, known: Option<&str>, shell: Shell) -> Option<Response> {
     let path = if requested.is_empty() { "index.html" } else { requested };
     if let Some(data) = read_inside(root, path) {
-        return Some(asset(path, data, known));
+        return Some(page(path, data, known, shell));
     }
     // None rather than a 404: an external theme lacking the file defers to the
     // built-in one, which issues the refusal.
     if is_asset(path) {
         return None;
     }
-    read_inside(root, "index.html").map(|data| asset("index.html", data, known))
+    read_inside(root, "index.html").map(|data| page("index.html", data, known, shell))
 }
 
 /// Serves one file with the caching policy its path warrants.
@@ -207,7 +333,9 @@ fn manifest(root: &Path, short: &str) -> Option<Theme> {
         return None;
     }
     let theme: Theme = serde_json::from_slice(&data)
-        .inspect_err(|e| tracing::warn!("{short}/theme.json 不是有效的 manifest，主题不会出现在列表里：{e}"))
+        .inspect_err(|e| {
+            tracing::warn!("{short}/theme.json is not a valid manifest; the theme is left out: {e}")
+        })
         .ok()?;
     (theme.short == short).then_some(theme)
 }
@@ -295,17 +423,25 @@ pub fn install<R: Read>(themes: &Path, archive: R, expect: Option<&str>) -> Resu
 }
 
 /// The answer to any archive that cannot be read to the end: a download cut
-/// short, which is how a partial `theme.tar.gz` fails, or a file that is not a
-/// gzip'd tar at all.
+/// short, which is how a partial `theme.tar.gz` fails, or a gzip stream that is
+/// corrupt or holds no tar.
 const DAMAGED: &str = "主题包损坏或不完整（可能没下载完），重新下载 theme.tar.gz 再试";
 
 /// The answer to an archive whose entries cannot all be written: a file and a
 /// directory under one name, or a name the filesystem refuses.
 const TANGLED: &str = "主题包里有同名的文件和目录，或者文件名过长，包本身有问题，请联系主题作者";
 
+/// The answer to a file that is not gzip at all, most often the release's
+/// Source code zip. Reported as [`DAMAGED`], it would direct the reader to
+/// download the same wrong file again.
+const NOT_GZIP: &str = "选的不是主题包：到主题仓库的 Releases 下载 theme.tar.gz，不要选 Source code";
+
+/// The first two bytes of every gzip stream.
+pub const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
+
 /// Tells a failure the archive caused from one of this machine's. Reading fails
 /// with `UnexpectedEof` where the stream stops short and `InvalidInput` for a
-/// corrupt or non-gzip one; a layout that cannot be written fails with the
+/// corrupt one; a layout that cannot be written fails with the
 /// second group. Anything else -- a full disk, a permission -- is this machine's
 /// to fix.
 fn archive_error(e: std::io::Error) -> anyhow::Error {
@@ -319,6 +455,10 @@ fn archive_error(e: std::io::Error) -> anyhow::Error {
 }
 
 fn unpack<R: Read>(archive: R, into: &Path) -> Result<()> {
+    let mut archive = std::io::BufReader::new(archive);
+    if !std::io::BufRead::fill_buf(&mut archive)?.starts_with(&GZIP_MAGIC) {
+        refuse!("{NOT_GZIP}");
+    }
     fs::create_dir(into)?;
     let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(archive));
     let mut expanded = 0u64;
@@ -332,7 +472,11 @@ fn unpack<R: Read>(archive: R, into: &Path) -> Result<()> {
         // device node belongs in none, and each is a route to writing where the
         // path check below cannot see.
         let kind = entry.header().entry_type();
-        if !kind.is_file() && !kind.is_dir() {
+        // Also a pax global header: metadata that writes nothing, which
+        // `git archive` and GitHub's Source code archives open with. Refusing
+        // it would hide the answer that names the right file to download.
+        let metadata = kind.is_pax_global_extensions();
+        if !kind.is_file() && !kind.is_dir() && !metadata {
             refuse!("主题包里有不支持的条目：{}", entry.path()?.display());
         }
         let size = entry.size();
@@ -345,6 +489,9 @@ fn unpack<R: Read>(archive: R, into: &Path) -> Result<()> {
             refuse!("主题包解压后超过 {} MiB", MAX_EXPANDED >> 20);
         }
         expanded += size;
+        if metadata {
+            continue;
+        }
         // Rejects an entry whose path escapes `into` -- absolute, `..`, or via
         // a symlinked parent -- reporting `false` rather than an error.
         if !entry.unpack_in(into).map_err(archive_error)? {
@@ -365,7 +512,11 @@ fn unpack<R: Read>(archive: R, into: &Path) -> Result<()> {
 /// Checks the unpacked directory is a theme this hub can actually serve, then
 /// moves it into place under the name its manifest asks for.
 fn publish(themes: &Path, staging: &Path, expect: Option<&str>) -> Result<Theme> {
-    let Some(manifest) = read_inside(staging, "theme.json") else { refuse!("主题包里没有 theme.json") };
+    // Source code (tar.gz) is gzip'd too, and nests everything one directory
+    // down, so it fails here rather than at the magic bytes.
+    let Some(manifest) = read_inside(staging, "theme.json") else {
+        refuse!("主题包里没有 theme.json，下载的若是 Source code，换成 Releases 里的 theme.tar.gz")
+    };
     if manifest.len() > 64 * 1024 {
         refuse!("theme.json 过大");
     }
@@ -567,6 +718,33 @@ mod tests {
             let Err(e) = install(&base, damaged, None) else { panic!("a damaged archive installed") };
             assert_eq!(e.downcast_ref::<crate::Shown>().map(|s| s.0.as_str()), Some(DAMAGED), "{e:#}");
         }
+        // The wrong file rather than a damaged one: a zip, or the same tar
+        // already decompressed. Downloading it again cannot help, so the answer
+        // names the right file instead.
+        let mut plain = Vec::new();
+        flate2::read::GzDecoder::new(&whole[..]).read_to_end(&mut plain).unwrap();
+        for wrong in [&b"PK\x03\x04"[..], &plain[..]] {
+            let Err(e) = install(&base, wrong, None) else { panic!("a file that is not gzip installed") };
+            assert_eq!(e.downcast_ref::<crate::Shown>().map(|s| s.0.as_str()), Some(NOT_GZIP), "{e:#}");
+        }
+        // Source code (tar.gz): a pax global header, then the repository one
+        // directory down. It reaches the missing manifest, which names the file.
+        let mut source =
+            tar::Builder::new(flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast()));
+        let mut header = tar::Header::new_ustar();
+        header.set_entry_type(tar::EntryType::XGlobalHeader);
+        header.set_size(6);
+        header.set_mode(0o644);
+        source.append_data(&mut header, "pax_global_header", &b"6 a=b\n"[..]).unwrap();
+        for (name, data) in [("aurora-1/theme.json", manifest), ("aurora-1/dist/index.html", b"v9")] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            source.append_data(&mut header, name, data).unwrap();
+        }
+        let source = source.into_inner().unwrap().finish().unwrap();
+        let Err(e) = install(&base, &source[..], None) else { panic!("a source archive installed") };
+        assert!(e.to_string().contains("Source code"), "{e:#}");
         // Past the end marker, padding and nothing more.
         let mut padded = tar::Builder::new(Vec::new());
         let mut header = tar::Header::new_gnu();
@@ -678,6 +856,57 @@ mod tests {
         let hashed = asset("assets/index-CSjcYfL9.js", b"console.log(1)".to_vec(), None);
         assert_eq!(hashed.status(), StatusCode::OK);
         assert_eq!(etag(&hashed), None);
+    }
+
+    /// The bytes decide the type, whatever the data URL declares, and anything
+    /// that is not one of the image formats is refused before it is stored.
+    #[test]
+    fn a_site_icon_is_typed_by_its_bytes() {
+        use base64::Engine;
+        let url = |declared: &str, data: &[u8]| {
+            format!("data:image/{declared};base64,{}", base64::engine::general_purpose::STANDARD.encode(data))
+        };
+        let png = b"\x89PNG\r\n\x1a\n....";
+        assert_eq!(site_icon(&url("png", png)).unwrap(), ("image/png", png.to_vec()));
+        assert_eq!(site_icon(&url("x-icon", b"\0\0\x01\0rest")).unwrap().0, "image/x-icon");
+        assert_eq!(
+            site_icon(&url("png", b"<svg xmlns='http://www.w3.org/2000/svg'/>")).unwrap().0,
+            "image/svg+xml"
+        );
+        assert_eq!(site_icon(&url("webp", b"RIFF\0\0\0\0WEBPVP8 ")).unwrap().0, "image/webp");
+
+        assert!(site_icon(&url("png", b"<html><script>")).is_err());
+        assert!(site_icon("data:text/html;base64,PHN2Zz4=").is_err());
+        assert!(site_icon("data:image/png;base64,not base64!").is_err());
+        assert!(site_icon(&url("png", &[png.as_slice(), &[0; MAX_ICON]].concat())).is_err());
+
+        let served = icon("favicon.svg", "image/png", png.to_vec(), None);
+        assert_eq!(served.headers()[header::CONTENT_TYPE], "image/png");
+        assert!(served.headers().contains_key(header::ETAG));
+        assert!(served.headers()[header::CONTENT_SECURITY_POLICY].to_str().unwrap().contains("sandbox"));
+    }
+
+    /// The shell names each icon after the bytes served for it, so a changed
+    /// icon is a new URL: Chrome does not refetch a tab icon it already holds on
+    /// an ordinary navigation.
+    #[test]
+    fn the_shell_names_each_icon_after_what_it_serves() {
+        let app = App::for_test(crate::db::Db::open(":memory:").unwrap());
+        let html = br#"<link rel="icon" href="/favicon.svg" /><link rel="apple-touch-icon" href="/apple-touch-icon.png" />"#;
+        let shell = || String::from_utf8(stamp_icons(&app, html.to_vec())).unwrap();
+        let before = shell();
+        assert!(
+            before.contains(r#"href="/favicon.svg?v="#)
+                && before.contains(r#"href="/apple-touch-icon.png?v="#)
+        );
+        assert_eq!(shell(), before, "the same bytes, the same URL");
+
+        app.db.set("favicon", "data:image/png;base64,iVBORw0KGgo=").unwrap();
+        let after = shell();
+        assert_ne!(after, before);
+        // Only the icon that changed moves.
+        let touch = |html: &str| html.split("apple-touch-icon.png").nth(1).unwrap().to_owned();
+        assert_eq!(touch(&after), touch(&before));
     }
 
     /// The two guards on a theme name, applied together by the settings page:

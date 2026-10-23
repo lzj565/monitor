@@ -72,7 +72,8 @@ fn verify_password(password: &str, stored: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Per-address failure counter for the password endpoint.
+/// Per-address failure counter. The hub keeps two: one for the sign-in page,
+/// one for agent registration (`App::registrations`).
 pub struct Throttle {
     seen: Mutex<HashMap<IpAddr, (u32, Instant)>>,
     /// How long a failure is remembered. A field rather than the constant so
@@ -338,7 +339,7 @@ pub async fn github_callback(
         Err(e) => return sign_in_failed(&app, &headers, e),
     };
     crate::notify::signed_in(&app, &format!("GitHub {user}"), client_ip(&headers, peer.ip()));
-    with_cookies(Redirect::to("/admin"), [clear_state(&app, &headers), session])
+    with_cookies(Redirect::to("/admin/nodes"), [clear_state(&app, &headers), session])
 }
 
 /// Redirects the browser back to the sign-in page with the reason, rather than
@@ -349,7 +350,7 @@ fn sign_in_failed(app: &App, headers: &HeaderMap, e: anyhow::Error) -> Response 
     // the redirect.
     warn!("GitHub sign-in rejected: {e:#}");
     let reason = e.downcast_ref::<Shown>().map_or(crate::api::INTERNAL, |shown| shown.0.as_str());
-    let target = format!("/admin?login_error={}", urlencode(reason));
+    let target = format!("/admin/nodes?login_error={}", urlencode(reason));
     with_cookies(Redirect::to(&target), [clear_state(app, headers), String::new()])
 }
 

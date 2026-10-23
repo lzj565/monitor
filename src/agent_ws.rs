@@ -70,10 +70,9 @@ impl Arrival {
 /// interval of a hub restart.
 ///
 /// A single map, because "the node is online" and "the node has current figures"
-/// are the same fact. Split across two, they required manual synchronisation at
-/// every call site and diverged: the connection was recorded at the handshake
-/// and the metrics at the first report, so a node that had connected but not yet
-/// reported appeared offline for a whole `--interval`.
+/// are the same fact. Split across two, they would need synchronising at every
+/// call site, and a node connected but not yet reporting would read offline for
+/// a whole `--interval`.
 #[derive(Debug)]
 pub struct Agent {
     /// Distinguishes one session on a node from the next; see [`release`].
@@ -154,24 +153,26 @@ struct Mark {
 const MEAN_FLOAT: [&str; 1] = ["cpu"];
 const MEAN_INT: [&str; 6] = ["mem_used", "swap_used", "disk_used", "tcp", "udp", "procs"];
 
-/// Rates a history row also carries at their highest over the minute, each as
-/// the agent measured it across one report interval, under the column it is
-/// stored in. The row's own rate is the minute's mean, which integrates to the
-/// traffic totals and therefore stores a 15-second burst at 286 Mbps as 72 Mbps
-/// (measured).
+/// Figures a history row also carries at their highest over the minute, each
+/// as the agent measured it across one report interval, under the column it is
+/// stored in. The row's own figure is the minute's mean, which for a rate
+/// integrates to the traffic totals and therefore stores a 15-second burst at
+/// 286 Mbps as 72 Mbps (measured); a 15-second CPU spike to 100% is likewise a
+/// minute at 25%.
 ///
 /// Taken from the agent rather than derived here from the arrival of two
 /// frames: the network bunches frames, and a second of bytes divided by the
 /// half second between two arrivals would record twice the rate that ran.
-const PEAK: [(&str, &str); 2] = [("net_rx", "net_rx_max"), ("net_tx", "net_tx_max")];
+const PEAK_FLOAT: [(&str, &str); 1] = [("cpu", "cpu_max")];
+const PEAK_INT: [(&str, &str); 2] = [("net_rx", "net_rx_max"), ("net_tx", "net_tx_max")];
 
 /// Running sums for the minute in progress, one slot per averaged field, and
-/// the highest of each [`PEAK`] rate.
+/// the highest of each peak figure.
 #[derive(Debug, Default)]
 struct Minute {
     sums: [f64; MEAN_FLOAT.len() + MEAN_INT.len()],
     reports: f64,
-    peaks: [i64; PEAK.len()],
+    peaks: [f64; PEAK_FLOAT.len() + PEAK_INT.len()],
 }
 
 impl Minute {
@@ -179,8 +180,8 @@ impl Minute {
         for (slot, key) in MEAN_FLOAT.iter().chain(&MEAN_INT).enumerate() {
             self.sums[slot] += metrics.get(key).and_then(|v| v.as_f64()).unwrap_or(0.0);
         }
-        for (peak, (key, _)) in self.peaks.iter_mut().zip(PEAK) {
-            *peak = (*peak).max(metrics.get(key).and_then(|v| v.as_i64()).unwrap_or(0));
+        for (peak, (key, _)) in self.peaks.iter_mut().zip(PEAK_FLOAT.iter().chain(&PEAK_INT)) {
+            *peak = peak.max(metrics.get(key).and_then(|v| v.as_f64()).unwrap_or(0.0));
         }
         self.reports += 1.0;
     }
@@ -203,8 +204,11 @@ impl Minute {
         }
         // Written whatever the report carried, so an agent sending these keys
         // itself cannot choose the stored value.
-        for (peak, (_, column)) in self.peaks.iter().zip(PEAK) {
-            obj.insert(column.to_owned(), json!(peak));
+        for (slot, (peak, (_, column))) in
+            self.peaks.iter().zip(PEAK_FLOAT.iter().chain(&PEAK_INT)).enumerate()
+        {
+            let peak = if slot < PEAK_FLOAT.len() { json!(peak) } else { json!(*peak as i64) };
+            obj.insert((*column).to_owned(), peak);
         }
     }
 }
@@ -789,8 +793,8 @@ pub(crate) const INJECTED: [&str; 4] = ["total_rx", "total_tx", "month_rx", "mon
 /// `mem_total`, `swap_total` and `disk_total` never reach the `metric` table but
 /// go straight to the browser, and the default theme blanks a node's entire live
 /// view when one is absent. Derived from the stored columns instead, this list
-/// left those four uncovered, so an agent renaming one blanked every card on the
-/// page with nothing in any log to explain it.
+/// would leave those four uncovered, and an agent renaming one would blank every
+/// card on the page with nothing in any log to explain it.
 ///
 /// Hub and agent ship as two binaries from two repositories, and every reader
 /// here ends in `unwrap_or(0)`: a field the agent renames does not fail, it
@@ -1000,14 +1004,17 @@ fn ping_tasks_message(app: &App, node_id: i64) -> String {
     json!({"jsonrpc": "2.0", "method": "ping.tasks", "params": tasks}).to_string()
 }
 
-/// Pushes the current probe list to every connected agent, so a panel edit takes
-/// effect without waiting for a reconnect.
-pub fn push_ping_tasks(app: &App) {
+/// Pushes the current probe list to the connected agents, so a panel edit takes
+/// effect without waiting for a reconnect. `only` limits it to one node, for an
+/// edit that changed that node alone: every push is a query and a message per
+/// agent.
+pub fn push_ping_tasks(app: &App, only: Option<i64>) {
     let connected: Vec<(i64, mpsc::Sender<String>)> = app
         .agents
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .iter()
+        .filter(|(id, _)| only.is_none_or(|only| only == **id))
         .map(|(id, agent)| (*id, agent.tx.clone()))
         .collect();
     for (node_id, sender) in connected {
@@ -1026,7 +1033,7 @@ mod tests {
     use chrono::TimeZone;
 
     use super::*;
-    use crate::db::{AuthorizationDraft, Node, PingTask, ProxyDraft, UserDraft};
+    use crate::db::{AuthorizationDraft, Node, PingTask, ProxyDraft, Span, UserDraft};
 
     fn app() -> App {
         App::for_test(Db::open(":memory:").unwrap())
@@ -1272,7 +1279,7 @@ mod tests {
     fn results(app: &App, id: i64) -> Vec<(i64, i64)> {
         let mut seen: Vec<(i64, i64)> = app
             .db
-            .ping_records(id, 0, 60)
+            .ping_records(id, Span::minutes(0, 60))
             .unwrap()
             .0
             .iter()
@@ -1368,10 +1375,10 @@ mod tests {
     }
 
     /// The contract check is what makes a cross-repository rename visible.
-    /// Derived from the columns the hub stores, it missed four fields that never
-    /// reach the `metric` table but do reach the browser; the default theme
-    /// blanks a node's entire live view if one is absent, so the drift surfaced
-    /// as empty cards and no log output.
+    /// Derived from the columns the hub stores, it would miss four fields that
+    /// never reach the `metric` table but do reach the browser; the default theme
+    /// blanks a node's entire live view if one is absent, so the drift would
+    /// surface as empty cards and no log output.
     #[test]
     fn the_contract_covers_every_field_the_browser_needs_not_just_the_stored_ones() {
         let fields: Vec<&str> = report_fields().collect();
@@ -1407,7 +1414,7 @@ mod tests {
         assert_eq!(app.agents.read().unwrap()[&id].metrics["net_rx_total"], 6_900, "the live view follows");
         assert_eq!(total_rx(&app, id), 0, "within the minute nothing past the baseline is booked");
         assert!(
-            app.db.metrics(id, 0, 60).unwrap().is_empty(),
+            app.db.metrics(id, Span::minutes(0, 60)).unwrap().is_empty(),
             "a session writes no row for its first minute"
         );
 
@@ -1415,7 +1422,7 @@ mod tests {
         // The minute's last reading, 59 s in, is what the boundary books; the
         // reading that crossed it waits for the next.
         assert_eq!(total_rx(&app, id), 5_900);
-        let rows = app.db.metrics(id, 0, 60).unwrap();
+        let rows = app.db.metrics(id, Span::minutes(0, 60)).unwrap();
         assert_eq!(rows.len(), 1, "a minute of reports is one row");
         // History rows are keyed by (node, ts), so counting them proves nothing on
         // its own: reports a second apart collapse onto one row with or without
@@ -1469,13 +1476,14 @@ mod tests {
         send(&app, id, &mut session, 30, &burst(1_000 + 45_000_000, 3_000_000, 50.0, 151)).unwrap();
         send(&app, id, &mut session, 60, &burst(1_000 + 60_000_000, 0, 0.0, 201)).unwrap();
 
-        let row = &app.db.metrics(id, 0, 60).unwrap()[0];
+        let row = &app.db.metrics(id, Span::minutes(0, 60)).unwrap()[0];
         assert_eq!(
             row["net_rx"], 1_008_403,
             "60 MB over 59.5 s, not the agent's 0 nor over 59 whole seconds"
         );
         assert_eq!(row["net_rx_max"], 3_000_000, "the busiest second survives the mean");
         assert_eq!(row["cpu"], 50.0, "the mean of the minute, not the idle second it ended on");
+        assert_eq!(row["cpu_max"], 100.0, "and its busiest second of CPU survives it too");
         // Integers remain integral: the column is read with as_i64, which returns
         // nothing for the 150.67 the raw mean would produce.
         assert_eq!(row["mem_used"], 151);
@@ -1495,7 +1503,7 @@ mod tests {
         let mut session = Session::default();
         send(&app, id, &mut session, 0, &report_json("boot-a", 1_000, 500)).unwrap();
         send(&app, id, &mut session, 60, &report_json("boot-a", 2_000, 500)).unwrap();
-        let before = app.db.metrics(id, 0, 60).unwrap();
+        let before = app.db.metrics(id, Span::minutes(0, 60)).unwrap();
         assert_eq!(before.len(), 1, "the running session wrote the row for this minute");
 
         // The socket drops and the agent returns within the same minute.
@@ -1506,7 +1514,11 @@ mod tests {
                                      "net_tx_total": 4_500}})
         .to_string();
         send(&app, id, &mut Session::default(), 70, &loud).unwrap();
-        assert_eq!(app.db.metrics(id, 0, 60).unwrap(), before, "the row keeps the minute it described");
+        assert_eq!(
+            app.db.metrics(id, Span::minutes(0, 60)).unwrap(),
+            before,
+            "the row keeps the minute it described"
+        );
     }
 
     /// Booking about once a minute must leave exactly what booking every report
@@ -1743,11 +1755,12 @@ mod tests {
         // The rejected results carry task ids of their own: a bare count would be
         // satisfied by the key collapsing them onto a valid row.
         send(&app, id, &mut session, 0, &result_json(two, 15)).unwrap();
-        send(&app, id, &mut session, 0, &result_json(0, 42)).unwrap(); // no such task
-        send(&app, id, &mut session, 0, &result_json(-1, 42)).unwrap(); // nor this one
-        send(&app, id, &mut session, 0, &result_json(99, 42)).unwrap(); // not this node's
-                                                                        // A frame carrying no reading. Defaulting to -1 would file it as a lost
-                                                                        // packet, rendering a malformed frame as an outage.
+        // Ids naming no probe this node runs.
+        for task in [0, -1, 99] {
+            send(&app, id, &mut session, 0, &result_json(task, 42)).unwrap();
+        }
+        // A frame carrying no reading. Defaulting to -1 would file it as a lost
+        // packet, rendering a malformed frame as an outage.
         let blind = json!({"jsonrpc": "2.0", "method": "ping.result", "params": {"task_id": one}});
         send(&app, id, &mut session, 0, &blind.to_string()).unwrap();
         assert!(results(&app, id).is_empty(), "gathered until the minute turns");
@@ -1795,8 +1808,7 @@ mod tests {
         connect(1);
         connect(2);
         assert!(release(&app, id, 1).is_none(), "a stale session must release nothing");
-        assert!(live(), "the reconnected agent stays online");
-        assert!(app.agents.read().unwrap().contains_key(&id), "and keeps receiving probe pushes");
+        assert!(live(), "the reconnected agent stays online and keeps receiving probe pushes");
     }
 
     #[test]

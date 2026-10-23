@@ -9,7 +9,7 @@ use axum::http::request::Parts;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use chrono::{Local, NaiveDate, Utc};
+use chrono::{DateTime, Local, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tracing::{debug, info, warn};
@@ -20,7 +20,7 @@ use crate::auth::{
 };
 use crate::command::{self, StartError};
 use crate::db::{
-    AuthorizationDraft, AuthorizationWriteIssue, Db, Node, NodePatch, PingTask, Proxy, ProxyWriteIssue,
+    self, AuthorizationDraft, AuthorizationWriteIssue, Db, Node, NodePatch, PingTask, Proxy, ProxyWriteIssue,
     Traffic, TrafficPatch, User, UserDeleteResult, UserWriteIssue,
 };
 use crate::proxy::{self, AuthorizationRequest, ProxyRequest, UserRequest};
@@ -1124,14 +1124,20 @@ fn addresses<'a>(
 
 /// One node as the UI consumes it: stored config, live metrics and the hub's
 /// accumulated traffic in a single object.
-fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool, today: NaiveDate) -> Value {
+fn node_view(
+    node: &Node,
+    current: Option<&Agent>,
+    traffic: &Traffic,
+    full: bool,
+    now: DateTime<Local>,
+) -> Value {
     // The three capacities arrive twice: once in `Facts`, sent at the handshake,
     // and again in every `Metrics`. The stored figure follows the reports a
     // minute at a time and as the session ends, so it lags a disk mounted while
     // the agent runs -- the agent re-reads its mount table every sample so that
     // it appears -- by up to a minute. Using the report while a node is connected
     // keeps every consumer of this view on one number: the card reads the live
-    // metrics and the detail page reads these, and they previously showed the
+    // metrics and the detail page reads these, which would otherwise show the
     // same machine two different capacities. Offline, the stored figure is the
     // last one reported. No floor is applied: a host whose swap has just been
     // disabled reports zero and means it. A node connected but not yet reporting
@@ -1139,6 +1145,10 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
     let live = |key: &str, stored: i64| {
         current.and_then(|a| a.metrics.get(key).and_then(serde_json::Value::as_i64)).unwrap_or(stored)
     };
+    // The live entry while connected, the stored one afterwards. Zero means
+    // connected but not yet reporting, which is not a timestamp, so it falls
+    // back to the stored value and "offline since" survives the gap.
+    let last_seen = current.map(|a| a.last_seen).filter(|t| *t > 0).unwrap_or(node.last_seen);
     let mut view = json!({
         "id": node.id,
         "name": node.name,
@@ -1149,13 +1159,17 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
         // Named by the operator for the status page to divide the list by, so
         // public like the node's name. Empty is ungrouped.
         "group": node.group,
+        // Written by the operator for visitors, unlike `remark` below.
+        "public_remark": node.public_remark,
         "sort": node.sort,
         "public": node.public,
         "online": current.is_some(),
-        // The live entry while connected, the stored one afterwards. Zero means
-        // connected but not yet reporting, which is not a timestamp, so it falls
-        // back to the stored value and "offline since" survives the gap.
-        "last_seen": current.map(|a| a.last_seen).filter(|t| *t > 0).unwrap_or(node.last_seen),
+        "last_seen": last_seen,
+        // Counted on the hub's clock, for the same reason as `expires_in`: a page
+        // subtracting `last_seen` from its own clock is off by as much as that
+        // clock is, and one eight hours fast shows a node that dropped a minute
+        // ago as offline for eight hours. Null for a node never seen.
+        "last_seen_ago": (last_seen > 0).then(|| (now.timestamp() - last_seen).max(0)),
         "metrics": current.map(|a| a.metrics.clone()).unwrap_or(Value::Null),
         "os": node.os,
         "kernel": node.kernel,
@@ -1175,7 +1189,7 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
         // on the visitor's clock would, with the hub on UTC and the visitor on
         // UTC+8, show every online node expired for eight hours each cycle
         // before the hub rolls its date forward.
-        "expires_in": node.expires_at.as_deref().and_then(|d| d.parse::<NaiveDate>().ok()).map(|d| (d - today).num_days()),
+        "expires_in": node.expires_at.as_deref().and_then(|d| d.parse::<NaiveDate>().ok()).map(|d| (d - now.date_naive()).num_days()),
         "traffic_limit": node.traffic_limit,
         "traffic_mode": node.traffic_mode,
         "traffic_reset_day": node.traffic_reset_day,
@@ -1194,7 +1208,7 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
     // from its own repository, so a field added there would otherwise reach
     // anonymous visitors the day it is released, and a node token in the wrong
     // hands could fill the panel's frame with whatever it sends. No address,
-    // hostname or note may ever reach a visitor.
+    // hostname or private note may ever reach a visitor.
     if let Some(m) = view["metrics"].as_object_mut() {
         m.retain(|k, _| PUBLIC_METRICS.contains(&k.as_str()) || (full && k == "iface"));
         // The same figures as the top-level ones, from the same row. Both official
@@ -1208,8 +1222,8 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
             m.insert(key.into(), json!(value));
         }
     }
-    // Address, private notes and the token never leave the panel. The token is
-    // included so the install command can be displayed without reissuing it.
+    // Address and private notes never leave the panel. The token is not here at
+    // all: the panel reads it from `node_token` as it shows the install command.
     if full {
         let held = (node.ipv4.as_str(), node.ipv6.as_str());
         let (pin4, pin6) = (node.ipv4_pin.as_str(), node.ipv6_pin.as_str());
@@ -1236,7 +1250,6 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
         view["country_pin"] = json!(node.country_pin);
         view["country_auto"] = json!(node.country);
         view["remark"] = json!(node.remark);
-        view["token"] = json!(node.token);
         view["notify"] = json!(node.notify);
     }
     view
@@ -1249,11 +1262,11 @@ fn visible_nodes(app: &App, full: bool) -> Result<Vec<Value>, anyhow::Error> {
     let traffic = app.db.all_traffic();
     let agents = app.agents.read().unwrap_or_else(|e| e.into_inner());
     let none = Traffic::default();
-    let today = Local::now().date_naive();
+    let now = Local::now();
     Ok(nodes
         .iter()
         .filter(|n| full || n.public)
-        .map(|n| node_view(n, agents.get(&n.id), traffic.get(&n.id).unwrap_or(&none), full, today))
+        .map(|n| node_view(n, agents.get(&n.id), traffic.get(&n.id).unwrap_or(&none), full, now))
         .collect())
 }
 
@@ -1265,8 +1278,16 @@ pub async fn nodes(State(app): State<Shared>, headers: HeaderMap) -> Response {
     // The same rendered frame the browser streams receive, for the same reason:
     // otherwise every visitor would rebuild every node's row against the
     // connection the agents write through.
-    ([(axum::http::header::CONTENT_TYPE, "application/json")], live_snapshot(&app, full).as_str().to_owned())
-        .into_response()
+    let mut res =
+        ([(header::CONTENT_TYPE, "application/json")], axum::body::Bytes::from(live_snapshot(&app, full)))
+            .into_response();
+    // Uncompressed by the hub and by Cloudflare, as the admin stream is: every
+    // node's address and private notes beside strings an agent reports.
+    if full {
+        res.headers_mut()
+            .insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store, no-transform"));
+    }
+    res
 }
 
 #[derive(Deserialize)]
@@ -1287,22 +1308,22 @@ fn default_hours() -> i64 {
 
 /// How many history windows are built concurrently.
 ///
-/// `PUBLIC_HOURS` bounds what one request costs; this bounds how many may run,
+/// `span` bounds what one request costs; this bounds how many may run,
 /// closing the same gap `main::RELAY_GATE` and `auth::PASSWORD_GATE` close on
 /// the other two paths an anonymous caller can make expensive. This is the most
-/// expensive of the three: every request holds the single connection the agents
-/// report through for its entire scan, measured at 118 ms for a week of four
-/// probes and growing with `retention_days`. Without a gate, 120 requests from
-/// one machine took the panel's own node list from 1 ms to 2.8 s.
+/// expensive of the three: a week of probe results is a scan of 98 ms at four
+/// 60-second probes and 486 ms at eight 10-second ones, growing with the probes
+/// the admin configured rather than with anything the caller sends.
 ///
-/// Four, because the requests serialise on that one connection regardless: a
-/// fifth in flight buys no throughput and merely places another scan ahead of
-/// the next agent report. What the number actually sets is how long that wait
-/// can become -- four at roughly 120 ms is half a second -- while leaving room
-/// for several people opening charts simultaneously.
+/// The scans run on the database's read-only connection, so the agents' writes
+/// do not wait on them, and they serialise on that one connection instead. Four,
+/// because a fifth in flight buys no throughput and only lengthens the wait
+/// behind the others: what the number sets is how long a chart can wait, four
+/// scans of the slower kind being 2 s, while leaving room for several people
+/// opening charts simultaneously.
 ///
 /// Refused rather than queued, as in `auth`: a queue admits the same flood,
-/// merely later.
+/// merely later, and each request waiting in it holds a blocking thread.
 ///
 /// **This gate is ineffective without the `spawn_blocking` below.** The body of
 /// this handler never awaits, so a permit taken and dropped within it is held
@@ -1332,15 +1353,13 @@ pub async fn metrics(
     let Ok(_permit) = HISTORY_GATE.try_acquire() else {
         return answer(StatusCode::SERVICE_UNAVAILABLE, "查询历史的请求太多，稍后再试");
     };
-    let hours = w.hours.clamp(1, if full { ADMIN_HOURS } else { PUBLIC_HOURS });
-    let since = Utc::now().timestamp() - hours * 3_600;
-    let step = sample_step(hours, w.points);
+    let hours = w.hours.clamp(1, app.db.retention_days() * 24);
+    let span = span(hours, w.points, Utc::now().timestamp());
     let wants = |name: &str| w.series.as_deref().is_none_or(|s| s == name);
     let (want_metrics, want_ping) = (wants("metrics"), wants("ping"));
-    // Off the runtime, for the reason given in `db_stats` below: this reads every
-    // probe result the node has retained within the window and holds the
-    // connection the agents report through throughout. That route is behind
-    // `Admin` and cheaper than this one, which anyone can reach.
+    // Off the runtime: this reads every probe result the node has retained
+    // within the window, and a worker thread blocked on that scan, or on the
+    // reader while another request holds it, serves nothing else.
     //
     // It is also what makes the gate above effective: the permit is held across
     // an await, so exactly four callers are inside it at once rather than however
@@ -1349,19 +1368,24 @@ pub async fn metrics(
         // Probe names accompany the samples they label, so the page needs no
         // second request. Names only: targets and assignments remain behind
         // `Admin`. Skipped when probes were not requested, since the resources tab
-        // has nothing to label and this costs a turn at the write connection.
+        // has nothing to label and this costs a turn at the reader.
         let probes =
             if want_ping { app.db.ping_task_names(id).unwrap_or_else(|_| json!({})) } else { json!({}) };
-        let metrics = if want_metrics { app.db.metrics(id, since, step)? } else { vec![] };
+        let metrics = if want_metrics { app.db.metrics(id, span)? } else { vec![] };
         // `loss` is per probe across the whole window, alongside the per-bucket
         // `loss` on the rows. Both are required and neither replaces the other:
         // the row figure is what a tooltip reads, while the window figure is the
         // only one that can be accurate, since the denominators it divides by are
         // gone by the time the rows are built. Additive, so a theme unaware of it
         // continues to work.
-        let (ping, loss) =
-            if want_ping { app.db.ping_records(id, since, step)? } else { (vec![], json!({})) };
-        anyhow::Ok(json!({"metrics": metrics, "ping": ping, "probes": probes, "loss": loss}))
+        let (ping, loss) = if want_ping { app.db.ping_records(id, span)? } else { (vec![], json!({})) };
+        // `step` is the seconds each point spans, against which a row's `minutes`
+        // is read; inferred from the stamps instead, it would be missing for a
+        // window holding a single point. The last point is the bucket still in
+        // progress and holds only the minutes elapsed.
+        anyhow::Ok(json!({
+            "metrics": metrics, "ping": ping, "probes": probes, "loss": loss, "step": span.step,
+        }))
     })
     .await;
     match built.map_err(|e| anyhow::anyhow!(e)).and_then(|r| r) {
@@ -1370,40 +1394,43 @@ pub async fn metrics(
     }
 }
 
-/// Widest history window each audience may request.
+/// The window a chart request is answered with: `hours` back from `now`,
+/// widened to the point boundary at or before that.
 ///
-/// The thinning below bounds the response, not the scan behind it: `hours=2160`
-/// returns 320 rows after reading every probe result the node has retained. At a
-/// month of retention that is 224 ms holding the single write connection the
-/// agents report through, growing with `retention_days`.
-///
-/// The public ceiling is a week because that is the widest chart the themes
-/// draw, so nothing in use is lost. The panel retains the quarter year, being
-/// one signed-in operator rather than an anonymous caller.
-const PUBLIC_HOURS: i64 = 24 * 7;
-const ADMIN_HOURS: i64 = 24 * 90;
-
-/// Seconds between the samples a window is drawn from.
+/// The width is capped by the retention window alone, the same for every
+/// caller, because no width costs more than the week: up to `DETAIL_DAYS` a
+/// request reads minute rows, 10,080 per series at most, and past it hourly
+/// rows, 8,760 per series at a year, with the minute rows not yet folded, which
+/// `Db::metrics` bounds to the newest week. The scan is what a request costs --
+/// the thinning below bounds the response, not the rows read -- so a width
+/// reading more than the week would need a lower ceiling for anonymous callers.
 ///
 /// Thinning exists for what the screen cannot draw rather than as a convention:
 /// where the samples fit, every one is sent. A chart of a hundred points reads
 /// as a hundred samples taken, which for a probe is a claim about the network.
-/// Whole minutes, matching the grid the metric rows sit on.
+/// Whole minutes, matching the grid the metric rows sit on, and whole hours
+/// past the week, so that no hourly row straddles two points.
 ///
 /// `points` is what the caller reports it can draw, and can only lower the
 /// budget: `SAMPLES` is the hub's ceiling rather than the caller's, set at a day
-/// of minutes so the widest charted probe window returns intact.
+/// of minutes so the day's probe window returns intact.
 // ponytail: the budget is per series, so a response is SAMPLES × (1 + probes) --
 // bounded by how many probes the admin created, not by the caller. Four probes
 // at a day is ~90 kB gzipped; if that list ever grows long, scale SAMPLES by
 // the probe count.
-fn sample_step(hours: i64, points: Option<i64>) -> i64 {
+fn span(hours: i64, points: Option<i64>, now: i64) -> db::Span {
     const SAMPLES: i64 = 1_440;
     let budget = points.unwrap_or(SAMPLES).clamp(60, SAMPLES);
+    let hourly = hours > db::DETAIL_DAYS * 24;
+    let unit = if hourly { 3_600 } else { 60 };
     // Rounded up, or the budget would not be one: a window that does not divide
     // evenly would keep the finer step and exceed it. `i64::div_ceil` is still
     // unstable, and both operands are positive here.
-    60 * ((hours * 60 + budget - 1) / budget).max(1)
+    let step = unit * ((hours * 3_600 / unit + budget - 1) / budget).max(1);
+    // Rows are bucketed by `ts / step` from the epoch, and a window opening
+    // partway through a bucket would leave its first point short of the
+    // `step / 60` minutes a whole one holds.
+    db::Span { since: (now - hours * 3_600).div_euclid(step) * step, step, hourly }
 }
 
 /// Guards a per-node read: the panel sees everything, while the public page sees
@@ -1428,34 +1455,68 @@ pub const MAX_FRAME: usize = 64 * 1024;
 /// every tick rebuilds once and no viewer receives a stale frame twice.
 const SNAPSHOT_TTL_MS: i64 = 1_900;
 
-/// The payload every browser stream sends, built at most once per tick however
-/// many tabs are watching: the public page is anonymous, so a per-connection
-/// build would make viewer count a multiplier on database work. Two slots,
-/// because the admin view carries fields the public one must never expose.
-fn live_snapshot(app: &App, full: bool) -> Utf8Bytes {
+/// One audience's node list, as every browser stream and `/api/nodes` send it.
+#[derive(Default)]
+pub struct Frame {
+    /// The millisecond it was built.
+    at: i64,
+    json: Utf8Bytes,
+    /// `json` gzipped, made by the first stream that asks for it.
+    gzip: Option<axum::body::Bytes>,
+}
+
+/// Runs `read` on one audience's frame, rebuilt first once it has expired. A
+/// frame is built at most once per tick however many tabs are watching: the
+/// public page is anonymous, so a per-connection build would make viewer count
+/// a multiplier on database work. Two slots, because the admin view carries
+/// fields the public one must never expose.
+fn current<T>(app: &App, full: bool, read: impl FnOnce(&mut Frame) -> T) -> T {
     let now = Utc::now().timestamp_millis();
-    let slot = usize::from(full);
-    let mut cache = app.snapshot.lock().unwrap_or_else(|e| e.into_inner());
+    // Held while the frame is built, so that tabs ticking together build it
+    // once; the rest wait for it off the runtime, as for the database.
+    let mut cache = db::lock(&app.snapshot);
+    let frame = &mut cache[usize::from(full)];
     // A cached frame's age must be non-negative. A wall clock can step backwards
     // -- NTP correcting a fresh boot -- and against a bare upper bound the
     // resulting negative reads as young, pinning the panel to a stale frame until
     // real time catches up.
-    if (0..SNAPSHOT_TTL_MS).contains(&now.saturating_sub(cache[slot].0)) {
-        return cache[slot].1.clone();
+    if !(0..SNAPSHOT_TTL_MS).contains(&now.saturating_sub(frame.at)) {
+        let nodes = visible_nodes(app, full).unwrap_or_default();
+        // `admin` is included so the panel's first fetch and its stream share one
+        // cached frame.
+        let json = json!({"nodes": nodes, "admin": full}).to_string().into();
+        *frame = Frame { at: now, json, gzip: None };
     }
-    let nodes = visible_nodes(app, full).unwrap_or_default();
-    // `admin` is included so the panel's first fetch and its stream share one
-    // cached frame.
-    let payload = Utf8Bytes::from(json!({"nodes": nodes, "admin": full}).to_string());
-    cache[slot] = (now, payload.clone());
-    payload
+    read(frame)
+}
+
+fn live_snapshot(app: &App, full: bool) -> Utf8Bytes {
+    current(app, full, |frame| frame.json.clone())
+}
+
+/// The public frame gzipped, for streams opened with `?gzip`. A hundred
+/// reporting nodes are about 110 KB of JSON every two seconds, 15 KB compressed,
+/// for each page left open. Compressed once per frame, about a millisecond at
+/// that size, however many streams take it.
+fn live_gzip(app: &App) -> axum::body::Bytes {
+    current(app, false, |frame| {
+        frame
+            .gzip
+            .get_or_insert_with(|| {
+                let mut packed = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                // Into a Vec, which cannot fail.
+                let _ = std::io::Write::write_all(&mut packed, frame.json.as_bytes());
+                packed.finish().unwrap_or_default().into()
+            })
+            .clone()
+    })
 }
 
 /// Drops the cached frames so the next push rebuilds. Without it a node just
 /// added in the panel would disappear from the list until the frame expires.
 fn invalidate_snapshot(app: &App) {
-    for slot in app.snapshot.lock().unwrap_or_else(|e| e.into_inner()).iter_mut() {
-        slot.0 = 0;
+    for frame in db::lock(&app.snapshot).iter_mut() {
+        frame.at = 0;
     }
 }
 
@@ -1464,10 +1525,10 @@ fn invalidate_snapshot(app: &App) {
 /// open to anonymous callers, and nothing once either ceases to hold.
 ///
 /// Both are checked every tick rather than at the handshake alone, because a
-/// socket outlives both answers. The admin frame carries every node's token in
-/// the clear, so one outliving its session would distribute credentials that
-/// survive revocation -- the same gap `reset_token` closes on the agent side by
-/// dropping its sender. The public frame is what an operator withdraws by
+/// socket outlives both answers. The admin frame carries every node's address
+/// and private notes, so one outliving its session would keep disclosing them
+/// after the session was revoked -- the gap `reset_token` closes on the agent
+/// side by dropping its sender. The public frame is what an operator withdraws by
 /// switching the status page off, and a socket opened a minute earlier would
 /// continue sending it for as long as the tab stayed open: `live_ws` refuses new
 /// anonymous connections from that moment and `nodes` answers them 401, leaving
@@ -1480,10 +1541,23 @@ fn stream_audience(app: &App, session: Option<&str>) -> Option<bool> {
     }
 }
 
+#[derive(Deserialize)]
+pub struct Stream {
+    /// Present for each public frame gzipped, in a binary message; the admin
+    /// frame stays text. Without it frames are text, which every theme written
+    /// before it reads.
+    gzip: Option<String>,
+}
+
 /// Live stream for the browser. Each connection runs its own timer -- simpler to
 /// reason about than a fan-out channel -- over a shared snapshot, so a timer
 /// costs no more than a send.
-pub async fn live_ws(State(app): State<Shared>, headers: HeaderMap, upgrade: WebSocketUpgrade) -> Response {
+pub async fn live_ws(
+    State(app): State<Shared>,
+    headers: HeaderMap,
+    Query(stream): Query<Stream>,
+    upgrade: WebSocketUpgrade,
+) -> Response {
     // The digest rather than the result: signing out must reach a stream already
     // running, and only the row it names can report whether it has.
     let session = current_session(&headers).filter(|hash| app.db.session_valid(hash));
@@ -1493,18 +1567,43 @@ pub async fn live_ws(State(app): State<Shared>, headers: HeaderMap, upgrade: Web
     upgrade
         .read_buffer_size(SOCKET_BUFFER)
         .max_message_size(MAX_FRAME)
-        .on_upgrade(move |socket| stream_live(app, socket, session))
+        .on_upgrade(move |socket| stream_live(app, socket, session, stream.gzip.is_some()))
 }
 
-async fn stream_live(app: Shared, mut socket: WebSocket, session: Option<String>) {
+async fn stream_live(app: Shared, mut socket: WebSocket, session: Option<String>, gzip: bool) {
+    // The panel and both official themes treat 10 s without a frame as a lost
+    // stream and reconnect, so the interval must stay well below that.
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
+    // A delayed tick, for instance behind a vacuum holding the database, is
+    // followed by one frame rather than by every tick it missed: those would
+    // all carry the same snapshot, 60 of them per tab after a two-minute wait.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        ticker.tick().await;
+        tokio::select! {
+            _ = ticker.tick() => {}
+            // The browser sends nothing but its close frame, and that is seen only
+            // by reading. Unread, the close goes unanswered: the browser waits out
+            // its 60 s closing handshake while this loop keeps pushing a full frame
+            // every tick to a page that has already discarded the socket.
+            inbound = socket.recv() => match inbound {
+                Some(Ok(Message::Close(_)) | Err(_)) | None => break,
+                Some(Ok(_)) => continue,
+            },
+        }
         // Closed rather than downgraded to the public frame, which would leave the
         // panel rendering a list with every admin field missing. The close allows
         // a client to re-query /api/me and determine its current state.
         let Some(full) = stream_audience(&app, session.as_deref()) else { break };
-        if socket.send(Message::Text(live_snapshot(&app, full))).await.is_err() {
+        // The admin frame stays uncompressed, asked or not: it carries every
+        // node's address and private notes beside strings an agent reports, and the
+        // length of each compressed frame, every two seconds on the wire,
+        // would let one rogue agent guess the rest a character at a time.
+        let frame = if gzip && !full {
+            Message::Binary(live_gzip(&app))
+        } else {
+            Message::Text(live_snapshot(&app, full))
+        };
+        if socket.send(frame).await.is_err() {
             break;
         }
     }
@@ -1601,10 +1700,8 @@ fn provisioning_allowed(app: &App, headers: &HeaderMap) -> Result<(), &'static s
 }
 
 /// Range and sign limits every stored node must satisfy, or the reason it does
-/// not. Shared because both writers must enforce them: the create path formerly
-/// accepted a whole `Node` unchecked, leaving the values the update path refuses
-/// reachable by another route, and an out-of-range reset day remained harmless
-/// only because `period_start` clamps what it reads.
+/// not. Shared because both writers must enforce them: a value one refuses must
+/// not be reachable through the other.
 fn node_limits(reset_day: Option<u32>, price: Option<f64>, limit: Option<i64>) -> Option<&'static str> {
     if reset_day.is_some_and(|d| !(1..=31).contains(&d)) {
         return Some("流量重置日要在 1 到 31 之间");
@@ -1629,11 +1726,15 @@ fn group_error(group: &mut String) -> Option<&'static str> {
     None
 }
 
+/// A public remark goes to every visitor in every frame, every two seconds, where
+/// a node's public view is about 1 KB; a hundred CJK characters add 300 bytes.
+const MAX_PUBLIC_REMARK: usize = 100;
+
 /// Normalizes the currency and billing cycle, or names the one that cannot be
 /// stored. The currency is held to the ISO 4217 form of three letters, the only
-/// one `Intl.NumberFormat` accepts, so a theme may pass it on without guarding
-/// against a throw. Each cycle length is stored in a single spelling, see
-/// `cycle_name`.
+/// one `Intl.NumberFormat` accepts. Hubs before 1.3.1 stored it unchecked, so a
+/// theme still guards the call against a throw. Each cycle length is stored in a
+/// single spelling, see `cycle_name`.
 fn billing_error(currency: Option<&mut String>, cycle: Option<&mut String>) -> Option<&'static str> {
     if let Some(code) = currency {
         *code = code.trim().to_ascii_uppercase();
@@ -1663,6 +1764,13 @@ fn patch_error(node: &mut NodePatch) -> Option<&'static str> {
     if let Some(group) = &mut node.group {
         if let Some(message) = group_error(group) {
             return Some(message);
+        }
+    }
+    // Refused rather than truncated, as a group name is.
+    if let Some(text) = &mut node.public_remark {
+        *text = text.trim().to_owned();
+        if text.chars().count() > MAX_PUBLIC_REMARK || text.chars().any(char::is_control) {
+            return Some("公开备注最多 100 个字，不能含控制字符");
         }
     }
     node_limits(node.traffic_reset_day, node.price, node.traffic_limit)
@@ -1712,6 +1820,9 @@ pub async fn me(State(app): State<Shared>, headers: HeaderMap) -> Json<Value> {
         "github": app.db.get("github_client_id").is_some_and(|v| !v.is_empty()),
         "site_name": app.db.get("site_name").unwrap_or_else(|| "Monitor".into()),
         "public_page": app.public_page(),
+        // How far back a chart may reach, so a theme offers only windows the hub
+        // answers in full; `metrics` narrows a wider one without saying so.
+        "history_days": app.db.retention_days(),
         // Whether this browser may provision is not answered here: a GET carries
         // no `Origin`, so the panel applies `provisioning_allowed`'s rule itself.
         //
@@ -2001,8 +2112,8 @@ pub async fn create_node(
     node.name = node.name.trim().to_owned();
     let token = random_token();
     match app.db.create_node(&node, &token) {
-        // Usable immediately: the install command is readable from the node list,
-        // so adding and deploying require no reissue in between.
+        // Usable immediately: the install dialog reads the token as it opens, so
+        // adding and deploying require no reissue in between.
         Ok(id) => {
             invalidate_snapshot(&app);
             Json(json!({"id": id})).into_response()
@@ -2089,7 +2200,7 @@ pub async fn agent_register(
     let closed = || {
         answer(StatusCode::FORBIDDEN, "registration is closed; open a new window from the panel's node list")
     };
-    let until = app.db.get("register_until").and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
+    let until = register_until(&app);
     let Some(key) = app.db.get("register_key").filter(|k| !k.is_empty() && Utc::now().timestamp() < until)
     else {
         return closed();
@@ -2151,9 +2262,25 @@ pub async fn open_register(_: Admin, State(app): State<Shared>, headers: HeaderM
     let key = random_token();
     let until = (Utc::now().timestamp() + REGISTER_WINDOW).to_string();
     match app.db.set("register_key", &key).and_then(|()| app.db.set("register_until", &until)) {
-        Ok(()) => Json(json!({"register_key": key, "register_until": until})).into_response(),
+        Ok(()) => Json(json!({"register_key": key, "register_left": REGISTER_WINDOW})).into_response(),
         Err(e) => fail(e),
     }
+}
+
+/// Seconds the registration window has left, 0 when none is open. What the
+/// panel counts down from, rather than the stored deadline: compared with the
+/// browser's clock, a deadline is off by as much as that clock is. A browser
+/// eight hours fast -- Windows and Linux sharing a machine in UTC+8 -- would hide
+/// the command of an open window, and one eight hours slow would show it for
+/// eight hours after the key stopped working.
+fn register_left(app: &App) -> i64 {
+    (register_until(app) - Utc::now().timestamp()).clamp(0, REGISTER_WINDOW)
+}
+
+/// The stored deadline, 0 when none was ever set. One reading for the gate in
+/// `agent_register` and the panel's countdown, so the two cannot disagree.
+fn register_until(app: &App) -> i64 {
+    app.db.get("register_until").and_then(|v| v.parse::<i64>().ok()).unwrap_or(0)
 }
 
 /// Closes the window early, before the hour elapses.
@@ -2290,12 +2417,25 @@ pub async fn reset_token(_: Admin, State(app): State<Shared>, Path(id): Path<i64
     // agent reconnects and is refused. Its own teardown leaves the entry
     // untouched, because the session tag no longer matches.
     app.agents.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
-    // The token is part of the admin frame, which would otherwise continue to
-    // display an install command for the credential just retired.
+    // The node shows offline at once rather than when the frame expires.
     invalidate_snapshot(&app);
     // The token alone: the panel builds the command, and one place needs to know
     // its form.
     Json(json!({"token": token})).into_response()
+}
+
+/// A node's token, for the install command the panel shows. Not part of the
+/// node list, where it would share an answer with strings agents report: a
+/// proxy compressing that answer would let one rogue agent guess it a character
+/// at a time from the compressed length.
+pub async fn node_token(_: Admin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
+    match app.db.node(id) {
+        Ok(Some(node)) => {
+            ([(header::CACHE_CONTROL, "no-store")], Json(json!({"token": node.token}))).into_response()
+        }
+        Ok(None) => no_such_node(),
+        Err(e) => fail(e),
+    }
 }
 
 pub async fn patch_traffic(
@@ -2385,9 +2525,34 @@ pub async fn save_ping_task(_: Admin, State(app): State<Shared>, Json(mut task):
     }
     match app.db.save_ping_task(&task) {
         Ok(id) => {
-            agent_ws::push_ping_tasks(&app);
+            agent_ws::push_ping_tasks(&app, None);
             Json(json!({"id": id})).into_response()
         }
+        Err(e) => fail(e),
+    }
+}
+
+/// The probes ticked for one node, and `base`, those it had when the editor
+/// opened; see `Db::set_node_ping_tasks`.
+#[derive(Deserialize)]
+pub struct NodeProbes {
+    tasks: Vec<i64>,
+    base: Vec<i64>,
+}
+
+pub async fn set_node_ping_tasks(
+    _: Admin,
+    State(app): State<Shared>,
+    Path(id): Path<i64>,
+    body: Result<Json<NodeProbes>, JsonRejection>,
+) -> Response {
+    let Ok(Json(probes)) = body else { return bad("监控列表格式不对") };
+    match app.db.set_node_ping_tasks(id, &probes.tasks, &probes.base) {
+        Ok(true) => {
+            agent_ws::push_ping_tasks(&app, Some(id));
+            Json(json!({"ok": true})).into_response()
+        }
+        Ok(false) => no_such_node(),
         Err(e) => fail(e),
     }
 }
@@ -2395,7 +2560,7 @@ pub async fn save_ping_task(_: Admin, State(app): State<Shared>, Json(mut task):
 pub async fn delete_ping_task(_: Admin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
     match app.db.delete_ping_task(id) {
         Ok(()) => {
-            agent_ws::push_ping_tasks(&app);
+            agent_ws::push_ping_tasks(&app, None);
             Json(json!({"ok": true})).into_response()
         }
         Err(e) => fail(e),
@@ -2413,6 +2578,8 @@ const READABLE_SETTINGS: &[&str] = &[
     "theme",
     "github_proxy",
     "update_notice",
+    "favicon",
+    "touch_icon",
 ];
 
 // ---- the database itself ----
@@ -2431,12 +2598,14 @@ pub const MAX_CHUNK: usize = 8 * 1024 * 1024;
 /// the first request rather than by counting bytes as they arrive, so an
 /// oversized upload is refused before a byte is sent.
 ///
-/// The backup ceiling is set where it is because restoring holds the connection
-/// every read and write passes through: at the measured ~40 MB/s that is roughly
-/// 6.5 seconds during which the panel and the public page also wait. Database
-/// sizes reachable with a few hundred nodes sit two orders of magnitude below
-/// it.
-pub const MAX_RESTORE: u64 = 256 * 1024 * 1024;
+/// The backup ceiling bounds how long a restore holds the connection every read
+/// and write passes through, while the panel and the public page wait and the
+/// agents' reports queue: a 1.5 GiB copy measured 20.5 s from the page cache, so
+/// 1 GiB is 14 s, or 27 s at the ~40 MB/s measured from disk -- within the 90 s
+/// an agent waits before reconnecting. It clears what history can reach: at 300
+/// nodes with four probes, a week of minute rows and a year of hourly ones come
+/// to about 720 MiB.
+pub const MAX_RESTORE: u64 = 1024 * 1024 * 1024;
 pub const MAX_THEME: u64 = 32 * 1024 * 1024;
 
 /// One request of an upload: `total` is the whole file, `offset` where this piece
@@ -2541,10 +2710,9 @@ fn scratch_path(app: &App, kind: &str) -> String {
 /// The data page's figures.
 ///
 /// Off the runtime, like the three routes below: `stats` counts every row of
-/// `metric` and `ping_record` -- both WITHOUT ROWID, so each count is a full
-/// index scan -- holding the connection the agents report through throughout. At
-/// 2.2M rows that is 127 ms during which the public page and every agent report
-/// also wait, growing with `retention_days`.
+/// both tiers of history -- all WITHOUT ROWID, so each count is a full index
+/// scan -- 127 ms at 2.2M rows with the file cached, growing with
+/// `retention_days`, and uncached, as long as reading the file takes.
 pub async fn db_stats(_: Admin, State(app): State<Shared>) -> Response {
     match tokio::task::spawn_blocking(move || app.db.stats()).await {
         Ok(Ok(stats)) => Json(stats).into_response(),
@@ -2561,8 +2729,8 @@ pub async fn db_stats(_: Admin, State(app): State<Shared>) -> Response {
 /// outlives the download.
 pub async fn db_backup(_: Admin, State(app): State<Shared>) -> Response {
     let path = scratch_path(&app, "backup");
-    // Off the runtime: this reads the entire database while holding the
-    // connection the agents write through.
+    // Off the runtime: this reads the entire database, through a connection of
+    // its own, so the agents' writes continue meanwhile.
     let copied = {
         let (app, path) = (app.clone(), path.clone());
         tokio::task::spawn_blocking(move || app.db.backup_into(&path)).await
@@ -2671,7 +2839,7 @@ pub async fn db_restore(
 
 async fn restore(app: &Shared, path: &str) -> Result<(), anyhow::Error> {
     // Both halves read the whole file, off the runtime: `PRAGMA integrity_check`
-    // on a 256 MiB upload is not runtime work, and the copy that follows holds
+    // on a 1 GiB upload is not runtime work, and the copy that follows holds
     // the connection the agents write through.
     let (app, source) = (app.clone(), path.to_owned());
     tokio::task::spawn_blocking(move || {
@@ -2840,19 +3008,21 @@ struct Asset {
     name: String,
 }
 
-/// The `<owner>/<repo>` a theme's `url` names, where it names a GitHub repository
-/// at all.
+/// The `<owner>/<repo>` a theme's `url` or an address pasted to install one
+/// names, where it names a GitHub repository at all.
 ///
-/// An allowlist rather than a filter. Every address the update path fetches is
-/// constructed from these two strings, so nothing in a manifest can direct the
-/// hub at a host it did not choose, which is why no private-address check is
-/// needed here. The only host that is not github.com is the GitHub proxy in the
-/// panel's settings, configured by the operator and already used by the agent
-/// relay.
+/// An allowlist rather than a filter. Every address the update and install paths
+/// fetch is constructed from these two strings, so neither a manifest nor a pasted
+/// address can direct the hub at a host it did not choose, which is why no
+/// private-address check is needed here. The only host that is not github.com
+/// is the GitHub proxy in the panel's settings, configured by the operator and
+/// already used by the agent relay.
 fn github_repo(url: &str) -> Option<(&str, &str)> {
     let (owner, rest) = url.strip_prefix("https://github.com/")?.split_once('/')?;
-    // A link to a branch or a file is still a link to the repository.
-    let repo = rest.split('/').next()?;
+    // A link to a branch or a file is still a link to the repository, as is the
+    // `?tab=readme-ov-file` or `#readme` a browser's address bar often carries;
+    // neither part reaches the addresses built from the result.
+    let repo = rest.split(['/', '?', '#']).next()?;
     let repo = repo.strip_suffix(".git").unwrap_or(repo);
     (path_segment(owner) && path_segment(repo)).then_some((owner, repo))
 }
@@ -2882,29 +3052,13 @@ pub async fn update_theme(_: Admin, State(app): State<Shared>, Path(short): Path
 }
 
 async fn update(app: &App, short: &str) -> Result<(bool, String), anyhow::Error> {
-    use anyhow::Context;
-
     let Some(installed) = crate::frontend::themes(app)?.into_iter().find(|theme| theme.short == short) else {
         refuse!("没有这个主题");
     };
     let Some((owner, repo)) = github_repo(&installed.url) else {
         refuse!("这个主题的 url 不是 https://github.com/<owner>/<repo>，只能手动上传新包");
     };
-
-    let release = match latest_release(app, &format!("{owner}/{repo}")).await {
-        Ok(release) => release,
-        Err(e) => {
-            let why = match e.status().map(|s| s.as_u16()) {
-                None if e.is_decode() => "GitHub 的回复无法识别，稍后再试",
-                Some(404) => "这个仓库还没有正式 release",
-                // Unauthenticated callers get 60 requests an hour per address.
-                Some(403 | 429) => "GitHub 限制了这台机器的请求次数，过一小时再试",
-                Some(_) => "GitHub 接口出错，稍后再试",
-                None => "hub 连不上 api.github.com，检查它的网络",
-            };
-            return Err(e).context(crate::Shown(format!("读不到 {owner}/{repo} 的最新 release：{why}")));
-        }
-    };
+    let release = latest_theme(app, owner, repo).await?;
 
     // Tags read `v1.2.3` while manifests carry `1.2.3`. Equal means up to date;
     // anything else is installed, including a deliberate downgrade, since the
@@ -2913,6 +3067,74 @@ async fn update(app: &App, short: &str) -> Result<(bool, String), anyhow::Error>
     if tag.strip_prefix('v').unwrap_or(tag) == installed.version {
         return Ok((false, installed.version));
     }
+    // Constrained to the theme it may replace. The built-in theme has no
+    // directory until this runs: updating it writes one, which then serves in
+    // place of the embedded copy until it is deleted.
+    let theme = fetch_theme(app, owner, repo, &release, Some(short)).await?;
+    Ok((true, theme.version))
+}
+
+/// Installs a theme from the latest release of a GitHub repository the
+/// administrator pastes, in place of downloading its `theme.tar.gz` and
+/// uploading it.
+///
+/// The trust is that of an upload: either way the administrator vouches for the
+/// repository. The address is read as an update reads a manifest's `url`, with
+/// only `<owner>/<repo>` taken from it, so the hub still fetches from no host but
+/// GitHub and the configured proxy.
+pub async fn install_theme(_: Admin, State(app): State<Shared>, Json(body): Json<Repository>) -> Response {
+    let url = body.url.trim();
+    // A bare `github.com/...`, the form addresses are often passed along in.
+    let url = if url.starts_with("github.com/") { format!("https://{url}") } else { url.to_owned() };
+    let Some((owner, repo)) = github_repo(&url) else {
+        return bad("填主题的 GitHub 仓库地址，形如 https://github.com/作者/仓库");
+    };
+    let release = match latest_theme(&app, owner, repo).await {
+        Ok(release) => release,
+        Err(e) => return fail(e),
+    };
+    match fetch_theme(&app, owner, repo, &release, None).await {
+        Ok(theme) => Json(json!({"theme": theme})).into_response(),
+        Err(e) => fail(e),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct Repository {
+    url: String,
+}
+
+/// The latest release of a theme's repository, with GitHub's refusal put into
+/// words the panel can show.
+async fn latest_theme(app: &App, owner: &str, repo: &str) -> Result<Release, anyhow::Error> {
+    use anyhow::Context;
+
+    latest_release(app, &format!("{owner}/{repo}")).await.or_else(|e| {
+        let why = match e.status().map(|s| s.as_u16()) {
+            None if e.is_decode() => "GitHub 的回复无法识别，稍后再试",
+            // A private repository answers the same as a missing one.
+            Some(404) => "仓库不存在，或者还没有正式 release",
+            // Unauthenticated callers get 60 requests an hour per address.
+            Some(403 | 429) => "GitHub 限制了这台机器的请求次数，过一小时再试",
+            Some(_) => "GitHub 接口出错，稍后再试",
+            None => "hub 连不上 api.github.com，检查它的网络",
+        };
+        Err(e).context(crate::Shown(format!("读不到 {owner}/{repo} 的最新 release：{why}")))
+    })
+}
+
+/// Downloads the `theme.tar.gz` of `release` and installs it; `expect` names
+/// the theme it must replace, as for [`crate::frontend::install`].
+async fn fetch_theme(
+    app: &App,
+    owner: &str,
+    repo: &str,
+    release: &Release,
+    expect: Option<&str>,
+) -> Result<crate::frontend::Theme, anyhow::Error> {
+    use anyhow::Context;
+
+    let tag = &release.tag_name;
     if !path_segment(tag) {
         refuse!("release 的 tag {tag:?} 不能出现在下载地址里");
     }
@@ -2923,16 +3145,27 @@ async fn update(app: &App, short: &str) -> Result<(bool, String), anyhow::Error>
     }
 
     // Through the panel's GitHub proxy when one is configured, the archive being
-    // the part a blocked network cannot reach. The API call above is not proxied:
-    // most proxies front only releases, and a hub that cannot read the tag still
-    // has the upload path.
-    let url =
-        crate::proxied(app, format!("https://github.com/{owner}/{repo}/releases/download/{tag}/{ARCHIVE}"));
-    let unreachable = || crate::Shown(format!("下载 {ARCHIVE} 失败，检查 hub 的网络或面板里的 GitHub 代理"));
+    // the part a blocked network cannot reach. The API call in `latest_theme` is
+    // not proxied: most proxies front only releases, and a hub that cannot read
+    // the tag still has the upload path.
+    let direct = format!("https://github.com/{owner}/{repo}/releases/download/{tag}/{ARCHIVE}");
+    let url = crate::proxied(app, direct.clone());
+    let proxy = url != direct;
+    let unreachable = || {
+        crate::Shown(if proxy {
+            format!("经 GitHub 代理下载 {ARCHIVE} 失败，换一个代理，或清空代理让 hub 直连")
+        } else {
+            format!("下载 {ARCHIVE} 失败：hub 连不上 github.com 时，在设置里填 GitHub 代理")
+        })
+    };
     let response = app
         .http
         .get(url)
-        .timeout(std::time::Duration::from_secs(120))
+        // With the release lookup's 15 s, this keeps the request inside the 100 s
+        // Cloudflare waits for an origin before answering 524 itself: a download
+        // too slow to finish is then reported as one, naming the proxy setting,
+        // rather than as a hub that did not respond.
+        .timeout(std::time::Duration::from_secs(75))
         .send()
         .await
         .and_then(reqwest::Response::error_for_status)
@@ -2948,17 +3181,22 @@ async fn update(app: &App, short: &str) -> Result<(bool, String), anyhow::Error>
         None => refuse!("下载没有给出大小，无法确认它在 {} MiB 以内", MAX_THEME / 1024 / 1024),
     }
     let archive = response.bytes().await.with_context(unreachable)?;
+    // Checked here as well as in `unpack`, whose answer is written for an upload.
+    // A proxy answers with a page of its own -- a block notice, a sign-in wall --
+    // under a 200.
+    if !archive.starts_with(&crate::frontend::GZIP_MAGIC) {
+        if proxy {
+            refuse!("GitHub 代理返回的不是主题包，换一个代理，或清空代理让 hub 直连");
+        }
+        refuse!("release {tag} 里的 {ARCHIVE} 不是 gzip 格式，包本身有问题，请联系主题作者");
+    }
 
-    // The same unpacking, validation and atomic replace an upload undergoes,
-    // constrained to the theme it may replace. The built-in theme has no
-    // directory until this runs: updating it writes one, which then serves in
-    // place of the embedded copy until it is deleted.
-    let (themes, short) = (app.themes.clone(), short.to_owned());
-    let theme = tokio::task::spawn_blocking(move || {
-        crate::frontend::install(&themes, std::io::Cursor::new(archive), Some(&short))
+    // The same unpacking, validation and atomic replace an upload undergoes.
+    let (themes, expect) = (app.themes.clone(), expect.map(str::to_owned));
+    tokio::task::spawn_blocking(move || {
+        crate::frontend::install(&themes, std::io::Cursor::new(archive), expect.as_deref())
     })
-    .await??;
-    Ok((true, theme.version))
+    .await?
 }
 
 /// The thumbnail the theme list displays, where the theme provides one; the list
@@ -3097,8 +3335,8 @@ pub async fn settings(_: Admin, State(app): State<Shared>) -> Json<Value> {
     }
     // The one readable key with a default that also rejects the empty string:
     // `setting_error` below refuses "" and `save_settings` writes nothing when any
-    // key fails, so a hub where this was never set returned "" here and then
-    // rejected the entire settings form, naming a field that was never edited.
+    // key fails, so answering "" for a hub where this was never set would have
+    // the entire settings form rejected, naming a field that was never edited.
     // `retention_days()` already holds the default `prune` and the data page read,
     // so it answers here as well.
     out.insert("retention_days".into(), json!(app.db.retention_days().to_string()));
@@ -3108,10 +3346,9 @@ pub async fn settings(_: Admin, State(app): State<Shared>) -> Json<Value> {
     );
     // Read-only here. A window is opened and closed through its own route, so the
     // key is always one the hub generated, and `save_settings` continues to refuse
-    // both names.
-    for key in ["register_key", "register_until"] {
-        out.insert(key.into(), json!(app.db.get(key).unwrap_or_default()));
-    }
+    // both stored names.
+    out.insert("register_key".into(), json!(app.db.get("register_key").unwrap_or_default()));
+    out.insert("register_left".into(), json!(register_left(&app)));
     crate::notify::settings(&app, &mut out);
     Json(Value::Object(out))
 }
@@ -3125,16 +3362,17 @@ pub async fn settings(_: Admin, State(app): State<Shared>) -> Json<Value> {
 /// the UI reported as rejected.
 fn setting_error(app: &App, key: &str, value: &Value) -> Option<String> {
     // Settings are stored as text. A caller sending the natural JSON type --
-    // `{"public_page": false}`, `{"retention_days": 7}` -- was formerly skipped by
-    // a bare `continue`, so nothing was written while the response reported
-    // success.
+    // `{"public_page": false}`, `{"retention_days": 7}` -- is refused rather than
+    // skipped, which would write nothing while the response reported success.
     let Some(value) = value.as_str() else { return Some(format!("设置 {key} 的值格式不对")) };
     match key {
         "theme" if !crate::frontend::selectable(app, value) => Some("主题没有安装".into()),
         // Housekeeping clamps whatever it reads, so an unparsable value would be
-        // stored, echoed back, and silently mean 7 days indefinitely.
-        "retention_days" if !value.parse::<i64>().is_ok_and(|d| (1..=3_650).contains(&d)) => {
-            Some("历史保留天数要在 1 到 3650 之间".into())
+        // stored, echoed back, and silently mean the default indefinitely.
+        "retention_days"
+            if !value.parse::<i64>().is_ok_and(|d| (1..=db::MAX_RETENTION_DAYS).contains(&d)) =>
+        {
+            Some(format!("历史保留天数要在 1 到 {} 之间", db::MAX_RETENTION_DAYS))
         }
         // The hub fetches this URL itself, so it must be one: a scheme it cannot
         // speak turns every agent download into a 502 that says nothing about the
@@ -3147,6 +3385,9 @@ fn setting_error(app: &App, key: &str, value: &Value) -> Option<String> {
         // the hub.
         "github_proxy" if !(value.is_empty() || value.starts_with("https://")) => {
             Some("GitHub 代理必须以 https:// 开头：agent 程序经它下载，再安装到每个节点".into())
+        }
+        "favicon" | "touch_icon" if !value.is_empty() => {
+            crate::frontend::site_icon(value).err().map(Into::into)
         }
         "admin_password" if value.len() < 12 => Some("密码至少 12 位".into()),
         "admin_password" => None,
@@ -3168,13 +3409,11 @@ pub async fn save_settings(
             return bad(&message);
         }
     }
-    // Set when the password changed, so the caller receives a fresh session rather
-    // than being logged out by their own change.
+    // Set when the password changed: the change signs every session out, and the
+    // caller receives a replacement rather than being logged out by it.
     let mut reissued = String::new();
     for (key, value) in map {
         let value = value.as_str().unwrap_or_default();
-        // Changing the password logs out every existing session; the caller
-        // receives a replacement.
         if key == "admin_password" {
             match hash_password(value).and_then(|h| {
                 app.db.replace_password(&h)?;
@@ -3197,7 +3436,7 @@ mod tests {
     use super::*;
     // Sessions remain hashed; only node tokens are stored in the clear.
     use crate::auth::sha256;
-    use crate::db::Db;
+    use crate::db::{Db, Span};
 
     /// What a browser on `https://monitor.example.com` sends with a panel write.
     fn panel_headers() -> HeaderMap {
@@ -3595,16 +3834,23 @@ mod tests {
         assert_eq!(stored, vec![5, 60, 3_600]);
     }
 
-    /// The update path follows a manifest's `url` to build a download address, so
-    /// what counts as a GitHub repository constitutes the entire trust boundary:
-    /// whatever this accepts, the hub will fetch.
+    /// The update and install paths follow a manifest's `url` or a pasted address
+    /// to build a download address, so what counts as a GitHub repository
+    /// constitutes the entire trust boundary: whatever this accepts, the hub will
+    /// fetch.
     #[test]
     fn only_a_github_repository_url_can_name_a_release_to_download() {
-        assert_eq!(github_repo("https://github.com/lzj565/monitor"), Some(("lzj565", "monitor")));
-        // A link to the repository, in whatever form the author wrote it.
+        assert_eq!(
+            github_repo("https://github.com/monitor-probe/monitor"),
+            Some(("monitor-probe", "monitor"))
+        );
+        // A link to the repository, in whatever form the author wrote it or the
+        // address bar showed it.
         assert_eq!(github_repo("https://github.com/a/b.git"), Some(("a", "b")));
         assert_eq!(github_repo("https://github.com/a/b/tree/main"), Some(("a", "b")));
         assert_eq!(github_repo("https://github.com/a/b/"), Some(("a", "b")));
+        assert_eq!(github_repo("https://github.com/a/b?tab=readme-ov-file"), Some(("a", "b")));
+        assert_eq!(github_repo("https://github.com/a/b#readme"), Some(("a", "b")));
 
         for hostile in [
             "",
@@ -3621,7 +3867,8 @@ mod tests {
             // Anything that could open a segment of its own in the URL built from
             // it, whether encoded, queried or fragmented.
             "https://github.com/a/b%2f..%2fc",
-            "https://github.com/a/b?x=1",
+            "https://github.com/a?x=/b",
+            "https://github.com/a#/b",
             "https://github.com/a b",
         ] {
             assert_eq!(github_repo(hostile), None, "{hostile} must not name a download");
@@ -3746,15 +3993,15 @@ mod tests {
 
     /// A chart request costs roughly the same whatever it spans. This path
     /// requires no session, so an unbounded window would be megabytes of JSON any
-    /// caller could have the hub build on the connection the agents report
-    /// through.
+    /// caller could have the hub build.
     #[test]
     fn a_history_window_costs_the_same_however_wide_it_is() {
         let app = app();
         let id = node(&app, "n", true);
         let now = Utc::now().timestamp();
-        // A month of history at the rate the hub writes it. Two probes, because
-        // the budget is per series and a single-probe fixture would conceal that.
+        // A month of history at the rate the hub writes it, folded as the hourly
+        // pass would. Two probes, because the budget is per series and a
+        // single-probe fixture would conceal that.
         const PROBES: i64 = 2;
         for _ in 0..PROBES {
             task(&app, vec![id]);
@@ -3762,17 +4009,21 @@ mod tests {
         for i in 0..30 * 1440 {
             app.db.insert_metric(id, now - i * 60, &json!({"cpu": 1.0})).unwrap();
             for task in 1..=PROBES {
-                app.db.insert_pings(id, &[(task, now - i * 20, 42)]).unwrap();
+                app.db.insert_pings(id, &[(task, now - i * 60, 42)]).unwrap();
             }
         }
+        app.db.roll_up(now, 365).unwrap();
 
         // Including windows that do not divide evenly, which are where a step
-        // rounded the wrong way overruns.
-        for hours in [1, 6, 13, 23, 24, 168, 2_160] {
-            let step = sample_step(hours, None);
-            let since = now - hours * 3_600;
-            let metrics = app.db.metrics(id, since, step).unwrap();
-            let (ping, _) = app.db.ping_records(id, since, step).unwrap();
+        // rounded the wrong way overruns, and both sides of the hourly tier.
+        for hours in [1, 6, 13, 23, 24, 168, 169, 720, 8_760] {
+            let span = span(hours, None, now);
+            assert_eq!(span.hourly, hours > 168, "{hours}h");
+            if span.hourly {
+                assert_eq!(span.step % 3_600, 0, "{hours}h: an hourly row straddles two points");
+            }
+            let metrics = app.db.metrics(id, span).unwrap();
+            let (ping, _) = app.db.ping_records(id, span).unwrap();
             // Against the budget itself rather than whatever the step produced:
             // derived from the step, this would only demonstrate that division
             // works. One bucket of slack, as the window rarely divides evenly.
@@ -3785,26 +4036,29 @@ mod tests {
             );
             // Thinned, but neither empty nor reaching outside the window.
             assert!(!metrics.is_empty() && !ping.is_empty(), "{hours}h returned nothing");
-            // A bucket the window opens partway through begins before it.
             assert!(
-                metrics.iter().all(|m| m["ts"].as_i64().unwrap() >= since - step),
+                metrics.iter().all(|m| m["ts"].as_i64().unwrap() >= span.since),
                 "{hours}h reached back too far"
             );
+            // Begun on a point boundary, so the first point is a whole one where
+            // the history reaches past it: this node reported every minute.
+            if hours < 720 {
+                assert_eq!(metrics[0]["minutes"], span.step / 60, "{hours}h opened partway through a point");
+            }
         }
-        // The widest window costs no more than a narrow one: unthinned, a month of
-        // history is 43,200 rows.
-        assert!(app.db.metrics(id, now - 2_160 * 3_600, sample_step(2_160, None)).unwrap().len() <= 1_441);
 
         // A day returns every minute it holds: thinning exists only for what the
         // screen cannot draw.
-        assert_eq!(sample_step(24, Some(2_000)), 60, "a day of minutes fits under the ceiling");
-        assert_eq!(sample_step(6, Some(2_000)), 60, "and so does six hours");
+        let step = |hours, points| span(hours, points, now).step;
+        assert_eq!(step(24, Some(2_000)), 60, "a day of minutes fits under the ceiling");
+        assert_eq!(step(6, Some(2_000)), 60, "and so does six hours");
+        assert_eq!(step(720, None), 3_600, "a month is its hours");
 
         // A caller may request less than the budget, never more: the ceiling
         // belongs to the hub, since this path takes no credentials.
-        assert!(sample_step(24, Some(390)) > sample_step(24, None));
-        assert_eq!(sample_step(24, Some(100_000)), sample_step(24, None));
-        assert_eq!(sample_step(24, Some(0)), sample_step(24, Some(60)));
+        assert!(step(24, Some(390)) > step(24, None));
+        assert_eq!(step(24, Some(100_000)), step(24, None));
+        assert_eq!(step(24, Some(0)), step(24, Some(60)));
 
         // Requesting one half leaves the other empty rather than sending it: on
         // the day window that half was two thirds of the response.
@@ -3814,8 +4068,8 @@ mod tests {
     }
 
     /// What a thinned bucket may return. Keeping one row and discarding the rest
-    /// made the seven-day chart integrate to twice the traffic the minutes hold,
-    /// and drew a probe losing half its packets as an unbroken line.
+    /// would integrate the seven-day chart to twice the traffic the minutes hold,
+    /// and draw a probe losing half its packets as an unbroken line.
     #[test]
     fn a_thinned_bucket_answers_with_its_mean_and_says_what_it_lost() {
         let app = app();
@@ -3845,7 +4099,7 @@ mod tests {
         app.db.insert_pings(id, &[(2, base + 10, -1)]).unwrap();
         app.db.insert_pings(id, &[(3, base + 10, 12)]).unwrap();
 
-        let m = &app.db.metrics(id, base, 120).unwrap()[0];
+        let m = &app.db.metrics(id, Span::minutes(base, 120)).unwrap()[0];
         assert_eq!(m["cpu"], 20.0, "the bucket is its mean, not one row of it");
         assert_eq!(m["net_rx"], 500);
         assert_eq!(m["net_rx_max"], 4_000, "the bucket peaks where its busiest minute did");
@@ -3854,7 +4108,7 @@ mod tests {
 
         // Keyed by task rather than index: the order is the panel's, which
         // `a_probe_chart_follows_the_panel_order` covers.
-        let (rows, window_loss) = app.db.ping_records(id, base, 120).unwrap();
+        let (rows, window_loss) = app.db.ping_records(id, Span::minutes(base, 120)).unwrap();
         let probe = |task: i64| {
             rows.iter().find(|r| r["task_id"] == task).unwrap_or_else(|| panic!("no probe {task}"))
         };
@@ -3882,7 +4136,7 @@ mod tests {
         for i in 0..180 {
             app.db.insert_pings(wide, &[(wide_probe, wide_base + i, if i == 0 { -1 } else { 20 })]).unwrap();
         }
-        let (rows, _) = app.db.ping_records(wide, wide_base, 180).unwrap();
+        let (rows, _) = app.db.ping_records(wide, Span::minutes(wide_base, 180)).unwrap();
         assert_eq!(rows.len(), 1, "the fixture has to be one bucket for this to mean anything");
         let row = &rows[0];
         assert_eq!(row["loss"], 1, "a bucket that lost one of 180 has not lost none");
@@ -3895,7 +4149,7 @@ mod tests {
         for (i, latency) in [10, 20, 50, 20, 20].into_iter().enumerate() {
             app.db.insert_pings(jitter, &[(jitter_probe, wide_base + i as i64, latency)]).unwrap();
         }
-        let row = &app.db.ping_records(jitter, wide_base, 180).unwrap().0[0];
+        let row = &app.db.ping_records(jitter, Span::minutes(wide_base, 180)).unwrap().0[0];
         assert_eq!(row["latency"], 20, "the middle answer, not the mean of 24");
         assert_eq!(row["band"], json!([10, 50]));
 
@@ -3907,7 +4161,7 @@ mod tests {
         for (i, latency) in [40, 10, 30, 20].into_iter().enumerate() {
             app.db.insert_pings(even, &[(even_probe, wide_base + i as i64, latency)]).unwrap();
         }
-        assert_eq!(app.db.ping_records(even, wide_base, 180).unwrap().0[0]["latency"], 25);
+        assert_eq!(app.db.ping_records(even, Span::minutes(wide_base, 180)).unwrap().0[0]["latency"], 25);
     }
 
     /// What a window lost is the proportion of its samples lost, and only the hub
@@ -3931,7 +4185,7 @@ mod tests {
         }
         app.db.insert_pings(id, &[(probe, base + 60, -1)]).unwrap();
 
-        let (rows, loss) = app.db.ping_records(id, base, 60).unwrap();
+        let (rows, loss) = app.db.ping_records(id, Span::minutes(base, 60)).unwrap();
         let per_bucket: Vec<i64> = rows.iter().map(|r| r["loss"].as_i64().unwrap_or(0)).collect();
         assert_eq!(per_bucket, vec![0, 100], "the buckets are right about themselves");
 
@@ -3983,6 +4237,10 @@ mod tests {
         assert_eq!(admin.len(), 2);
         assert_eq!(admin[0]["ip"], "198.51.100.9");
         assert_eq!(admin[0]["remark"], "secret note");
+        assert!(
+            !serde_json::to_string(&admin).unwrap().contains("token-of-open"),
+            "the token is read on its own, never beside what agents report"
+        );
         // The panel reads `iface` and nothing else the contract leaves out.
         assert_eq!(admin[0]["metrics"]["iface"], "eth1");
         for hidden in ["boot_id", "net_rx_total", "hostname", "ip"] {
@@ -4099,6 +4357,13 @@ mod tests {
 
         let response = reset_token(Admin, axum::extract::State(app.clone()), Path(id)).await;
         assert_eq!(response.status(), StatusCode::OK);
+        let issued = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let read = node_token(Admin, axum::extract::State(app.clone()), Path(id)).await;
+        assert_eq!(
+            axum::body::to_bytes(read.into_body(), 1024).await.unwrap(),
+            issued,
+            "the panel reads the new token"
+        );
         // The agent loop selects on this receiver, so a closed channel is how it
         // learns to stop. `try_recv`, because `recv().await` on a channel
         // incorrectly left open would hang the suite rather than fail it.
@@ -4134,7 +4399,12 @@ mod tests {
         assert_eq!(group(a), "香港", "a refused batch leaves every node as it was");
 
         // Only the listed fields deserialize, so the extractor refuses the rest.
-        for refused in [json!({"name": "x"}), json!({"ipv4_pin": "1.2.3.4"}), json!({"public": false})] {
+        for refused in [
+            json!({"name": "x"}),
+            json!({"ipv4_pin": "1.2.3.4"}),
+            json!({"public": false}),
+            json!({"public_remark": "x"}),
+        ] {
             assert!(serde_json::from_value::<BatchPatch>(refused.clone()).is_err(), "{refused}");
         }
         // Counted in characters, not bytes: thirteen of them take 39 bytes.
@@ -4149,6 +4419,26 @@ mod tests {
         );
 
         assert!(live_snapshot(&app, false).as_str().contains(r#""group":"香港""#), "the group is public");
+    }
+
+    /// The public note reaches visitors trimmed, and one too long for every
+    /// frame, or one carrying a line break, is refused rather than cut.
+    #[tokio::test]
+    async fn a_public_remark_is_bounded_and_reaches_visitors() {
+        let app = std::sync::Arc::new(app());
+        let id = node(&app, "n", true);
+        let put = |text: String| {
+            let patch = serde_json::from_value(json!({ "public_remark": text })).unwrap();
+            update_node(Admin, axum::extract::State(app.clone()), Path(id), Ok(Json(patch)))
+        };
+
+        assert_eq!(put("港".repeat(MAX_PUBLIC_REMARK + 1)).await.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(put("一行\n两行".into()).await.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(put(" CN2 GIA ".into()).await.status(), StatusCode::OK);
+        let public = &visible_nodes(&app, false).unwrap()[0];
+        assert_eq!((&public["public_remark"], &public["remark"]), (&json!("CN2 GIA"), &Value::Null));
+        // Counted in characters, not bytes.
+        assert_eq!(put("港".repeat(MAX_PUBLIC_REMARK)).await.status(), StatusCode::OK);
     }
 
     /// What the panel saves is what an anonymous visitor reads, under the same
@@ -4204,6 +4494,7 @@ mod tests {
         assert_eq!(update_node(Admin, state(), Path(9), patch).await.status(), StatusCode::NOT_FOUND);
         assert_eq!(delete_node(Admin, state(), Path(9)).await.status(), StatusCode::NOT_FOUND);
         assert_eq!(reset_token(Admin, state(), Path(9)).await.status(), StatusCode::NOT_FOUND);
+        assert_eq!(node_token(Admin, state(), Path(9)).await.status(), StatusCode::NOT_FOUND);
         let traffic = Json(TrafficPatch { total_rx: Some(1), ..Default::default() });
         assert_eq!(patch_traffic(Admin, state(), Path(9), traffic).await.status(), StatusCode::NOT_FOUND);
     }
@@ -4303,9 +4594,8 @@ mod tests {
         );
     }
 
-    /// Both writers enforce the same limits. The create path formerly accepted a
-    /// whole `Node` unchecked, leaving everything the update path refuses
-    /// reachable by another route.
+    /// Both writers enforce the same limits, so nothing the update path refuses
+    /// is reachable through the create path, which takes a whole `Node`.
     #[tokio::test]
     async fn both_write_paths_refuse_the_same_out_of_range_values() {
         let app = std::sync::Arc::new(app());
@@ -4365,7 +4655,7 @@ mod tests {
 
     /// A stream outlives the request that opened it, so everything the handshake
     /// tested must be re-read rather than captured -- both answers, not one. The
-    /// admin frame carries every node's token in the clear, and the public frame
+    /// admin frame carries every node's address and private notes, and the public frame
     /// is what switching the status page off is meant to withdraw; a socket
     /// surviving either decision would continue sending what was withdrawn.
     #[test]
@@ -4391,6 +4681,17 @@ mod tests {
         assert_eq!(stream_audience(&app, Some(&hash)), Some(true), "a signed-in operator still gets theirs");
     }
 
+    #[tokio::test]
+    async fn only_the_admin_node_list_is_marked_no_transform() {
+        let app = std::sync::Arc::new(app());
+        app.db.create_session(&sha256("live-token"), Utc::now().timestamp() + 3_600).unwrap();
+        let mut signed_in = HeaderMap::new();
+        signed_in.insert(header::COOKIE, format!("{}=live-token", crate::auth::COOKIE).parse().unwrap());
+        let cache = |res: Response| res.headers().get(header::CACHE_CONTROL).cloned();
+        assert_eq!(cache(nodes(State(app.clone()), signed_in).await).unwrap(), "no-store, no-transform");
+        assert_eq!(cache(nodes(State(app), HeaderMap::new()).await), None, "the public list compresses");
+    }
+
     #[test]
     fn the_shared_snapshot_keeps_the_two_audiences_apart() {
         let app = app();
@@ -4409,6 +4710,12 @@ mod tests {
         // same bytes, so the data is modified first.
         node(&app, "late", true);
         assert_eq!(live_snapshot(&app, false), public, "the frame is reused, not rebuilt per viewer");
+
+        let mut unpacked = String::new();
+        std::io::Read::read_to_string(&mut flate2::read::GzDecoder::new(&live_gzip(&app)[..]), &mut unpacked)
+            .unwrap();
+        assert_eq!(unpacked, public.as_str(), "the gzipped frame is the same frame");
+        assert_eq!(live_gzip(&app).as_ptr(), live_gzip(&app).as_ptr(), "compressed once per frame");
     }
 
     #[test]
@@ -4419,7 +4726,7 @@ mod tests {
 
         // NTP correcting a fresh boot leaves the cached stamp in the future, which
         // does not constitute a young frame.
-        app.snapshot.lock().unwrap()[0].0 = Utc::now().timestamp_millis() + 60_000;
+        app.snapshot.lock().unwrap()[0].at = Utc::now().timestamp_millis() + 60_000;
         node(&app, "added-after", true);
         assert!(live_snapshot(&app, false).as_str().contains("added-after"));
     }
@@ -4476,6 +4783,7 @@ mod tests {
 
         assert_eq!(open_register(Admin, State(app.clone()), panel_headers()).await.status(), StatusCode::OK);
         let key = app.db.get("register_key").unwrap();
+        assert!(register_left(&app) > REGISTER_WINDOW - 5, "the panel counts down from the full hour");
         assert_eq!(register(Some("guess"), "a").await.status(), StatusCode::FORBIDDEN);
         assert_eq!(register(None, "a").await.status(), StatusCode::FORBIDDEN);
         assert!(app.db.nodes().unwrap().is_empty());
@@ -4496,6 +4804,7 @@ mod tests {
         // An hour later the same key is worthless, which is what makes leaving the
         // window open harmless.
         app.db.set("register_until", &(Utc::now().timestamp() - 1).to_string()).unwrap();
+        assert_eq!(register_left(&app), 0);
         assert_eq!(register(Some(&key), "b").await.status(), StatusCode::FORBIDDEN);
 
         // Reopened, then closed manually: the key from the open window stops
@@ -4592,13 +4901,18 @@ mod tests {
         // The live entry went with the connection, so "offline since" must come
         // from the node row.
         assert_eq!(view["last_seen"], 1_700_000_000);
+        let ago = view["last_seen_ago"].as_i64().unwrap();
+        assert!((Utc::now().timestamp() - 1_700_000_000 - ago).abs() <= 1, "counted on the hub's clock");
+
+        node(&app, "never", true);
+        assert_eq!(visible_nodes(&app, true).unwrap()[1]["last_seen_ago"], Value::Null, "never seen");
     }
 
     /// A capacity arrives twice -- once in the facts stored at the handshake, and
     /// again in every report -- and the two diverge as soon as a disk is mounted
     /// on a running machine, which the agent detects by re-reading its mount table
     /// every sample. Drawn from the stored copy, the card and the detail page
-    /// showed the same host two different sizes until it reconnected.
+    /// would show the same host two different sizes until it reconnected.
     #[test]
     fn a_capacity_that_changed_since_the_handshake_is_the_reported_one() {
         let app = app();
@@ -4634,11 +4948,10 @@ mod tests {
         assert_eq!(app.db.node(id).unwrap().unwrap().disk_total, 30i64 << 30, "and no extra write to get it");
     }
 
-    /// `PUBLIC_HOURS` bounds one window; this bounds how many are built
-    /// concurrently. Each holds the connection the agents report through for its
-    /// entire scan, and the path takes no credentials. `PASSWORD_GATE` refuses the
-    /// same way; `RELAY_GATE` queues briefly instead, as a batch install is one
-    /// burst of legitimate requests.
+    /// `span` bounds one window; this bounds how many are built concurrently.
+    /// Each holds the reader for its entire scan, and the path takes no
+    /// credentials. `PASSWORD_GATE` refuses the same way; `RELAY_GATE` queues
+    /// briefly instead, as a batch install is one burst of legitimate requests.
     #[tokio::test]
     async fn history_queries_past_the_gate_are_refused_rather_than_queued() {
         let _serial = HISTORY_TESTS.lock().await;
@@ -4733,11 +5046,12 @@ mod tests {
         assert!(readable(&app, true, open), "and never closes it for the panel");
     }
 
-    /// The window ceiling is a scan bound rather than a response bound: the
-    /// thinning already limits the row count, while a quarter-year still reads
-    /// every row behind it holding the write connection.
+    /// The retention window is the ceiling for every caller: no width reads more
+    /// than the week of minute rows, so wider windows need no separate bound for
+    /// anonymous callers, and a window past what is kept would only draw
+    /// history that is not there.
     #[tokio::test]
-    async fn an_anonymous_history_window_stops_at_a_week() {
+    async fn a_history_window_stops_at_the_retention_window() {
         let _serial = HISTORY_TESTS.lock().await;
         let app = std::sync::Arc::new(app());
         let id = node(&app, "n", true);
@@ -4751,23 +5065,39 @@ mod tests {
         }
         let ask = |hours| {
             let query = format!("hours={hours}&series=metrics");
-            metrics(
-                State(app.clone()),
-                HeaderMap::new(),
-                Path(id),
-                Query(serde_urlencoded::from_str::<Window>(&query).unwrap()),
-            )
+            let app = app.clone();
+            async move {
+                let answer = metrics(
+                    State(app),
+                    HeaderMap::new(),
+                    Path(id),
+                    Query(serde_urlencoded::from_str::<Window>(&query).unwrap()),
+                )
+                .await;
+                axum::body::to_bytes(answer.into_body(), usize::MAX).await.unwrap()
+            }
         };
         let rows =
-            |body: &str| serde_json::from_str::<Value>(body).unwrap()["metrics"].as_array().unwrap().len();
+            |body: &[u8]| serde_json::from_slice::<Value>(body).unwrap()["metrics"].as_array().unwrap().len();
+        let step = |body: &[u8]| serde_json::from_slice::<Value>(body).unwrap()["step"].clone();
 
-        let week = axum::body::to_bytes(ask(168).await.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(rows(std::str::from_utf8(&week).unwrap()), 8, "a week reaches back seven days");
+        // Before the first rollup nothing is folded, and a window past the week
+        // reads the newest week of minute rows rather than every one.
+        app.db.set("retention_days", "30").unwrap();
+        assert_eq!(rows(&ask(720).await), 8, "unfolded minute rows past the week are not read");
+        app.db.roll_up(now, 90).unwrap();
 
-        // Requesting the quarter year formerly available to an anonymous caller
-        // returns the week: the extra rows exist, and reading them is the cost.
-        let quarter = axum::body::to_bytes(ask(2_160).await.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(quarter, week, "an anonymous window past a week is clamped to one");
+        app.db.set("retention_days", "7").unwrap();
+        let week = ask(168).await;
+        assert_eq!(rows(&week), 8, "a week reaches back seven days");
+        assert_eq!(step(&week), 420, "in seven-minute points, a week of minutes at the 1,440-point budget");
+        assert_eq!(ask(2_160).await, week, "a window past the retention window is narrowed to it");
+
+        // Past the week, from the hourly tier and the minute rows after it.
+        app.db.set("retention_days", "30").unwrap();
+        let month = ask(2_160).await;
+        assert_eq!(rows(&month), 30, "a month reaches back thirty days");
+        assert_eq!(step(&month), 3_600, "in whole hours, as no hourly row may straddle two points");
     }
 
     #[tokio::test]
@@ -4841,8 +5171,8 @@ mod tests {
     }
 
     /// Housekeeping clamps whatever it finds, so an unparsable value is not an
-    /// error downstream: it silently means 7 days, in a field still displaying
-    /// what was entered.
+    /// error downstream: it silently means the default, in a field still
+    /// displaying what was entered.
     #[tokio::test]
     async fn a_retention_window_that_would_never_apply_is_refused() {
         let app = std::sync::Arc::new(app());
@@ -4870,7 +5200,7 @@ mod tests {
     async fn a_fresh_hub_answers_settings_that_it_will_take_back() {
         let app = std::sync::Arc::new(app());
         let Json(read) = settings(Admin, State(app.clone())).await;
-        assert_eq!(read["retention_days"], "7", "the default belongs in the answer, not in each caller");
+        assert_eq!(read["retention_days"], "30", "the default belongs in the answer, not in each caller");
 
         // Exactly what the panel sends, on a hub where nothing was ever set.
         let echoed = json!({
@@ -4891,7 +5221,7 @@ mod tests {
             StatusCode::OK,
             "a fresh hub's own settings must survive a round trip"
         );
-        assert_eq!(app.db.retention_days(), 7, "and the stored window is the one that was shown");
+        assert_eq!(app.db.retention_days(), 30, "and the stored window is the one that was shown");
     }
 
     #[tokio::test]

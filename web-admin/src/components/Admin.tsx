@@ -1,5 +1,5 @@
 import { memo, useCallback, useEffect, useId, useRef, useState } from "react"
-import { Activity, ArrowUpCircle, Bell, CalendarClock, Check, ChevronDown, ChevronRight, CircleQuestionMark, Copy, Database, Download, KeyRound, Layers, Network, Palette, Pencil, Plus, Radio, RefreshCw, Send, Server, Settings, Shield, SlidersHorizontal, Trash2, Upload, Users } from "lucide-react"
+import { Activity, ArrowUpCircle, Bell, CalendarClock, Check, ChevronDown, ChevronRight, CircleQuestionMark, Copy, Database, Download, KeyRound, Layers, Network, Palette, Pencil, Plus, Radio, RefreshCw, Send, Search, Server, Settings, Shield, SlidersHorizontal, Trash2, Upload, Users } from "lucide-react"
 import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
@@ -34,6 +34,7 @@ const TRAFFIC_MODES: Record<string, string> = {
   up: "仅上行",
   down: "仅下行",
 }
+
 
 function copy(text: string, done = "已复制") {
   // navigator.clipboard exists only in a secure context. Over plain http the
@@ -145,9 +146,74 @@ function GroupFilter({ nodes, value, onChange, className = "" }: {
   )
 }
 
-// Ticks nodes in a searchable grid. 全选 and 全不选 act on the rows in view, so a
-// search or a group narrows what they touch: pick a group, then 全选. Offline
-// nodes are dimmed but remain selectable.
+function NodeSearch({ value, onChange, className = "", placeholder = "名称/地址/地区/分组", label = "搜索节点" }: {
+  value: string
+  onChange: (value: string) => void
+  className?: string
+  placeholder?: string
+  label?: string
+}) {
+  return (
+    <div className={`relative ${className}`}>
+      <Search className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
+      <Input
+        className="pl-8"
+        placeholder={placeholder}
+        aria-label={label}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        // Inside a dialog's form, Enter would otherwise save the dialog.
+        onKeyDown={(e) => e.key === "Enter" && e.preventDefault()}
+      />
+    </div>
+  )
+}
+
+// Ticks items in a searchable list. 全选 and 全不选 act on the rows in view, so a
+// search or a filter narrows what they touch: pick a group, then 全选. The
+// callers own the search and pass in what it leaves visible.
+function Picker<T extends { id: number }>({ visible, chosen, onPick, disabled = false, toolbar, empty, listClass, title, children }: {
+  visible: T[]
+  chosen: Set<number>
+  onPick: (list: T[], on: boolean) => void
+  disabled?: boolean
+  toolbar: React.ReactNode
+  empty: string
+  listClass: string
+  title: (item: T) => string
+  children: (item: T) => React.ReactNode
+}) {
+  // The unfiltered list's height, held as its floor: in a centred dialog a
+  // shrinking list would move the search box out from under the cursor.
+  const [listHeight, setListHeight] = useState(0)
+  const visibleChosen = visible.filter((n) => chosen.has(n.id)).length
+  return (
+    <div className="rounded-lg border">
+      <div className="flex flex-wrap items-center gap-1 border-b p-2">
+        {toolbar}
+        <Button type="button" size="sm" variant="ghost" className="px-2.5" disabled={disabled || visibleChosen === visible.length} onClick={() => onPick(visible, true)}>全选</Button>
+        <Button type="button" size="sm" variant="ghost" className="px-2.5" disabled={disabled || visibleChosen === 0} onClick={() => onPick(visible, false)}>全不选</Button>
+      </div>
+      <div
+        ref={(el) => { if (el && !listHeight) setListHeight(el.offsetHeight) }}
+        // Capped like the height itself, which a min-height would otherwise
+        // override once the viewport shrinks.
+        style={{ minHeight: listHeight ? `min(${listHeight}px, 16rem, 40dvh)` : undefined }}
+        className={`grid max-h-[min(16rem,40dvh)] content-start gap-0.5 overflow-y-auto p-1.5 ${listClass}`}
+      >
+        {visible.map((item) => (
+          <label key={item.id} title={title(item)} className="flex min-w-0 cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-sm hover:bg-muted">
+            <input type="checkbox" checked={chosen.has(item.id)} disabled={disabled} onChange={(e) => onPick([item], e.target.checked)} className="shrink-0 accent-primary" />
+            {children(item)}
+          </label>
+        ))}
+        {!visible.length && <p className="col-span-full p-2 text-xs text-muted-foreground">{empty}</p>}
+      </div>
+    </div>
+  )
+}
+
+// Offline nodes are dimmed but remain selectable.
 function NodePicker({ nodes, chosen, onPick, disabled = false }: {
   nodes: Node[]
   chosen: Set<number>
@@ -156,40 +222,54 @@ function NodePicker({ nodes, chosen, onPick, disabled = false }: {
 }) {
   const [query, setQuery] = useState("")
   const [group, setGroup] = useGroupFilter(nodes)
-  // The unfiltered list's height, held as its floor: in a centred dialog a
-  // shrinking list would move the search box out from under the cursor.
-  const [listHeight, setListHeight] = useState(0)
-  const visible = inGroup(searchNodes(nodes, query), group)
-  const visibleChosen = visible.filter((n) => chosen.has(n.id)).length
   return (
-    <div className="rounded-lg border">
-      <div className="flex flex-wrap items-center gap-1 border-b p-2">
-        <AdminSearchInput className="min-w-0 flex-1 basis-40" ariaLabel="搜索节点" placeholder="名称/地址/地区/分组" value={query} onChange={setQuery} />
+    <Picker
+      visible={inGroup(searchNodes(nodes, query), group)}
+      chosen={chosen}
+      onPick={onPick}
+      disabled={disabled}
+      toolbar={<>
+        <NodeSearch className="min-w-0 flex-1 basis-40" value={query} onChange={setQuery} />
         <GroupFilter nodes={nodes} value={group} onChange={setGroup} className="w-32" />
-        <Button type="button" size="sm" variant="ghost" className="px-2.5" disabled={disabled || visibleChosen === visible.length} onClick={() => onPick(visible, true)}>全选</Button>
-        <Button type="button" size="sm" variant="ghost" className="px-2.5" disabled={disabled || visibleChosen === 0} onClick={() => onPick(visible, false)}>全不选</Button>
-      </div>
-      {/* Three columns keep a few dozen nodes within one scroll. A phone gets
-          one: two cut a name to a few characters, and a tap shows no title. */}
-      <div
-        ref={(el) => { if (el && !listHeight) setListHeight(el.offsetHeight) }}
-        // Capped like the height itself, which a min-height would otherwise
-        // override once the viewport shrinks.
-        style={{ minHeight: listHeight ? `min(${listHeight}px, 16rem, 40dvh)` : undefined }}
-        className="grid max-h-[min(16rem,40dvh)] grid-cols-1 content-start gap-0.5 overflow-y-auto p-1.5 min-[480px]:grid-cols-2 sm:grid-cols-3"
-      >
-        {visible.map((n) => (
-          <label key={n.id} title={n.group ? `${n.name} · ${n.group}` : n.name} className="flex min-w-0 cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-sm hover:bg-muted">
-            <input type="checkbox" checked={chosen.has(n.id)} disabled={disabled} onChange={(e) => onPick([n], e.target.checked)} className="shrink-0 accent-primary" />
-            <span className={`truncate ${n.online ? "" : "text-muted-foreground"}`}>{n.name}</span>
-            {n.country && <span className="ml-auto shrink-0 text-xs text-muted-foreground">{n.country}</span>}
-          </label>
-        ))}
-        {!visible.length && (
-          <p className="col-span-full p-2 text-xs text-muted-foreground">{nodes.length ? "没有匹配的节点" : "先添加节点"}</p>
-        )}
-      </div>
-    </div>
+      </>}
+      empty={nodes.length ? "没有匹配的节点" : "先添加节点"}
+      // Three columns keep a few dozen nodes within one scroll. A phone gets
+      // one: two cut a name to a few characters, and a tap shows no title.
+      listClass="grid-cols-1 min-[480px]:grid-cols-2 sm:grid-cols-3"
+      title={(n) => (n.group ? `${n.name} · ${n.group}` : n.name)}
+    >
+      {(n) => <>
+        <span className={`truncate ${n.online ? "" : "text-muted-foreground"}`}>{n.name}</span>
+        {n.country && <span className="ml-auto shrink-0 text-xs text-muted-foreground">{n.country}</span>}
+      </>}
+    </Picker>
+  )
+}
+
+// One probe per row, with the target and interval that tell two of a name apart.
+function ProbePicker({ tasks, chosen, onPick }: {
+  tasks: PingTask[]
+  chosen: Set<number>
+  onPick: (list: PingTask[], on: boolean) => void
+}) {
+  const [query, setQuery] = useState("")
+  const needle = query.trim().toLowerCase()
+  return (
+    <Picker
+      visible={needle ? tasks.filter((t) => `${t.name} ${t.target}`.toLowerCase().includes(needle)) : tasks}
+      chosen={chosen}
+      onPick={onPick}
+      toolbar={<NodeSearch className="min-w-0 flex-1 basis-32" value={query} onChange={setQuery} placeholder="名称/目标" label="搜索监控" />}
+      empty={tasks.length ? "没有匹配的监控" : "还没有延迟监控，先点「添加监控」"}
+      listClass="grid-cols-1"
+      title={(t) => `${t.name} · ${t.target}`}
+    >
+      {(t) => <>
+        <span className="min-w-0 flex-1 truncate">{t.name}</span>
+        <span className="tnum max-w-[45%] shrink-0 truncate text-xs text-muted-foreground">{t.target}</span>
+        <span className="tnum w-12 shrink-0 text-right text-xs text-muted-foreground">{t.interval}s</span>
+      </>}
+    </Picker>
   )
 }
 
@@ -203,26 +283,33 @@ function Command({ className = "", children }: { className?: string; children: R
   )
 }
 
-function Field({ label, hint, help, className = "", children }: {
+function Field({ label, hint, help, helpWidth, className = "", children }: {
   label: string
   hint?: string
   help?: React.ReactNode
+  helpWidth?: string
   className?: string
   children: React.ReactNode
 }) {
   const title = <Label className="text-sm font-medium">{label}</Label>
   return (
     <div className={`space-y-2 ${className}`}>
-      {help ? <div className="flex items-center gap-1.5">{title}<Help>{help}</Help></div> : title}
+      {help ? <div className="flex items-center gap-1.5">{title}<Help width={helpWidth}>{help}</Help></div> : title}
       {children}
-      {hint && <p className="text-xs leading-relaxed text-muted-foreground">{hint}</p>}
+      {/* Kept whole between punctuation, as in Help below. */}
+      {hint && <p className="text-xs leading-relaxed text-muted-foreground break-keep wrap-anywhere">{hint}</p>}
     </div>
   )
 }
 
 // A tap shows no tooltip on its own, so a click opens it as well. The trigger's
 // own handlers would close it on press and on click; both are prevented.
-function Help({ children }: { children: React.ReactNode }) {
+//
+// `width` is fitted to each text: the narrowest at which its paragraphs take the
+// fewest lines, plus some room for a wider font. A screen too narrow for that
+// gets the narrowest width holding the lines it can fit; capping the wide box
+// at the screen instead would leave its lines well short of the right edge.
+function Help({ children, width = "max-w-64" }: { children: React.ReactNode; width?: string }) {
   const [open, setOpen] = useState(false)
   return (
     <Tooltip open={open} onOpenChange={setOpen}>
@@ -240,7 +327,17 @@ function Help({ children }: { children: React.ReactNode }) {
           <CircleQuestionMark className="size-3.5" />
         </button>
       </TooltipTrigger>
-      <TooltipContent className="max-w-64 space-y-1 text-left">{children}</TooltipContent>
+      {/* text-wrap over the component's text-balance, which breaks multi-line
+          Chinese halfway across the box. Chinese may also break between any
+          two characters, which splits words such as 季付 across lines; kept
+          whole, a line breaks at punctuation and spaces, and mid-run only when
+          a run cannot fit at all. */}
+      <TooltipContent
+        collisionPadding={16}
+        className={`${width} space-y-1 text-left text-wrap break-keep wrap-anywhere`}
+      >
+        {children}
+      </TooltipContent>
     </Tooltip>
   )
 }
@@ -544,6 +641,7 @@ function NodeForm({ node, nodes, onClose, onSaved }: {
       name: form.name.trim(),
       public: form.public,
       remark: form.remark,
+      public_remark: (form.public_remark ?? "").trim(),
       group: (form.group ?? "").trim(),
       traffic_mode: form.traffic_mode,
       traffic_limit: Math.round(Number(limitGib) * GIB),
@@ -600,7 +698,14 @@ function NodeForm({ node, nodes, onClose, onSaved }: {
                 <Field label="分组" hint="公开页可见，留空为未分组">
                   <GroupInput nodes={nodes} value={form.group ?? ""} onChange={(v) => set("group", v)} />
                 </Field>
-                <Field label="备注" className="sm:col-span-2">
+                <Field label="公开备注">
+                  <Input
+                    value={form.public_remark ?? ""}
+                    onChange={(e) => set("public_remark", e.target.value)}
+                    placeholder="公开页可见，最多 100 字"
+                  />
+                </Field>
+                <Field label="私有备注">
                   <Input value={form.remark ?? ""} onChange={(e) => set("remark", e.target.value)} placeholder="仅管理员可见" />
                 </Field>
               </div>
@@ -764,6 +869,7 @@ function BillingForm({ node, onClose, onSaved }: {
               <Field
                 label="货币"
                 hint={currencyHint(form.currency.toUpperCase())}
+                helpWidth="max-w-72"
                 help={
                   <>
                     <p>填三个字母的货币代码，大小写都行。</p>
@@ -836,8 +942,8 @@ function scriptCommand(site: string, args: (site: string) => string[]) {
   return site && `curl -fsSL ${site}/install.sh | sh -s -- ${args(site).join(" ")}`
 }
 
-// Built here rather than fetched: the node list already carries the token, so
-// viewing an install command is a read rather than an action. Reissuing one to
+// Built here rather than fetched: the install dialog reads the token on its own,
+// so viewing an install command is a read rather than an action. Reissuing one to
 // display it would take the running agent offline.
 function installCommand(site: string, token: string, seconds: number | undefined, iface: string | undefined, realm?: boolean) {
   return scriptCommand(site, (s) => [`--server ${s}`, `--token ${token}`, ...intervalArg(seconds), ...ifaceArg(iface), ...realmArg(realm)])
@@ -899,16 +1005,35 @@ function useVersions() {
 }
 
 // The window lives on the hub; this reads it back and counts down, which is also
-// what makes an expired one disappear from the panel without interaction.
+// what makes an expired one disappear from the panel without interaction. The hub
+// reports the seconds left rather than the deadline, so the countdown runs from
+// the moment its answer arrives and needs this browser's clock to keep time, not
+// to agree with the hub's.
 function useRegisterWindow() {
   const [key, setKey] = useState("")
   const [until, setUntil] = useState(0)
   const [now, setNow] = useState(() => Math.floor(Date.now() / 1000))
+  // Advanced by every read sent and every change that lands, so an answer
+  // overtaken by either is dropped rather than restoring a replaced key.
+  const epoch = useRef(0)
+  const begin = (key: string, left: number) => {
+    const at = Math.floor(Date.now() / 1000)
+    setKey(key)
+    setNow(at)
+    setUntil(at + left)
+  }
+  // Also run as the dialog opens: the window may have been closed or reopened
+  // from another device since this page loaded, and the command shown must
+  // carry the key the hub holds now.
+  const sync = () => {
+    const at = ++epoch.current
+    api<Settings>("/settings")
+      .then((s) => at === epoch.current && begin(String(s.register_key ?? ""), Number(s.register_left ?? 0)))
+      .catch(() => {})
+  }
 
   useEffect(() => {
-    api<Settings>("/settings")
-      .then((s) => { setKey(String(s.register_key ?? "")); setUntil(Number(s.register_until ?? 0)) })
-      .catch(() => {})
+    sync()
     const timer = setInterval(() => setNow(Math.floor(Date.now() / 1000)), 1000)
     return () => clearInterval(timer)
   }, [])
@@ -916,11 +1041,12 @@ function useRegisterWindow() {
   return {
     key,
     left: key === "" ? 0 : Math.max(0, until - now),
+    sync,
     async open() {
       try {
-        const w = await api<{ register_key: string; register_until: string }>("/register-window", { method: "POST" })
-        setKey(w.register_key)
-        setUntil(Number(w.register_until))
+        const w = await api<{ register_key: string; register_left: number }>("/register-window", { method: "POST" })
+        epoch.current++
+        begin(w.register_key, w.register_left)
       } catch (e) {
         toast.error((e as Error).message)
       }
@@ -928,6 +1054,7 @@ function useRegisterWindow() {
     async close() {
       try {
         await api("/register-window", { method: "DELETE" })
+        epoch.current++
         setKey("")
         setUntil(0)
         toast.success("注册窗口已关闭")
@@ -1107,25 +1234,42 @@ function InstallDialog({ node, site, onClose, onRotated }: {
   onClose: () => void
   onRotated: () => void
 }) {
-  const [token, setToken] = useState(node.token ?? "")
+  const [token, setToken] = useState("")
+  const [unread, setUnread] = useState("")
   const [rotating, setRotating] = useState(false)
   const [confirmRotate, setConfirmRotate] = useState(false)
   const iface = useIfaceOption(currentIface(node))
   const interval = useIntervalOption(node.interval)
   const [realm, setRealm] = useState(false)
 
+  // Read as the dialog opens rather than carried in the node list, where it
+  // would share an answer with strings agents report. A token rotated meanwhile
+  // is newer and kept.
+  useEffect(() => {
+    let live = true
+    api<{ token: string }>(`/nodes/${node.id}/token`)
+      .then((t) => live && setToken((held) => held || t.token))
+      .catch((e) => live && setUnread((e as Error).message))
+    return () => { live = false }
+  }, [node.id])
+
   const command = token && iface.valid ? installCommand(site, token, interval.flag, iface.flag, realm) : ""
+  const placeholder = token ? "网卡名有误，改正后显示命令" : unread ? `读取凭证失败：${unread}` : "正在读取凭证…"
 
   async function rotate() {
     setRotating(true)
     try {
       const fresh = await api<{ token: string }>(`/nodes/${node.id}/token`, { method: "POST" })
       setToken(fresh.token)
+      setUnread("")
       setConfirmRotate(false)
       toast.success("凭证已换发，需用新命令重装")
       onRotated()
     } catch (e) {
       toast.error((e as Error).message)
+      // The rotation may have taken effect with its answer lost on the way, and
+      // the command shown would then carry a retired token. Whichever holds now.
+      api<{ token: string }>(`/nodes/${node.id}/token`).then((t) => setToken(t.token)).catch(() => {})
     } finally {
       setRotating(false)
     }
@@ -1149,10 +1293,8 @@ function InstallDialog({ node, site, onClose, onRotated }: {
           </section>
           <section className="space-y-2 border-t pt-5">
             <h3 className="text-sm font-medium">安装命令</h3>
-            {/* A node added before the hub kept tokens has nothing to show
-                until one is reissued. */}
             <Command className={`max-h-40 min-h-24 ${command ? "" : "text-muted-foreground"}`}>
-              {command || (token ? "网卡名有误，改正后显示命令" : "旧版本创建的凭证不可读取，换发后显示")}
+              {command || placeholder}
             </Command>
           </section>
           <OptionRow title="换发凭证" hint="旧凭证立即作废，agent 掉线，需用新命令重装">
@@ -1269,7 +1411,7 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
         </Button>
         {/* An open window is visible from the list itself, so nobody has to
             remember they left one open. */}
-        <Button variant="outline" disabled={!!refusal} onClick={() => setRegistering(true)}>
+        <Button variant="outline" disabled={!!refusal} onClick={() => { reg.sync(); setRegistering(true) }}>
           <Server /> 批量添加{reg.left > 0 && ` · ${Math.ceil(reg.left / 60)} 分`}
         </Button>
         <Button disabled={!!refusal} onClick={() => setCreating(true)}>
@@ -1350,10 +1492,10 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
                         the pills' width that the text spills out of evenly, so a
                         long duration does not widen the slot and move the
                         pills off the axis the other rows share. */}
-                    {!n.online && n.last_seen > 0 && Date.now() / 1000 - n.last_seen >= 60 && (
+                    {!n.online && n.last_seen_ago !== null && n.last_seen_ago >= 60 && (
                       <div className="flex w-14 justify-center">
                         <span className="tnum text-xs whitespace-nowrap text-muted-foreground">
-                          {uptime(Date.now() / 1000 - n.last_seen)}
+                          {uptime(n.last_seen_ago)}
                         </span>
                       </div>
                     )}
@@ -1569,12 +1711,146 @@ function PingForm({ task, nodes, onClose, onSaved }: {
   )
 }
 
+// One node's probes, ticked from the node's side. Saves only what changed from
+// the list it opened with, as PingForm does for a probe's nodes.
+function NodeProbesForm({ node, tasks, onClose, onSaved }: {
+  node: Node
+  tasks: PingTask[]
+  onClose: () => void
+  onSaved: () => void
+}) {
+  const [base] = useState(() => tasks.filter((t) => t.nodes.includes(node.id)).map((t) => t.id))
+  const [chosen, setChosen] = useState(() => new Set(base))
+  const [saving, setSaving] = useState(false)
+  // Taken from the live list: `chosen` can still hold a probe deleted since the
+  // dialog opened, which the list no longer shows to untick.
+  const ticked = tasks.filter((t) => chosen.has(t.id)).map((t) => t.id)
+
+  const pick = (list: PingTask[], on: boolean) =>
+    setChosen((c) => {
+      const next = new Set(c)
+      for (const t of list) {
+        if (on) next.add(t.id)
+        else next.delete(t.id)
+      }
+      return next
+    })
+
+  async function save() {
+    setSaving(true)
+    try {
+      await api(`/nodes/${node.id}/ping-tasks`, { method: "PUT", body: JSON.stringify({ tasks: ticked, base }) })
+      toast.success("已保存，正在下发")
+      onClose()
+      onSaved()
+    } catch (e) {
+      toast.error((e as Error).message)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <Dialog open onOpenChange={(open) => !open && onClose()}>
+      <DialogContent onOpenAutoFocus={(e) => e.preventDefault()} className="sm:max-w-xl">
+        <DialogHeader>
+          <DialogTitle className="break-all">「{node.name}」的延迟监控</DialogTitle>
+        </DialogHeader>
+        <form noValidate className="contents" onSubmit={(e) => { e.preventDefault(); save() }}>
+          {/* min-w-0: as a grid item the list would otherwise grow to its
+              widest target and push the dialog past a phone's edge. */}
+          <section className="min-w-0 space-y-3">
+            <div className="flex items-baseline justify-between gap-2">
+              <h3 className="text-sm font-medium">运行的监控</h3>
+              <span className="tnum text-xs text-muted-foreground">已选 {ticked.length} / {tasks.length}</span>
+            </div>
+            <ProbePicker tasks={tasks} chosen={chosen} onPick={pick} />
+          </section>
+          <DialogFooter>
+            <Button type="button" variant="ghost" onClick={onClose}>取消</Button>
+            <Button type="submit" disabled={saving}>保存</Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+// The probes seen from the nodes: one row per node, so a machine's whole set is
+// read and edited in one place.
+function PingByNode({ nodes, tasks, reload }: { nodes: Node[]; tasks: PingTask[]; reload: () => void }) {
+  const [query, setQuery] = useState("")
+  const [group, setGroup] = useGroupFilter(nodes)
+  const [editing, setEditing] = useState<Node | null>(null)
+  const visible = inGroup(searchNodes(nodes, query), group)
+  const owned = new Map(nodes.map((n) => [n.id, [] as PingTask[]]))
+  for (const t of tasks) for (const id of t.nodes) owned.get(id)?.push(t)
+
+  return (
+    <>
+      <div className="flex gap-2">
+        <NodeSearch className="min-w-0 flex-1 sm:w-64 sm:flex-none" value={query} onChange={setQuery} />
+        <GroupFilter nodes={nodes} value={group} onChange={setGroup} className="w-32" />
+      </div>
+      <Card className="overflow-x-auto p-0">
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead className="w-[30%]">节点</TableHead>
+              <TableHead>监控</TableHead>
+              <TableHead className="w-0 text-right">操作</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {visible.map((n) => {
+              const mine = owned.get(n.id) ?? []
+              const names = mine.map((t) => t.name).join("、")
+              return (
+                <TableRow key={n.id}>
+                  <TableCell className="whitespace-normal">
+                    <div className="font-medium text-balance break-keep">{nameText(n.name)}</div>
+                    {n.group && <div className="text-xs text-balance text-muted-foreground">{n.group}</div>}
+                  </TableCell>
+                  {/* max-w-0 lets the cell take what is left and no more, so a
+                      long list truncates instead of widening the table. */}
+                  <TableCell className="max-w-0 text-sm">
+                    {mine.length ? (
+                      <div className="truncate" title={names}>
+                        <span className="tnum">{mine.length} 个</span>
+                        <span className="text-muted-foreground"> · {names}</span>
+                      </div>
+                    ) : (
+                      <span className="text-muted-foreground">未配置</span>
+                    )}
+                  </TableCell>
+                  <TableCell className="text-right">
+                    <Button variant="ghost" size="icon" onClick={() => setEditing(n)} title="选择监控" aria-label="选择监控"><Pencil /></Button>
+                  </TableCell>
+                </TableRow>
+              )
+            })}
+            {!visible.length && (
+              <TableRow>
+                <TableCell colSpan={3} className="py-10 text-center text-sm text-muted-foreground">
+                  {nodes.length ? "没有匹配的节点" : "还没有节点"}
+                </TableCell>
+              </TableRow>
+            )}
+          </TableBody>
+        </Table>
+      </Card>
+      {editing && <NodeProbesForm node={editing} tasks={tasks} onClose={() => setEditing(null)} onSaved={reload} />}
+    </>
+  )
+}
+
 function Ping({ nodes }: { nodes: Node[] }) {
   // null until loaded, so the empty state does not flash before the list.
   const [tasks, setTasks] = useState<PingTask[] | null>(null)
   const [editing, setEditing] = useState<Partial<PingTask> | null>(null)
   const [deleting, setDeleting] = useState<PingTask | null>(null)
   const [removing, setRemoving] = useState(false)
+  const [view, setView] = useState<"task" | "node">("task")
 
   // A failed first load draws the page empty, keeping 添加监控 in reach.
   const load = () =>
@@ -1608,13 +1884,25 @@ function Ping({ nodes }: { nodes: Node[] }) {
   if (!tasks) return null
   return (
     <div className="space-y-4">
-      <div className="flex justify-end">
+      <div className="flex items-center justify-between gap-2">
+        <div role="group" aria-label="视图" className="inline-flex rounded-lg bg-muted p-0.5">
+          {(["task", "node"] as const).map((v) => (
+            <button
+              key={v}
+              aria-pressed={view === v}
+              onClick={() => setView(v)}
+              className={`rounded-md px-3 py-1 text-sm transition-colors ${view === v ? "bg-background font-medium shadow-sm" : "text-muted-foreground hover:text-foreground"}`}
+            >
+              {v === "task" ? "按监控" : "按节点"}
+            </button>
+          ))}
+        </div>
         <Button onClick={() => setEditing({ name: "", target: "", interval: 60, nodes: nodes.map((n) => n.id), auto_join: true })}>
           <Plus /> 添加监控
         </Button>
       </div>
 
-      <Card className="overflow-x-auto p-0">
+      {view === "node" ? <PingByNode nodes={nodes} tasks={tasks} reload={load} /> : <Card className="overflow-x-auto p-0">
         <Table>
           <TableHeader>
             <TableRow>
@@ -1657,7 +1945,7 @@ function Ping({ nodes }: { nodes: Node[] }) {
             )}
           </TableBody>
         </Table>
-      </Card>
+      </Card>}
 
       {editing && <PingForm task={editing} nodes={nodes} onClose={() => setEditing(null)} onSaved={load} />}
       {deleting && (
@@ -1865,6 +2153,7 @@ function Themes() {
   const [doomed, setDoomed] = useState<Theme | null>(null)
   const [zoomed, setZoomed] = useState<Theme | null>(null)
   const [configuring, setConfiguring] = useState<{ theme: Theme; saved: Record<string, unknown> } | null>(null)
+  const [repo, setRepo] = useState("")
   const picker = useRef<HTMLInputElement>(null)
 
   const load = () =>
@@ -1881,13 +2170,15 @@ function Themes() {
     }
   }
 
-  async function install(file: File) {
-    setBusy("upload")
+  // Both ways in answer with the installed manifest.
+  async function install(how: "upload" | "github", installing: () => Promise<{ theme: Theme }>) {
+    setBusy(how)
     try {
-      const { theme } = await upload<{ theme: Theme }>("/themes", file)
+      const { theme } = await installing()
       // The hub reads a theme from disk on every request, so it is already live;
       // reloading the list only brings this page up to date.
       toast.success(`已安装 ${theme.name} ${theme.version}`)
+      if (how === "github") setRepo("")
       load()
     } catch (e) {
       toast.error((e as Error).message)
@@ -1945,18 +2236,53 @@ function Themes() {
     <div className="space-y-4">
       <Card className="gap-4 p-5">
         <div>
-          <h3 className="text-sm font-medium">安装主题</h3>
-          <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-            上传主题作者发布的 <code>theme.tar.gz</code>，同名主题整体替换。
-            <br />
-            主题的 <code>url</code> 指向 GitHub 仓库时，卡片上的 <RefreshCw className="inline size-3" /> 从它最新的
-            release 取 <code>theme.tar.gz</code>，版本没变就不下载。
-            <br />
-            主题代码在访客浏览器中执行，请只安装可信来源。
-          </p>
+          <div className="flex items-center gap-1.5">
+            <h3 className="text-sm font-medium">安装主题</h3>
+            <Help width="max-w-64 min-[480px]:max-w-112">
+              <p>填主题的 GitHub 仓库地址，例如 <span className="whitespace-nowrap">https://github.com/作者/仓库</span></p>
+              <p>仓库首页、Releases 页的地址都可以，总是安装最新的 release。</p>
+              <p>也可以上传 release 里的 theme.tar.gz，不要选 Source code。</p>
+              <p>两种方式都是同名主题整体替换。</p>
+              <p>
+                主题的 url 指向 GitHub 仓库时，卡片上的 <RefreshCw className="inline size-3" /> 检查更新，版本没变就不下载。
+              </p>
+            </Help>
+            <Button size="sm" variant="ghost" className="-my-1 -mr-2.5 ml-auto h-7" asChild>
+              <a href="https://monitor-themes.pages.dev" target="_blank" rel="noreferrer">
+                <Palette /> 浏览主题
+              </a>
+            </Button>
+          </div>
+          {/* Stays in view: it is the one line about what installing permits. */}
+          <p className="mt-1 text-xs text-muted-foreground">主题代码在访客浏览器中执行，请只安装可信来源。</p>
         </div>
-        <div>
-          <Button size="sm" disabled={!!busy} onClick={() => picker.current?.click()}>
+        <form
+          className="flex flex-wrap gap-2"
+          onSubmit={(e) => {
+            e.preventDefault()
+            install("github", () =>
+              api("/theme-install", { method: "POST", body: JSON.stringify({ url: repo.trim() }) }),
+            )
+          }}
+        >
+          {/* text rather than url: the browser's own validation would answer
+              in its language before the hub's message could. */}
+          <Input
+            value={repo}
+            onChange={(e) => setRepo(e.target.value)}
+            disabled={!!busy}
+            inputMode="url"
+            autoCapitalize="off"
+            autoCorrect="off"
+            spellCheck={false}
+            placeholder="主题 GitHub 仓库地址"
+            aria-label="主题 GitHub 仓库地址"
+            className="h-8 flex-1 basis-60"
+          />
+          <Button size="sm" type="submit" disabled={!!busy || !repo.trim()}>
+            <Download /> {busy === "github" ? "安装中…" : "从 GitHub 安装"}
+          </Button>
+          <Button size="sm" type="button" variant="outline" disabled={!!busy} onClick={() => picker.current?.click()}>
             <Upload /> {busy === "upload" ? "安装中…" : "上传主题包"}
           </Button>
           <input
@@ -1967,10 +2293,10 @@ function Themes() {
             onChange={(e) => {
               const file = e.target.files?.[0]
               e.target.value = ""
-              if (file) install(file)
+              if (file) install("upload", () => upload<{ theme: Theme }>("/themes", file))
             }}
           />
-        </div>
+        </form>
       </Card>
 
       {/* items-start：有预览图和没有的卡片不该为了等高而留白 */}
@@ -2076,7 +2402,7 @@ function Themes() {
   )
 }
 
-type Settings = Record<string, string | boolean>
+type Settings = Record<string, string | boolean | number>
 
 // Two pages write settings, and each loads only what it displays.
 function useSettings() {
@@ -2114,10 +2440,74 @@ function useSettings() {
   }
 }
 
+// The hub's limit on each icon, which keeps both under its 64 KiB body limit.
+const ICON_BYTES = 20 * 1024
+
+const decodedBytes = (url: string) => Math.floor(((url.length - url.indexOf(",") - 1) * 3) / 4)
+
+// `img` contained in a `side`-pixel square, centred.
+function drawIcon(img: HTMLImageElement, side: number, background: string | null, type: string, quality?: number) {
+  const canvas = document.createElement("canvas")
+  canvas.width = canvas.height = side
+  const context = canvas.getContext("2d")!
+  if (background) {
+    context.fillStyle = background
+    context.fillRect(0, 0, side, side)
+  }
+  // An SVG without width and height has no intrinsic size; drawn square.
+  const w = img.naturalWidth || side
+  const h = img.naturalHeight || side
+  const scale = side / Math.max(w, h)
+  context.drawImage(img, (side - w * scale) / 2, (side - h * scale) / 2, w * scale, h * scale)
+  return canvas.toDataURL(type, quality)
+}
+
+// The two icons the hub serves from one picked image: the tab icon, an SVG kept
+// as it is or anything else scaled to 64 px (32 px at 2x), and the 180 px
+// apple-touch-icon iOS puts on the home screen. iOS fills a transparent one
+// with black, so it is drawn on white; a photo too detailed for a 20 KiB PNG
+// falls back to JPEG.
+async function siteIcons(file: File) {
+  const url = URL.createObjectURL(file)
+  try {
+    const img = new Image()
+    img.src = url
+    await img.decode().catch(() => {
+      throw new Error("这张图片打不开，换一张 PNG、SVG 或 ICO 试试")
+    })
+    const favicon =
+      file.type === "image/svg+xml" && file.size <= ICON_BYTES
+        ? await new Promise<string>((resolve, reject) => {
+            const reader = new FileReader()
+            reader.onload = () => resolve(String(reader.result))
+            reader.onerror = () => reject(new Error("读取图片失败，请重新选择"))
+            reader.readAsDataURL(file)
+          })
+        : drawIcon(img, 64, null, "image/png")
+    let touch = drawIcon(img, 180, "#fff", "image/png")
+    for (let quality = 0.9; decodedBytes(touch) > ICON_BYTES && quality > 0.3; quality -= 0.15) {
+      touch = drawIcon(img, 180, "#fff", "image/jpeg", quality)
+    }
+    return { favicon, touch_icon: touch }
+  } finally {
+    URL.revokeObjectURL(url)
+  }
+}
+
 // `onSaved` refreshes what the header shows, the site name among it.
 function SettingsTab({ onSaved }: { onSaved: () => void }) {
   const { s, set, save } = useSettings()
+  const iconPicker = useRef<HTMLInputElement>(null)
   if (!s) return null
+  // Applied on its own, as soon as a file is picked: a picked file is already a
+  // decision, and the form's save button below is easy to miss for it.
+  const saveIcons = (icons: { favicon: string; touch_icon: string }, done: string) =>
+    save(icons, done).then((ok) => {
+      // The tab's icon is cached under its fixed URL; a new query fetches the
+      // one just saved.
+      const link = document.querySelector<HTMLLinkElement>('link[rel="icon"]')
+      if (ok && link) link.href = `/admin/favicon.svg?${Date.now()}`
+    })
 
   return (
     <div className="space-y-4">
@@ -2126,17 +2516,76 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
           <Field label="站点名称">
             <Input value={String(s.site_name ?? "")} onChange={(e) => set("site_name", e.target.value)} placeholder="Monitor" />
           </Field>
-          <Field label="历史数据保留天数" hint="超出的明细自动清理，累计流量不受影响">
+          <Field
+            label="历史数据保留天数"
+            hint="1–365 天，超出的自动清理，累计流量不受影响"
+            helpWidth="max-w-66 min-[408px]:max-w-94"
+            help={
+              <>
+                <p>
+                  默认 <span className="whitespace-nowrap">30 天</span>，能看约一个月的历史。
+                </p>
+                <p>
+                  最近 <span className="whitespace-nowrap">7 天</span>
+                  {"按分钟保存，更早的按小时保存：超过一周的图表上，两者画出来几乎一样，按小时存只占几十分之一的空间。"}
+                </p>
+                <p>
+                  上限 <span className="whitespace-nowrap">365 天</span>。
+                </p>
+              </>
+            }
+          >
             <Input
               type="number"
               value={String(s.retention_days ?? "")}
               onChange={(e) => set("retention_days", e.target.value)}
-              placeholder="7"
+              placeholder="30"
             />
+          </Field>
+          <Field label="站点图标" hint="标签页、书签和手机主屏幕上的图标，选好即生效，换主题也保留">
+            <div className="flex items-center gap-2">
+              {!s.favicon && <span className="text-sm text-muted-foreground">默认</span>}
+              <div className="flex size-9 shrink-0 items-center justify-center rounded-md border">
+                <img src={String(s.favicon || "/favicon.svg?theme")} alt="站点图标" className="size-6 object-contain" />
+              </div>
+              <Button size="sm" variant="outline" onClick={() => iconPicker.current?.click()}>
+                <Upload /> 选择图标
+              </Button>
+              {s.favicon && (
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => saveIcons({ favicon: "", touch_icon: "" }, "已换回主题自带的图标")}
+                >
+                  用主题自带的
+                </Button>
+              )}
+              <input
+                ref={iconPicker}
+                type="file"
+                accept="image/png,image/x-icon,image/svg+xml,image/webp,image/jpeg,image/gif,.ico"
+                className="hidden"
+                onChange={(e) => {
+                  const file = e.target.files?.[0]
+                  e.target.value = ""
+                  if (!file) return
+                  siteIcons(file).then(
+                    (icons) => saveIcons(icons, "站点图标已更新"),
+                    (e: Error) => toast.error(e.message),
+                  )
+                }}
+              />
+            </div>
           </Field>
           <Field
             label="GitHub 代理"
-            hint="留空直连。仅在 hub 自己拉不到 GitHub Release 时填。这个地址返回的字节会被安装到每一台节点上，只填信得过的镜像"
+            helpWidth="max-w-58 min-[376px]:max-w-86 min-[432px]:max-w-100"
+            help={
+              <>
+                <p>留空直连。仅在 hub 自己拉不到 GitHub Release 时填。</p>
+                <p>这个地址返回的字节会被安装到每一台节点上，只填信得过的镜像。</p>
+              </>
+            }
           >
             <Input
               value={String(s.github_proxy ?? "")}
@@ -2161,10 +2610,9 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
             onClick={() =>
               save({
                 site_name: String(s.site_name ?? ""),
-                // `||` rather than `??`: the hub returns "" for an unset key
-                // rather than null, and "" is the one value this key's write path
-                // refuses.
-                retention_days: String(s.retention_days || "7"),
+                // `||` rather than `??`: an emptied box saves the default, ""
+                // being the one value this key's write path refuses.
+                retention_days: String(s.retention_days || "30"),
                 github_proxy: String(s.github_proxy ?? ""),
                 public_page: s.public_page === "off" ? "off" : "on",
               }).then((ok) => ok && onSaved())
@@ -2428,7 +2876,7 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
         <h3 className="text-sm font-medium">事件</h3>
         <div className="grid gap-4 sm:grid-cols-3">
           <Field label="离线宽限期（分钟）" hint="断开超过这么久才算离线，1–30">
-            <Input type="number" min={1} max={30}value={text("notify_grace")} onChange={(e) => set("notify_grace", e.target.value)} />
+            <Input type="number" min={1} max={30} value={text("notify_grace")} onChange={(e) => set("notify_grace", e.target.value)} />
           </Field>
           <Field label="流量提醒（%）" hint="本期用量达到该比例和 100% 时各提醒一次，0 关闭">
             <Input type="number" min={0} max={100} value={text("notify_traffic")} onChange={(e) => set("notify_traffic", e.target.value)} />
@@ -2461,8 +2909,6 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
   )
 }
 
-// The two ways into this panel, on their own page: the GitHub identity it trusts
-// and the password that works when GitHub does not.
 type Session = { id: string; current: boolean; created_at: number }
 
 function useSessions() {
@@ -2528,6 +2974,8 @@ function Sessions({ rows, reload }: { rows: Session[]; reload: () => void }) {
   )
 }
 
+// The ways into this panel, on their own page: the sessions signed in, the
+// GitHub identity it trusts and the password that works when GitHub does not.
 function Security({ site }: { site: string }) {
   const { s, set, save } = useSettings()
   const sessions = useSessions()
@@ -2619,17 +3067,19 @@ type DbInfo = {
   size: number
   wal: number
   free: number
-  /** Timestamp of the earliest history row, null on a database with none. */
-  oldest: number | null
+  /** Seconds since the earliest history row on the hub's clock, null on a database with none. */
+  oldest_ago: number | null
   retention: number
   rows: Record<string, number>
 }
 
-// The only two tables whose row count indicates anything about size. Every other
-// holds one row per node or per key.
+// The only tables whose row count indicates anything about size, each kind of
+// history in both tiers. Every other holds one row per node or per key.
 const DB_ROWS: [string, string][] = [
   ["metric", "历史明细"],
+  ["metric_hour", "历史小时汇总"],
   ["ping_record", "延迟记录"],
+  ["ping_hour", "延迟小时汇总"],
 ]
 
 function Data() {
@@ -2683,8 +3133,8 @@ function Data() {
   }
 
   if (!info) return null
-  const stat = (label: string, value: string) => (
-    <div key={label}>
+  const stat = (label: string, value: string, className = "") => (
+    <div key={label} className={className}>
       <div className="text-xs text-muted-foreground">{label}</div>
       <div className="tnum mt-0.5 text-sm">{value}</div>
     </div>
@@ -2694,14 +3144,17 @@ function Data() {
     <div className="space-y-4">
       <Card className="gap-4 p-5">
         <h3 className="text-sm font-medium">数据库</h3>
-        <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
+        {/* Five columns: the file and the window on one row, the four row counts
+            on the next. On two columns the free space takes a row of its own, so
+            the window and each kind's two tiers still pair up. */}
+        <div className="grid grid-cols-2 gap-4 sm:grid-cols-5">
           {stat("文件大小", bytes(info.size))}
           {stat("预写日志", bytes(info.wal))}
-          {stat("可回收空间", bytes(info.free))}
+          {stat("可回收空间", bytes(info.free), "col-span-2 sm:col-span-1")}
           {stat("保留天数", `${info.retention} 天`)}
           {/* 和保留天数并排：跨度小于保留期是还没攒够，大于保留期就是每小时
               那次 prune 没在跑。 */}
-          {stat("历史跨度", info.oldest ? `${Math.floor((Date.now() / 1000 - info.oldest) / 86400)} 天` : "—")}
+          {stat("历史跨度", info.oldest_ago !== null ? `${Math.floor(info.oldest_ago / 86400)} 天` : "—")}
           {DB_ROWS.map(([key, label]) => stat(label, (info.rows[key] ?? 0).toLocaleString()))}
         </div>
         <p className="truncate text-xs text-muted-foreground" title={info.path}>
@@ -2713,7 +3166,7 @@ function Data() {
         <div>
           <h3 className="text-sm font-medium">回收空间</h3>
           <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-            按保留天数清掉过期明细，再重建数据库文件把空出来的页还给磁盘（SQLite 的 VACUUM）。重建期间需要与数据库等量的空闲磁盘，过程中面板和上报会短暂变慢。
+            清掉超出保留天数的历史，再重建数据库文件把空出来的页还给磁盘（SQLite 的 VACUUM）。重建期间需要约为数据库两倍的空闲磁盘，过程中面板和上报会短暂变慢。
           </p>
         </div>
         <div>
@@ -2759,7 +3212,7 @@ function Data() {
       {confirm === "vacuum" && (
         <ConfirmDialog
           title="回收空间？"
-          description="超出保留天数的历史明细会被删除，然后重建数据库文件。累计流量不受影响。"
+          description="超出保留天数的历史会被删除，然后重建数据库文件。累计流量不受影响。"
           confirmLabel={busy === "vacuum" ? "回收中…" : "开始回收"}
           busy={!!busy}
           onClose={() => setConfirm(null)}

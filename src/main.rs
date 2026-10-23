@@ -44,7 +44,7 @@ use axum::http::{header, Extensions, HeaderMap, StatusCode, Version};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::Router;
-use chrono::{DateTime, Local, Months, NaiveDate, TimeZone, Timelike};
+use chrono::{DateTime, Local, Months, NaiveDate, TimeZone, Timelike, Utc};
 use tokio::signal::unix::{signal, SignalKind};
 use tower_http::compression::Predicate;
 use tracing::{info, warn};
@@ -69,8 +69,8 @@ pub struct App {
     pub readings: Mutex<HashMap<i64, agent_ws::Reading>>,
     /// Last rendered node list per audience, `[public, admin]`, with the
     /// millisecond it was built. Shared by every browser stream so viewers do
-    /// not multiply the query load. See `api::live_snapshot`.
-    pub snapshot: Mutex<[(i64, axum::extract::ws::Utf8Bytes); 2]>,
+    /// not multiply the query load. See `api::current`.
+    pub snapshot: Mutex<[api::Frame; 2]>,
     pub throttle: auth::Throttle,
     /// Failed agent registrations, counted separately from failed sign-ins: the
     /// two have different threat models, and a batch install run with a stale
@@ -109,7 +109,7 @@ impl App {
             agents: RwLock::default(),
             commands: command::Registry::default(),
             readings: Mutex::default(),
-            snapshot: Mutex::new([(0, Default::default()), (0, Default::default())]),
+            snapshot: Mutex::default(),
             throttle: auth::Throttle::default(),
             registrations: auth::Throttle::default(),
             http: reqwest::Client::builder()
@@ -278,14 +278,11 @@ impl<S: futures_core::Stream + Unpin> futures_core::Stream for Metered<S> {
 ///
 /// ponytail: these bytes are relayed unverified, and `install.sh` executes them
 /// as root on every node. Fetched directly from github.com that is TLS's
-/// concern; through the panel's `github_proxy` it rests on the mirror alone.
-/// Currently held by the setting accepting https:// only, and by stating so
-/// where it is entered. The upgrade path is a pinned digest -- `agent.pin`
-/// beside `web-theme.pin`, a fixed release tag, hashed after the fetch and
-/// before the relay (4 permits x 1.73 MiB against MemoryMax=256M, so buffering
-/// is free). Not a fetched checksum: whoever can replace the binary can replace
-/// that too. Deliberately deferred, as it couples agent releases to hub
-/// releases.
+/// concern; through the panel's `github_proxy` it rests on the mirror alone,
+/// which the setting holds to https:// and states where it is entered. A
+/// checksum fetched alongside proves nothing, as whoever can replace the binary
+/// can replace that too, and a digest pinned into the hub build was evaluated
+/// and not adopted: it would tie every agent release to a hub release.
 async fn agent_binary(State(app): State<Shared>, Path(arch): Path<String>) -> Response {
     if !matches!(arch.as_str(), "x86_64" | "aarch64") {
         return api::answer(StatusCode::NOT_FOUND, "unknown architecture");
@@ -516,15 +513,33 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     std::fs::create_dir_all(&args.themes)?;
+    if let Err(e) = db::temp_files_beside(&args.database) {
+        warn!("SQLite keeps its temporary files in its default directory: {e:#}");
+    }
     let (notes, inbox) = tokio::sync::mpsc::channel(notify::QUEUE);
     let app = Arc::new(App::new(Db::open(&args.database)?, args.site.clone(), args.themes, notes));
     let url = advertised_url(&args.site, args.listen);
+    let port = args.listen.port();
+    // On a container's bridge network the host side of `-p` decides who can
+    // connect, which the hub cannot see, and a loopback listener would leave the
+    // published port with nothing behind it. Under host networking the listener
+    // is the host's own, as on a bare host. The marker files do not tell the two
+    // apart, so the advice names both.
+    let close = if in_container() {
+        format!(
+            "publish it on the host's loopback only (-p 127.0.0.1:HOST_PORT:{port}) or not at all when \
+             the proxy shares the container's network; under host networking, --listen \
+             127.0.0.1:{port} instead"
+        )
+    } else {
+        format!("--listen 127.0.0.1:{port}")
+    };
     if exposed_over_plain_http(&url) {
         warn!(
             "this hub answers plain HTTP at {url}; sessions and agent tokens travel in the clear. \
              Put it behind a TLS reverse proxy -- the panel builds install commands from the \
-             browser's own address, so nothing here has to change -- then --listen 127.0.0.1:PORT \
-             so this port is no longer reachable in the clear"
+             browser's own address, so nothing here has to change -- and close this port so the \
+             proxy is the only way in: {close}"
         );
     }
     // The warning above derives from --site, the address the operator
@@ -536,10 +551,9 @@ async fn main() -> Result<()> {
     else if !args.listen.ip().is_loopback() {
         warn!(
             "listening on {} in the clear. If a TLS proxy fronts this hub, callers can still reach \
-             this port directly and set their own X-Forwarded-Proto -- --listen 127.0.0.1:{} so the \
-             proxy is the only way in",
-            args.listen,
-            args.listen.port()
+             this port directly and set their own X-Forwarded-Proto. Close it so the proxy is the \
+             only way in: {close}",
+            args.listen
         );
     }
     // Checked once here, because the answer is static: `provisioning_allowed`
@@ -585,8 +599,9 @@ async fn main() -> Result<()> {
         .route("/api/nodes/order", put(api::reorder_nodes))
         .route("/api/nodes/batch", put(api::update_nodes))
         .route("/api/nodes/{id}", put(api::update_node).delete(api::delete_node))
-        .route("/api/nodes/{id}/token", post(api::reset_token))
+        .route("/api/nodes/{id}/token", get(api::node_token).post(api::reset_token))
         .route("/api/nodes/{id}/traffic", put(api::patch_traffic))
+        .route("/api/nodes/{id}/ping-tasks", put(api::set_node_ping_tasks))
         .route("/api/ping-tasks", get(api::ping_tasks).post(api::save_ping_task))
         .route("/api/ping-tasks/order", put(api::reorder_ping_tasks))
         .route("/api/ping-tasks/{id}", delete(api::delete_ping_task))
@@ -599,19 +614,23 @@ async fn main() -> Result<()> {
         .route("/api/themes/{short}", delete(api::delete_theme))
         .route("/api/themes/{short}/preview", get(api::theme_preview))
         .route("/api/themes/{short}/update", post(api::update_theme))
+        // Not under /api/themes/: a fixed segment there would shadow the theme
+        // of that name for the routes keyed by `{short}`.
+        .route("/api/theme-install", post(api::install_theme))
         .route("/api/themes/{short}/config", put(api::save_theme_config))
         .route("/api/db", get(api::db_stats))
         .route("/api/db/backup", get(api::db_backup))
         .route("/api/db/vacuum", post(api::db_vacuum))
         .fallback(frontend::serve)
-        // A report is a few hundred bytes; anything larger is not a report.
+        // Every body above is a JSON form of a few KiB at most. The ceiling also
+        // bounds a theme's saved settings, which anonymous callers read back.
         .layer(tower_http::limit::RequestBodyLimitLayer::new(64 * 1024))
         // The two chunked uploads, merged after that layer rather than beneath
-        // it. They raise the ceiling on a single request -- one 4 MiB piece --
-        // not on the file behind it: a 256 MiB backup arrives as 64 such
-        // requests, so no reverse proxy needs to know the database size. The
-        // whole-file ceilings live on `total` and are checked before the first
-        // byte is sent.
+        // it. They raise the ceiling on a single request to `api::MAX_CHUNK`,
+        // not on the file behind it: a 256 MiB backup arrives as 64 of the
+        // panel's 4 MiB pieces, so no reverse proxy needs to know the database
+        // size. The whole-file ceilings live on `total` and are checked on the
+        // first request.
         .merge(
             Router::new()
                 .route("/api/db/restore", post(api::db_restore))
@@ -692,20 +711,7 @@ async fn main() -> Result<()> {
                 .layer(tower_http::limit::RequestBodyLimitLayer::new(64 * 1024))
                 .with_state(app.clone()),
         )
-        // Excludes the agent binary and database backups: both are already
-        // compressed and both are megabytes, so deflating them would consume the
-        // cores argon2 and the SQLite writer share for no gain.
-        .layer(
-            tower_http::compression::CompressionLayer::new().compress_when(
-                tower_http::compression::predicate::DefaultPredicate::new()
-                    .and(tower_http::compression::predicate::NotForContentType::const_new(
-                        "application/octet-stream",
-                    ))
-                    .and(|status: StatusCode, _: Version, _: &HeaderMap, _: &Extensions| {
-                        status != StatusCode::SWITCHING_PROTOCOLS
-                    }),
-            ),
-        )
+        .layer(tower_http::compression::CompressionLayer::new().compress_when(compressible()))
         .with_state(app.clone());
 
     let listener = match tokio::net::TcpListener::bind(args.listen).await {
@@ -746,6 +752,7 @@ async fn shutdown() {
         _ = term.recv() => {}
     }
     info!("shutting down");
+    db::halt();
 }
 
 /// The address printed at startup: `--site` when given, otherwise the listen
@@ -808,6 +815,18 @@ fn host_is_loopback(authority: &str) -> bool {
     // resolving wherever its owner points it, and reading it as loopback would
     // suppress the only warning that the cookie travels in the clear.
     host.is_empty() || host == "localhost" || host.parse::<IpAddr>().is_ok_and(|a| a.is_loopback())
+}
+
+/// Whether the hub runs in a Docker or Podman container, which mark each one
+/// with /.dockerenv and /run/.containerenv. The wider signals
+/// (/run/systemd/container, cgroup paths) are not consulted: they also mark
+/// LXC, and a VPS that is itself an LXC container is a bare host for this
+/// purpose.
+///
+/// ponytail: Kubernetes pods carry neither marker and receive the bare-host
+/// advice; checking $KUBERNETES_SERVICE_HOST would cover them.
+fn in_container() -> bool {
+    ["/.dockerenv", "/run/.containerenv"].into_iter().any(|p| std::path::Path::new(p).exists())
 }
 
 /// Prints a one-time admin password when the database is first created, since a
@@ -897,8 +916,8 @@ fn renew_online_nodes(app: &App) -> Result<()> {
     Ok(())
 }
 
-/// Expires sessions, trims history, rolls over expiry dates and sends the daily
-/// expiry digest: once at startup, then on the hour of the hub's clock.
+/// Rolls over expiry dates, expires sessions, sends the daily expiry digest and
+/// folds and trims history: once at startup, then on the hour of the hub's clock.
 ///
 /// On the hour because renewal falls due when the hub's date changes. Passes
 /// counted from startup would leave an online node shown expired for up to an
@@ -914,10 +933,6 @@ async fn housekeeping(app: Shared) {
         if let Err(e) = renew_online_nodes(&app) {
             warn!("rolling expiry dates failed: {e:#}");
         }
-        let keep = app.db.retention_days();
-        if let Err(e) = app.db.prune(keep) {
-            warn!("pruning history failed: {e:#}");
-        }
         if let Err(e) = app.db.expire_sessions() {
             warn!("expiring sessions failed: {e:#}");
         }
@@ -927,6 +942,27 @@ async fn housekeeping(app: Shared) {
             Ok(None) => {}
             Err(e) => warn!("expiry digest failed: {e:#}"),
         }
+        // Last, and off the runtime: the first pass after an upgrade folds every
+        // hour still held in minute rows and prunes the week's excess, which
+        // takes seconds to minutes. Folding precedes pruning, and pruning runs
+        // even when folding fails: it keeps minute rows until their hour is
+        // folded, and skipping it would leave the database growing.
+        let history = app.clone();
+        let done = tokio::task::spawn_blocking(move || {
+            let keep = history.db.retention_days();
+            match history.db.roll_up(Utc::now().timestamp(), keep) {
+                // More than the hour a pass normally folds is a catch-up, logged
+                // for the disk activity it causes.
+                Ok(folded) if folded > 1 => info!("folded {folded} hours of history into the hourly tier"),
+                Ok(_) => {}
+                Err(e) => warn!("folding history failed: {e:#}"),
+            }
+            history.db.prune(keep)
+        })
+        .await;
+        if let Err(e) = done.map_err(anyhow::Error::from).and_then(|r| r) {
+            warn!("maintaining history failed: {e:#}");
+        }
         tokio::time::sleep(until_next_hour(Local::now())).await;
     }
 }
@@ -935,6 +971,29 @@ async fn housekeeping(app: Shared) {
 /// every pass, so a clock step or a daylight-saving change shifts no later one.
 fn until_next_hour<Tz: TimeZone>(now: DateTime<Tz>) -> std::time::Duration {
     std::time::Duration::from_secs(u64::from(3_600 - now.minute() * 60 - now.second()))
+}
+
+/// Which answers the hub compresses. Not the agent binary, already compressed,
+/// nor database backups, hundreds of megabytes on a large fleet: deflating either
+/// would occupy the cores argon2 and the SQLite writer share for the whole
+/// transfer. Nor an answer marked `no-transform`, which Cloudflare leaves
+/// uncompressed as well: the admin node list, whose secrets sit beside strings an
+/// agent reports, so that the length of a compressed copy would let one rogue
+/// agent guess them a character at a time. nginx's gzip ignores the directive,
+/// so a proxy configured to compress JSON compresses this answer regardless.
+fn compressible() -> impl Predicate {
+    tower_http::compression::predicate::DefaultPredicate::new()
+        .and(tower_http::compression::predicate::NotForContentType::const_new("application/octet-stream"))
+        .and(|status: StatusCode, _: Version, headers: &HeaderMap, _: &Extensions| {
+            // Directives are case-insensitive and comma-separated.
+            let no_transform = headers
+                .get_all(header::CACHE_CONTROL)
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .flat_map(|v| v.split(','))
+                .any(|d| d.trim().eq_ignore_ascii_case("no-transform"));
+            status != StatusCode::SWITCHING_PROTOCOLS && !no_transform
+        })
 }
 
 #[cfg(test)]
@@ -959,6 +1018,25 @@ mod tests {
             headers.insert("x-forwarded-proto", scheme.parse().unwrap());
         }
         headers
+    }
+
+    #[test]
+    fn an_answer_marked_no_transform_is_left_uncompressed() {
+        let json = |cache: Option<&'static str>| {
+            let mut res = Response::new(axum::body::Body::from("x".repeat(1024)));
+            res.headers_mut().insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+            if let Some(cache) = cache {
+                res.headers_mut().insert(header::CACHE_CONTROL, cache.parse().unwrap());
+            }
+            res
+        };
+        assert!(compressible().should_compress(&json(None)));
+        assert!(!compressible().should_compress(&json(Some("no-store, no-transform"))));
+        assert!(!compressible().should_compress(&json(Some("No-Transform"))), "directives ignore case");
+        assert!(
+            compressible().should_compress(&json(Some("x-no-transform-ext"))),
+            "only the directive itself"
+        );
     }
 
     /// Whichever wildcard this kernel supports must parse and carry the default
@@ -1004,7 +1082,10 @@ mod tests {
         assert_eq!(spa("/api").await.status(), StatusCode::NOT_FOUND);
 
         // Client-side routes still fall through to the app.
-        assert_eq!(spa("/admin").await.status(), StatusCode::OK);
+        assert_eq!(spa("/admin/nodes").await.status(), StatusCode::OK);
+        // The panel's entry is a redirect to its first page, keeping the query.
+        let entry = spa("/admin?login_error=x").await;
+        assert_eq!(entry.headers()[axum::http::header::LOCATION], "/admin/nodes?login_error=x");
         for path in ["/user", "/user/", "/user/center"] {
             let response = spa(path).await;
             assert_eq!(response.status(), StatusCode::OK, "{path}");

@@ -1,18 +1,35 @@
 //! SQLite storage. A single writer connection behind a mutex: at a handful of
-//! nodes reporting every few seconds, every statement here is sub-millisecond.
-// ponytail: single global connection; move to a read pool if the dashboard ever
-// blocks behind ingest.
+//! nodes reporting every few seconds, every statement on it is sub-millisecond.
+//! The history charts, whose scans are not, read through a second connection.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard, TryLockError};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, Local, NaiveDate, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use tokio::runtime::RuntimeFlavor;
 use tracing::info;
 
-pub struct Db(Mutex<Connection>);
+pub struct Db {
+    /// A read-only connection to the same file, for the history charts. A week
+    /// of one node's probe results is a scan of 98 ms at four 60-second probes
+    /// and 486 ms at eight 10-second ones. With four of the latter in flight on
+    /// `conn`, every agent report and panel request behind them would wait 1.1 s
+    /// at the median; with the scans here they wait 1.8 ms, as WAL lets this
+    /// connection read while `conn` commits. `None` for `:memory:`, which a second
+    /// connection cannot open.
+    ///
+    /// Declared before `conn` so that it closes first. The last connection to
+    /// close folds the WAL into the database file and deletes it, which a
+    /// read-only one cannot do, and a stopped hub would otherwise leave rows in
+    /// a -wal that a copy of the database file alone misses.
+    // ponytail: one reader, so chart requests queue behind one another, at most
+    // `api::HISTORY_SLOTS` deep; a pool if that wait becomes visible.
+    reader: Option<Mutex<Connection>>,
+    conn: Mutex<Connection>,
+}
 
 const SCHEMA: &str = r#"
 PRAGMA journal_mode = WAL;
@@ -77,6 +94,9 @@ CREATE TABLE IF NOT EXISTS node (
   -- Set in the panel and shown on the status page, where a theme may divide the
   -- node list by it. Empty is ungrouped. Not `group`, a reserved word.
   group_name TEXT NOT NULL DEFAULT '',
+  -- Set in the panel and shown on the status page, unlike `remark`. Empty is
+  -- none.
+  public_remark TEXT NOT NULL DEFAULT '',
   -- Set in the panel, each replacing the address shown for its family. Empty
   -- means automatic. Panel only, like the reported addresses.
   ipv4_pin TEXT NOT NULL DEFAULT '', ipv6_pin TEXT NOT NULL DEFAULT '',
@@ -116,6 +136,7 @@ CREATE TABLE IF NOT EXISTS metric (
   net_rx INTEGER NOT NULL, net_tx INTEGER NOT NULL,
   tcp INTEGER NOT NULL, udp INTEGER NOT NULL, procs INTEGER NOT NULL,
   net_rx_max INTEGER NOT NULL DEFAULT 0, net_tx_max INTEGER NOT NULL DEFAULT 0,
+  cpu_max REAL NOT NULL DEFAULT 0,
   PRIMARY KEY (node_id, ts)
 ) WITHOUT ROWID;
 
@@ -136,10 +157,46 @@ CREATE TABLE IF NOT EXISTS ping_node (
 
 -- Key order follows the only query there is: one node, one time window,
 -- every probe. With task_id ahead of ts SQLite can seek to the node and no
--- further, then scans every record it ever kept -- see the migration in open().
+-- further, then scans every record it ever kept -- see migrate_to_1.
 CREATE TABLE IF NOT EXISTS ping_record (
   node_id INTEGER NOT NULL, task_id INTEGER NOT NULL,
   ts INTEGER NOT NULL, latency INTEGER NOT NULL,
+  PRIMARY KEY (node_id, ts, task_id)
+) WITHOUT ROWID;
+
+-- The hourly tier: charts wider than DETAIL_DAYS read these, and they outlive
+-- the minute rows they are folded from. `ts` is the start of the hour, and a
+-- row covers the minute rows stamped within it. Keyed like the tables above.
+--
+-- `minutes` counts the rows folded in and weights each average when buckets
+-- spanning several hours merge them. Every column of `metric` is kept, whether
+-- or not the chart returns it yet: a minute row is gone after DETAIL_DAYS, and
+-- a column added here later would start empty.
+CREATE TABLE IF NOT EXISTS metric_hour (
+  node_id INTEGER NOT NULL REFERENCES node(id) ON DELETE CASCADE,
+  ts      INTEGER NOT NULL,
+  minutes INTEGER NOT NULL,
+  cpu REAL NOT NULL, cpu_max REAL NOT NULL,
+  mem_used INTEGER NOT NULL, swap_used INTEGER NOT NULL, disk_used INTEGER NOT NULL,
+  net_rx INTEGER NOT NULL, net_tx INTEGER NOT NULL,
+  net_rx_max INTEGER NOT NULL, net_tx_max INTEGER NOT NULL,
+  tcp INTEGER NOT NULL, udp INTEGER NOT NULL, procs INTEGER NOT NULL,
+  PRIMARY KEY (node_id, ts)
+) WITHOUT ROWID;
+
+-- `latency` is the median of the hour's answers and NULL when none arrived;
+-- `lo` and `hi` bound them. `answered` weights the median when buckets merge.
+--
+-- Foreign keys, unlike `ping_record`: an earlier build run against this file
+-- deletes nodes and probes knowing nothing of this table, and SQLite gives a
+-- deleted id to the next one created, which would draw the deleted one's
+-- hourly latency. The cascade clears the rows whichever build deletes.
+CREATE TABLE IF NOT EXISTS ping_hour (
+  node_id INTEGER NOT NULL REFERENCES node(id) ON DELETE CASCADE,
+  task_id INTEGER NOT NULL REFERENCES ping_task(id) ON DELETE CASCADE,
+  ts INTEGER NOT NULL,
+  answered INTEGER NOT NULL, lost INTEGER NOT NULL,
+  latency INTEGER, lo INTEGER, hi INTEGER,
   PRIMARY KEY (node_id, ts, task_id)
 ) WITHOUT ROWID;
 
@@ -254,7 +311,7 @@ CREATE TABLE IF NOT EXISTS proxy_node_traffic (
 /// cannot: `open` runs `SCHEMA` before migrating, and on an older file the
 /// column is not there yet. `an_upgraded_release_matches_a_fresh_database`
 /// holds every migration to these rules, starting from v1.0.0's schema.
-const SCHEMA_VERSION: i64 = 20;
+const SCHEMA_VERSION: i64 = 21;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -504,6 +561,40 @@ fn migrate_to_18(conn: &Connection) -> Result<()> {
     add_column(conn, "metric", "net_tx_max INTEGER NOT NULL DEFAULT 0")
 }
 
+/// The hourly tier, and the peak CPU the minute rows begin to carry. A file in
+/// service already has both tables, since `open` runs `SCHEMA` first; a backup
+/// from an earlier release does not, and restoring one would leave every rollup
+/// failing until the next restart.
+fn migrate_history(conn: &Connection) -> Result<()> {
+    add_column(conn, "metric", "cpu_max REAL NOT NULL DEFAULT 0")?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS metric_hour (
+           node_id INTEGER NOT NULL REFERENCES node(id) ON DELETE CASCADE,
+           ts      INTEGER NOT NULL,
+           minutes INTEGER NOT NULL,
+           cpu REAL NOT NULL, cpu_max REAL NOT NULL,
+           mem_used INTEGER NOT NULL, swap_used INTEGER NOT NULL, disk_used INTEGER NOT NULL,
+           net_rx INTEGER NOT NULL, net_tx INTEGER NOT NULL,
+           net_rx_max INTEGER NOT NULL, net_tx_max INTEGER NOT NULL,
+           tcp INTEGER NOT NULL, udp INTEGER NOT NULL, procs INTEGER NOT NULL,
+           PRIMARY KEY (node_id, ts)
+         ) WITHOUT ROWID;
+         CREATE TABLE IF NOT EXISTS ping_hour (
+           node_id INTEGER NOT NULL REFERENCES node(id) ON DELETE CASCADE,
+           task_id INTEGER NOT NULL REFERENCES ping_task(id) ON DELETE CASCADE,
+           ts INTEGER NOT NULL,
+           answered INTEGER NOT NULL, lost INTEGER NOT NULL,
+           latency INTEGER, lo INTEGER, hi INTEGER,
+           PRIMARY KEY (node_id, ts, task_id)
+         ) WITHOUT ROWID;",
+    )?;
+    Ok(())
+}
+
+fn migrate_public_remark(conn: &Connection) -> Result<()> {
+    add_column(conn, "node", "public_remark TEXT NOT NULL DEFAULT ''")
+}
+
 /// Brings a database already in service up to `SCHEMA_VERSION` and stamps it.
 /// `from` is its current version, so a fresh file passes `SCHEMA_VERSION` and
 /// receives only the stamp.
@@ -574,6 +665,8 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
         add_column(&tx, "users", column)?;
     }
     migrate_to_20(&tx)?;
+    migrate_history(&tx)?;
+    migrate_public_remark(&tx)?;
     seed_default_admin(&tx)?;
     if from < 18 {
         migrate_to_18(&tx)?;
@@ -623,7 +716,7 @@ fn seed_default_admin(conn: &Connection) -> Result<()> {
 }
 
 /// Every table a backup must carry before this build will restore it.
-const TABLES: [&str; 14] = [
+const TABLES: [&str; 16] = [
     "setting",
     "node",
     "proxies",
@@ -638,6 +731,8 @@ const TABLES: [&str; 14] = [
     "proxy_user_traffic",
     "proxy_node_traffic",
     "user_proxy_order",
+    "metric_hour",
+    "ping_hour",
 ];
 const PRE_RESOURCE_TABLES: [&str; 8] =
     ["setting", "node", "traffic", "metric", "ping_task", "ping_node", "ping_record", "session"];
@@ -925,6 +1020,8 @@ pub struct AuthorizationSummary {
     pub auth: serde_json::Value,
 }
 
+const HOURLY_TABLES: [&str; 2] = ["metric_hour", "ping_hour"];
+
 /// One node's stored configuration and last known facts.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct Node {
@@ -945,6 +1042,10 @@ pub struct Node {
     pub expires_at: Option<String>,
     #[serde(default)]
     pub remark: String,
+    /// Set in the panel for visitors to read, beside `remark`, which they never
+    /// see. Empty is none.
+    #[serde(default)]
+    pub public_remark: String,
     /// Monthly allowance in bytes; 0 means unmetered.
     #[serde(default)]
     pub traffic_limit: i64,
@@ -1023,10 +1124,11 @@ fn yes() -> bool {
 }
 
 /// Omitted settings stay unchanged. An explicit null clears the expiry date.
+/// The position in the list is not among them: it changes only through
+/// `reorder_nodes`, which takes the whole order at once.
 #[derive(Deserialize, Default)]
 pub struct NodePatch {
     pub name: Option<String>,
-    pub sort: Option<i64>,
     pub public: Option<bool>,
     pub price: Option<f64>,
     pub currency: Option<String>,
@@ -1034,6 +1136,7 @@ pub struct NodePatch {
     #[serde(default, deserialize_with = "expiry_patch")]
     pub expires_at: Option<Option<String>>,
     pub remark: Option<String>,
+    pub public_remark: Option<String>,
     pub traffic_limit: Option<i64>,
     pub traffic_mode: Option<String>,
     pub traffic_reset_day: Option<u32>,
@@ -1116,6 +1219,32 @@ pub struct PingTask {
     pub base: Option<Vec<i64>>,
 }
 
+/// Points SQLite's temporary files -- the copy `VACUUM` rebuilds the database
+/// into, and any sort too large for memory -- at the directory holding the
+/// database. Every deployment keeps that directory writable and sized for the
+/// database (the unit's `ReadWritePaths`, the image's /data), and the backup and
+/// restore scratch files already go there.
+///
+/// SQLite otherwise tries $SQLITE_TMPDIR, $TMPDIR, /var/tmp, /usr/tmp, /tmp and
+/// the working directory. The Docker image is built from scratch and has none of
+/// them writable. The rebuilt copy stays in a page cache sized like the main
+/// database's 8 MiB and needs a file only beyond it, so `VACUUM` would succeed
+/// on a database compacting to 6.3 MB and fail on one compacting to 9 MB, with
+/// "unable to determine a suitable directory for temporary files". SQLite
+/// unlinks each file as it opens it, so none remain there.
+///
+/// Process-wide and not thread-safe, so it is called once, before any
+/// connection is opened. A bare file name keeps SQLite's own search, which ends
+/// at the working directory holding it.
+pub fn temp_files_beside(database: &str) -> Result<()> {
+    let Some(dir) = std::path::Path::new(database).parent().filter(|d| !d.as_os_str().is_empty()) else {
+        return Ok(());
+    };
+    let dir = dir.to_string_lossy().replace('\'', "''");
+    Connection::open_in_memory()?.execute_batch(&format!("PRAGMA temp_store_directory = '{dir}'"))?;
+    Ok(())
+}
+
 /// Restricts the database to its owner.
 ///
 /// It is the credential store: node tokens in the clear, the GitHub client
@@ -1138,6 +1267,20 @@ fn own_only(file: &str) {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600));
     }
+}
+
+/// Opens a read-only connection to the database: [`Db`]'s reader, and the one
+/// [`Db::backup_into`] exports through. Read-only from the open, so no statement
+/// reaching it can write. It inherits none of the PRAGMAs in `SCHEMA`, so the
+/// busy timeout is set again; without it, a checkpoint racing a read would
+/// return SQLITE_BUSY immediately.
+fn read_only(file: &str) -> Result<Connection> {
+    let conn = Connection::open_with_flags(
+        file,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    Ok(conn)
 }
 
 /// The `main` database's path as SQLite reports it, empty for `:memory:`.
@@ -1176,6 +1319,210 @@ const PING_ROWS: &str = "SELECT ts/?3, task_id, latency FROM ping_record
            AND task_id IN (SELECT task_id FROM ping_node WHERE node_id=?1)
      ORDER BY ts";
 
+/// [`PING_ROWS`] for the hourly tier: the folded hours before the watermark
+/// `?4`, in time order off the key.
+const PING_HOURS: &str = "SELECT ts/?3, task_id, answered, lost, latency, lo, hi FROM ping_hour
+     WHERE node_id=?1 AND ts>=?2 AND ts<?4
+           AND task_id IN (SELECT task_id FROM ping_node WHERE node_id=?1)
+     ORDER BY ts";
+
+/// Minute rows are kept this many days at most, and windows up to this wide are
+/// drawn from them. It is the widest window where they change what is drawn: at
+/// the 1,440-point budget a week is 7-minute points, where hourly rows would
+/// give 168. A month is half-hour points from minute rows and hourly from the
+/// tier, which a chart the width of a screen cannot tell apart.
+pub const DETAIL_DAYS: i64 = 7;
+
+/// The longest history a hub keeps. A year spans the longest billing cycle the
+/// panel records, so a machine paid annually can be judged over a whole term.
+/// At 100 nodes with four probes the hourly tier holds about 145 MiB for it,
+/// where minute rows would hold 6.6 GiB.
+pub const MAX_RETENTION_DAYS: i64 = 365;
+
+/// History kept where the panel has never saved a value: a month. Its hourly
+/// tier adds about 0.12 MiB per node with four probes to the week of minute rows
+/// every setting keeps.
+const DEFAULT_RETENTION_DAYS: i64 = 30;
+
+/// How long after an hour ends its rows may still arrive. Metric rows are
+/// written as they are stamped, but probe results wait in the session until a
+/// frame from a later minute arrives, and an agent may send one as seldom as
+/// once an hour: its `--interval` and a probe's interval are both capped at
+/// 3600 seconds.
+const LATE: i64 = 3_600 + 60;
+
+/// Setting holding the start of the first hour not yet folded into the hourly
+/// tier. Internal: the settings routes neither return nor accept it.
+const ROLLED: &str = "history_rolled";
+
+/// One chart window as the database answers it.
+#[derive(Clone, Copy, Debug)]
+pub struct Span {
+    /// Start of the window, in unix seconds.
+    pub since: i64,
+    /// Seconds each returned point covers: whole minutes, or whole hours when
+    /// `hourly`, so that no hourly row straddles two points.
+    pub step: i64,
+    /// Whether the window reaches past [`DETAIL_DAYS`] and is read from the
+    /// hourly tier.
+    pub hourly: bool,
+}
+
+#[cfg(test)]
+impl Span {
+    /// A window read from minute rows alone.
+    pub fn minutes(since: i64, step: i64) -> Self {
+        Span { since, step, hourly: false }
+    }
+}
+
+/// Lets a caller waiting on the connection take it between the steps of a long
+/// maintenance run. Dropping the guard alone does not: `std::sync::Mutex` is
+/// not fair, and the thread releasing it takes it back before a woken waiter
+/// runs. Without the pause, on the upgrade of 90 days of 100 nodes, a request
+/// would wait up to 12 s behind a prune releasing the lock between nodes.
+fn let_waiters_in() {
+    std::thread::sleep(std::time::Duration::from_millis(1));
+}
+
+/// Set once the hub begins to stop, and checked between the steps of
+/// `roll_up` and `prune`. The runtime waits on blocking work before the process
+/// exits, so the catch-up after an upgrade, minutes long, would otherwise hold
+/// the exit past systemd's 90-second stop timeout and end in SIGKILL. Each step
+/// commits on its own, and the next pass resumes where this one stopped.
+static HALTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn halt() {
+    HALTED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn halted() -> bool {
+    HALTED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The first hour not yet folded into the hourly tier, `None` before the first
+/// rollup, while every row is still a minute row.
+fn rolled(conn: &Connection) -> Result<Option<i64>> {
+    let value: Option<String> =
+        conn.query_row("SELECT value FROM setting WHERE key=?1", [ROLLED], |r| r.get(0)).optional()?;
+    Ok(value.and_then(|v| v.parse().ok()))
+}
+
+/// The earliest `ts` across `tables`, sought node by node: every key here
+/// begins with `node_id`, and `MIN(ts)` over a whole table scans it, 15.9 s at
+/// 90 days of 100 nodes against 1.8 ms this way. `tables` are names from
+/// [`TABLES`].
+fn oldest(conn: &Connection, tables: &[&str]) -> Result<Option<i64>> {
+    let per_node: Vec<String> = tables
+        .iter()
+        .map(|t| format!("SELECT (SELECT MIN(ts) FROM {t} WHERE node_id=n.id) AS ts FROM node n"))
+        .collect();
+    let sql = format!("SELECT MIN(ts) FROM ({})", per_node.join(" UNION ALL "));
+    Ok(conn.query_row(&sql, [], |r| r.get(0))?)
+}
+
+/// Probe results as the latency fold receives them. A stored result is a
+/// single answer or a single loss; an hourly row is that hour's answers,
+/// represented by their median, and its losses.
+struct Sample {
+    answered: i64,
+    lost: i64,
+    median: Option<i64>,
+    lo: Option<i64>,
+    hi: Option<i64>,
+}
+
+impl Sample {
+    /// One stored result. A timeout is stored as -1: counted as lost, and kept
+    /// out of the median.
+    fn result(latency: i64) -> Self {
+        let answer = (latency >= 0).then_some(latency);
+        Sample {
+            answered: i64::from(answer.is_some()),
+            lost: i64::from(answer.is_none()),
+            median: answer,
+            lo: answer,
+            hi: answer,
+        }
+    }
+}
+
+/// One probe's samples within one bucket.
+#[derive(Default)]
+struct Tally {
+    /// Each sample's median and the answers it stands for.
+    medians: Vec<(i64, i64)>,
+    lost: i64,
+    lo: Option<i64>,
+    hi: Option<i64>,
+}
+
+impl Tally {
+    fn add(&mut self, s: Sample) {
+        if let Some(median) = s.median {
+            self.medians.push((median, s.answered));
+        }
+        self.lost += s.lost;
+        self.lo = self.lo.into_iter().chain(s.lo).min();
+        self.hi = self.hi.into_iter().chain(s.hi).max();
+    }
+
+    fn answered(&self) -> i64 {
+        self.medians.iter().map(|m| m.1).sum()
+    }
+
+    /// The median of the answers, each sample's median counted once per answer
+    /// it stands for. Over single results that is the ordinary median, the
+    /// middle two averaged. Over hourly rows it is exact while a bucket is one
+    /// hour and an approximation once it spans several, since the hours'
+    /// medians stand in for the answers themselves.
+    fn median(&mut self) -> Option<i64> {
+        self.medians.sort_unstable();
+        let total = self.answered();
+        let at = |rank: i64| {
+            let mut seen = 0;
+            self.medians.iter().find(|m| {
+                seen += m.1;
+                seen >= rank
+            })
+        };
+        // The 1-based ranks of the middle answer, or of the middle two.
+        Some((at((total + 1) / 2)?.0 + at(total / 2 + 1)?.0) / 2)
+    }
+}
+
+/// Locks `mutex`, and when it is taken, waits with this thread's share of the
+/// runtime handed to another.
+///
+/// A vacuum or a restore holds the writer for as long as the disk takes to
+/// rewrite the file: minutes, on a slow one. Requests, browser streams, agent
+/// handshakes and the hourly housekeeping reach it from async tasks, and each
+/// waiting in place would take a worker thread with it: on one core with a
+/// browser stream open, a 13 s vacuum would hold every other request for 12.5 s.
+///
+/// ponytail: each waiter holds a blocking thread -- during a vacuum or a
+/// restore, every open browser stream and connected agent, plus each request
+/// arriving meanwhile. Past tokio's default of 512 the next waiter stalls a
+/// worker again; refuse waiters past a limit, as the history charts do, if
+/// hubs reach that.
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    match mutex.try_lock() {
+        Ok(guard) => guard,
+        Err(TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(TryLockError::WouldBlock) => {
+            let wait = || mutex.lock().unwrap_or_else(|e| e.into_inner());
+            // `block_in_place` panics on a current-thread runtime, which is
+            // what `#[tokio::test]` runs. Off the runtime's workers -- in
+            // `spawn_blocking`, or already in `block_in_place` -- it calls the
+            // closure as it is.
+            match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+                Ok(RuntimeFlavor::MultiThread) => tokio::task::block_in_place(wait),
+                _ => wait(),
+            }
+        }
+    }
+}
+
 impl Db {
     pub fn open(path: &str) -> Result<Self> {
         let conn = Connection::open(path)?;
@@ -1194,11 +1541,44 @@ impl Db {
         restrict(path);
 
         migrate(&conn, if fresh { SCHEMA_VERSION } else { version })?;
-        Ok(Self(Mutex::new(conn)))
+        let reader = match main_file(&conn) {
+            file if file.is_empty() => None,
+            file => Some(Mutex::new(read_only(&file)?)),
+        };
+        Ok(Self { reader, conn: Mutex::new(conn) })
     }
 
-    fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    fn conn(&self) -> MutexGuard<'_, Connection> {
+        lock(&self.conn)
+    }
+
+    /// The connection the history charts read through: the read-only one, or
+    /// the writer for `:memory:`.
+    ///
+    /// A scan holds its snapshot throughout, and with chart requests queued the
+    /// next begins as the last ends, so no commit's checkpoint would find the
+    /// reader idle and the WAL would keep every commit for as long as anyone
+    /// sent them: 20 MB in 20 s at 100 commits a second, from four requests kept
+    /// in flight. Before the scan the reader is idle, and a checkpoint taken
+    /// here resets the WAL itself. Past 4 MiB only, as without readers the WAL
+    /// stays within the 1 MiB `journal_size_limit` plus one transaction.
+    ///
+    /// Without waiting: an export is the one other reader, and waiting on it
+    /// would hold the writer, and every agent report behind it, for the busy
+    /// timeout.
+    ///
+    /// The writer is taken after the reader here and must never be held while
+    /// taking the reader.
+    fn reader(&self) -> MutexGuard<'_, Connection> {
+        let Some(reader) = &self.reader else { return self.conn() };
+        let reader = reader.lock().unwrap_or_else(|e| e.into_inner());
+        if bytes_of(&format!("{}-wal", reader.path().unwrap_or_default())) > 4 << 20 {
+            let conn = self.conn();
+            let _ = conn.busy_timeout(std::time::Duration::ZERO);
+            let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+            let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
+        }
+        reader
     }
 
     // ---- settings ----
@@ -1297,8 +1677,7 @@ impl Db {
             return Ok(Err(ProxyWriteIssue::PortConflict));
         }
         let now = Utc::now().timestamp();
-        let sort: i64 =
-            tx.query_row("SELECT COALESCE(MAX(sort),-1)+1 FROM proxies", [], |row| row.get(0))?;
+        let sort: i64 = tx.query_row("SELECT COALESCE(MAX(sort),-1)+1 FROM proxies", [], |row| row.get(0))?;
         tx.execute(
             "INSERT INTO proxies(node_id,name,include_node_name,protocol,address_type,address,port,enabled,flow,config,created_at,updated_at,sort)
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?11,?12)",
@@ -2324,23 +2703,23 @@ impl Db {
         let tx = conn.transaction()?;
         {
             let mut update = tx.prepare(
-                "UPDATE node SET name=COALESCE(?2,name), sort=COALESCE(?3,sort), public=COALESCE(?4,public),
-                                 price=COALESCE(?5,price), currency=COALESCE(?6,currency),
-                                 billing_cycle=COALESCE(?7,billing_cycle),
-                                 expires_at=CASE WHEN ?8 THEN ?9 ELSE expires_at END,
-                                 remark=COALESCE(?10,remark), traffic_limit=COALESCE(?11,traffic_limit),
-                                 traffic_mode=COALESCE(?12,traffic_mode),
-                                 traffic_reset_day=COALESCE(?13,traffic_reset_day),
-                                 notify=COALESCE(?14,notify), country_pin=COALESCE(?15,country_pin),
-                                 ipv4_pin=COALESCE(?16,ipv4_pin), ipv6_pin=COALESCE(?17,ipv6_pin),
-                                 group_name=COALESCE(?18,group_name)
+                "UPDATE node SET name=COALESCE(?2,name), public=COALESCE(?3,public),
+                                 price=COALESCE(?4,price), currency=COALESCE(?5,currency),
+                                 billing_cycle=COALESCE(?6,billing_cycle),
+                                 expires_at=CASE WHEN ?7 THEN ?8 ELSE expires_at END,
+                                 remark=COALESCE(?9,remark), traffic_limit=COALESCE(?10,traffic_limit),
+                                 traffic_mode=COALESCE(?11,traffic_mode),
+                                 traffic_reset_day=COALESCE(?12,traffic_reset_day),
+                                 notify=COALESCE(?13,notify), country_pin=COALESCE(?14,country_pin),
+                                 ipv4_pin=COALESCE(?15,ipv4_pin), ipv6_pin=COALESCE(?16,ipv6_pin),
+                                 group_name=COALESCE(?17,group_name),
+                                 public_remark=COALESCE(?18,public_remark)
                  WHERE id=?1",
             )?;
             for id in ids {
                 let found = update.execute(params![
                     id,
                     n.name,
-                    n.sort,
                     n.public,
                     n.price,
                     n.currency,
@@ -2355,7 +2734,8 @@ impl Db {
                     n.country_pin,
                     n.ipv4_pin,
                     n.ipv6_pin,
-                    n.group
+                    n.group,
+                    n.public_remark
                 ])?;
                 // Dropping the transaction uncommitted rolls back the nodes
                 // already updated.
@@ -2417,9 +2797,10 @@ impl Db {
     pub fn delete_node(&self, id: i64) -> Result<bool> {
         let conn = self.conn();
         // `ping_record` carries no foreign key -- it is WITHOUT ROWID and keyed
-        // for the chart query -- so it is cleared explicitly. SQLite reassigns a
-        // deleted node's id to the next node created, which would otherwise
-        // inherit the removed machine's latency chart.
+        // for the chart query -- so it is cleared explicitly; the other history
+        // tables cascade. SQLite reassigns a deleted node's id to the next node
+        // created, which would otherwise inherit the removed machine's latency
+        // chart.
         conn.execute("DELETE FROM ping_record WHERE node_id = ?1", [id])?;
         Ok(conn.execute("DELETE FROM node WHERE id = ?1", [id])? > 0)
     }
@@ -2774,8 +3155,8 @@ impl Db {
             .prepare_cached(
                 "INSERT OR REPLACE INTO metric
                (node_id, ts, cpu, mem_used, swap_used, disk_used, net_rx, net_tx, tcp, udp, procs,
-                net_rx_max, net_tx_max)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                net_rx_max, net_tx_max, cpu_max)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
             )?
             .execute(params![
                 node_id,
@@ -2790,12 +3171,13 @@ impl Db {
                 n("udp"),
                 n("procs"),
                 n("net_rx_max"),
-                n("net_tx_max")
+                n("net_tx_max"),
+                f("cpu_max")
             ])?;
         Ok(())
     }
 
-    /// History for one node, thinned to one sample every `step` seconds.
+    /// History for one node, one sample every `span.step` seconds.
     ///
     /// Bucketed rather than filtered on a multiple of `step`: rows normally land
     /// on the minute, but nothing enforces it, and a filter would return nothing
@@ -2807,46 +3189,258 @@ impl Db {
     /// minutes hold, while averaging gives 28.02 GB, matching the accumulator.
     ///
     /// `swap_used`, `tcp`, `udp` and `procs` are stored but not returned, as
-    /// nothing draws them from history. The columns are retained deliberately;
-    /// `load1` was the fifth and has been removed, see `migrate_to_2`.
+    /// nothing draws them from history. The columns are retained deliberately,
+    /// in the hourly tier as well; `load1` was the fifth and has been removed,
+    /// see `migrate_to_2`.
     ///
     /// The stamp is the bucket's start rather than a row inside it, so every
     /// series lands on one grid and the probe rows below can be shared.
     ///
-    /// `net_rx_max` and `net_tx_max` are the bucket's highest rather than its
-    /// mean, since a maximum of maxima loses nothing: a week's window peaks at
-    /// the same rate as the minute that reached it. Each row counts as at least
-    /// its own mean: rows predating the column hold 0, and the mean, timed by
-    /// the hub's arrivals rather than the agent's clock, can edge past the
-    /// agent's own rates by the network's jitter.
-    pub fn metrics(&self, node_id: i64, since: i64, step: i64) -> Result<Vec<serde_json::Value>> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare_cached(
-            "SELECT (MIN(ts)/?3)*?3, AVG(cpu), CAST(AVG(mem_used) AS INTEGER),
-                    CAST(AVG(disk_used) AS INTEGER),
-                    CAST(AVG(net_rx) AS INTEGER), CAST(AVG(net_tx) AS INTEGER),
-                    MAX(MAX(net_rx, net_rx_max)), MAX(MAX(net_tx, net_tx_max))
-             FROM metric WHERE node_id=?1 AND ts>=?2 GROUP BY ts/?3 ORDER BY ts/?3",
-        )?;
-        let rows = stmt.query_map(params![node_id, since, step], |r| {
+    /// `net_rx_max`, `net_tx_max` and `cpu_max` are the bucket's highest rather
+    /// than its mean, since a maximum of maxima loses nothing: a week's window
+    /// peaks at the same rate as the minute that reached it. Each row counts as
+    /// at least its own mean: rows predating the columns hold 0, and the mean,
+    /// timed by the hub's arrivals rather than the agent's clock, can edge past
+    /// the agent's own rates by the network's jitter.
+    ///
+    /// `minutes` is how many minute rows the bucket holds, against the
+    /// `step / 60` it spans: a node offline for part of a bucket has its means
+    /// taken over the minutes it reported, and a caller integrating the rates
+    /// or showing availability needs the difference. That holds while the
+    /// agent reports at least once a minute. A row is written only in a minute
+    /// a report arrives, so past a 60-second `--interval` each row covers one
+    /// interval and `minutes` falls in proportion: a fifth of the full count at
+    /// 300 seconds.
+    ///
+    /// An hourly window reads the folded hours before the watermark and the
+    /// minute rows after it, each hour weighted by the minutes it holds, so a
+    /// bucket averages the same minutes it would have were they all still kept.
+    /// The integer columns lose under one unit to the truncated hourly means.
+    ///
+    /// The minute rows read are the newest `DETAIL_DAYS` at most. Normally the
+    /// watermark sits a few hours back, but it lags while a catch-up runs or a
+    /// rollup keeps failing, and every minute row the node holds would then
+    /// enter one request: 0.7–1.0 s per series at 90 days of 100 nodes during
+    /// the catch-up after an upgrade, against 13–87 ms once it completes. The
+    /// hours between the watermark and that week are missing from the chart
+    /// until they are folded.
+    pub fn metrics(&self, node_id: i64, span: Span) -> Result<Vec<serde_json::Value>> {
+        let mut reader = self.reader();
+        // One snapshot for every statement below. On the reader, a rollup can
+        // otherwise commit between reading the watermark and reading the rows
+        // on either side of it.
+        let conn = reader.transaction()?;
+        let row = |r: &rusqlite::Row<'_>| {
             Ok(serde_json::json!({
                 "ts": r.get::<_, i64>(0)?, "cpu": r.get::<_, f64>(1)?,
                 "mem_used": r.get::<_, i64>(2)?, "disk_used": r.get::<_, i64>(3)?,
                 "net_rx": r.get::<_, i64>(4)?, "net_tx": r.get::<_, i64>(5)?,
                 "net_rx_max": r.get::<_, i64>(6)?, "net_tx_max": r.get::<_, i64>(7)?,
+                "cpu_max": r.get::<_, f64>(8)?, "minutes": r.get::<_, i64>(9)?,
             }))
-        })?;
+        };
+        if !span.hourly {
+            let mut stmt = conn.prepare_cached(
+                "SELECT (MIN(ts)/?3)*?3, AVG(cpu), CAST(AVG(mem_used) AS INTEGER),
+                        CAST(AVG(disk_used) AS INTEGER),
+                        CAST(AVG(net_rx) AS INTEGER), CAST(AVG(net_tx) AS INTEGER),
+                        MAX(MAX(net_rx, net_rx_max)), MAX(MAX(net_tx, net_tx_max)),
+                        MAX(MAX(cpu, cpu_max)), COUNT(*)
+                 FROM metric WHERE node_id=?1 AND ts>=?2 GROUP BY ts/?3 ORDER BY ts/?3",
+            )?;
+            let rows = stmt.query_map(params![node_id, span.since, span.step], row)?;
+            return Ok(rows.collect::<Result<_, _>>()?);
+        }
+        let rolled = rolled(&conn)?.unwrap_or(i64::MIN);
+        let mut stmt = conn.prepare_cached(
+            "SELECT (MIN(ts)/?3)*?3, SUM(cpu*w)/SUM(w), SUM(mem_used*w)/SUM(w), SUM(disk_used*w)/SUM(w),
+                    SUM(net_rx*w)/SUM(w), SUM(net_tx*w)/SUM(w), MAX(rx_max), MAX(tx_max), MAX(cpu_top), SUM(w)
+             FROM (SELECT ts, minutes AS w, cpu, mem_used, disk_used, net_rx, net_tx,
+                          net_rx_max AS rx_max, net_tx_max AS tx_max, cpu_max AS cpu_top
+                   FROM metric_hour WHERE node_id=?1 AND ts>=?2 AND ts<?4
+                   UNION ALL
+                   SELECT ts, 1, cpu, mem_used, disk_used, net_rx, net_tx,
+                          MAX(net_rx, net_rx_max), MAX(net_tx, net_tx_max), MAX(cpu, cpu_max)
+                   FROM metric WHERE node_id=?1
+                        AND ts>=MAX(?2, ?4, (SELECT MAX(ts) FROM metric WHERE node_id=?1) - ?5))
+             GROUP BY ts/?3 ORDER BY ts/?3",
+        )?;
+        let rows =
+            stmt.query_map(params![node_id, span.since, span.step, rolled, DETAIL_DAYS * 86_400], row)?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// Drops history beyond the retention window. Traffic totals live in their
-    /// own table precisely so history can be pruned freely.
+    // ---- the hourly tier ----
+
+    /// Folds every hour whose rows are complete into the hourly tier and
+    /// returns how many were folded.
+    ///
+    /// One hour per transaction, so a long catch-up -- the first run after an
+    /// upgrade folds every hour still held in minute rows -- lets the agents'
+    /// writes through between hours. At 100 nodes and four probes an hour takes
+    /// about 15 ms.
+    ///
+    /// Without a watermark it records one at the hour of the oldest minute row,
+    /// or with none at all at the current hour, so that `prune` has a watermark
+    /// to respect. Hours before `keep_days` are skipped rather than folded, as
+    /// `prune` would drop them next.
+    pub fn roll_up(&self, now: i64, keep_days: i64) -> Result<usize> {
+        {
+            let conn = self.conn();
+            if rolled(&conn)?.is_none() {
+                let from = oldest(&conn, &["metric", "ping_record"])?.unwrap_or(now);
+                conn.execute(
+                    "INSERT OR REPLACE INTO setting (key, value) VALUES (?1, ?2)",
+                    params![ROLLED, (from.div_euclid(3_600) * 3_600).to_string()],
+                )?;
+            }
+        }
+        let floor = (now - keep_days * 86_400).div_euclid(3_600) * 3_600;
+        let mut folded = 0;
+        while !halted() && self.fold_next(floor, now - 3_600 - LATE)? {
+            let_waiters_in();
+            folded += 1;
+        }
+        Ok(folded)
+    }
+
+    /// Folds the hour at the watermark, or at `floor` when the watermark is
+    /// older, into `metric_hour` and `ping_hour` and moves the watermark past
+    /// it, in one transaction: a failure leaves the hour to be folded again
+    /// rather than half folded. `INSERT OR REPLACE` makes a second fold of the
+    /// same hour a rewrite. False, folding nothing, once the hour is past `last`
+    /// or when there is no watermark.
+    ///
+    /// The watermark is read here rather than carried between hours: a restore
+    /// replaces it along with the rows it describes, and a stale one would skip
+    /// the restored hours.
+    ///
+    /// By node, as the keys begin with it; `ts` alone would scan each table.
+    /// The probe results are held one node's hour at a time, and only for
+    /// probes that still exist: `ping_hour` refers to `ping_task`, and one row
+    /// left behind by a deleted probe would otherwise fail the hour on every
+    /// pass, keeping its minute rows from ever being pruned.
+    ///
+    /// The byte columns truncate their means, a loss under one byte; the counts
+    /// round theirs, as truncating would drop a UDP socket held for half the
+    /// hour.
+    fn fold_next(&self, floor: i64, last: i64) -> Result<bool> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let Some(hour) = rolled(&tx)?.map(|h| h.max(floor)).filter(|&h| h <= last) else {
+            return Ok(false);
+        };
+        tx.prepare_cached(
+            "INSERT OR REPLACE INTO metric_hour
+               (node_id, ts, minutes, cpu, cpu_max, mem_used, swap_used, disk_used, net_rx, net_tx,
+                net_rx_max, net_tx_max, tcp, udp, procs)
+             SELECT node_id, ?1, COUNT(*), AVG(cpu), MAX(MAX(cpu, cpu_max)), CAST(AVG(mem_used) AS INTEGER),
+                    CAST(AVG(swap_used) AS INTEGER), CAST(AVG(disk_used) AS INTEGER),
+                    CAST(AVG(net_rx) AS INTEGER), CAST(AVG(net_tx) AS INTEGER),
+                    MAX(MAX(net_rx, net_rx_max)), MAX(MAX(net_tx, net_tx_max)),
+                    CAST(ROUND(AVG(tcp)) AS INTEGER), CAST(ROUND(AVG(udp)) AS INTEGER),
+                    CAST(ROUND(AVG(procs)) AS INTEGER)
+             FROM metric WHERE node_id IN (SELECT id FROM node) AND ts>=?1 AND ts<?1+3600
+             GROUP BY node_id",
+        )?
+        .execute([hour])?;
+        let nodes: Vec<i64> = tx
+            .prepare_cached("SELECT id FROM node")?
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        for node in nodes {
+            let mut probes: std::collections::BTreeMap<i64, Tally> = Default::default();
+            let mut read = tx.prepare_cached(
+                "SELECT task_id, latency FROM ping_record
+                 WHERE node_id=?1 AND ts>=?2 AND ts<?2+3600 AND task_id IN (SELECT id FROM ping_task)",
+            )?;
+            let mut rows = read.query(params![node, hour])?;
+            while let Some(r) = rows.next()? {
+                probes.entry(r.get(0)?).or_default().add(Sample::result(r.get(1)?));
+            }
+            let mut write = tx.prepare_cached(
+                "INSERT OR REPLACE INTO ping_hour (node_id, task_id, ts, answered, lost, latency, lo, hi)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            )?;
+            for (task, mut t) in probes {
+                let median = t.median();
+                write.execute(params![node, task, hour, t.answered(), t.lost, median, t.lo, t.hi])?;
+            }
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO setting (key, value) VALUES (?1, ?2)",
+            params![ROLLED, (hour + 3_600).to_string()],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Drops history beyond the retention window: minute rows past
+    /// `DETAIL_DAYS`, or the window itself when shorter, and hourly rows past
+    /// `keep_days`. Traffic totals live in their own table precisely so history
+    /// can be pruned freely.
+    ///
+    /// A minute row outlives its window until its hour is folded, so a rollup
+    /// that has fallen behind costs disk rather than history.
+    ///
+    /// Per node, as the keys begin with `node_id`: `ts < ?` alone scans the whole
+    /// table, 25 s at 90 days of 100 nodes against 86 ms by seek. The node table
+    /// lists every node with rows: `metric` and the hourly tables cascade from
+    /// it, `delete_node` clears `ping_record`, and `insert_pings` writes only for
+    /// probes assigned to an existing node.
+    ///
+    /// Minute rows are deleted at most one node's day per statement, with the
+    /// lock the agents write through released in between. An hourly pass
+    /// deletes an hour and is one statement per table; the first pass after an
+    /// upgrade deletes everything past the week, which in one statement would
+    /// hold the lock for 37.8 s at 90 days of 100 nodes, and a node at a time
+    /// 0.9 s each.
+    ///
+    /// Hourly rows are deleted a node at a time, one statement per table:
+    /// lowering the window from a year to a month deletes 8,040 and 32,160 rows
+    /// of a node with four probes, 24 ms each. A day per statement would spend
+    /// 0.96 s per node on the lookups and pauses in between, 4.8 minutes at 300
+    /// nodes ahead of the `VACUUM` that usually follows.
+    ///
+    /// The watermark is read with each statement: a restore can replace it,
+    /// and the minute rows it guards, between two of them.
     pub fn prune(&self, keep_days: i64) -> Result<usize> {
-        let cutoff = Utc::now().timestamp() - keep_days * 86_400;
-        let conn = self.conn();
-        let a = conn.execute("DELETE FROM metric WHERE ts < ?1", [cutoff])?;
-        let b = conn.execute("DELETE FROM ping_record WHERE ts < ?1", [cutoff])?;
-        Ok(a + b)
+        let now = Utc::now().timestamp();
+        let nodes: Vec<i64> = self
+            .conn()
+            .prepare_cached("SELECT id FROM node")?
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        let minutes = now - keep_days.min(DETAIL_DAYS) * 86_400;
+        let hours = now - keep_days * 86_400;
+        let mut pruned = 0;
+        for id in nodes {
+            for (table, cutoff, guarded) in [
+                ("metric", minutes, true),
+                ("ping_record", minutes, true),
+                ("metric_hour", hours, false),
+                ("ping_hour", hours, false),
+            ] {
+                loop {
+                    if halted() {
+                        return Ok(pruned);
+                    }
+                    let conn = self.conn();
+                    let before =
+                        if guarded { cutoff.min(rolled(&conn)?.unwrap_or(i64::MIN)) } else { cutoff };
+                    let first: Option<i64> = conn
+                        .prepare_cached(&format!("SELECT MIN(ts) FROM {table} WHERE node_id=?1"))?
+                        .query_row([id], |r| r.get(0))?;
+                    let Some(first) = first.filter(|&ts| ts < before) else { break };
+                    pruned += conn
+                        .prepare_cached(&format!("DELETE FROM {table} WHERE node_id=?1 AND ts<?2"))?
+                        .execute(params![id, if guarded { before.min(first + 86_400) } else { before }])?;
+                    drop(conn);
+                    let_waiters_in();
+                }
+            }
+        }
+        Ok(pruned)
     }
 
     // ---- ping ----
@@ -2953,26 +3547,7 @@ impl Db {
                 _ => e.into(),
             })?;
         }
-        // Queried from the table after the rows are in rather than counted from
-        // the request: an update changes this task's own assignments, so
-        // arithmetic on the way in would have to subtract them again. The
-        // transaction makes this atomic with the write, and bailing here rolls it
-        // back.
-        // By name: the panel identifies nodes by name and never shows an id.
-        let crowded: Option<String> = tx
-            .query_row(
-                "SELECT n.name FROM ping_node p JOIN node n ON n.id = p.node_id
-                 GROUP BY p.node_id HAVING COUNT(*) > ?1 LIMIT 1",
-                [Self::MAX_PROBES_PER_NODE],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if let Some(node) = crowded {
-            refuse!(
-                "节点「{node}」会被分配超过 {} 个探测任务，agent 最多只跑这么多，多出来的会被静默丢掉",
-                Self::MAX_PROBES_PER_NODE
-            );
-        }
+        Self::refuse_crowded(&tx, None)?;
         // The next node created receives every auto-joining probe at once.
         let joining: i64 =
             tx.query_row("SELECT COUNT(*) FROM ping_task WHERE auto_join", [], |r| r.get(0))?;
@@ -2983,17 +3558,77 @@ impl Db {
         Ok(id)
     }
 
+    /// Refuses a write that leaves some node over [`Self::MAX_PROBES_PER_NODE`],
+    /// or `node` alone when the write touched only that node's rows: another
+    /// node already over the limit is not this edit's to fix.
+    ///
+    /// Queried from the table after the rows are in rather than counted from the
+    /// request: an update changes the caller's own assignments, so arithmetic on
+    /// the way in would have to subtract them again. Run inside the write's
+    /// transaction, so refusing rolls it back. By name: the panel identifies
+    /// nodes by name and never shows an id.
+    fn refuse_crowded(tx: &rusqlite::Transaction, node: Option<i64>) -> Result<()> {
+        let crowded: Option<String> = tx
+            .query_row(
+                "SELECT n.name FROM ping_node p JOIN node n ON n.id = p.node_id
+                 WHERE ?2 IS NULL OR p.node_id = ?2
+                 GROUP BY p.node_id HAVING COUNT(*) > ?1 LIMIT 1",
+                params![Self::MAX_PROBES_PER_NODE, node],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(node) = crowded {
+            refuse!(
+                "节点「{node}」会被分配超过 {} 个探测任务，agent 最多只跑这么多，多出来的会被静默丢掉",
+                Self::MAX_PROBES_PER_NODE
+            );
+        }
+        Ok(())
+    }
+
+    /// One node's probes, edited from the node's side: `save_ping_task` with
+    /// the roles swapped. Only the change from `base` is applied, as there, so a
+    /// probe assigned to this node elsewhere while the editor was open keeps the
+    /// assignment. `false` when the node does not exist.
+    pub fn set_node_ping_tasks(&self, node: i64, tasks: &[i64], base: &[i64]) -> Result<bool> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        if tx.query_row("SELECT 1 FROM node WHERE id=?1", [node], |_| Ok(())).optional()?.is_none() {
+            return Ok(false);
+        }
+        for task in base.iter().filter(|t| !tasks.contains(t)) {
+            tx.execute("DELETE FROM ping_node WHERE task_id=?1 AND node_id=?2", params![task, node])?;
+        }
+        for task in tasks.iter().filter(|t| !base.contains(t)) {
+            // The node was checked above, so a key failing here is the probe.
+            tx.execute(
+                "INSERT OR IGNORE INTO ping_node (task_id, node_id) VALUES (?1,?2)",
+                params![task, node],
+            )
+            .map_err(|e| match e.sqlite_error_code() {
+                Some(rusqlite::ErrorCode::ConstraintViolation) => {
+                    anyhow::Error::from(e).context(crate::Shown("有监控已被删除，刷新后重试".into()))
+                }
+                _ => e.into(),
+            })?;
+        }
+        Self::refuse_crowded(&tx, Some(node))?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// Deletes a probe and the results filed under it.
     ///
-    /// `ping_record` carries no foreign key -- it is WITHOUT ROWID and keyed for
-    /// the chart query -- so it is cleared explicitly, as in `delete_node`.
-    /// SQLite reassigns a deleted probe's id to the next one created, and the
-    /// chart selects on `task_id IN (assignments for this node)`: without this
-    /// the new probe would draw the removed one's latency under its own name,
-    /// with its timeouts folded into the loss figure.
+    /// `ping_record` carries no foreign key, so it is cleared explicitly, as in
+    /// `delete_node`; `ping_hour` cascades. SQLite reassigns a deleted probe's
+    /// id to the next one created, and the chart selects on `task_id IN
+    /// (assignments for this node)`: without this the new probe would draw the
+    /// removed one's latency under its own name, with its timeouts folded into
+    /// the loss figure.
     ///
-    /// The delete is a scan -- the key begins at `node_id` -- comparable in cost
-    /// to `prune`, for an action taken manually a few times a year.
+    /// Each delete is a scan -- the keys begin at `node_id` -- bounded by the
+    /// week of minute rows and the hourly tier, for an action taken manually a
+    /// few times a year.
     pub fn delete_ping_task(&self, id: i64) -> Result<()> {
         let conn = self.conn();
         conn.execute("DELETE FROM ping_record WHERE task_id = ?1", [id])?;
@@ -3006,7 +3641,7 @@ impl Db {
     /// Ordered, because the agent keeps the first [`Self::MAX_PROBES_PER_NODE`]
     /// as its backstop against a hub requesting hundreds. Unordered, a list at
     /// that boundary could yield a different subset on each push, restarting half
-    /// the timers each time; `save_ping_task` prevents reaching that boundary,
+    /// the timers each time; `refuse_crowded` prevents reaching that boundary,
     /// and this makes the backstop deterministic should a database arrive there
     /// by another route.
     ///
@@ -3035,7 +3670,7 @@ impl Db {
     /// routinely carries a hostname or a customer, and the rest of the table
     /// belongs to nodes this caller may not be able to see.
     pub fn ping_task_names(&self, node_id: i64) -> Result<serde_json::Value> {
-        let conn = self.conn();
+        let conn = self.reader();
         let mut stmt = conn.prepare(
             "SELECT id, name FROM ping_task WHERE id IN (SELECT task_id FROM ping_node WHERE node_id=?1)",
         )?;
@@ -3105,47 +3740,73 @@ impl Db {
     /// starts, stops, loses its node or skips a round produces more. The
     /// denominators are available only here, in the pass that already reads every
     /// row. Probes that lost nothing are omitted, as `loss` is per bucket.
+    ///
+    /// An hourly window reads [`PING_HOURS`] up to the watermark and
+    /// [`PING_ROWS`] after it. Each hourly row enters the fold as its hour's
+    /// answers and losses, so the loss figures and the range stay exact and the
+    /// median is weighted as [`Tally::median`] describes. The minute rows are
+    /// bounded as in [`Db::metrics`].
     pub fn ping_records(
         &self,
         node_id: i64,
-        since: i64,
-        step: i64,
+        span: Span,
     ) -> Result<(Vec<serde_json::Value>, serde_json::Value)> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare_cached(PING_ROWS)?;
-        let mut rows = stmt.query(params![node_id, since, step])?;
+        let mut reader = self.reader();
+        // One snapshot for every statement below, as in `metrics`.
+        let conn = reader.transaction()?;
+        let step = span.step;
         let mut out = Vec::new();
-        // Per probe in the bucket being filled: what answered, and how many did
-        // not.
-        let mut open: Vec<(i64, Vec<i64>, i64)> = Vec::new();
+        // Per probe in the bucket being filled.
+        let mut open: Vec<(i64, Tally)> = Vec::new();
         // Per probe across the whole window: how many were lost, out of how many.
         // Folded in the same pass rather than queried from SQLite a second time,
         // for the same reason the bucket fold itself is in Rust.
         let mut totals: HashMap<i64, (i64, i64)> = HashMap::new();
         let mut bucket = 0;
-        while let Some(row) = rows.next()? {
-            let (b, task, latency) = (row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?);
+        let mut feed = |b: i64, task: i64, sample: Sample| {
             if b != bucket {
                 close_bucket(&mut out, &mut open, bucket * step);
                 bucket = b;
             }
             let seen = totals.entry(task).or_insert((0, 0));
-            seen.1 += 1;
-            let probe = match open.iter().position(|(id, ..)| *id == task) {
-                Some(at) => &mut open[at],
+            seen.0 += sample.lost;
+            seen.1 += sample.answered + sample.lost;
+            match open.iter_mut().find(|(id, _)| *id == task) {
+                Some((_, tally)) => tally.add(sample),
                 None => {
-                    open.push((task, Vec::new(), 0));
-                    open.last_mut().expect("just pushed")
+                    let mut tally = Tally::default();
+                    tally.add(sample);
+                    open.push((task, tally));
                 }
-            };
-            // A timeout is stored as -1: excluded from the median and counted
-            // instead.
-            if latency < 0 {
-                probe.2 += 1;
-                seen.0 += 1;
-            } else {
-                probe.1.push(latency);
             }
+        };
+        // The folded hours first, then the minute rows after them: both come off
+        // their keys in time order, and a bucket spanning the watermark takes
+        // rows from each.
+        let mut minutes_from = span.since;
+        if span.hourly {
+            let rolled = rolled(&conn)?.unwrap_or(i64::MIN);
+            let newest: Option<i64> = conn
+                .prepare_cached("SELECT MAX(ts) FROM ping_record WHERE node_id=?1")?
+                .query_row([node_id], |r| r.get(0))?;
+            minutes_from = minutes_from.max(rolled).max(newest.unwrap_or(0) - DETAIL_DAYS * 86_400);
+            let mut stmt = conn.prepare_cached(PING_HOURS)?;
+            let mut rows = stmt.query(params![node_id, span.since, step, rolled])?;
+            while let Some(r) = rows.next()? {
+                let sample = Sample {
+                    answered: r.get(2)?,
+                    lost: r.get(3)?,
+                    median: r.get(4)?,
+                    lo: r.get(5)?,
+                    hi: r.get(6)?,
+                };
+                feed(r.get(0)?, r.get(1)?, sample);
+            }
+        }
+        let mut stmt = conn.prepare_cached(PING_ROWS)?;
+        let mut rows = stmt.query(params![node_id, minutes_from, step])?;
+        while let Some(r) = rows.next()? {
+            feed(r.get(0)?, r.get(1)?, Sample::result(r.get(2)?));
         }
         close_bucket(&mut out, &mut open, bucket * step);
         // Probe by probe in the panel's order, each probe's rows still in time
@@ -3158,13 +3819,14 @@ impl Db {
             .enumerate()
             .map(|(i, id)| id.map(|id| (id, i)))
             .collect::<Result<_, _>>()?;
-        // Sorted after releasing the connection the agents write through. A
-        // probe missing from the rank, which the assignment filter in
+        // Sorted after releasing the reader, which the next chart request waits
+        // on. A probe missing from the rank, which the assignment filter in
         // `PING_ROWS` rules out today, goes last rather than taking the first
         // colour.
         drop(rows);
         drop(stmt);
         drop(conn);
+        drop(reader);
         out.sort_by_cached_key(|row| {
             row["task_id"].as_i64().and_then(|id| rank.get(&id).copied()).unwrap_or(usize::MAX)
         });
@@ -3191,7 +3853,10 @@ impl Db {
     /// text by the settings form, so a missing or unparsable value falls back to
     /// the default rather than erroring.
     pub fn retention_days(&self) -> i64 {
-        self.get("retention_days").and_then(|v| v.parse::<i64>().ok()).unwrap_or(7).clamp(1, 3_650)
+        self.get("retention_days")
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(DEFAULT_RETENTION_DAYS)
+            .clamp(1, MAX_RETENTION_DAYS)
     }
 
     /// What the panel's data page reads: how much space the file occupies, how
@@ -3201,21 +3866,28 @@ impl Db {
     /// `oldest` against `retention` is the one pair here that can indicate a
     /// fault: history older than the window means `prune` has not been running.
     pub fn stats(&self) -> Result<serde_json::Value> {
-        // Before acquiring the connection: `conn()` returns a guard on a plain
-        // Mutex, and `retention_days` acquires the same one.
+        // Before acquiring the connection, which for `:memory:` is the writer
+        // that `retention_days` acquires as well.
         let retention = self.retention_days();
-        let conn = self.conn();
-        let file = main_file(&conn);
+        // A read-only connection of its own: the counts scan every row of both
+        // tiers of history, which on a cold cache means reading most of the
+        // file -- 13 s for 52 MB at 4 MB/s. Through the writer, agent reports
+        // would wait out that read; through the charts' reader, so would the
+        // public page's history charts.
+        let (own, writer);
+        let conn: &Connection = if self.reader.is_some() {
+            own = read_only(&self.file())?;
+            &own
+        } else {
+            writer = self.conn();
+            &writer
+        };
+        let file = main_file(conn);
         let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
         let free_pages: i64 = conn.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
-        // Both are pruned at the same cutoff, so the earlier of the two marks
-        // where history begins. A full scan of each, which the counts below
-        // already incur.
-        let oldest: Option<i64> = conn.query_row(
-            "SELECT MIN(ts) FROM (SELECT MIN(ts) AS ts FROM metric UNION ALL SELECT MIN(ts) FROM ping_record)",
-            [],
-            |r| r.get(0),
-        )?;
+        // Across both tiers: history begins at whichever row is earliest, and
+        // a minute row can predate the hourly tier while a rollup catches up.
+        let oldest = oldest(conn, &["metric_hour", "ping_hour", "metric", "ping_record"])?;
         let mut rows = serde_json::Map::new();
         for table in TABLES {
             let n: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?;
@@ -3227,6 +3899,9 @@ impl Db {
             "wal": bytes_of(&format!("{file}-wal")),
             "free": free_pages * page_size,
             "oldest": oldest,
+            // What the panel shows, counted on the hub's clock: from the browser's,
+            // a clock eight hours off would shift the span by up to a day.
+            "oldest_ago": oldest.map(|t| (Utc::now().timestamp() - t).max(0)),
             "retention": retention,
             "rows": rows,
         }))
@@ -3240,15 +3915,11 @@ impl Db {
     /// reads the whole file, so the caller runs it off the runtime -- every other
     /// statement here is sub-millisecond, this one is not.
     pub fn backup_into(&self, dest: &str) -> Result<()> {
-        // A second connection to the same file. `VACUUM INTO` only reads, and WAL
-        // allows it to read a consistent snapshot while the agents continue
-        // writing through the first -- exporting is the one heavy operation here
-        // that need not block them. A fresh connection inherits none of the
-        // PRAGMAs in SCHEMA, so the busy timeout must be set again or a
-        // checkpoint racing this read returns SQLITE_BUSY immediately.
-        let reader = Connection::open(self.file())?;
-        reader.busy_timeout(std::time::Duration::from_secs(5))?;
-        reader.execute("VACUUM INTO ?1", [dest])?;
+        // A connection of its own. `VACUUM INTO` only reads, and WAL allows it to
+        // read a consistent snapshot while the agents continue writing through
+        // the first -- exporting is the one heavy operation here that need not
+        // block them. Not the charts' reader, which it would hold throughout.
+        read_only(&self.file())?.execute("VACUUM INTO ?1", [dest])?;
         // The copy is the credential store in one portable file: node tokens in
         // the clear, the GitHub secret, the password hash. SQLite creates it
         // under the umask, which at the usual 022 is world-readable.
@@ -3261,8 +3932,9 @@ impl Db {
     ///
     /// SQLite's constraints on `VACUUM`, and why they hold here: it cannot run
     /// inside a transaction or with a live statement on the connection (there is
-    /// one connection, and this call owns it); it requires roughly as much free
-    /// disk as the database itself, and a failure rolls back leaving the original
+    /// one connection, and this call owns it); it requires free disk of about
+    /// twice the compacted database -- the temporary copy, then the same pages
+    /// again in the WAL -- and a failure rolls back leaving the original
     /// untouched; and it can renumber rowids, which nothing here keys on, since
     /// `metric` and `ping_record` are WITHOUT ROWID and every other table
     /// declares its own primary key.
@@ -3328,7 +4000,7 @@ impl Db {
         } else {
             &TABLES
         };
-        for table in required_tables {
+        for table in required_tables.iter().filter(|t| !HOURLY_TABLES.contains(t)) {
             let found: i64 = candidate.query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
                 [table],
@@ -3526,26 +4198,21 @@ impl Db {
 /// `"loss":0` on each would add 29 kB of nothing. Rounded up, so that the absence
 /// of a `loss` key means no timeouts occurred: truncating would report a bucket
 /// that lost 1 of 180 as clean.
-fn close_bucket(out: &mut Vec<serde_json::Value>, open: &mut Vec<(i64, Vec<i64>, i64)>, ts: i64) {
-    for (task, mut answered, lost) in open.drain(..) {
-        answered.sort_unstable();
-        let middle = match answered.len() {
-            0 => None,
-            n if n % 2 == 1 => Some(answered[n / 2]),
-            n => Some((answered[n / 2 - 1] + answered[n / 2]) / 2),
-        };
-        let mut row = serde_json::json!({"task_id": task, "ts": ts, "latency": middle});
+fn close_bucket(out: &mut Vec<serde_json::Value>, open: &mut Vec<(i64, Tally)>, ts: i64) {
+    for (task, mut tally) in open.drain(..) {
+        let answered = tally.answered();
+        let mut row = serde_json::json!({"task_id": task, "ts": ts, "latency": tally.median()});
         // Only when the bucket actually varied. At the hour and six-hour windows a
         // bucket holds one sample, and a band would be a zero-height ribbon under
         // every line.
-        if let (Some(lo), Some(hi)) = (answered.first(), answered.last()) {
+        if let (Some(lo), Some(hi)) = (tally.lo, tally.hi) {
             if hi > lo {
                 row["band"] = serde_json::json!([lo, hi]);
             }
         }
-        if lost > 0 {
-            let total = answered.len() as i64 + lost;
-            row["loss"] = ((100 * lost + total - 1) / total).into();
+        if tally.lost > 0 {
+            let total = answered + tally.lost;
+            row["loss"] = ((100 * tally.lost + total - 1) / total).into();
         }
         out.push(row);
     }
@@ -3698,6 +4365,7 @@ fn row_to_node(r: &rusqlite::Row<'_>) -> Node {
         billing_cycle: s("billing_cycle"),
         expires_at: r.get::<_, Option<String>>("expires_at").unwrap_or(None),
         remark: s("remark"),
+        public_remark: s("public_remark"),
         traffic_limit: n("traffic_limit"),
         traffic_mode: s("traffic_mode"),
         traffic_reset_day: n("traffic_reset_day") as u32,
@@ -3793,6 +4461,51 @@ mod tests {
         Db::open(":memory:").unwrap()
     }
 
+    /// One worker, as on a one-core hub: a task waiting for the writer must not
+    /// keep it, or the timer below would never fire.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn waiting_for_the_writer_leaves_the_runtime_running() {
+        let db = std::sync::Arc::new(db());
+        let (locked, taken) = std::sync::mpsc::channel();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        std::thread::scope(|s| {
+            let holder = &db;
+            s.spawn(move || {
+                let _conn = holder.conn();
+                locked.send(()).unwrap();
+                let _ = held.recv();
+            });
+            taken.recv().unwrap();
+            let db = db.clone();
+            tokio::spawn(async move { db.get("site_name") });
+            let (fired, ticks) = std::sync::mpsc::channel();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                fired.send(()).unwrap();
+            });
+            let outcome = ticks.recv_timeout(std::time::Duration::from_secs(5));
+            drop(release);
+            assert!(outcome.is_ok(), "a timer must fire while a task waits for the writer");
+        });
+    }
+
+    /// The data page's counts must not queue behind a history chart holding
+    /// the reader, nor hold it while the public page's charts wait.
+    #[test]
+    fn stats_do_not_take_the_charts_reader() {
+        let scratch = Scratch::new();
+        let db = Db::open(&scratch.0).unwrap();
+        let chart = db.reader.as_ref().unwrap().lock().unwrap();
+        let (done, finished) = std::sync::mpsc::channel();
+        let outcome = std::thread::scope(|s| {
+            s.spawn(|| done.send(db.stats().is_ok()).unwrap());
+            let outcome = finished.recv_timeout(std::time::Duration::from_secs(5));
+            drop(chart);
+            outcome
+        });
+        assert_eq!(outcome, Ok(true), "stats must not wait for the reader");
+    }
+
     /// PRAGMA settings are per connection, so a value read through any other
     /// handle proves nothing about the one the hub writes through.
     #[test]
@@ -3806,8 +4519,8 @@ mod tests {
         assert_eq!(read("busy_timeout"), 5_000);
     }
 
-    /// A real file, since these three tests exist to exercise what happens to
-    /// one. Removed by the test that created it.
+    /// A real file, for the tests that exercise what happens to one. Removed with
+    /// its companions when dropped.
     struct Scratch(String);
 
     impl Scratch {
@@ -3827,6 +4540,100 @@ mod tests {
                 let _ = std::fs::remove_file(format!("{}{suffix}", self.0));
             }
         }
+    }
+
+    /// The history charts read through their own connection, so a scan never
+    /// holds up the writer: a week of eight 10-second probes is 486 ms, which
+    /// every agent report would otherwise wait out.
+    #[test]
+    fn history_is_read_while_the_writer_is_held() {
+        let scratch = Scratch::new();
+        let db = std::sync::Arc::new(Db::open(&scratch.0).unwrap());
+        let id = db.create_node(&Node { name: "n".into(), ..Default::default() }, "token").unwrap();
+        let task = db
+            .save_ping_task(&PingTask {
+                name: "probe".into(),
+                target: "1.1.1.1:443".into(),
+                interval: 60,
+                nodes: vec![id],
+                ..Default::default()
+            })
+            .unwrap();
+        db.insert_metric(id, 60, &serde_json::json!({"cpu": 1.0})).unwrap();
+        db.insert_pings(id, &[(task, 60, 42)]).unwrap();
+
+        let writer = db.conn();
+        let (send, receive) = std::sync::mpsc::channel();
+        let reading = std::thread::spawn({
+            let db = db.clone();
+            move || {
+                let span = Span::minutes(0, 60);
+                let (metrics, pings) = (db.metrics(id, span).unwrap(), db.ping_records(id, span).unwrap().0);
+                send.send((metrics, pings, db.ping_task_names(id).unwrap())).unwrap();
+            }
+        });
+        // Bounded, so a read that does wait fails here rather than hanging the
+        // test; released below, it then finishes.
+        let read = receive.recv_timeout(std::time::Duration::from_secs(5));
+        drop(writer);
+        reading.join().unwrap();
+        let (metrics, pings, names) = read.expect("history is read while the writer is held");
+        assert_eq!((metrics.len(), pings.len()), (1, 1), "and it sees what the writer committed");
+        assert_eq!(names[&task.to_string()], "probe");
+    }
+
+    /// Chart reads kept back to back leave no commit an idle reader to
+    /// checkpoint past, so the reader checkpoints for them and the WAL stays
+    /// bounded however long they continue. Without that, these writes would
+    /// grow it to 85 MB.
+    #[test]
+    fn chart_reads_back_to_back_do_not_grow_the_wal() {
+        let scratch = Scratch::new();
+        let db = std::sync::Arc::new(Db::open(&scratch.0).unwrap());
+        let id = db.create_node(&Node { name: "n".into(), ..Default::default() }, "token").unwrap();
+        let task = db
+            .save_ping_task(&PingTask {
+                name: "probe".into(),
+                target: "1.1.1.1:443".into(),
+                interval: 10,
+                nodes: vec![id],
+                ..Default::default()
+            })
+            .unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let (db, stop) = (db.clone(), stop.clone());
+                std::thread::spawn(move || {
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        db.ping_records(id, Span::minutes(0, 60)).unwrap();
+                    }
+                })
+            })
+            .collect();
+        let wal = format!("{}-wal", scratch.0);
+        let mut largest = 0;
+        for ts in 0..20_000 {
+            db.insert_pings(id, &[(task, ts * 10, 40)]).unwrap();
+            largest = largest.max(bytes_of(&wal));
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        readers.into_iter().for_each(|r| r.join().unwrap());
+        assert!(largest < 16 << 20, "the WAL reached {largest} bytes");
+    }
+
+    /// A closed database is one file again, as before the reader existed, so a
+    /// copy of the file taken with the hub stopped holds every row.
+    #[test]
+    fn a_closed_database_leaves_no_wal_behind() {
+        let scratch = Scratch::new();
+        let db = Db::open(&scratch.0).unwrap();
+        let id = db.create_node(&Node { name: "n".into(), ..Default::default() }, "token").unwrap();
+        db.insert_metric(id, 60, &serde_json::json!({"cpu": 1.0})).unwrap();
+        // The reader joins the WAL on its first read, not when it opens.
+        db.metrics(id, Span::minutes(0, 60)).unwrap();
+        drop(db);
+        assert!(!std::path::Path::new(&format!("{}-wal", scratch.0)).exists());
     }
 
     /// Backup and restore are the two operations that can lose every row in the
@@ -3941,10 +4748,17 @@ mod tests {
         let now = Utc::now().timestamp();
 
         assert_eq!(db.stats().unwrap()["oldest"], serde_json::Value::Null, "no history, no start");
-        assert_eq!(db.stats().unwrap()["retention"], 7, "an unset window is the default");
+        assert_eq!(db.stats().unwrap()["oldest_ago"], serde_json::Value::Null, "the panel shows a dash");
+        assert_eq!(
+            db.stats().unwrap()["retention"],
+            DEFAULT_RETENTION_DAYS,
+            "an unset window is the default"
+        );
 
         db.insert_metric(id, now - 3 * 86_400, &serde_json::json!({"cpu": 1.0})).unwrap();
         assert_eq!(db.stats().unwrap()["oldest"], now - 3 * 86_400);
+        let ago = db.stats().unwrap()["oldest_ago"].as_i64().unwrap();
+        assert!((ago - 3 * 86_400).abs() <= 1, "counted on the hub's clock");
 
         // Older, and in the other table: the earlier of the two prevails. The probe
         // must be assigned, or the result is not this node's to file.
@@ -3961,8 +4775,14 @@ mod tests {
         db.insert_pings(id, &[(task, now - 9 * 86_400, 12)]).unwrap();
         assert_eq!(db.stats().unwrap()["oldest"], now - 9 * 86_400);
 
+        // And the hourly tier, which outlives both.
+        db.insert_pings(id, &[(task, now - 40 * 86_400, 12)]).unwrap();
+        db.roll_up(now, 90).unwrap();
+        db.prune(90).unwrap();
+        assert_eq!(db.stats().unwrap()["oldest"], (now - 40 * 86_400).div_euclid(3_600) * 3_600);
+
         db.set("retention_days", "9999").unwrap();
-        assert_eq!(db.stats().unwrap()["retention"], 3_650, "a stored window is still clamped");
+        assert_eq!(db.stats().unwrap()["retention"], MAX_RETENTION_DAYS, "a stored window is still clamped");
     }
 
     /// Deleted rows leave free pages behind; only a rebuild returns them to the
@@ -3983,6 +4803,10 @@ mod tests {
         }
         let _ = db.conn().query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
         let fat = on_disk(&scratch.0);
+        // Folded first, as the hourly pass does: minute rows outlive the window
+        // until their hour is folded. Dated past the lateness allowance so the
+        // last hour counts as complete.
+        db.roll_up(now + 3 * 3_600, 1).unwrap();
         db.prune(0).unwrap();
 
         let freed = db.vacuum().unwrap();
@@ -4139,8 +4963,10 @@ mod tests {
         let c = db.create_proxy(first_node, &proxy_draft("all-c", false)).unwrap().unwrap();
         db.reorder_proxies(&[c, b, a]).unwrap();
         let items = db.all_proxies().unwrap();
-        assert_eq!(items.iter().map(|p| (p.id, p.node_id)).collect::<Vec<_>>(),
-            vec![(c, first_node), (b, second_node), (a, first_node)]);
+        assert_eq!(
+            items.iter().map(|p| (p.id, p.node_id)).collect::<Vec<_>>(),
+            vec![(c, first_node), (b, second_node), (a, first_node)]
+        );
         assert!(items.iter().all(|p| !p.enabled));
         db.conn().execute("UPDATE proxies SET sort=0", []).unwrap();
         assert_eq!(db.all_proxies().unwrap().iter().map(|p| p.id).collect::<Vec<_>>(), vec![a, b, c]);
@@ -4353,12 +5179,19 @@ mod tests {
         assert!(accesses[0].access.enabled);
         assert_eq!(db.user(other).unwrap().unwrap().proxy_count, 0);
         db.replace_authorizations(uid, &[(old, true), (added, true)]).unwrap().unwrap();
-        assert!(db.user(uid).unwrap().unwrap().auto_authorize_new_proxies, "legacy writes preserve the policy");
-        assert!(matches!(db.replace_authorizations_with_policy(uid, &[(i64::MAX, true)], Some(false)).unwrap(),
-            Err(AuthorizationWriteIssue::ProxyNotFound)));
+        assert!(
+            db.user(uid).unwrap().unwrap().auto_authorize_new_proxies,
+            "legacy writes preserve the policy"
+        );
+        assert!(matches!(
+            db.replace_authorizations_with_policy(uid, &[(i64::MAX, true)], Some(false)).unwrap(),
+            Err(AuthorizationWriteIssue::ProxyNotFound)
+        ));
         assert!(db.user(uid).unwrap().unwrap().auto_authorize_new_proxies);
         assert_eq!(db.user(uid).unwrap().unwrap().proxy_count, 2);
-        db.replace_authorizations_with_policy(uid, &[(old, true), (added, true)], Some(false)).unwrap().unwrap();
+        db.replace_authorizations_with_policy(uid, &[(old, true), (added, true)], Some(false))
+            .unwrap()
+            .unwrap();
         db.create_proxy(nid, &proxy_draft("after-off", false)).unwrap().unwrap();
         assert_eq!(db.user(uid).unwrap().unwrap().proxy_count, 2);
     }
@@ -4370,8 +5203,12 @@ mod tests {
         let nid = node(&db, 1);
         let old = db.create_proxy(nid, &proxy_draft("atomic-existing", false)).unwrap().unwrap();
         db.replace_authorizations_with_policy(uid, &[(old, true)], Some(true)).unwrap().unwrap();
-        db.conn().execute_batch("CREATE TRIGGER fail_auto BEFORE INSERT ON user_proxy_authorizations
-            BEGIN SELECT RAISE(ABORT, 'test failure'); END;").unwrap();
+        db.conn()
+            .execute_batch(
+                "CREATE TRIGGER fail_auto BEFORE INSERT ON user_proxy_authorizations
+            BEGIN SELECT RAISE(ABORT, 'test failure'); END;",
+            )
+            .unwrap();
         assert!(db.create_proxy(nid, &proxy_draft("atomic-new", false)).is_err());
         assert_eq!(db.all_proxies().unwrap().len(), 1);
         assert!(db.replace_authorizations_with_policy(uid, &[(old, true)], Some(false)).is_err());
@@ -4383,7 +5220,11 @@ mod tests {
     fn version_twenty_auto_authorize_migration_defaults_off_and_is_repeatable() {
         let db = db();
         let uid = db.create_user(&user_draft("migrated-auto")).unwrap().unwrap();
-        db.conn().execute_batch("ALTER TABLE users DROP COLUMN auto_authorize_new_proxies; PRAGMA user_version=19;").unwrap();
+        db.conn()
+            .execute_batch(
+                "ALTER TABLE users DROP COLUMN auto_authorize_new_proxies; PRAGMA user_version=19;",
+            )
+            .unwrap();
         migrate(&db.conn(), 19).unwrap();
         assert!(!db.user(uid).unwrap().unwrap().auto_authorize_new_proxies);
         db.replace_authorizations_with_policy(uid, &[], Some(true)).unwrap().unwrap();
@@ -4536,6 +5377,31 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn version_twenty_gains_upstream_history_without_changing_resource_identity() {
+        let db = db();
+        let id = db.create_user(&user_draft("migration-user")).unwrap().unwrap();
+        let uuid = db.user(id).unwrap().unwrap().uuid;
+        {
+            let conn = db.conn();
+            conn.execute_batch(
+                "DROP TABLE metric_hour; DROP TABLE ping_hour;
+                 ALTER TABLE metric DROP COLUMN cpu_max;
+                 ALTER TABLE node DROP COLUMN public_remark;
+                 PRAGMA user_version = 20;",
+            )
+            .unwrap();
+            migrate(&conn, 20).unwrap();
+            assert!(columns_of(&conn, "metric").unwrap().contains("cpu_max"));
+            assert!(columns_of(&conn, "node").unwrap().contains("public_remark"));
+            for table in HOURLY_TABLES {
+                assert!(!columns_of(&conn, table).unwrap().is_empty());
+            }
+            migrate(&conn, SCHEMA_VERSION).unwrap();
+        }
+        assert_eq!(db.user(id).unwrap().unwrap().uuid, uuid);
     }
 
     #[test]
@@ -5126,7 +5992,7 @@ mod tests {
         db.insert_pings(id, &[(task, 1, 42)]).unwrap();
         db.delete_node(id).unwrap();
         assert!(db.node(id).unwrap().is_none());
-        assert_eq!(db.metrics(id, 0, 60).unwrap().len(), 0);
+        assert_eq!(db.metrics(id, Span::minutes(0, 60)).unwrap().len(), 0);
         assert!(!db.all_traffic().contains_key(&id));
         // Ticked in an editor opened before the delete: named, not a 500.
         let gone = db.save_ping_task(&probe(vec![id])).unwrap_err();
@@ -5143,7 +6009,10 @@ mod tests {
         let fresh = node(&db, 1);
         assert_eq!(fresh, id, "the id is reused, which is what makes this reachable");
         db.save_ping_task(&PingTask { id: task, nodes: vec![fresh], ..probe(vec![]) }).unwrap();
-        assert!(db.ping_records(fresh, 0, 60).unwrap().0.is_empty(), "and it starts with no history");
+        assert!(
+            db.ping_records(fresh, Span::minutes(0, 60)).unwrap().0.is_empty(),
+            "and it starts with no history"
+        );
     }
 
     /// The mirror of the sweep above, on the other key of the same table. SQLite
@@ -5168,7 +6037,65 @@ mod tests {
 
         let fresh = db.save_ping_task(&probe("singapore")).unwrap();
         assert_eq!(fresh, old, "the id is reused, which is what makes this reachable");
-        assert!(db.ping_records(id, 0, 60).unwrap().0.is_empty(), "and it starts with no history");
+        assert!(
+            db.ping_records(id, Span::minutes(0, 60)).unwrap().0.is_empty(),
+            "and it starts with no history"
+        );
+    }
+
+    /// An earlier build deleting a node or a probe runs only its own statements,
+    /// those of v1.3.1 below, and knows nothing of `ping_hour`. Rows it leaves
+    /// would be drawn under the next node or probe given the id, once the newer
+    /// build is back.
+    #[test]
+    fn an_earlier_builds_deletes_clear_the_hourly_probe_rows() {
+        let db = db();
+        let (kept_node, gone_node) = (node(&db, 1), node(&db, 1));
+        let probe = || PingTask {
+            id: 0,
+            name: "p".into(),
+            target: "1.1.1.1:443".into(),
+            interval: 60,
+            nodes: vec![kept_node, gone_node],
+            ..Default::default()
+        };
+        let (kept_task, gone_task) =
+            (db.save_ping_task(&probe()).unwrap(), db.save_ping_task(&probe()).unwrap());
+        let conn = db.conn();
+        for n in [kept_node, gone_node] {
+            for t in [kept_task, gone_task] {
+                conn.execute("INSERT INTO ping_hour VALUES (?1, ?2, 3600, 60, 0, 42, 40, 44)", params![n, t])
+                    .unwrap();
+            }
+        }
+        conn.execute_batch(&format!(
+            "DELETE FROM ping_record WHERE node_id = {gone_node}; DELETE FROM node WHERE id = {gone_node};
+             DELETE FROM ping_record WHERE task_id = {gone_task}; DELETE FROM ping_task WHERE id = {gone_task};"
+        ))
+        .unwrap();
+        let left: Vec<(i64, i64)> = conn
+            .prepare("SELECT node_id, task_id FROM ping_hour")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(left, [(kept_node, kept_task)]);
+    }
+
+    /// `ping_hour` refers to `ping_task`, so a result filed under a probe that
+    /// no longer exists would fail the fold of its hour on every pass.
+    #[test]
+    fn a_result_left_by_a_deleted_probe_does_not_stop_the_rollup() {
+        let db = db();
+        let id = node(&db, 1);
+        let now = Utc::now().timestamp();
+        let hour = (now - 3 * 3_600).div_euclid(3_600) * 3_600;
+        db.conn().execute("INSERT INTO ping_record VALUES (?1, 999, ?2, 42)", params![id, hour]).unwrap();
+        db.insert_metric(id, hour, &serde_json::json!({"cpu": 1.0})).unwrap();
+        assert!(db.roll_up(now, 1).unwrap() > 0);
+        let span = Span { since: hour, step: 3_600, hourly: true };
+        assert_eq!(db.metrics(id, span).unwrap().len(), 1, "the hour is folded");
     }
 
     /// Counted directly from the table rather than read back through
@@ -5264,13 +6191,14 @@ mod tests {
         let patch = |v| serde_json::from_value::<NodePatch>(v).unwrap();
         db.update_node(
             id,
-            &patch(serde_json::json!({"public":false,"remark":"private","expires_at":"2030-01-01"})),
+            &patch(serde_json::json!({"public":false,"remark":"private","public_remark":"CN2 GIA","expires_at":"2030-01-01"})),
         )
         .unwrap();
         db.update_node(id, &patch(serde_json::json!({"price":20}))).unwrap();
         let n = db.node(id).unwrap().unwrap();
         assert!(!n.public);
         assert_eq!(n.remark, "private");
+        assert_eq!(n.public_remark, "CN2 GIA");
         assert_eq!(n.expires_at.as_deref(), Some("2030-01-01"));
         db.update_node(id, &patch(serde_json::json!({"price":0,"expires_at":null}))).unwrap();
         let n = db.node(id).unwrap().unwrap();
@@ -5357,10 +6285,149 @@ mod tests {
         assert_eq!(listed, vec![b, a, c], "a new probe starts at the end");
 
         db.insert_pings(id, &[(a, 0, 10), (a, 60, 10), (b, 60, 20), (c, 60, 30)]).unwrap();
-        let rows = db.ping_records(id, 0, 60).unwrap().0;
+        let rows = db.ping_records(id, Span::minutes(0, 60)).unwrap().0;
         let drawn: Vec<_> =
             rows.iter().map(|r| (r["task_id"].as_i64().unwrap(), r["ts"].as_i64().unwrap())).collect();
         assert_eq!(drawn, vec![(b, 60), (a, 0), (a, 60), (c, 60)]);
+    }
+
+    /// The hourly tier draws what the minute rows would. At an hour per point
+    /// every figure matches; at several hours per point the integer means differ
+    /// by the truncation of each hour's, the peaks, ranges and losses still
+    /// match, and the probe median is the weighted one, inside its range.
+    /// Checked while the last hour is still minute rows and again once folded.
+    #[test]
+    fn the_hourly_tier_draws_what_the_minute_rows_would() {
+        let db = db();
+        let id = node(&db, 1);
+        let probe = |name: &str| {
+            db.save_ping_task(&PingTask {
+                id: 0,
+                name: name.into(),
+                target: "1.1.1.1:443".into(),
+                interval: 60,
+                nodes: vec![id],
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        let (a, b) = (probe("a"), probe("b"));
+        // Six hours whose values vary within each hour, with minutes missing so
+        // the hours carry different weights, and a probe that loses rounds.
+        let start = 472_224 * 3_600;
+        // Per hour, the columns the chart does not return, to check the tier
+        // keeps them.
+        let mut kept: [Vec<[i64; 4]>; 6] = Default::default();
+        for m in (0..6 * 60).filter(|m| m % 17 != 3 && !(100..130).contains(m)) {
+            let ts = start + m * 60;
+            let unreturned = [2_000_000 + m * 331, 10 + m % 4, m % 3, 120 + m % 9];
+            kept[(m / 60) as usize].push(unreturned);
+            let [swap_used, tcp, udp, procs] = unreturned;
+            let sample = serde_json::json!({"cpu": (m % 7) as f64 * 1.5, "mem_used": 1_000_000 + m * 997,
+                "disk_used": 5_000_000 + m, "net_rx": 1_000 + m * 13, "net_tx": 500 + m * 7,
+                "net_rx_max": 3_000 + m % 50 * 40, "cpu_max": (m % 7) as f64 * 1.5 + (m % 11) as f64,
+                "swap_used": swap_used, "tcp": tcp, "udp": udp, "procs": procs});
+            db.insert_metric(id, ts, &sample).unwrap();
+            db.insert_pings(
+                id,
+                &[(a, ts + 5, 20 + m % 11), (b, ts + 9, if m % 5 == 0 { -1 } else { 80 + m % 3 })],
+            )
+            .unwrap();
+        }
+        let end = start + 6 * 3_600;
+
+        let compare = |step: i64| {
+            let hourly = Span { since: start, step, hourly: true };
+            let minutes = Span::minutes(start, step);
+            let (got, want) = (db.metrics(id, hourly).unwrap(), db.metrics(id, minutes).unwrap());
+            assert_eq!(got.len(), want.len());
+            for (g, w) in got.iter().zip(&want) {
+                assert_eq!(
+                    (&g["ts"], &g["net_rx_max"], &g["net_tx_max"], &g["cpu_max"], &g["minutes"]),
+                    (&w["ts"], &w["net_rx_max"], &w["net_tx_max"], &w["cpu_max"], &w["minutes"])
+                );
+                assert!((g["cpu"].as_f64().unwrap() - w["cpu"].as_f64().unwrap()).abs() < 1e-9, "{g} {w}");
+                let slack = if step == 3_600 { 0 } else { 1 };
+                for key in ["mem_used", "disk_used", "net_rx", "net_tx"] {
+                    let d = g[key].as_i64().unwrap() - w[key].as_i64().unwrap();
+                    assert!(d.abs() <= slack, "{key} at {step}s: {g} {w}");
+                }
+            }
+            let ((got, got_loss), (want, want_loss)) =
+                (db.ping_records(id, hourly).unwrap(), db.ping_records(id, minutes).unwrap());
+            assert_eq!(got_loss, want_loss, "the window's loss is exact");
+            assert_eq!(got.len(), want.len());
+            for (g, w) in got.iter().zip(&want) {
+                if step == 3_600 {
+                    assert_eq!(g, w);
+                } else {
+                    assert_eq!((&g["ts"], &g["band"], &g["loss"]), (&w["ts"], &w["band"], &w["loss"]));
+                    let median = g["latency"].as_i64().unwrap();
+                    let band = g["band"].as_array().map(|b| (b[0].as_i64().unwrap(), b[1].as_i64().unwrap()));
+                    assert!(band.is_none_or(|(lo, hi)| (lo..=hi).contains(&median)), "{g}");
+                }
+            }
+        };
+
+        // An hour's median stands for each of its answers: one hour of a single
+        // 10 ms answer and one of three at 20 ms are four answers, median 20.
+        let mut t = Tally::default();
+        t.add(Sample { answered: 1, lost: 0, median: Some(10), lo: Some(10), hi: Some(10) });
+        t.add(Sample { answered: 3, lost: 2, median: Some(20), lo: Some(15), hi: Some(40) });
+        assert_eq!((t.median(), t.answered(), t.lo, t.hi), (Some(20), 4, Some(10), Some(40)));
+
+        // The last hour waits out the lateness allowance and is read from its
+        // minute rows meanwhile.
+        assert_eq!(db.roll_up(end + LATE - 1, 365).unwrap(), 5);
+        compare(3_600);
+        compare(7_200);
+        assert_eq!(db.roll_up(end + LATE, 365).unwrap(), 1);
+        compare(3_600);
+        compare(7_200);
+
+        // Against the fixture itself, as the comparison above would pass two
+        // tiers wrong in the same way: every minute counted once, the peak the
+        // busiest minute reached.
+        let points = db.metrics(id, Span { since: start, step: 7_200, hourly: true }).unwrap();
+        let held: usize = kept.iter().map(Vec::len).sum();
+        assert_eq!(points.iter().map(|p| p["minutes"].as_i64().unwrap()).sum::<i64>(), held as i64);
+        assert_eq!(points.iter().map(|p| p["cpu_max"].as_f64().unwrap()).fold(0.0, f64::max), 9.0 + 10.0);
+        // The columns the chart does not return are kept as each hour's mean,
+        // swap truncated like the other bytes and the counts rounded.
+        let stored: Vec<[i64; 4]> = db
+            .conn()
+            .prepare("SELECT swap_used, tcp, udp, procs FROM metric_hour WHERE node_id=?1 ORDER BY ts")
+            .unwrap()
+            .query_map([id], |r| Ok([r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?]))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let means: Vec<[i64; 4]> = kept
+            .iter()
+            .map(|hour| {
+                let mean = |i: usize| hour.iter().map(|v| v[i]).sum::<i64>() as f64 / hour.len() as f64;
+                [mean(0) as i64, mean(1).round() as i64, mean(2).round() as i64, mean(3).round() as i64]
+            })
+            .collect();
+        assert_eq!(stored, means);
+    }
+
+    /// A backup from before the hourly tier lacks its tables. It must still pass
+    /// every gate, and come out of the restore with the tables a fresh file has.
+    #[test]
+    fn a_backup_from_before_the_hourly_tier_restores() {
+        let scratch = Scratch::new();
+        let db = Db::open(&scratch.0).unwrap();
+        let old = format!("{}.copy", scratch.0);
+        release_file(&old);
+        db.check_backup(&old).unwrap();
+        db.restore_from(&old).unwrap();
+        let now = Utc::now().timestamp();
+        let hour = (now - 3 * 3_600).div_euclid(3_600) * 3_600;
+        db.insert_metric(1, hour, &serde_json::json!({"cpu": 1.0})).unwrap();
+        db.roll_up(now, 1).unwrap();
+        let span = Span { since: hour, step: 3_600, hourly: true };
+        assert_eq!(db.metrics(1, span).unwrap().len(), 1, "the restored file folds and answers");
     }
 
     #[test]
@@ -5374,14 +6441,17 @@ mod tests {
         db.insert_metric(id, Utc::now().timestamp(), &serde_json::json!({"cpu": 2.0})).unwrap();
 
         db.prune(30).unwrap();
-        assert_eq!(db.metrics(id, 0, 60).unwrap().len(), 1);
+        assert_eq!(db.metrics(id, Span::minutes(0, 60)).unwrap().len(), 2, "unfolded minutes are kept");
+        db.roll_up(Utc::now().timestamp(), 30).unwrap();
+        db.prune(30).unwrap();
+        assert_eq!(db.metrics(id, Span::minutes(0, 60)).unwrap().len(), 1);
         assert_eq!(db.all_traffic()[&id].total_rx, 800);
     }
 
-    /// The rekeying in `open()`: rows must survive it, and the chart's query must
-    /// emerge able to seek. A migration that leaves every row on the old key fails
-    /// silently, and stays silent while the query it exists for scans a node's
-    /// entire history.
+    /// The rekeying in `migrate_to_1`: rows must survive it, and the chart's
+    /// query must emerge able to seek. A migration that leaves every row on the
+    /// old key fails silently, and stays silent while the query it exists for
+    /// scans a node's entire history.
     #[test]
     fn rekeying_ping_record_keeps_the_rows_and_lets_the_chart_query_seek() {
         let file = std::env::temp_dir().join(format!("monitor-rekey-{}.db", std::process::id()));
@@ -5433,7 +6503,10 @@ mod tests {
         let _ = std::fs::remove_file(&file);
     }
 
-    /// Every row of every table, comparable across two opens of one file.
+    /// Every row of every table, comparable across two opens of one file. A
+    /// table the file does not have yet holds no rows: the hourly tables are
+    /// created by `SCHEMA` before the migrations run, so a failed upgrade leaves
+    /// them behind, empty.
     fn dump(conn: &Connection) -> Vec<String> {
         let mut rows = Vec::new();
         for table in TABLES {
@@ -5568,11 +6641,11 @@ mod tests {
         let db = Db::open(path).unwrap();
         assert!(!schema_mentions(&db.conn(), "metric", "load1").unwrap(), "the column has to be gone");
         // The row remains, along with everything else it carried.
-        let kept = &db.metrics(1, 0, 60).unwrap()[0];
+        let kept = &db.metrics(1, Span::minutes(0, 60)).unwrap()[0];
         assert_eq!((kept["ts"].as_i64(), kept["cpu"].as_f64()), (Some(60), Some(12.5)));
         // The shape this build inserts now fits the table.
         db.insert_metric(1, 120, &serde_json::json!({"cpu": 2.0, "load": [0.5, 0.4, 0.3]})).unwrap();
-        assert_eq!(db.metrics(1, 0, 60).unwrap().len(), 2);
+        assert_eq!(db.metrics(1, Span::minutes(0, 60)).unwrap().len(), 2);
 
         // Opening again must not attempt to drop a column already removed.
         drop(db);
@@ -5601,15 +6674,22 @@ mod tests {
         };
         let task = probe(vec![id], 0);
         db.insert_pings(id, &[(task, 100, 42)]).unwrap();
-        assert_eq!(db.ping_records(id, 0, 60).unwrap().0.len(), 1, "an assigned probe draws");
+        assert_eq!(db.ping_records(id, Span::minutes(0, 60)).unwrap().0.len(), 1, "an assigned probe draws");
 
         probe(vec![], task);
-        assert!(db.ping_records(id, 0, 60).unwrap().0.is_empty(), "an unassigned one does not");
+        assert!(
+            db.ping_records(id, Span::minutes(0, 60)).unwrap().0.is_empty(),
+            "an unassigned one does not"
+        );
 
         // The rows remain: reassigning restores the history rather than starting
         // over.
         probe(vec![id], task);
-        assert_eq!(db.ping_records(id, 0, 60).unwrap().0.len(), 1, "and it comes back with its history");
+        assert_eq!(
+            db.ping_records(id, Span::minutes(0, 60)).unwrap().0.len(),
+            1,
+            "and it comes back with its history"
+        );
 
         // The names accompany those samples and follow the same filter: a probe
         // name is operator-supplied text that routinely carries a hostname or a
@@ -5729,6 +6809,58 @@ mod tests {
         db.delete_ping_task(id).unwrap();
         assert!(save(id, vec![], vec![]).is_err(), "a deleted probe is not reported as saved");
         assert!(db.ping_tasks().unwrap().is_empty());
+    }
+
+    /// The node-side editor sends its ticks and what it opened with; only the
+    /// difference is written.
+    #[test]
+    fn a_node_edit_applies_only_the_probes_it_changed() {
+        let db = db();
+        let (a, other) = (node(&db, 1), node(&db, 1));
+        let probe = |db: &Db, nodes| {
+            db.save_ping_task(&PingTask {
+                name: "p".into(),
+                target: "1.1.1.1:443".into(),
+                interval: 60,
+                nodes,
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        let (kept, dropped, added, elsewhere) =
+            (probe(&db, vec![a]), probe(&db, vec![a, other]), probe(&db, vec![]), probe(&db, vec![]));
+        // Assigned from the probe's side while this node's editor was open.
+        db.save_ping_task(&PingTask {
+            id: elsewhere,
+            name: "p".into(),
+            target: "1.1.1.1:443".into(),
+            interval: 60,
+            nodes: vec![a],
+            base: Some(vec![]),
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert!(db.set_node_ping_tasks(a, &[kept, added], &[kept, dropped]).unwrap());
+        let ids =
+            |n| db.ping_tasks_for(n).unwrap().iter().map(|t| t["id"].as_i64().unwrap()).collect::<Vec<_>>();
+        assert_eq!(ids(a), [kept, added, elsewhere]);
+        assert_eq!(ids(other), [dropped], "an assignment on another node is unchanged");
+
+        assert!(!db.set_node_ping_tasks(a + 100, &[kept], &[]).unwrap());
+        db.delete_ping_task(added).unwrap();
+        assert!(db.set_node_ping_tasks(other, &[added], &[]).is_err(), "a deleted probe is refused");
+        let many: Vec<i64> = (0..Db::MAX_PROBES_PER_NODE).map(|_| probe(&db, vec![])).collect();
+        assert!(db.set_node_ping_tasks(other, &many, &[]).is_err(), "65 probes on one node");
+        assert_eq!(ids(other), [dropped], "a refusal writes nothing");
+
+        // Over the limit by another route: editing a different node still saves.
+        for task in &many {
+            db.conn()
+                .execute("INSERT INTO ping_node (task_id, node_id) VALUES (?1,?2)", params![task, other])
+                .unwrap();
+        }
+        assert!(db.set_node_ping_tasks(a, &[kept], &[kept, added]).unwrap());
     }
 
     /// The agent caps the probe list it will run and drops the remainder with
