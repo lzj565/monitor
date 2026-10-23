@@ -264,6 +264,10 @@ impl Db {
         tx.commit()?;
         Ok(RealmDesired { node_id: node, revision, digest, run, config, entries, restart, request })
     }
+    pub fn realm_reset_applied(&self) -> Result<()> {
+        self.conn().execute("UPDATE realm_hosts SET applied_revision=0,applied_digest='',applied_entries='[]',status='{}',last_error='备份恢复后等待 Agent 重新确认'",[])?;
+        Ok(())
+    }
     pub fn realm_error(&self, node: i64, error: &str) -> Result<()> {
         self.conn().execute("UPDATE realm_hosts SET last_error=?2 WHERE node_id=?1", params![node, error])?;
         Ok(())
@@ -381,6 +385,13 @@ mod tests {
         );
         assert!(db.realm_applied(&second).unwrap());
         assert_eq!(db.active_user_subscription(user, 0).unwrap().unwrap().1[1].port, 20444);
+        db.realm_reset_applied().unwrap();
+        assert_eq!(
+            db.active_user_subscription(user, 0).unwrap().unwrap().1.len(),
+            1,
+            "restored snapshots cannot publish until confirmed again"
+        );
+        db.realm_applied(&second).unwrap();
         db.put_authorization(user, proxy, &AuthorizationDraft { enabled: false, auth: None })
             .unwrap()
             .unwrap();
