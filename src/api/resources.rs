@@ -60,7 +60,8 @@ pub async fn create_command(
             Ok(body) => body,
             Err(error) => return error.into_response(),
         };
-        if matches!(body.method.as_str(), "realm.config.apply" | "realm.restart") {
+        if matches!(body.method.as_str(), "realm.config.apply" | "realm.restart" | "realm.traffic.configure")
+        {
             return bad("请通过 Realm 页面应用配置和重启");
         }
         if body.method.starts_with("realm.") {

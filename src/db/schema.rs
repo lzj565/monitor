@@ -285,7 +285,7 @@ CREATE TABLE IF NOT EXISTS proxy_node_traffic (
 /// cannot: `open` runs `SCHEMA` before migrating, and on an older file the
 /// column is not there yet. `an_upgraded_release_matches_a_fresh_database`
 /// holds every migration to these rules, starting from v1.0.0's schema.
-pub(super) const SCHEMA_VERSION: i64 = 22;
+pub(super) const SCHEMA_VERSION: i64 = 23;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -621,6 +621,12 @@ pub(super) fn migrate(conn: &Connection, from: i64) -> Result<()> {
     )",
     )?;
     tx.execute_batch(REALM_SCHEMA)?;
+    if !tx.prepare("SELECT * FROM realm_hosts LIMIT 0")?.column_names().contains(&"traffic_recheck") {
+        tx.execute_batch("ALTER TABLE realm_hosts ADD COLUMN traffic_recheck TEXT NOT NULL DEFAULT ''; ALTER TABLE realm_rules ADD COLUMN traffic_key TEXT NOT NULL DEFAULT '';")?;
+    }
+    tx.execute_batch(REALM_TRAFFIC_SCHEMA)?;
+    tx.execute("UPDATE realm_rules SET traffic_key=lower(hex(randomblob(16))) WHERE traffic_key=''", [])?;
+    tx.execute("INSERT OR IGNORE INTO realm_traffic_rules(key,node_id,rule_id,name) SELECT traffic_key,node_id,id,name FROM realm_rules",[])?;
     tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     tx.commit()?;
     Ok(())
@@ -658,7 +664,7 @@ pub(super) fn seed_default_admin(conn: &Connection) -> Result<()> {
 }
 
 /// Every table a backup must carry before this build will restore it.
-pub(super) const TABLES: [&str; 18] = [
+pub(super) const TABLES: [&str; 21] = [
     "setting",
     "node",
     "proxies",
@@ -677,6 +683,9 @@ pub(super) const TABLES: [&str; 18] = [
     "ping_hour",
     "realm_hosts",
     "realm_rules",
+    "realm_traffic_rules",
+    "realm_traffic_buckets",
+    "realm_traffic_status",
 ];
 pub(super) const PRE_RESOURCE_TABLES: [&str; 8] =
     ["setting", "node", "traffic", "metric", "ping_task", "ping_node", "ping_record", "session"];

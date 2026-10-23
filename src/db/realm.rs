@@ -41,6 +41,8 @@ pub struct RealmRuleInput {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RealmEntry {
+    #[serde(default)]
+    pub traffic_key: String,
     pub source_node_id: i64,
     pub source_name: String,
     pub id: i64,
@@ -61,6 +63,7 @@ pub struct RealmDesired {
     pub entries: Vec<RealmEntry>,
     pub restart: bool,
     pub request: i64,
+    pub accounting: Value,
 }
 
 pub fn realm_address(host: &str) -> bool {
@@ -91,8 +94,8 @@ impl Db {
     }
     pub fn realm_rules(&self) -> Result<Vec<Value>> {
         let conn = self.conn();
-        let mut stmt=conn.prepare("SELECT r.id,r.node_id,r.target_proxy_id,r.name,r.listen_host,r.listen_port,r.enabled,p.node_id,p.name,p.address,p.port,p.enabled FROM realm_rules r JOIN proxies p ON p.id=r.target_proxy_id ORDER BY r.node_id,r.id")?;
-        let items=stmt.query_map([],|r|Ok(json!({"id":r.get::<_,i64>(0)?,"node_id":r.get::<_,i64>(1)?,"target_proxy_id":r.get::<_,i64>(2)?,"name":r.get::<_,String>(3)?,"listen_host":r.get::<_,String>(4)?,"listen_port":r.get::<_,i64>(5)?,"enabled":r.get::<_,bool>(6)?,"target_node_id":r.get::<_,i64>(7)?,"target_name":r.get::<_,String>(8)?,"target_address":r.get::<_,String>(9)?,"target_port":r.get::<_,i64>(10)?,"target_enabled":r.get::<_,bool>(11)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut stmt=conn.prepare("SELECT r.id,r.node_id,r.target_proxy_id,r.name,r.listen_host,r.listen_port,r.enabled,p.node_id,p.name,p.address,p.port,p.enabled,r.traffic_key FROM realm_rules r JOIN proxies p ON p.id=r.target_proxy_id ORDER BY r.node_id,r.id")?;
+        let items=stmt.query_map([],|r|Ok(json!({"id":r.get::<_,i64>(0)?,"node_id":r.get::<_,i64>(1)?,"target_proxy_id":r.get::<_,i64>(2)?,"name":r.get::<_,String>(3)?,"listen_host":r.get::<_,String>(4)?,"listen_port":r.get::<_,i64>(5)?,"enabled":r.get::<_,bool>(6)?,"target_node_id":r.get::<_,i64>(7)?,"target_name":r.get::<_,String>(8)?,"target_address":r.get::<_,String>(9)?,"target_port":r.get::<_,i64>(10)?,"target_enabled":r.get::<_,bool>(11)?,"traffic_key":r.get::<_,String>(12)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(items)
     }
     pub fn realm_save_host(&self, body: &RealmHostInput) -> Result<()> {
@@ -183,6 +186,10 @@ impl Db {
             id
         ];
         let saved = if let Some(id) = id {
+            tx.execute(
+                "UPDATE realm_rules SET traffic_key=lower(hex(randomblob(16))) WHERE id=?1 AND node_id<>?2",
+                params![id, body.node_id],
+            )?;
             let changed=tx.execute("UPDATE realm_rules SET node_id=?1,target_proxy_id=?2,name=?3,listen_host=?4,listen_port=?5,enabled=?6 WHERE id=?7",args)?;
             if changed == 0 {
                 refuse!("规则不存在");
@@ -192,6 +199,11 @@ impl Db {
             tx.execute("INSERT INTO realm_rules(node_id,target_proxy_id,name,listen_host,listen_port,enabled) VALUES(?1,?2,?3,?4,?5,?6)",params![body.node_id,body.target_proxy_id,body.name.trim(),body.listen_host,body.listen_port,body.enabled])?;
             tx.last_insert_rowid()
         };
+        tx.execute(
+            "UPDATE realm_rules SET traffic_key=lower(hex(randomblob(16))) WHERE id=?1 AND traffic_key=''",
+            [saved],
+        )?;
+        tx.execute("INSERT INTO realm_traffic_rules(key,node_id,rule_id,name) SELECT traffic_key,node_id,id,name FROM realm_rules WHERE id=?1 ON CONFLICT(key) DO UPDATE SET name=excluded.name",[saved])?;
         tx.commit()?;
         Ok(saved)
     }
@@ -215,11 +227,14 @@ impl Db {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let (address,enabled,revision,old_digest,restart,request):(String,bool,i64,String,bool,i64)=tx.query_row("SELECT public_address,enabled,desired_revision,desired_digest,restart_requested,request_nonce FROM realm_hosts WHERE node_id=?1",[node],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)))?;
+        let recheck: String =
+            tx.query_row("SELECT traffic_recheck FROM realm_hosts WHERE node_id=?1", [node], |r| r.get(0))?;
+        let mut traffic_rules = Vec::new();
         let source_name: String = tx.query_row("SELECT name FROM node WHERE id=?1", [node], |r| r.get(0))?;
         let mut entries = Vec::new();
         let mut endpoints = Vec::new();
         if enabled {
-            let mut stmt=tx.prepare("SELECT r.id,r.target_proxy_id,r.name,r.listen_host,r.listen_port,p.address,p.port FROM realm_rules r JOIN proxies p ON p.id=r.target_proxy_id WHERE r.node_id=?1 AND r.enabled=1 AND p.enabled=1 AND p.node_id<>r.node_id ORDER BY r.id")?;
+            let mut stmt=tx.prepare("SELECT r.id,r.target_proxy_id,r.name,r.listen_host,r.listen_port,p.address,p.port,r.traffic_key FROM realm_rules r JOIN proxies p ON p.id=r.target_proxy_id WHERE r.node_id=?1 AND r.enabled=1 AND p.enabled=1 AND p.node_id<>r.node_id ORDER BY r.id")?;
             let rows = stmt.query_map([node], |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
@@ -229,13 +244,16 @@ impl Db {
                     r.get::<_, i64>(4)?,
                     r.get::<_, String>(5)?,
                     r.get::<_, i64>(6)?,
+                    r.get::<_, String>(7)?,
                 ))
             })?;
             for row in rows {
-                let (id, target, name, listen, port, remote, remote_port) = row?;
+                let (id, target, name, listen, port, remote, remote_port, traffic_key) = row?;
+                traffic_rules.push(json!({"key":traffic_key,"listen":listen,"port":port}));
                 endpoints
                     .push(json!({"listen":endpoint(&listen,port),"remote":endpoint(&remote,remote_port)}));
                 entries.push(RealmEntry {
+                    traffic_key,
                     source_node_id: node,
                     source_name: source_name.clone(),
                     id,
@@ -262,10 +280,22 @@ impl Db {
             )?;
         }
         tx.commit()?;
-        Ok(RealmDesired { node_id: node, revision, digest, run, config, entries, restart, request })
+        let accounting_digest = hex::encode(Sha256::digest(serde_json::to_vec(&traffic_rules)?));
+        let accounting = json!({"digest":accounting_digest,"recheck":recheck,"rules":traffic_rules});
+        Ok(RealmDesired {
+            node_id: node,
+            revision,
+            digest,
+            run,
+            config,
+            entries,
+            restart,
+            request,
+            accounting,
+        })
     }
     pub fn realm_reset_applied(&self) -> Result<()> {
-        self.conn().execute("UPDATE realm_hosts SET applied_revision=0,applied_digest='',applied_entries='[]',status='{}',last_error='备份恢复后等待 Agent 重新确认'",[])?;
+        self.conn().execute("UPDATE realm_hosts SET applied_revision=0,applied_digest='',applied_entries='[]',status='{}',traffic_recheck='',last_error='备份恢复后等待 Agent 重新确认'",[])?;
         Ok(())
     }
     pub fn realm_error(&self, node: i64, error: &str) -> Result<()> {
@@ -445,11 +475,29 @@ mod tests {
         }
         db.check_backup(path.to_str().unwrap()).unwrap();
         let upgraded = Connection::open(&path).unwrap();
-        assert_eq!(upgraded.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 22);
+        assert_eq!(
+            upgraded.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(),
+            SCHEMA_VERSION
+        );
         assert!(!columns_of(&upgraded, "realm_hosts").unwrap().is_empty());
         drop(upgraded);
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
+    }
+    #[test]
+    fn accounting_identity_survives_port_edits_and_deleted_history_is_retained() {
+        let (db, source, _, proxy, _) = fixture();
+        let mut draft = rule(source, proxy);
+        let id = db.realm_save_rule(None, &draft).unwrap();
+        let first = db.realm_desired(source).unwrap();
+        let key = first.accounting["rules"][0]["key"].clone();
+        draft.listen_port += 1;
+        db.realm_save_rule(Some(id), &draft).unwrap();
+        assert_eq!(db.realm_desired(source).unwrap().accounting["rules"][0]["key"], key);
+        db.realm_delete_rule(id).unwrap();
+        assert_eq!(db.realm_traffic().unwrap()["rules"][0]["active"], false);
+        db.realm_save_rule(None, &draft).unwrap();
+        assert_ne!(db.realm_desired(source).unwrap().accounting["rules"][0]["key"], key);
     }
 }

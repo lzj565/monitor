@@ -721,6 +721,7 @@ async fn main() -> Result<()> {
 
     let router = Router::new()
         // Read paths; the public page reaches these unauthenticated.
+        .route("/api/realm/traffic", get(api::realm_traffic))
         .route("/api/realm/hosts", get(api::realm_hosts).put(api::realm_save_host))
         .route("/api/realm/hosts/{id}", delete(api::realm_delete_host))
         .route("/api/realm/hosts/{id}/config", get(api::realm_preview))

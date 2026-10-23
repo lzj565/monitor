@@ -66,6 +66,9 @@ with tempfile.TemporaryDirectory() as d:
   request(admin,f'/api/users/{uid}/proxies/{proxy}',{'enabled':True},'PUT')
   request(admin,'/api/realm/hosts',{'node_id':source,'public_address':'127.0.0.1','enabled':True,'takeover':True},'PUT')
   listen_port=free_port();rule=request(admin,'/api/realm/rules',{'node_id':source,'target_proxy_id':proxy,'name':'test-route','listen_host':'0.0.0.0','listen_port':listen_port,'enabled':True},'POST')[1]['id']
+  # Optional controlled failure backend: count every invocation and refuse it.
+  if os.environ.get('REALM_TEST_NO_NFT'):
+   (binpath/'nft').write_text('#!/bin/sh\necho probe >> /tmp/nft-probes\necho unavailable >&2\nexit 1\n');(binpath/'nft').chmod(0o755)
   env=os.environ.copy();env['PATH']=str(binpath)+':'+env['PATH']
   agent=subprocess.Popen(['/agent/target/debug/monitor-agent','--server',base,'--token',token],env=env,stdout=agentlog,stderr=agentlog)
   for _ in range(200):
@@ -75,6 +78,64 @@ with tempfile.TemporaryDirectory() as d:
   else:raise AssertionError(('realm did not apply',host,pathlib.Path(d+'/agent.log').read_text()[-1500:]))
   with socket.create_connection(('127.0.0.1',listen_port),timeout=3) as conn:
    conn.sendall(b'realm-real-binary-e2e');assert conn.recv(1024)==b'realm-real-binary-e2e'
+  if os.environ.get('REALM_TEST_TRAFFIC') or os.environ.get('REALM_TEST_NO_NFT'):
+   def traffic_status():
+    hosts=request(admin,'/api/realm/traffic')[1]['hosts']
+    return next((h['status'] for h in hosts if h['node_id']==source),{})
+   for _ in range(200):
+    stats=traffic_status()
+    if stats.get('state') in ('monitoring','unmonitored'):break
+    time.sleep(.2)
+   if os.environ.get('REALM_TEST_NO_NFT'):
+    assert stats.get('state')=='unmonitored', stats
+    before=pathlib.Path('/tmp/nft-probes').read_text().count('probe')
+    request(admin,f'/api/realm/hosts/{source}/operations',{'action':'retry'},'POST')
+    time.sleep(7)
+    assert pathlib.Path('/tmp/nft-probes').read_text().count('probe')==before
+    agent.terminate();agent.wait(timeout=10)
+    agent=subprocess.Popen(['/agent/target/debug/monitor-agent','--server',base,'--token',token],env=env,stdout=agentlog,stderr=agentlog)
+    time.sleep(7)
+    assert pathlib.Path('/tmp/nft-probes').read_text().count('probe')==before
+    request(admin,f'/api/realm/hosts/{source}/operations',{'action':'traffic_recheck'},'POST')
+    for _ in range(200):
+     if pathlib.Path('/tmp/nft-probes').read_text().count('probe')>before:break
+     time.sleep(.2)
+    else:raise AssertionError('manual recheck did not probe')
+    with socket.create_connection(('127.0.0.1',listen_port),timeout=3) as conn:
+     conn.sendall(b'forwarding-still-works');assert conn.recv(1024)==b'forwarding-still-works'
+    print('PASS: unavailable nft latched across refresh and Agent restart; manual recheck retries; forwarding unaffected')
+   else:
+    assert stats.get('state')=='monitoring',stats
+    # External client runs in a second isolated container; do not count loopback.
+    pathlib.Path('/tmp/realm-traffic-port').write_text(str(listen_port))
+    for _ in range(300):
+     data=request(admin,'/api/realm/traffic')[1]
+     if data['rules'] and data['rules'][0]['up']>0 and data['rules'][0]['down']>0:break
+     time.sleep(.2)
+    else:raise AssertionError(('no externally generated traffic',data))
+    totals=(data['rules'][0]['up'],data['rules'][0]['down'])
+    for _ in range(10):
+     with socket.create_connection(('127.0.0.1',listen_port),timeout=3) as conn:
+      conn.sendall(b'loopback-not-counted');assert conn.recv(1024)==b'loopback-not-counted'
+    time.sleep(6)
+    data=request(admin,'/api/realm/traffic')[1]
+    assert (data['rules'][0]['up'],data['rules'][0]['down'])==totals,('loopback counted',totals,data)
+    print('PASS: real nft input/output counters received by Hub; both directions positive; loopback excluded')
+    original_key=data['rules'][0]['key'];listen_port=free_port()
+    request(admin,f'/api/realm/rules/{rule}',{'node_id':source,'target_proxy_id':proxy,'name':'test-route-edited','listen_host':'0.0.0.0','listen_port':listen_port,'enabled':True},'PUT')
+    for _ in range(200):
+     host=request(admin,'/api/realm/hosts')[1]['items'][0]
+     if not host['pending'] and host['status'].get('running'):break
+     time.sleep(.2)
+    else:raise AssertionError(('port edit did not apply',host))
+    pathlib.Path('/tmp/realm-traffic-port').write_text(str(listen_port))
+    for _ in range(300):
+     data=request(admin,'/api/realm/traffic')[1]
+     if data['rules'][0]['up']>totals[0] and data['rules'][0]['down']>totals[1]:break
+     time.sleep(.2)
+    else:raise AssertionError(('no traffic on edited port',data))
+    assert data['rules'][0]['key']==original_key
+    print('PASS: editing listener port preserves rule identity and cumulative traffic')
   user=client();request(user,'/api/user/auth/login',{'username':'realm-e2e','password':'temporary-test-password'},'POST')
   items=request(user,'/api/user/me/proxies')[1]['items'];assert len(items)==2 and any(p['id']==-rule for p in items)
   links=request(user,'/api/user/me/subscription')[1];clash=request(user,links['clash'])[1];assert b'127.0.0.1' in clash and ('Realm' in clash.decode())
@@ -86,6 +147,8 @@ with tempfile.TemporaryDirectory() as d:
    if not host['pending'] and host['status'].get('running') is False:break
    time.sleep(.2)
   else:raise AssertionError(('realm did not stop',host))
+  request(admin,f'/api/realm/rules/{rule}',method='DELETE')
+  history=request(admin,'/api/realm/traffic')[1]['rules'];assert history and history[0]['active'] is False
   print('PASS: real Realm v2.9.6 + new Agent + Hub: auto apply, TCP echo forwarding, authorized portal + Clash/sing-box entries, immediate withdrawal and confirmed stop')
  finally:
   if agent:agent.terminate();agent.wait(timeout=10)

@@ -77,6 +77,7 @@ impl Arrival {
 #[derive(Debug)]
 pub struct Agent {
     pub realm_capable: bool,
+    pub realm_traffic_capable: bool,
     /// Distinguishes one session on a node from the next; see [`release`].
     pub session: u64,
     /// Outbound channel, used to push probe assignments.
@@ -106,6 +107,7 @@ impl Agent {
     pub fn new(session: u64, tx: mpsc::Sender<String>) -> Self {
         Self {
             realm_capable: false,
+            realm_traffic_capable: false,
             session,
             tx,
             metrics: serde_json::Value::Null,
@@ -634,6 +636,9 @@ fn dispatch(
             }
             if let Some(agent) = app.agents.write().unwrap_or_else(|e| e.into_inner()).get_mut(&node_id) {
                 if agent.session == session.tag {
+                    agent.realm_traffic_capable = rpc.params["capabilities"]
+                        .as_array()
+                        .is_some_and(|caps| caps.iter().any(|v| v.as_str() == Some("realm.traffic.v1")));
                     agent.realm_capable = rpc.params["capabilities"]
                         .as_array()
                         .is_some_and(|caps| caps.iter().any(|v| v.as_str() == Some("realm.v1")));
@@ -651,6 +656,16 @@ fn dispatch(
             debug!("node {node_id}: a report within {REPORT_SPACING:?} of the last was dropped")
         }
         "report" => report(app, node_id, rpc.params, arrival)?,
+        "realm.traffic" => {
+            let agents = app.agents.read().unwrap_or_else(|e| e.into_inner());
+            let current = agents
+                .get(&node_id)
+                .filter(|a| session.greeted && a.session == session.tag && a.realm_traffic_capable);
+            if let Some(agent) = current {
+                let ack = app.db.realm_traffic_record(node_id, &rpc.params)?;
+                let _ = agent.tx.try_send(ack.to_string());
+            }
+        }
         "proxy.traffic" if !session.greeted => {
             session.complain(node_id, "proxy traffic arrived before hello and was ignored");
         }

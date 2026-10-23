@@ -104,7 +104,9 @@ impl Db {
 }
 
 mod realm;
+mod realm_traffic;
 pub(super) use realm::*;
+use realm_traffic::*;
 mod maintenance;
 mod probes;
 mod resources;

@@ -51,7 +51,7 @@ fn tick(app: &App, slots: &mut HashMap<i64, Slot>) -> anyhow::Result<()> {
                 slot.flight = Some(flight);
                 continue;
             }
-            slot.next = now + Duration::from_secs(15);
+            slot.next = now + Duration::from_secs(if flight.applying { 0 } else { 15 });
             if let Some(command) = command {
                 if command.status == "succeeded" {
                     let observed = command.result.unwrap_or(json!({}));
@@ -78,6 +78,33 @@ fn tick(app: &App, slots: &mut HashMap<i64, Slot>) -> anyhow::Result<()> {
                     {
                         app.db.realm_rebase(node, revision)?;
                         slot.next = now;
+                        continue;
+                    }
+                    let traffic_capable = app
+                        .agents
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&node)
+                        .is_some_and(|a| a.realm_traffic_capable);
+                    if traffic_capable
+                        && revision == desired.revision
+                        && digest == desired.digest
+                        && running == desired.run
+                        && enabled == desired.run
+                        && (observed["traffic"]["digest"] != desired.accounting["digest"]
+                            || observed["traffic"]["recheck"] != desired.accounting["recheck"])
+                    {
+                        match enqueue(
+                            app,
+                            node,
+                            "realm.traffic.configure",
+                            json!({"revision":desired.revision,"config_digest":desired.digest,"accounting":desired.accounting}),
+                        ) {
+                            Ok(id) => {
+                                slot.flight = Some(Flight { id, desired, applying: true, restarting: false })
+                            }
+                            Err(e) => app.db.realm_error(node, &e)?,
+                        }
                         continue;
                     }
                     if !flight.applying && !flight.restarting {

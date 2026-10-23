@@ -158,10 +158,11 @@ impl Db {
         } else {
             &TABLES
         };
-        for table in required_tables
-            .iter()
-            .filter(|t| !HOURLY_TABLES.contains(t) && (version >= 22 || !REALM_TABLES.contains(t)))
-        {
+        for table in required_tables.iter().filter(|t| {
+            !HOURLY_TABLES.contains(t)
+                && (version >= 22 || !REALM_TABLES.contains(t))
+                && (version >= 23 || !REALM_TRAFFIC_TABLES.contains(t))
+        }) {
             let found: i64 = candidate.query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
                 [table],
@@ -183,7 +184,9 @@ impl Db {
         // could not use while reporting a failure to the panel -- the one
         // arrangement in which the restore has failed and the original data is
         // also gone.
-        migrate(&candidate, version)?;
+        if let Err(e) = if version < SCHEMA_VERSION { migrate(&candidate, version) } else { Ok(()) } {
+            refuse!("{NOT_A_BACKUP}：数据库结构无法升级：{e}");
+        }
         // The migration lands in a -wal beside a backup taken from a running hub.
         // Checkpointed here so the copy below reads a single file.
         let _ = candidate.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));

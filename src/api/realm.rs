@@ -12,6 +12,7 @@ pub async fn realm_hosts(_: Admin, State(app): State<Shared>) -> Response {
             let agents = app.agents.read().unwrap_or_else(|e| e.into_inner());
             for host in &mut hosts {
                 let agent = host["node_id"].as_i64().and_then(|id| agents.get(&id));
+                host["traffic_capable"] = json!(agent.is_some_and(|a| a.realm_traffic_capable));
                 host["online"] = json!(agent.is_some());
                 host["capable"] = json!(agent.is_some_and(|a| a.realm_capable));
             }
@@ -104,6 +105,12 @@ pub async fn realm_operation(
     Json(body): Json<RealmOperation>,
 ) -> Response {
     crate::blocking::response(move || {
+        if body.action == "traffic_recheck" {
+            return match app.db.realm_traffic_recheck(id) {
+                Ok(()) => Json(json!({"queued":true})).into_response(),
+                Err(e) => rejected(e),
+            };
+        }
         if !["refresh", "retry", "restart"].contains(&body.action.as_str()) {
             return bad("不支持的 Realm 操作");
         }
@@ -111,6 +118,32 @@ pub async fn realm_operation(
             Ok(()) => Json(json!({"queued":true})).into_response(),
             Err(e) => rejected(e),
         }
+    })
+    .await
+}
+
+pub async fn realm_traffic(_: Admin, State(app): State<Shared>) -> Response {
+    crate::blocking::response(move || match app.db.realm_traffic() {
+        Ok(mut v) => {
+            let agents = app.agents.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(hosts) = v["hosts"].as_array_mut() {
+                for h in hosts {
+                    if !h["node_id"].as_i64().is_some_and(|id| agents.contains_key(&id)) {
+                        h["status"]["fresh"] = json!(false);
+                    }
+                }
+            }
+            if let Some(rules) = v["rules"].as_array_mut() {
+                for r in rules {
+                    if !r["node_id"].as_i64().is_some_and(|id| agents.contains_key(&id)) {
+                        r["up_rate"] = serde_json::Value::Null;
+                        r["down_rate"] = serde_json::Value::Null;
+                    }
+                }
+            }
+            Json(v).into_response()
+        }
+        Err(e) => fail(e),
     })
     .await
 }
