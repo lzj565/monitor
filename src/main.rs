@@ -33,6 +33,7 @@ mod db;
 mod frontend;
 mod notify;
 mod proxy;
+mod realm;
 mod uploads;
 
 use std::collections::HashMap;
@@ -714,11 +715,18 @@ async fn main() -> Result<()> {
     let held = app.clone();
     tokio::spawn(housekeeping(app.clone()));
     tokio::spawn(command::cleanup_loop(app.clone()));
+    tokio::spawn(realm::reconcile(app.clone()));
     tokio::spawn(notify::deliver(app.clone(), inbox));
     tokio::spawn(notify::watch(app.clone()));
 
     let router = Router::new()
         // Read paths; the public page reaches these unauthenticated.
+        .route("/api/realm/hosts", get(api::realm_hosts).put(api::realm_save_host))
+        .route("/api/realm/hosts/{id}", delete(api::realm_delete_host))
+        .route("/api/realm/hosts/{id}/config", get(api::realm_preview))
+        .route("/api/realm/hosts/{id}/operations", post(api::realm_operation))
+        .route("/api/realm/rules", get(api::realm_rules).post(api::realm_create_rule))
+        .route("/api/realm/rules/{id}", put(api::realm_update_rule).delete(api::realm_delete_rule))
         .route("/api/me", get(api::me))
         .route("/api/nodes", get(api::nodes))
         .route("/api/nodes/{id}/metrics", get(api::metrics))

@@ -158,7 +158,10 @@ impl Db {
         } else {
             &TABLES
         };
-        for table in required_tables.iter().filter(|t| !HOURLY_TABLES.contains(t)) {
+        for table in required_tables
+            .iter()
+            .filter(|t| !HOURLY_TABLES.contains(t) && (version >= 22 || !REALM_TABLES.contains(t)))
+        {
             let found: i64 = candidate.query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
                 [table],

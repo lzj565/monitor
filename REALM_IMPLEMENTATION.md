@@ -1,0 +1,26 @@
+# Realm 实现与验收
+
+基于 Hub `911e63a` 与 Agent `f92d99d`，两个仓库分别实现。
+
+## 已实现
+
+- `/admin/realm` 管理入口机器、IPv4/IPv6 TCP 规则、目标节点和现有代理；保存自动同步、离线待同步、旧 Agent 提示升级。
+- Agent 1.2.2 的 `realm.v1` 能力与五个 Realm 命令；仅接管安装器管理的服务，首次备份、原子替换、失败回滚、启停与开机启动状态恢复。
+- Hub 数据库版本 22；Realm 配置、成功应用快照和修订号持久化。旧结果不能发布新配置，备份恢复后远端更高修订会自动重新基线化。
+- 用户中心、Clash 与 sing-box 订阅追加入口；继承目标代理授权和认证，不重复计费。停用或撤销授权立即撤回；目标地址变化不继续发布过期入口。
+- 引用删除保护、监听端口冲突、目标变更自动同步；管理接口沿用鉴权及跨站防护。
+
+## 已验证
+
+- Hub：fmt、Clippy（warnings 为错误）、225 项测试及 Linux debug build。
+- Agent：fmt、Clippy、56 项测试及 Linux debug build。测试容器安装 systemd-detect-virt，未跳过现有环境交叉校验。
+- 前端：lint、六组测试和 TypeScript/Vite 构建；Realm 页面单独加载。
+- 安装脚本：Realm 生命周期、Agent unit、API 端口选择检查。
+- 真实联调：官方 Realm v2.9.6 aarch64 包的 SHA-256 与安装器固定摘要一致。隔离容器内启动新 Hub、新 Agent 和真实 Realm，通过 API 保存规则后自动启动并完成真实 TCP echo 转发；测试用户的用户中心、Clash/sing-box 出现额外入口，停用后立即撤回且确认服务停止。
+- systemd/OpenRC 命令及回滚通过适配器测试；真实联调中的 systemctl 使用测试适配器，不代表在真实 init 主机上的验收。
+
+## 未完成的环境验收及发布事项
+
+- 浏览器登录跳转后自动化连接失效；未完成表单逐项交互验收。API 联调与前端构建不能替代该项。
+- 真实多机器 VLESS Reality 认证链路、真实 systemd/OpenRC 主机部署未验收；实际字节转发测试使用本地 TCP echo 目标。
+- 发布核对发现已有不匹配：Hub 使用上游固定公钥验签，fork Agent 发布流程未生成 `.sig`。未移除或绕过验签；签名发布须另行接通，或暂只交付源码并在受控环境安装构建产物。未将源码 push 当作二进制已发布或生产已部署。

@@ -25,6 +25,8 @@ export const DB_ROWS: [string, string][] = [
   ["metric_hour", "历史小时汇总"],
   ["ping_record", "延迟记录"],
   ["ping_hour", "延迟小时汇总"],
+  ["realm_hosts", "Realm 机器"],
+  ["realm_rules", "Realm 规则"],
 ]
 
 export function Data() {

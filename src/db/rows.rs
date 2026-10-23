@@ -157,7 +157,7 @@ pub(super) fn proxy_name_in_use(
 pub(super) fn port_in_use(conn: &Connection, node_id: i64, port: i64, except: Option<i64>) -> Result<bool> {
     Ok(conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM proxies WHERE node_id=?1 AND port=?2 AND enabled=1
-                       AND (?3 IS NULL OR id<>?3))",
+                       AND (?3 IS NULL OR id<>?3)) OR EXISTS(SELECT 1 FROM realm_rules WHERE node_id=?1 AND listen_port=?2)",
         params![node_id, port, except],
         |r| r.get(0),
     )?)

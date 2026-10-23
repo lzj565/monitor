@@ -12,7 +12,12 @@ pub const RESULT_TTL: Duration = Duration::from_secs(5 * 60);
 pub const CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_COMMANDS: usize = 1024;
 
-const ACTIONS: [&str; 5] = [
+const ACTIONS: [&str; 10] = [
+    "realm.status",
+    "realm.config.get",
+    "realm.config.check",
+    "realm.config.apply",
+    "realm.restart",
     "singbox.status",
     "singbox.config.get",
     "singbox.config.check",

@@ -285,7 +285,7 @@ CREATE TABLE IF NOT EXISTS proxy_node_traffic (
 /// cannot: `open` runs `SCHEMA` before migrating, and on an older file the
 /// column is not there yet. `an_upgraded_release_matches_a_fresh_database`
 /// holds every migration to these rules, starting from v1.0.0's schema.
-pub(super) const SCHEMA_VERSION: i64 = 21;
+pub(super) const SCHEMA_VERSION: i64 = 22;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -620,6 +620,7 @@ pub(super) fn migrate(conn: &Connection, from: i64) -> Result<()> {
         PRIMARY KEY(user_id,proxy_id)
     )",
     )?;
+    tx.execute_batch(REALM_SCHEMA)?;
     tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     tx.commit()?;
     Ok(())
@@ -657,7 +658,7 @@ pub(super) fn seed_default_admin(conn: &Connection) -> Result<()> {
 }
 
 /// Every table a backup must carry before this build will restore it.
-pub(super) const TABLES: [&str; 16] = [
+pub(super) const TABLES: [&str; 18] = [
     "setting",
     "node",
     "proxies",
@@ -674,6 +675,8 @@ pub(super) const TABLES: [&str; 16] = [
     "user_proxy_order",
     "metric_hour",
     "ping_hour",
+    "realm_hosts",
+    "realm_rules",
 ];
 pub(super) const PRE_RESOURCE_TABLES: [&str; 8] =
     ["setting", "node", "traffic", "metric", "ping_task", "ping_node", "ping_record", "session"];

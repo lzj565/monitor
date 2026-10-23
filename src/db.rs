@@ -103,6 +103,8 @@ impl Db {
     }
 }
 
+mod realm;
+pub(super) use realm::*;
 mod maintenance;
 mod probes;
 mod resources;

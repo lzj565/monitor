@@ -78,3 +78,16 @@ CI 检查 `main`、`dev` 和拉取请求。E2E 使用 `agent-test.pin` 固定的
 Realm 程序位于 `/opt/monitor/realm`，配置位于 `/opt/monitor/config/realm.json`，服务名为 `monitor-realm`。首次安装创建空转发规则，不启动、不设置开机启动。编辑配置添加 `endpoints` 后，systemd 使用 `systemctl enable --now monitor-realm`；OpenRC 使用 `rc-update add monitor-realm default` 和 `rc-service monitor-realm start`。配置说明见 [Realm 官方文档](https://github.com/zhboner/realm#configuration)。
 
 重复安装保留配置及开机启动状态，正在运行的 Realm 在程序替换后重启。安装包由 Hub 通过已有 GitHub 代理中转，安装脚本校验固定 SHA-256，支持 x86_64、aarch64 Linux。未传 Realm 参数的旧安装命令和 `--upgrade` 不改变 Realm；升级时也可显式附加 `--realm` 或 `--no-realm`。`--uninstall` 仍仅卸载 Agent。第三方 Realm 安装不属于此开关管理范围。
+
+
+### Realm 页面管理
+
+在管理菜单「Realm 转发」中添加现有 Agent 节点作为入口机器，填写对外域名或 IP，并确认面板接管本安装器的配置。入口机器需要 Agent 1.2.2 或更新版本（支持 `realm.v1`）；未安装 Realm 时，页面提供带 `--realm` 的安装命令，执行后再刷新。
+
+新增规则时选择入口机器、监听端口、目标节点及其已有 VLESS Reality 代理。当前支持 TCP，监听地址可选 IPv4 或 IPv6。保存后 Hub 自动生成完整配置并通过 Agent 应用；有有效规则时自动启动并设置开机启动，停用机器或最后一条有效规则后停止并取消开机启动。首次接管会保留 `realm-panel-original.json`，应用失败恢复旧配置及服务状态。
+
+应用确认成功后，用户中心及 Clash / sing-box 订阅新增 Realm 入口，原直连入口保留。中转复用目标代理的认证、授权和额度；禁用规则、撤销授权或用户过期立即停止发布对应入口。目标地址变化时自动重新同步，过期结果不能发布新版本。对外地址必须从用户侧可达；端口防火墙不由面板自动修改。
+
+机器状态每 5 秒刷新。Agent 目标 TCP 检测每次最多检查 8 个目标，页面显示检测数量；进程运行和 TCP 可连接均不代表 VLESS 认证已通过。面板只接管安装器管理的 `monitor-realm` 服务，不接管第三方 Realm，也不支持手工配置与面板配置混用。
+
+数据库迁移到版本 22，Realm 机器和规则纳入备份。部署顺序为先升级 Agent，再部署 Hub。两仓库的 Rust 测试覆盖配置回滚、过期修订、授权和备份兼容；`scripts/e2e-realm.py` 是供隔离 Linux Docker 使用的真实 Realm + Agent + Hub 联调脚本，依赖分别挂载到 `/hub`、`/agent` 的 debug 二进制和 `/realm.tar.gz` 的固定 Realm 包。脚本拒绝覆盖已有 `/opt/monitor/config`；systemd 服务调用在测试容器中由适配器模拟，真实转发由 Realm v2.9.6 执行。

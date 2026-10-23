@@ -1,8 +1,9 @@
-import { Activity, ArrowUpCircle, Bell, Database, KeyRound, Network, Palette, Radio, Server, Settings, Shield, Users } from "lucide-react"
+import { Activity, ArrowUpCircle, Bell, Database, KeyRound, Network, Route, Palette, Radio, Server, Settings, Shield, Users } from "lucide-react"
 import { behind, outdatedAgents, type Node } from "@/lib/api"
 import { useVersions } from "./admin/hooks"
 import { lazy, Suspense } from "react"
 
+const Realm = lazy(() => import("./admin/Realm").then((m) => ({ default: m.Realm })))
 const Nodes = lazy(() => import("./admin/Nodes").then((m) => ({ default: m.Nodes })))
 const Ping = lazy(() => import("./admin/Ping").then((m) => ({ default: m.Ping })))
 const Themes = lazy(() => import("./admin/Themes").then((m) => ({ default: m.Themes })))
@@ -20,6 +21,7 @@ const ProxyTrafficPage = lazy(() => import("@/components/ProxyTrafficPage").then
 // reload returns to the same section.
 export const ADMIN_SECTIONS = [
   { path: "/admin/nodes", label: "节点", icon: Server },
+  { path: "/admin/realm", label: "Realm 转发", icon: Route },
   { path: "/admin/proxies", label: "代理", icon: Network },
   { path: "/admin/users", label: "用户", icon: Users },
   { path: "/admin/subscriptions", label: "订阅", icon: KeyRound },
@@ -84,7 +86,9 @@ export function Admin({
 
       <div className="min-w-0 flex-1">
         <Suspense fallback={<p className="p-6 text-sm text-muted-foreground">加载中…</p>}>
-        {path === "/admin/traffic" ? (
+        {path === "/admin/realm" ? (
+          <Realm nodes={nodes} site={site} refusal={refusal} />
+        ) : path === "/admin/traffic" ? (
           <ProxyTrafficPage nodes={nodes} />
         ) : path === "/admin/proxies" ? (
           <ProxiesPage nodes={nodes} />

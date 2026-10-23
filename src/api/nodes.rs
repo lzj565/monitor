@@ -291,6 +291,10 @@ pub async fn reorder_proxies(_: Admin, State(app): State<Shared>, Json(order): J
 
 pub async fn delete_node(_: Admin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
     crate::blocking::response(move || {
+        match app.db.realm_refs(Some(id),None) {
+            Ok(refs) if !refs.is_empty()=>return (StatusCode::CONFLICT,Json(json!({"error":{"code":"REALM_REFERENCED","message":"节点仍被 Realm 引用","references":refs}}))).into_response(),
+            Err(e)=>return fail(e), _=>{}
+        }
         match app.db.delete_node(id) {
             Ok(true) => {}
             Ok(false) => return no_such_node(),

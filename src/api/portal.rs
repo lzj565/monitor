@@ -56,7 +56,7 @@ pub async fn user_proxies(UserAuth(user_id): UserAuth, State(app): State<Shared>
             Ok(mut proxies) => {
                 let agents = app.agents.read().unwrap_or_else(|e| e.into_inner());
                 for proxy in &mut proxies {
-                    proxy.online = agents.contains_key(&proxy.node_id);
+                    proxy.online = agents.contains_key(&proxy.node_id) && proxy.realm_target_node_id.is_none_or(|id|agents.contains_key(&id));
                 }
                 let items = proxies.into_iter().map(|proxy| {
                     let label = crate::db::displayed_proxy_name(

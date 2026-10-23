@@ -631,7 +631,7 @@ impl Db {
              ORDER BY (SELECT o.sort FROM user_proxy_order o WHERE o.user_id=a.user_id AND o.proxy_id=p.id) IS NULL,
                       (SELECT o.sort FROM user_proxy_order o WHERE o.user_id=a.user_id AND o.proxy_id=p.id),p.node_id,p.id",
         )?;
-        let proxies = stmt
+        let mut proxies = stmt
             .query_map(params![id, now], |r| {
                 Ok(UserPortalProxy {
                     id: r.get(0)?,
@@ -652,9 +652,35 @@ impl Db {
                     short_id: r.get::<_, Option<String>>(15)?.unwrap_or_default(),
                     flow: r.get::<_, Option<String>>(16)?.unwrap_or_default(),
                     online: false,
+                    realm_target_node_id: None,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        drop(conn);
+        let direct = proxies.clone();
+        for entry in self.realm_subscription_entries()? {
+            if let Some(base) = direct.iter().find(|p| p.id == entry.target_proxy_id) {
+                let mut item = base.clone();
+                item.id = -entry.id;
+                item.realm_target_node_id = Some(item.node_id);
+                item.node_id = entry.source_node_id;
+                item.node_name = entry.source_name.clone();
+                item.name = format!("{} · Realm {} #{}", base.name, entry.source_name, entry.id);
+                item.include_node_name = false;
+                item.address = entry.address;
+                item.address_type = if item.address.parse::<std::net::Ipv4Addr>().is_ok() {
+                    "ipv4"
+                } else if item.address.parse::<std::net::Ipv6Addr>().is_ok() {
+                    "ipv6"
+                } else {
+                    "domain"
+                }
+                .into();
+                item.port = entry.port;
+                proxies.push(item);
+            }
+        }
         Ok(proxies)
     }
 
@@ -689,7 +715,7 @@ impl Db {
              ORDER BY (SELECT o.sort FROM user_proxy_order o WHERE o.user_id=a.user_id AND o.proxy_id=p.id) IS NULL,
                       (SELECT o.sort FROM user_proxy_order o WHERE o.user_id=a.user_id AND o.proxy_id=p.id),p.node_id,p.id",
         )?;
-        let proxies = stmt
+        let mut proxies = stmt
             .query_map([id], |r| {
                 Ok(UserSubscriptionProxy {
                     id: r.get(0)?,
@@ -706,6 +732,20 @@ impl Db {
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        drop(conn);
+        let direct = proxies.clone();
+        for entry in self.realm_subscription_entries()? {
+            if let Some(base) = direct.iter().find(|p| p.id == entry.target_proxy_id) {
+                let mut item = base.clone();
+                item.id = -entry.id;
+                item.name = format!("{} · Realm {} #{}", base.name, entry.source_name, entry.id);
+                item.include_node_name = false;
+                item.address = entry.address;
+                item.port = entry.port;
+                proxies.push(item);
+            }
+        }
         Ok(Some((uuid, proxies)))
     }
 

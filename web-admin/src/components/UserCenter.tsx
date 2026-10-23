@@ -68,7 +68,7 @@ export function UserCenter({ siteName, dark, toggleTheme, signOut, returnToAdmin
   const reloadProxies = useCallback(() => {
     void api<{ items: PortalProxy[] }>("/user/me/proxies").then((result) => setProxies(result.items)).catch((e: Error) => toast.error(e.message))
   }, [])
-  const drag = useDragOrder(proxies ?? [], "user/me/proxies", reloadProxies)
+  const drag = useDragOrder((proxies ?? []).filter((p) => p.id > 0), "user/me/proxies", reloadProxies)
   const used = profile ? profile.traffic.uplink_bytes + profile.traffic.downlink_bytes : 0
   const limit = profile?.traffic_limit ?? 0
   const percentage = limit > 0 ? used / limit * 100 : 0
@@ -232,9 +232,9 @@ export function UserCenter({ siteName, dark, toggleTheme, signOut, returnToAdmin
                   <tr><th className="w-10 px-1 py-3 sm:px-2"><span className="sr-only">排序</span></th><th className="w-[30%] px-2 py-3 sm:w-[20%] sm:px-3">节点</th><th className="hidden w-[14%] px-2 py-3 sm:table-cell sm:px-3">名称</th><th className="hidden w-[13%] px-3 py-3 xl:table-cell">协议</th><th className="w-[35%] px-2 py-3 sm:w-[22%] sm:px-3">地址</th><th className="hidden w-[7%] px-3 py-3 xl:table-cell">端口</th><th className="hidden w-[12%] px-3 py-3 xl:table-cell">SNI</th><th className="hidden w-[10%] px-3 py-3 xl:table-cell">状态</th><th className="w-20 px-1 py-3 sm:w-24 sm:px-3"><span className="sr-only">复制</span></th></tr>
                 </thead>
                 <tbody>
-                  {drag.order.map((proxy) => (
+                  {[...drag.order, ...(proxies ?? []).filter((p) => p.id < 0)].map((proxy) => (
                     <tr key={proxy.id} {...drag.row(proxy.id)} className="border-t transition-colors hover:bg-muted/30 data-[dragging]:opacity-40">
-                      <td className="px-1 py-3 sm:px-2"><DragHandle name={proxy.name} {...drag.handle(proxy.id)} /></td>
+                      <td className="px-1 py-3 sm:px-2"><DragHandle disabled={proxy.id < 0} name={proxy.name} {...drag.handle(proxy.id)} /></td>
                       <td className="whitespace-normal px-2 py-3 sm:px-3">
                         <div className="min-w-0">
                           <div className="font-medium text-balance break-keep">

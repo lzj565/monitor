@@ -76,6 +76,7 @@ impl Arrival {
 /// a whole `--interval`.
 #[derive(Debug)]
 pub struct Agent {
+    pub realm_capable: bool,
     /// Distinguishes one session on a node from the next; see [`release`].
     pub session: u64,
     /// Outbound channel, used to push probe assignments.
@@ -104,6 +105,7 @@ pub struct Agent {
 impl Agent {
     pub fn new(session: u64, tx: mpsc::Sender<String>) -> Self {
         Self {
+            realm_capable: false,
             session,
             tx,
             metrics: serde_json::Value::Null,
@@ -629,6 +631,13 @@ fn dispatch(
             if std::mem::replace(&mut session.greeted, true) {
                 session.complain(node_id, "a second hello on one connection was ignored");
                 return Ok(None);
+            }
+            if let Some(agent) = app.agents.write().unwrap_or_else(|e| e.into_inner()).get_mut(&node_id) {
+                if agent.session == session.tag {
+                    agent.realm_capable = rpc.params["capabilities"]
+                        .as_array()
+                        .is_some_and(|caps| caps.iter().any(|v| v.as_str() == Some("realm.v1")));
+                }
             }
             let field = |k: &str| rpc.params.get(k).and_then(|v| v.as_str()).unwrap_or("");
             let source =

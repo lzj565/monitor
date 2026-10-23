@@ -60,6 +60,32 @@ pub async fn create_command(
             Ok(body) => body,
             Err(error) => return error.into_response(),
         };
+        if matches!(body.method.as_str(), "realm.config.apply" | "realm.restart") {
+            return bad("请通过 Realm 页面应用配置和重启");
+        }
+        if body.method.starts_with("realm.") {
+            if !app
+                .agents
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&node_id)
+                .is_some_and(|a| a.realm_capable)
+            {
+                return api_error(StatusCode::CONFLICT, "REALM_AGENT_REQUIRED", "节点离线或 Agent 需要升级");
+            }
+            if body.method == "realm.config.check"
+                && body
+                    .params
+                    .get("config")
+                    .is_none_or(|v| !v.is_object() || v.to_string().len() > MAX_COMMAND_CONFIG)
+            {
+                return api_error(
+                    StatusCode::BAD_REQUEST,
+                    "REALM_CONFIG_INVALID",
+                    "Realm 配置必须是 1 MiB 以内的 JSON 对象",
+                );
+            }
+        }
         if !command::supports(&body.method) {
             return bad("不支持的 Agent 命令");
         }
@@ -379,6 +405,20 @@ pub async fn delete_proxy(_: ApiAdmin, State(app): State<Shared>, Path(id): Path
             Ok(proxy) => proxy.map(|proxy| proxy.node_id),
             Err(error) => return api_internal(error),
         };
+        match app.db.realm_refs(None, Some(id)) {
+            Ok(refs) if !refs.is_empty() => {
+                return api_error(
+                    StatusCode::CONFLICT,
+                    "REALM_REFERENCED",
+                    format!(
+                        "代理仍被 Realm 规则引用：{}",
+                        refs.iter().filter_map(|r| r["name"].as_str()).collect::<Vec<_>>().join("、")
+                    ),
+                )
+            }
+            Err(e) => return fail(e),
+            _ => {}
+        }
         match app.db.delete_proxy(id) {
             Ok(true) => {
                 let sync = sync_generated_nodes(&app, node_id.into_iter().collect());

@@ -130,6 +130,7 @@ fn restore_refuses_anything_that_is_not_a_backup_of_this_hub() {
     let newer = Connection::open(&bad).unwrap();
     newer.execute_batch(SCHEMA).unwrap();
     newer.execute_batch(RESOURCE_SCHEMA).unwrap();
+    newer.execute_batch(REALM_SCHEMA).unwrap();
     newer.execute_batch(&format!("PRAGMA user_version = {}", SCHEMA_VERSION + 1)).unwrap();
     refused("from a newer hub");
 

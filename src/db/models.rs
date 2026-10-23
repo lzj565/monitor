@@ -170,6 +170,7 @@ pub struct UserLoginRecord {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct UserPortalProxy {
+    pub realm_target_node_id: Option<i64>,
     pub id: i64,
     pub node_id: i64,
     pub node_name: String,
