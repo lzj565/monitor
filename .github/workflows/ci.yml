@@ -2,7 +2,7 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
     # Prose changes nothing a compiler or linter can check.
     paths-ignore: ["**.md", "LICENSE"]
   pull_request:
@@ -54,11 +54,15 @@ jobs:
       # when either test fails.
       - run: shellcheck -S warning install.sh install-hub.sh scripts/*.sh
 
-      # This commit's hub against the latest released agent: the field contract
+      # This commit's hub against a pinned released agent: the field contract
       # between the two repositories, and what the public view withholds.
       - run: cargo build
       - run: |
-          curl -fsSL -o agent https://github.com/monitor-probe/agent/releases/latest/download/monitor-agent-x86_64-unknown-linux-musl
+          read -r TAG SHA < agent-test.pin
+          AGENT_REPO=$(sed -n 's/^pub const AGENT_REPO: &str = "\(.*\)";/\1/p' src/main.rs)
+          test -n "$AGENT_REPO"
+          curl -fsSL --retry 3 -o agent "https://github.com/$AGENT_REPO/releases/download/$TAG/monitor-agent-x86_64-unknown-linux-musl"
+          printf '%s  agent\n' "$SHA" | sha256sum -c -
           chmod +x agent
       - run: scripts/e2e.sh target/debug/monitor-hub ./agent
 

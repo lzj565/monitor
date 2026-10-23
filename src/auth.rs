@@ -48,6 +48,7 @@ const LOCKOUT: Duration = Duration::from_secs(900);
 /// cost is that two simultaneous sign-ins require one to retry.
 const PASSWORD_CHECKS: usize = 1;
 static PASSWORD_GATE: Semaphore = Semaphore::const_new(PASSWORD_CHECKS);
+static HASH_GATE: Mutex<()> = Mutex::new(());
 
 pub fn sha256(value: &str) -> String {
     hex::encode(Sha256::digest(value.as_bytes()))
@@ -58,6 +59,7 @@ pub fn random_token() -> String {
 }
 
 pub fn hash_password(password: &str) -> Result<String> {
+    let _permit = HASH_GATE.lock().unwrap_or_else(|error| error.into_inner());
     let salt =
         SaltString::encode_b64(&rand::random::<[u8; 16]>()).map_err(|e| anyhow::anyhow!("salt: {e}"))?;
     Ok(Argon2::default()
@@ -203,29 +205,32 @@ pub async fn login(
     headers: HeaderMap,
     Json(body): Json<LoginBody>,
 ) -> Response {
-    let ip = client_ip(&app, &headers, peer.ip());
-    if app.throttle.locked(ip) {
-        return answer(StatusCode::TOO_MANY_REQUESTS, "尝试次数过多，稍后再试");
-    }
-    // Held across the check below, which is its purpose.
-    let Ok(_permit) = PASSWORD_GATE.try_acquire() else {
-        return answer(StatusCode::TOO_MANY_REQUESTS, "尝试次数过多，稍后再试");
-    };
-    let Some(stored) = app.db.get("admin_password_hash") else {
-        return answer(StatusCode::FORBIDDEN, "没有设置应急密码，无法用密码登录");
-    };
-    if !verify_password(&body.password, &stored) {
-        app.throttle.record_failure(ip);
-        return answer(StatusCode::UNAUTHORIZED, "密码错误");
-    }
-    app.throttle.clear(ip);
-    match issue_session(&app, &headers) {
-        Ok(cookie) => {
-            crate::notify::signed_in(&app, "应急密码", ip);
-            with_cookies(Json(serde_json::json!({"ok": true})), [cookie])
+    crate::blocking::response(move || {
+        let ip = client_ip(&app, &headers, peer.ip());
+        if app.throttle.locked(ip) {
+            return answer(StatusCode::TOO_MANY_REQUESTS, "尝试次数过多，稍后再试");
         }
-        Err(e) => fail(e),
-    }
+        // Held across the check below, which is its purpose.
+        let Ok(_permit) = PASSWORD_GATE.try_acquire() else {
+            return answer(StatusCode::TOO_MANY_REQUESTS, "尝试次数过多，稍后再试");
+        };
+        let Some(stored) = app.db.get("admin_password_hash") else {
+            return answer(StatusCode::FORBIDDEN, "没有设置应急密码，无法用密码登录");
+        };
+        if !verify_password(&body.password, &stored) {
+            app.throttle.record_failure(ip);
+            return answer(StatusCode::UNAUTHORIZED, "密码错误");
+        }
+        app.throttle.clear(ip);
+        match issue_session(&app, &headers) {
+            Ok(cookie) => {
+                crate::notify::signed_in(&app, "应急密码", ip);
+                with_cookies(Json(serde_json::json!({"ok": true})), [cookie])
+            }
+            Err(e) => fail(e),
+        }
+    })
+    .await
 }
 
 pub async fn user_login(
@@ -234,68 +239,81 @@ pub async fn user_login(
     headers: HeaderMap,
     Json(body): Json<UserLoginBody>,
 ) -> Response {
-    let ip = client_ip(&app, &headers, peer.ip());
-    if app.throttle.locked(ip) {
-        return answer(StatusCode::TOO_MANY_REQUESTS, "尝试次数过多，稍后再试");
-    }
-    let Ok(_permit) = PASSWORD_GATE.try_acquire() else {
-        return answer(StatusCode::TOO_MANY_REQUESTS, "尝试次数过多，稍后再试");
-    };
-    let username = body.username.trim();
-    let record = match app.db.user_login_record(username) {
-        Ok(record) => record,
-        Err(error) => return fail(error),
-    };
-    // Verify a hash even when the account is absent or has no password yet so
-    // those cases have the same Argon2 cost as an incorrect password.
-    static DUMMY_HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    let dummy =
-        DUMMY_HASH.get_or_init(|| hash_password("monitor-user-login-dummy").expect("dummy password hash"));
-    let hash = record.as_ref().and_then(|user| user.password_hash.as_deref()).unwrap_or(dummy);
-    if !verify_password(&body.password, hash)
-        || record.is_none()
-        || record.as_ref().is_some_and(|u| u.password_hash.is_none())
-    {
-        app.throttle.record_failure(ip);
-        return answer(StatusCode::UNAUTHORIZED, "用户名或密码错误");
-    }
-    let user = record.expect("checked above");
-    app.throttle.clear(ip);
-    if !user.enabled {
-        return answer(StatusCode::FORBIDDEN, "账号已禁用");
-    }
-    if user.expires_at.is_some_and(|expires| expires <= Utc::now().timestamp()) {
-        return answer(StatusCode::FORBIDDEN, "账号已过期");
-    }
-    match issue_user_session(&app, &headers, user.id) {
-        Ok(cookie) => {
-            with_cookies(Json(serde_json::json!({"ok": true, "id": user.id, "username": username})), [cookie])
+    crate::blocking::response(move || {
+        let ip = client_ip(&app, &headers, peer.ip());
+        if app.throttle.locked(ip) {
+            return answer(StatusCode::TOO_MANY_REQUESTS, "尝试次数过多，稍后再试");
         }
-        Err(error) => fail(error),
-    }
+        let Ok(_permit) = PASSWORD_GATE.try_acquire() else {
+            return answer(StatusCode::TOO_MANY_REQUESTS, "尝试次数过多，稍后再试");
+        };
+        let username = body.username.trim();
+        let record = match app.db.user_login_record(username) {
+            Ok(record) => record,
+            Err(error) => return fail(error),
+        };
+        // Verify a hash even when the account is absent or has no password yet so
+        // those cases have the same Argon2 cost as an incorrect password.
+        static DUMMY_HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        let dummy = DUMMY_HASH
+            .get_or_init(|| hash_password("monitor-user-login-dummy").expect("dummy password hash"));
+        let hash = record.as_ref().and_then(|user| user.password_hash.as_deref()).unwrap_or(dummy);
+        if !verify_password(&body.password, hash)
+            || record.is_none()
+            || record.as_ref().is_some_and(|u| u.password_hash.is_none())
+        {
+            app.throttle.record_failure(ip);
+            return answer(StatusCode::UNAUTHORIZED, "用户名或密码错误");
+        }
+        let user = record.expect("checked above");
+        app.throttle.clear(ip);
+        if !user.enabled {
+            return answer(StatusCode::FORBIDDEN, "账号已禁用");
+        }
+        if user.expires_at.is_some_and(|expires| expires <= Utc::now().timestamp()) {
+            return answer(StatusCode::FORBIDDEN, "账号已过期");
+        }
+        match issue_user_session(&app, &headers, user.id) {
+            Ok(cookie) => with_cookies(
+                Json(serde_json::json!({"ok": true, "id": user.id, "username": username})),
+                [cookie],
+            ),
+            Err(error) => fail(error),
+        }
+    })
+    .await
 }
 
 pub async fn logout(State(app): State<crate::Shared>, headers: HeaderMap) -> Response {
-    if let Some(token) = cookie_value(&headers, COOKIE) {
-        let _ = app.db.drop_session(&sha256(&token));
-    }
-    with_cookies(
-        Json(serde_json::json!({"ok": true})),
-        [set_cookie(COOKIE, "", 0, app.secure_cookies(&headers))],
-    )
+    crate::blocking::response(move || {
+        if let Some(token) = cookie_value(&headers, COOKIE) {
+            let _ = app.db.drop_session(&sha256(&token));
+        }
+        with_cookies(
+            Json(serde_json::json!({"ok": true})),
+            [set_cookie(COOKIE, "", 0, app.secure_cookies(&headers))],
+        )
+    })
+    .await
 }
 
 /// Step one of the OAuth exchange: issue a state nonce and redirect the browser
 /// to GitHub. The nonce returns in step two and must match.
 pub async fn github_start(State(app): State<crate::Shared>, headers: HeaderMap) -> Response {
-    let Some(client_id) = app.db.get("github_client_id").filter(|v| !v.is_empty()) else {
-        return answer(StatusCode::PRECONDITION_FAILED, "没有配置 GitHub 登录");
-    };
-    let state = random_token();
-    let url = format!(
-        "https://github.com/login/oauth/authorize?client_id={client_id}&scope=read:user&state={state}"
-    );
-    with_cookies(Redirect::to(&url), [set_cookie(STATE_COOKIE, &state, 600, app.secure_cookies(&headers))])
+    crate::blocking::response(move || {
+        let Some(client_id) = app.db.get("github_client_id").filter(|v| !v.is_empty()) else {
+            return answer(StatusCode::PRECONDITION_FAILED, "没有配置 GitHub 登录");
+        };
+        let state = random_token();
+        let url = format!(
+            "https://github.com/login/oauth/authorize?client_id={client_id}&scope=read:user&state={state}"
+        );
+        with_cookies(
+            Redirect::to(&url),
+            [set_cookie(STATE_COOKIE, &state, 600, app.secure_cookies(&headers))],
+        )
+    })
+    .await
 }
 
 /// Every field is optional. With required fields axum would reject a malformed
@@ -345,12 +363,15 @@ pub async fn github_callback(
         Ok(user) => user,
         Err(e) => return sign_in_failed(&app, &headers, e),
     };
-    let session = match issue_session(&app, &headers) {
-        Ok(cookie) => cookie,
-        Err(e) => return sign_in_failed(&app, &headers, e),
-    };
-    crate::notify::signed_in(&app, &format!("GitHub {user}"), client_ip(&app, &headers, peer.ip()));
-    with_cookies(Redirect::to("/admin/nodes"), [clear_state(&app, &headers), session])
+    crate::blocking::response(move || {
+        let session = match issue_session(&app, &headers) {
+            Ok(cookie) => cookie,
+            Err(e) => return sign_in_failed(&app, &headers, e),
+        };
+        crate::notify::signed_in(&app, &format!("GitHub {user}"), client_ip(&app, &headers, peer.ip()));
+        with_cookies(Redirect::to("/admin/nodes"), [clear_state(&app, &headers), session])
+    })
+    .await
 }
 
 /// Redirects the browser back to the sign-in page with the reason, rather than
@@ -413,12 +434,19 @@ fn github_failed(e: reqwest::Error) -> anyhow::Error {
 
 /// Exchanges the code for a token and checks the login against the allow list,
 /// returning the accepted login.
-async fn github_login(app: &App, code: &str) -> Result<String> {
-    let (Some(id), Some(secret)) = (app.db.get("github_client_id"), app.db.get("github_client_secret"))
-    else {
+async fn github_login(app: &crate::Shared, code: &str) -> Result<String> {
+    let state = app.clone();
+    let (id, secret, allowed) = crate::blocking::run(move || {
+        (
+            state.db.get("github_client_id"),
+            state.db.get("github_client_secret"),
+            state.db.get("github_allowed_users").unwrap_or_default(),
+        )
+    })
+    .await?;
+    let (Some(id), Some(secret)) = (id, secret) else {
         refuse!("没有配置 GitHub 登录");
     };
-    let allowed = app.db.get("github_allowed_users").unwrap_or_default();
     let allowed: Vec<String> =
         allowed.split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect();
     if allowed.is_empty() {

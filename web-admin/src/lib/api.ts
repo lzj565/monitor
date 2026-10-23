@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react"
+import { createNodeStream, type NodeFrame } from "./node-stream.ts"
 
 export type Metrics = {
   /** The agent's `--iface`, empty for the default rules; absent from an agent predating it. */
@@ -400,12 +401,14 @@ async function failure(res: Response): Promise<ApiError> {
 }
 
 /** `fetch`, failing with a message for the reader when nothing answers at all. */
-async function send(url: string, init?: RequestInit): Promise<Response> {
+async function send(url: string, init?: RequestInit, timeoutMs = 15_000): Promise<Response> {
   try {
-    return await fetch(url, init)
+    const timeout = AbortSignal.timeout(timeoutMs)
+    return await fetch(url, { ...init, signal: init?.signal ? AbortSignal.any([init.signal, timeout]) : timeout })
   } catch (e) {
     // An abort was asked for, and the caller tells it apart by name.
     if ((e as Error).name === "AbortError") throw e
+    if ((e as Error).name === "TimeoutError") throw new ApiError(0, "hub 响应超时，请稍后重试")
     throw new ApiError(0, "连不上 hub，检查网络后重试")
   }
 }
@@ -436,9 +439,8 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
 const CHUNK = 4 * 1024 * 1024
 
 /**
- * Uploads a file one chunk at a time. There is no upload id: the hub tracks an
- * upload by the length of what it has already written, so a chunk states only
- * where it begins. The last one carries the result.
+ * Uploads a file one chunk at a time. Each upload has a random ID, bound to the administrator session. Chunks
+ * carry the same ID and total, with the next accepted file offset. The last one carries the result.
  */
 export async function upload<T>(
   path: string,
@@ -447,18 +449,19 @@ export async function upload<T>(
   signal?: AbortSignal,
 ): Promise<T> {
   if (file.size === 0) throw new ApiError(400, "文件是空的")
+  const uploadId = crypto.randomUUID().replaceAll("-", "")
   let last: Response | null = null
   for (let offset = 0; offset < file.size; offset += CHUNK) {
     // A chunk boundary is a genuine stopping point: the hub applies nothing until
     // the last piece lands, and `offset = 0` truncates whatever an abandoned
     // attempt left behind, so aborting here leaves the state unchanged.
     if (signal?.aborted) throw new DOMException("aborted", "AbortError")
-    const res = await send(`/api${path}?offset=${offset}&total=${file.size}`, {
+    const res = await send(`/api${path}?upload_id=${uploadId}&offset=${offset}&total=${file.size}`, {
       method: "POST",
       headers: { "content-type": "application/octet-stream" },
       body: file.slice(offset, offset + CHUNK),
       signal,
-    })
+    }, 120_000)
     // A 413 never reached the hub: the proxy in front answered, and only its
     // own logs record it. The message names the setting responsible.
     if (res.status === 413) {
@@ -486,124 +489,26 @@ export function useNodes(enabled = true) {
 
   useEffect(() => {
     if (!enabled) return
-    let socket: WebSocket | null = null
-    let poll: ReturnType<typeof setInterval> | null = null
-    let retry: ReturnType<typeof setTimeout> | null = null
-    let silent: ReturnType<typeof setTimeout> | null = null
-
-    // Bumped by `pause`, which a refresh replacing this effect also runs. A
-    // request started before then may fail or land after a newer one, and
-    // neither result describes the page now; it is dropped rather than shown.
-    let epoch = 0
-    const fetchOnce = () => {
-      const started = epoch
-      return api<{ nodes: Node[]; admin: boolean }>("/nodes")
-        .then((d) => {
-          if (started !== epoch) return
-          setNodes(d.nodes)
-          setAdmin(d.admin)
-          setError(null)
-        })
-        .catch((e: Error) => {
-          if (started !== epoch) return
-          setError(e.message)
-          // With the public page switched off, a revoked session receives a 401
-          // here and on the stream, so the frame that would report admin=false
-          // never arrives and the panel would retain the list it already had.
-          if (e instanceof ApiError && e.status === 401) setAdmin(false)
-        })
-    }
-
     const url = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/ws`
-    // A hub restart closes every stream. Without reconnecting, a page that
-    // outlives a deploy would remain on the fallback poll for the rest of its
-    // life, refreshing at a fifth of the live rate with no indication.
-    const connect = () => {
-      let opened: WebSocket
-      try {
-        opened = new WebSocket(url)
-      } catch {
-        poll ??= setInterval(fetchOnce, 5000)
-        return
-      }
-      socket = opened
-      // Re-armed by every frame. Five of the hub's two-second pushes without one
-      // mean the connection died without closing, as when a NAT on the path
-      // forgets it or the hub's machine drops off the network; the browser sends
-      // nothing on it and would notice only when TCP keepalive gives up, 450 s
-      // later in Chrome. The stream is replaced rather
-      // than closed and awaited: on a dead connection the close event arrives
-      // only after the 60 s closing handshake times out. The notice stays until
-      // data arrives, since with no network the fetch started alongside may hang
-      // rather than fail.
-      const watch = () => {
-        if (silent) clearTimeout(silent)
-        silent = setTimeout(() => {
-          setError("实时数据中断，正在重新连接")
-          resume()
-        }, 10_000)
-      }
-      watch()
-      // Only a frame that parses re-arms the watchdog, so a stream whose frames
-      // cannot be read counts as silent and is replaced.
-      opened.onmessage = (event) => {
-        let nodes, admin
-        try {
-          ;({ nodes, admin } = JSON.parse(event.data))
-        } catch (e) {
-          console.warn("live frame dropped:", e)
-          return
-        }
-        watch()
-        setNodes(nodes)
-        setAdmin(admin)
-        setError(null)
-        // The stream has returned; the poll was only covering for it.
-        if (poll) {
-          clearInterval(poll)
-          poll = null
-        }
-      }
-      opened.onerror = () => opened.close()
-      opened.onclose = () => {
-        if (silent) clearTimeout(silent)
-        poll ??= setInterval(fetchOnce, 5000)
-        retry = setTimeout(connect, 5000)
-      }
-    }
-
-    // A phone suspends a page it sends to the background and drops its
-    // connections without telling it. Back in front, the socket may still read
-    // as open while nothing arrives, or close and wait out the retry, either
-    // way leaving the figures from before; a request caught in flight fails.
-    // So a hidden page lets go of the stream and starts nothing, and a visible
-    // one fetches at once and opens a fresh stream.
-    const pause = () => {
-      epoch++
-      if (socket) {
-        socket.onclose = null
-        socket.close()
-        socket = null
-      }
-      if (poll) clearInterval(poll)
-      if (retry) clearTimeout(retry)
-      if (silent) clearTimeout(silent)
-      poll = retry = silent = null
-    }
-    const resume = () => {
-      pause()
-      fetchOnce()
-      connect()
-    }
-    const visibility = () => (document.hidden ? pause() : resume())
-    document.addEventListener("visibilitychange", visibility)
-    resume()
-
-    return () => {
-      document.removeEventListener("visibilitychange", visibility)
-      pause()
-    }
+    return createNodeStream({
+      fetchNodes: (signal) => api<NodeFrame>("/nodes", { signal }),
+      openSocket: () => new WebSocket(url),
+      onFrame: (frame) => {
+        if (frame.nodes !== null) setNodes(frame.nodes)
+        setAdmin(frame.admin)
+        setError(frame.stale ? frame.error ?? "实时数据暂时不可用，正在显示上次结果" : null)
+      },
+      onError: (error) => {
+        setError(error.message)
+        if (error instanceof ApiError && error.status === 401) setAdmin(false)
+      },
+    })
   }, [enabled, reload])
 
-  return { nodes, admin, error, refresh: () => setReload((n) => n + 1) }
+  return {
+    nodes: enabled ? nodes : null,
+    admin: enabled ? admin : null,
+    error: enabled ? error : null,
+    refresh: () => setReload((n) => n + 1),
+  }
 }

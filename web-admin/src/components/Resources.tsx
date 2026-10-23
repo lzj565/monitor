@@ -50,7 +50,7 @@ import {
   type ProxyTrafficSummary,
 } from "@/lib/resources"
 
-function notifySync(message: string, sync?: SyncReport) {
+function notifySync(message: string, sync: SyncReport | undefined, signal: AbortSignal) {
   if (!sync) {
     toast.success(message)
     return
@@ -64,7 +64,7 @@ function notifySync(message: string, sync?: SyncReport) {
   if (otherFailures) toast.error(`${otherFailures} 个节点未能排队同步，请检查节点配置或命令队列`)
 
   if (queued) {
-    void resolveSync(sync).then((result) => {
+    void resolveSync(sync, signal).then((result) => {
       if (result.failed.length) {
         toast.error(`有 ${result.failed.length} 个节点应用配置失败：${result.failed.map((item) => `${item.node_id}（${item.message}）`).join("、")}`)
       }
@@ -74,8 +74,13 @@ function notifySync(message: string, sync?: SyncReport) {
       if (result.succeeded.length) {
         toast.success(`配置已在 ${result.succeeded.length} 个节点应用`)
       }
-    }).catch((error) => toast.error(`查询配置同步结果失败：${(error as Error).message}`))
+    }).catch((error) => { if (!signal.aborted) toast.error(`查询配置同步结果失败：${(error as Error).message}`) })
   }
+}
+
+function useNotifySync() {
+  const { syncSignal } = useAdminResources()
+  return (message: string, sync?: SyncReport) => notifySync(message, sync, syncSignal())
 }
 
 type Go = (to: string) => void
@@ -156,6 +161,7 @@ function ProxyForm({ proxy, nodes, onClose, onSaved }: {
   onClose: () => void
   onSaved: () => void
 }) {
+  const notifySync = useNotifySync()
   const initialReality = proxy?.config.reality
   const [creationPair] = useState(() => proxy ? null : generateRealityKeyPair())
   const initialNodeId = proxy?.node_id ?? nodes[0]?.id ?? 0
@@ -404,6 +410,7 @@ function ProxyForm({ proxy, nodes, onClose, onSaved }: {
 }
 
 function ProxyPage({ nodes }: { nodes: Node[] }) {
+  const notifySync = useNotifySync()
   const { items, error, loading, reload } = useAllProxies()
   const [query, setQuery] = useState("")
   const [nodeFilter, setNodeFilter] = useState("all")
@@ -593,6 +600,7 @@ function UserForm({ user, onClose, onSaved }: {
   onClose: () => void
   onSaved: () => void
 }) {
+  const notifySync = useNotifySync()
   const [username, setUsername] = useState(user?.username ?? "")
   const [password, setPassword] = useState("")
   const [trafficLimit, setTrafficLimit] = useState(user?.traffic_limit ? String(user.traffic_limit / 1024 ** 3) : "")
@@ -806,6 +814,7 @@ function UserTrafficDialog({ user, onClose, onChanged }: { user: User; onClose: 
 }
 
 function UsersPage() {
+  const notifySync = useNotifySync()
   const { items, error, loading, reload: refreshUsers } = useSharedUsers()
   const resources = useAdminResources()
   const [trafficResult, setTrafficResult] = useState<{ revision: number; items: Awaited<ReturnType<typeof listProxyUserTraffic>> | null; error: string } | null>(null)
@@ -970,6 +979,7 @@ function SubscriptionForm({ user, proxies, nodes, accesses, ready, onClose, onSa
   onClose: () => void
   onSaved: () => void
 }) {
+  const notifySync = useNotifySync()
   const [autoAuthorizeNewProxies, setAutoAuthorizeNewProxies] = useState(user.auto_authorize_new_proxies)
   const [proxyQuery, setProxyQuery] = useState("")
   const [expandedGroups, setExpandedGroups] = useState<Record<number, boolean>>({})
@@ -1150,6 +1160,7 @@ function SubscriptionProxyRows({ accesses, proxies, nodes }: { accesses: UserPro
 }
 
 function SubscriptionsPage({ nodes, search }: { nodes: Node[]; search: string }) {
+  const notifySync = useNotifySync()
   const { items: proxies, error: proxyError, loading: proxiesLoading, reload: reloadProxies } = useAllProxies()
   const requestedId = new URLSearchParams(search).get("user_id")
   const requestedUserId = requestedId && /^\d+$/.test(requestedId) ? Number(requestedId) : null

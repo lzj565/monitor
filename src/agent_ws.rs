@@ -9,11 +9,12 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{Message, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use chrono::{DateTime, Local};
+use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::mpsc;
@@ -355,11 +356,15 @@ pub async fn handler(
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    let node_id = match authenticate(&app, &headers) {
-        Ok(id) => id,
-        Err(refusal) => return crate::api::answer(StatusCode::UNAUTHORIZED, refusal),
+    let state = app.clone();
+    let auth_headers = headers.clone();
+    let authenticated = crate::blocking::run(move || authenticate(&state, &auth_headers)).await;
+    let node_id = match authenticated {
+        Ok(Ok(id)) => id,
+        Ok(Err(refusal)) => return crate::api::answer(StatusCode::UNAUTHORIZED, refusal),
+        Err(error) => return crate::api::fail(error),
     };
-    let ip = node_ip(&app, &headers, peer.ip()).to_string();
+    let ip = crate::blocking::in_place(|| node_ip(&app, &headers, peer.ip())).to_string();
 
     upgrade.read_buffer_size(crate::api::SOCKET_BUFFER).max_message_size(crate::api::MAX_FRAME).on_upgrade(
         move |socket| async move {
@@ -387,15 +392,19 @@ pub async fn echo(
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    let node_id = match authenticate(&app, &headers) {
-        Ok(id) => id,
-        Err(refusal) => return crate::api::answer(StatusCode::UNAUTHORIZED, refusal),
+    let state = app.clone();
+    let auth_headers = headers.clone();
+    let authenticated = crate::blocking::run(move || authenticate(&state, &auth_headers)).await;
+    let node_id = match authenticated {
+        Ok(Ok(id)) => id,
+        Ok(Err(refusal)) => return crate::api::answer(StatusCode::UNAUTHORIZED, refusal),
+        Err(error) => return crate::api::fail(error),
     };
     // A proxy that wrote nothing leaves the proxy's own address here, which
     // would replace an exit recorded earlier with one the panel never shows.
-    let ip = node_ip(&app, &headers, peer.ip());
+    let ip = crate::blocking::in_place(|| node_ip(&app, &headers, peer.ip()));
     if public(ip) {
-        if let Err(e) = app.db.set_ip_other(node_id, &ip.to_string()) {
+        if let Err(e) = crate::blocking::in_place(|| app.db.set_ip_other(node_id, &ip.to_string())) {
             warn!("node {node_id}: storing the address seen in the other family failed: {e:#}");
         }
     }
@@ -407,7 +416,11 @@ pub(crate) fn bearer(headers: &HeaderMap) -> Option<&str> {
     headers.get("authorization")?.to_str().ok()?.strip_prefix("Bearer ").filter(|t| !t.is_empty())
 }
 
-async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> Result<()> {
+async fn serve<S, E>(app: Shared, node_id: i64, ip: String, mut socket: S) -> Result<()>
+where
+    S: Stream<Item = std::result::Result<Message, E>> + Sink<Message, Error = E> + Unpin,
+    E: std::error::Error + Send + Sync + 'static,
+{
     let (tx, mut rx) = mpsc::channel::<String>(16);
     let tag = SESSION.fetch_add(1, Ordering::Relaxed);
     // Online from the handshake rather than the first report: a panel reporting
@@ -424,14 +437,6 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> 
     drop(replaced);
     info!("node {node_id} connected from {ip}");
 
-    // Send the probe list before the first report arrives.
-    let _ = socket.send(Message::Text(ping_tasks_message(&app, node_id).into())).await;
-    // The agent may have been offline when a user's UUID or authorization
-    // changed. Always reconcile to the hub's current state on reconnect.
-    if !crate::api::sync_node_config_on_connect(&app, node_id) {
-        debug!("node {node_id}: current sing-box config will need another sync attempt");
-    }
-
     let mut heartbeat = tokio::time::interval(HEARTBEAT);
     heartbeat.tick().await; // The first tick completes immediately.
     let mut last_frame = Instant::now();
@@ -442,10 +447,17 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> 
     let mut owed: Option<String> = None;
     let mut session = Session { tag, ..Session::default() };
 
-    let outcome = loop {
+    let outcome = async {
+        send_frame(&mut socket, Message::Text(crate::blocking::in_place(|| ping_tasks_message(&app, node_id)).into())).await?;
+        // Always reconcile before reports arrive, including after an offline
+        // credential or authorization change.
+        if !crate::blocking::in_place(|| crate::api::sync_node_config_on_connect(&app, node_id)) {
+            debug!("node {node_id}: current sing-box config will need another sync attempt");
+        }
+        loop {
         tokio::select! {
             outbound = rx.recv() => match outbound {
-                Some(text) => socket.send(Message::Text(text.into())).await?,
+                Some(text) => send_frame(&mut socket, Message::Text(text.into())).await?,
                 None => break Ok(()),
             },
             // A machine that leaves the network without closing its socket would
@@ -459,15 +471,15 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> 
                     break Err(anyhow::anyhow!("silent for {}s", quiet.as_secs()));
                 }
                 if let Some(source) = &owed {
-                    match tokio::task::block_in_place(|| app.db.country_owed(node_id, source)) {
+                    match crate::blocking::in_place(|| app.db.country_owed(node_id, source)) {
                         Ok(true) => locate(app.clone(), node_id, source.clone()),
                         Ok(false) => owed = None,
                         Err(e) => debug!("node {node_id}: country check failed: {e:#}"),
                     }
                 }
-                socket.send(Message::Ping(Vec::new().into())).await?;
+                send_frame(&mut socket, Message::Ping(Vec::new().into())).await?;
             }
-            inbound = socket.recv() => {
+            inbound = socket.next() => {
                 last_frame = Instant::now();
                 match inbound {
                 // A frame can wait on the single database connection, which a
@@ -477,7 +489,7 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> 
                 // signal.
                 Some(Ok(Message::Text(text))) => {
                     let arrival = Arrival::now();
-                    match tokio::task::block_in_place(|| dispatch(&app, node_id, &ip, &text, &mut session, arrival)) {
+                    match crate::blocking::in_place(|| dispatch(&app, node_id, &ip, &text, &mut session, arrival)) {
                         Ok(Some(source)) => {
                             locate(app.clone(), node_id, source.clone());
                             owed = Some(source);
@@ -492,14 +504,24 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> 
                 }
             }
         }
-    };
+        }
+    }.await;
 
     let ended = release(&app, node_id, tag);
     if ended.is_some() {
         info!("node {node_id} went offline");
     }
-    tokio::task::block_in_place(|| close(&app, node_id, ended.as_ref(), &mut session));
+    crate::blocking::in_place(|| close(&app, node_id, ended.as_ref(), &mut session));
     outcome
+}
+
+async fn send_frame<S, E>(socket: &mut S, message: Message) -> Result<()>
+where
+    S: Sink<Message, Error = E> + Unpin,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    tokio::time::timeout(Duration::from_secs(15), socket.send(message)).await??;
+    Ok(())
 }
 
 /// Drops a node's connection state, but only while the session tagged `tag` is
@@ -1077,6 +1099,94 @@ pub fn push_ping_tasks(app: &App, only: Option<i64>) {
 
 #[cfg(test)]
 mod tests {
+    struct BrokenSocket {
+        app: Shared,
+        node_id: i64,
+        heartbeat: bool,
+        stall: bool,
+        writes: usize,
+        command: std::sync::Arc<Mutex<Option<String>>>,
+    }
+
+    impl Stream for BrokenSocket {
+        type Item = std::io::Result<Message>;
+        fn poll_next(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    impl Sink<Message> for BrokenSocket {
+        type Error = std::io::Error;
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn start_send(mut self: std::pin::Pin<&mut Self>, message: Message) -> std::io::Result<()> {
+            self.writes += 1;
+            if self.writes == 1 {
+                let session = self.app.agents.read().unwrap()[&self.node_id].session;
+                *self.command.lock().unwrap() =
+                    Some(self.app.commands.start(self.node_id, session, "singbox.status").unwrap());
+            }
+            let fail = if self.stall {
+                false
+            } else if self.heartbeat {
+                matches!(message, Message::Ping(_))
+            } else {
+                self.writes > 1
+            };
+            if fail {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            } else {
+                Ok(())
+            }
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.stall && self.writes > 1 {
+                std::task::Poll::Pending
+            } else {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_or_stalled_command_and_heartbeat_sends_take_the_node_offline() {
+        for (heartbeat, stall) in [(false, false), (true, false), (false, true)] {
+            let app = std::sync::Arc::new(app());
+            let node_id = node(&app);
+            let command = std::sync::Arc::new(Mutex::new(None));
+            let socket = BrokenSocket {
+                app: app.clone(),
+                node_id,
+                heartbeat,
+                stall,
+                writes: 0,
+                command: command.clone(),
+            };
+            assert!(serve(app.clone(), node_id, "203.0.113.9".into(), socket).await.is_err());
+            assert!(!app.agents.read().unwrap().contains_key(&node_id));
+            let id = command.lock().unwrap().clone().unwrap();
+            let result = app.commands.get(&id, node_id).unwrap();
+            assert_eq!(result.status, "failed");
+            assert_eq!(result.error.unwrap().code, "AGENT_DISCONNECTED");
+        }
+    }
+
     use chrono::TimeZone;
 
     use super::*;

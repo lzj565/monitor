@@ -8,19 +8,24 @@ function createResources() {
 }
 
 const Context = createContext<(ReturnType<typeof createResources> & {
+  syncSignal: () => AbortSignal
   authorizationRevision: number
   invalidateAuthorizations: () => void
 }) | null>(null)
 
 export function AdminResourcesProvider({ nodes, children }: { nodes: { id: number }[]; children: ReactNode }) {
   const [resources] = useState(createResources)
+  const syncController = useRef(new AbortController())
+  const syncSignal = useCallback(() => syncController.current.signal, [])
   const [authorizationRevision, setAuthorizationRevision] = useState(0)
   const invalidateAuthorizations = useCallback(() => setAuthorizationRevision((value) => value + 1), [])
   const nodeKey = nodes.map((node) => node.id).sort((a, b) => a - b).join(",")
   const previousNodeKey = useRef(nodeKey)
   useEffect(() => {
+    syncController.current = new AbortController()
     void resources.users.refresh()
     return () => {
+      syncController.current.abort()
       resources.users.cancel()
       resources.proxies.cancel()
     }
@@ -34,7 +39,7 @@ export function AdminResourcesProvider({ nodes, children }: { nodes: { id: numbe
       void resources.users.refresh(true)
     }
   }, [nodeKey, resources, invalidateAuthorizations])
-  const value = useMemo(() => ({ ...resources, authorizationRevision, invalidateAuthorizations }), [resources, authorizationRevision, invalidateAuthorizations])
+  const value = useMemo(() => ({ ...resources, syncSignal, authorizationRevision, invalidateAuthorizations }), [resources, syncSignal, authorizationRevision, invalidateAuthorizations])
   return <Context.Provider value={value}>{children}</Context.Provider>
 }
 

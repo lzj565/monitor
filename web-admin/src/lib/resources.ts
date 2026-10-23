@@ -1,4 +1,5 @@
 import { api } from "@/lib/api"
+import { resolveCommandSync } from "./command-sync.ts"
 
 export type AddressType = "domain" | "ipv4" | "ipv6"
 export type Flow = "" | "xtls-rprx-vision"
@@ -62,32 +63,9 @@ export type SyncResolution = {
 }
 
 /** Waits briefly for Agent command results; initial queue state is available immediately. */
-export async function resolveSync(report: SyncReport): Promise<SyncResolution> {
-  const resolution: SyncResolution = { succeeded: [], failed: [], pending: [] }
-  await Promise.all(report.queued.map(async ({ node_id, command_id }) => {
-    const deadline = Date.now() + 36_000
-    while (Date.now() < deadline) {
-      try {
-        const command = await api<{ status: string; error?: { message?: string } }>(
-          `/nodes/${node_id}/commands/${encodeURIComponent(command_id)}`,
-        )
-        if (command.status === "succeeded") {
-          resolution.succeeded.push(node_id)
-          return
-        }
-        if (command.status === "failed") {
-          resolution.failed.push({ node_id, message: command.error?.message ?? "Agent 应用失败" })
-          return
-        }
-      } catch (error) {
-        resolution.failed.push({ node_id, message: error instanceof Error ? error.message : "查询命令结果失败" })
-        return
-      }
-      await new Promise((resolve) => setTimeout(resolve, 500))
-    }
-    resolution.pending.push(node_id)
-  }))
-  return resolution
+export function resolveSync(report: SyncReport, signal?: AbortSignal): Promise<SyncResolution> {
+  return resolveCommandSync(report, (nodeId, commandId, requestSignal) =>
+    api(`/nodes/${nodeId}/commands/${encodeURIComponent(commandId)}`, { signal: requestSignal }), { signal })
 }
 
 export type ProxyTrafficSummary = {

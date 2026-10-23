@@ -62,8 +62,11 @@ pub struct Theme {
 }
 
 pub async fn serve(State(app): State<Shared>, headers: HeaderMap, uri: Uri) -> Response {
-    let known = headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok());
-    respond(&app, uri.path().trim_start_matches('/'), uri.query(), known, &|html| stamp_icons(&app, html))
+    crate::blocking::response(move || {
+        let known = headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok());
+        respond(&app, uri.path().trim_start_matches('/'), uri.query(), known, &|html| stamp_icons(&app, html))
+    })
+    .await
 }
 
 /// What `serve` answers for `path`. `shell` rewrites the HTML shell on its way

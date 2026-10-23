@@ -27,11 +27,13 @@ macro_rules! refuse {
 mod agent_ws;
 mod api;
 mod auth;
+mod blocking;
 mod command;
 mod db;
 mod frontend;
 mod notify;
 mod proxy;
+mod uploads;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -56,6 +58,8 @@ pub type Shared = Arc<App>;
 
 pub struct App {
     pub db: Db,
+    pub uploads: uploads::Registry,
+    pub restore_gate: Arc<tokio::sync::Mutex<()>>,
     /// Every connected agent: its outbound channel, the session that opened it,
     /// and its latest report. A single map, since connectivity and current
     /// figures are one fact about a node rather than two. See `agent_ws`.
@@ -106,6 +110,8 @@ impl App {
     fn new(db: Db, site: String, themes: PathBuf, notes: tokio::sync::mpsc::Sender<notify::Note>) -> Self {
         Self {
             db,
+            uploads: uploads::Registry::default(),
+            restore_gate: Arc::new(tokio::sync::Mutex::new(())),
             agents: RwLock::default(),
             commands: command::Registry::default(),
             readings: Mutex::default(),
@@ -1059,21 +1065,37 @@ fn renew_online_nodes(app: &App) -> Result<()> {
 /// next hour.
 async fn housekeeping(app: Shared) {
     loop {
-        if let Err(e) = app.db.reset_due_user_traffic(chrono::Utc::now().timestamp()) {
-            warn!("resetting scheduled user traffic failed: {e:#}");
-        }
-        // First, so the midnight pass does not wait on pruning.
-        if let Err(e) = renew_online_nodes(&app) {
-            warn!("rolling expiry dates failed: {e:#}");
-        }
-        if let Err(e) = app.db.expire_sessions() {
-            warn!("expiring sessions failed: {e:#}");
-        }
-        // After the roll-over, so the digest lists dates as they now stand.
-        match notify::expiry_digest(&app, Local::now()) {
-            Ok(Some(note)) => notify::send(&app, note),
-            Ok(None) => {}
-            Err(e) => warn!("expiry digest failed: {e:#}"),
+        let state = app.clone();
+        if let Err(error) = blocking::run(move || {
+            let app = state;
+            app.uploads.cleanup();
+            let database = PathBuf::from(app.db.file());
+            if let (Some(parent), Some(name)) =
+                (database.parent(), database.file_name().and_then(|name| name.to_str()))
+            {
+                app.uploads.cleanup_files(parent, &format!("{name}.upload-"), "");
+            }
+            app.uploads.cleanup_files(&app.themes, ".upload-", ".tar.gz");
+            if let Err(e) = app.db.reset_due_user_traffic(chrono::Utc::now().timestamp()) {
+                warn!("resetting scheduled user traffic failed: {e:#}");
+            }
+            // First, so the midnight pass does not wait on pruning.
+            if let Err(e) = renew_online_nodes(&app) {
+                warn!("rolling expiry dates failed: {e:#}");
+            }
+            if let Err(e) = app.db.expire_sessions() {
+                warn!("expiring sessions failed: {e:#}");
+            }
+            // After the roll-over, so the digest lists dates as they now stand.
+            match notify::expiry_digest(&app, Local::now()) {
+                Ok(Some(note)) => notify::send(&app, note),
+                Ok(None) => {}
+                Err(e) => warn!("expiry digest failed: {e:#}"),
+            }
+        })
+        .await
+        {
+            warn!("housekeeping task failed: {error:#}");
         }
         // Last, and off the runtime: the first pass after an upgrade folds every
         // hour still held in minute rows and prunes the week's excess, which

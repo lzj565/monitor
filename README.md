@@ -50,6 +50,27 @@ hub 数据库和主题仍在 `/opt/monitor/data/`；hub 启动参数仍在 syste
 
 agent 卸载会删除新旧位置的 `agent.env`，保留 sing-box 配置。升级需配套使用更新后的 agent 二进制与安装器。
 
+## 开发与验证
+
+后端按 API 业务、数据库查询及迁移分别放在 `src/api/`、`src/db/`；管理页面位于 `web-admin/src/components/admin/`，按路由加载。同步 HTTP 工作通过 `src/blocking.rs` 限制并发，并在阻塞线程执行。
+
+```sh
+npm --prefix web-admin ci
+npm --prefix web-admin test
+npm --prefix web-admin run lint
+npm --prefix web-admin run build
+sh scripts/theme.sh
+cargo fmt --all --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked
+sh scripts/check-agent-unit.sh
+sh scripts/check-api-port-selection.sh
+```
+
+CI 检查 `main`、`dev` 和拉取请求。E2E 使用 `agent-test.pin` 固定的 Agent 版本及 SHA-256，下载来源与 `src/main.rs` 中的 `AGENT_REPO` 一致。更新兼容性测试版本时需同时更新 pin 中的版本和摘要。
+
+备份恢复和主题上传的每个分片必须携带 `upload_id`（32 位十六进制随机值）、`offset` 和 `total`。同一文件的 ID、登录会话及总大小必须保持一致；每片最多 8 MiB，面板使用 4 MiB。不同上传使用独立临时文件，同一上传的写入、校验和发布互斥；恢复操作串行执行。未完成的上传保留一小时，过期后清理，重启后需重新上传。旧上传客户端需增加 `upload_id` 参数。
+
 ### 可选安装 Realm
 
 单节点安装和批量添加中的“安装 Realm”开关默认关闭。开启生成 `--realm`，安装固定版本 2.9.6；关闭生成 `--no-realm`，执行后卸载本安装脚本管理的 Realm 程序和服务，保留配置。页面开关表示本次安装选择，不表示节点当前状态。

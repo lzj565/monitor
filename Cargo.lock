@@ -952,6 +952,7 @@ dependencies = [
  "chrono",
  "flate2",
  "futures-core",
+ "futures-util",
  "hex",
  "mime_guess",
  "rand 0.9.5",

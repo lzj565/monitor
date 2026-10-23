@@ -298,7 +298,7 @@ fn client() -> &'static reqwest::Client {
 }
 
 async fn post(app: &App, channel: &Channel, note: &Note) -> Result<(), Failure> {
-    let site = site_name(app);
+    let site = crate::blocking::in_place(|| site_name(app));
     let request = match channel {
         // Plain text: under a parse mode Telegram rejects a message whose node
         // name happens to contain markup.
@@ -375,7 +375,7 @@ pub fn send(app: &App, mut note: Note) {
 /// records it as sent, so it is not raised again.
 pub async fn deliver(app: Shared, mut inbox: mpsc::Receiver<Note>) {
     while let Some(note) = inbox.recv().await {
-        for channel in channels(&app) {
+        for channel in crate::blocking::in_place(|| channels(&app)) {
             for attempt in 1..=ATTEMPTS {
                 match post(&app, &channel, &note).await {
                     Ok(()) => break,
@@ -396,7 +396,7 @@ pub async fn deliver(app: Shared, mut inbox: mpsc::Receiver<Note>) {
 /// `POST /api/notify/test`: one alert through every configured channel, past the
 /// queue and its retries, so each channel's own error reaches the panel.
 pub async fn test(_: Admin, State(app): State<Shared>) -> Response {
-    let channels = channels(&app);
+    let channels = crate::blocking::in_place(|| channels(&app));
     if channels.is_empty() {
         return answer(StatusCode::BAD_REQUEST, "还没有配置通知渠道");
     }
@@ -522,7 +522,7 @@ pub async fn watch(app: Shared) {
     loop {
         ticker.tick().await;
         // Synchronous database work, kept off the runtime threads like a report.
-        match tokio::task::block_in_place(|| sweep(&app, &mut watch, Utc::now().timestamp())) {
+        match crate::blocking::in_place(|| sweep(&app, &mut watch, Utc::now().timestamp())) {
             Ok(notes) => notes.into_iter().for_each(|note| send(&app, note)),
             Err(e) => warn!("notification sweep failed: {e:#}"),
         }
