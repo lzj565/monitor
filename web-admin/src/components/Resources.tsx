@@ -3,6 +3,7 @@ import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "rea
 import { AlertTriangle, ChevronDown, ChevronRight, ChevronUp, Copy, Eye, EyeOff, Pencil, Plus, RefreshCw, Settings2, Trash2 } from "lucide-react"
 import { toast } from "sonner"
 
+import { ProxyDialog } from "@/components/ProxyDialog"
 import { TrafficUsage } from "@/components/TrafficUsage"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -157,12 +158,14 @@ function defaultAddressType(node: Node | undefined): ProxyDraft["address_type"] 
   return "domain"
 }
 
-function ProxyForm({ proxy, nodes, onClose, onSaved, onTypeChange }: {
+function ProxyForm({ proxy, nodes, onClose, onSaved, onBack, embedded, onBusyChange }: {
   proxy: Proxy | null
   nodes: Node[]
   onClose: () => void
   onSaved: () => void
-  onTypeChange?: (type: "vless" | "realm") => void
+  onBack?: () => void
+  embedded?: boolean
+  onBusyChange?: (busy: boolean) => void
 }) {
   const notifySync = useNotifySync()
   const initialReality = proxy?.config.reality
@@ -274,7 +277,7 @@ function ProxyForm({ proxy, nodes, onClose, onSaved, onTypeChange }: {
       },
     }
 
-    setSaving(true)
+    setSaving(true); onBusyChange?.(true)
     try {
       const saved = proxy
         ? await updateProxy(proxy.id, draft, nodeId)
@@ -285,16 +288,14 @@ function ProxyForm({ proxy, nodes, onClose, onSaved, onTypeChange }: {
     } catch (e) {
       toast.error((e as Error).message)
     } finally {
-      setSaving(false)
+      setSaving(false); onBusyChange?.(false)
     }
   }
 
-  return (
-    <Dialog open onOpenChange={(open) => !open && onClose()}>
-      <DialogContent onOpenAutoFocus={(event) => event.preventDefault()} className="flex max-h-[90vh] w-full max-w-[calc(100%-2rem)] flex-col gap-0 overflow-hidden p-0 sm:max-w-md">
+  const form = (
         <form className="flex min-h-0 flex-1 flex-col" onSubmit={save}>
           <DialogHeader className="shrink-0 px-6 pt-5 pb-3">
-            <DialogTitle className="pr-6 [overflow-wrap:anywhere]">{proxy ? `编辑代理：${displayProxyName(proxy, initialNode)}` : "新增代理"}</DialogTitle>
+            <DialogTitle className="pr-6 [overflow-wrap:anywhere]">{proxy ? `编辑代理：${displayProxyName(proxy, initialNode)}` : "新增 VLESS Reality 代理"}</DialogTitle>
             <DialogDescription>配置服务器上的 VLESS Reality 代理。</DialogDescription>
           </DialogHeader>
           <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-6 pb-4">
@@ -302,12 +303,7 @@ function ProxyForm({ proxy, nodes, onClose, onSaved, onTypeChange }: {
               <Field label="代理名称 *">
                 <Input autoFocus={!proxy} required maxLength={128} value={name} onChange={(event) => setName(event.target.value)} placeholder="Reality" />
               </Field>
-              <Field label="代理类型 *">
-                <Select value="vless" disabled={!!proxy} onValueChange={(value) => onTypeChange?.(value as "vless" | "realm")}>
-                  <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
-                <SelectContent position="popper"><SelectItem value="vless">VLESS Reality</SelectItem>{!proxy && <SelectItem value="realm">Realm 转发</SelectItem>}</SelectContent>
-                </Select>
-              </Field>
+
             </div>
 
             <div className="flex flex-wrap items-start gap-x-3 gap-y-1 text-sm">
@@ -396,20 +392,20 @@ function ProxyForm({ proxy, nodes, onClose, onSaved, onTypeChange }: {
             </Card>
           </div>
           <DialogFooter className="shrink-0 border-t px-6 py-3">
-            <Button type="button" variant="ghost" onClick={onClose}>取消</Button>
+            {onBack && <Button type="button" variant="outline" disabled={saving} onClick={onBack}>返回选择类型</Button>}
+            <Button type="button" variant="ghost" disabled={saving} onClick={onClose}>取消</Button>
             <Button type="submit" disabled={saving || (!proxy && !nodes.length)}>{proxy ? "保存修改" : "创建代理"}</Button>
           </DialogFooter>
         </form>
-      </DialogContent>
-      {confirmKeyPair && <ConfirmDialog
+  )
+  const content = <>{form}      {confirmKeyPair && <ConfirmDialog
         title="重新生成 Reality 密钥？"
         description="重新生成后，原有客户端使用的 Public Key 将失效，需要重新获取订阅或更新客户端配置。"
         confirmLabel="确认重新生成"
         onClose={() => setConfirmKeyPair(false)}
         onConfirm={regeneratePair}
-      />}
-    </Dialog>
-  )
+      />}</>
+  return embedded ? content : <ProxyDialog busy={saving} onClose={onClose}>{content}</ProxyDialog>
 }
 
 function ProxyPage({ nodes, site, refusal, search, go }: { nodes: Node[]; site: string; refusal: string; search: string; go: Go }) {
@@ -417,7 +413,7 @@ function ProxyPage({ nodes, site, refusal, search, go }: { nodes: Node[]; site: 
   const { items, error, loading, reload } = useAllProxies()
   const realm = useRealmProxies()
   const typeFilter = proxyTypeFilter(search)
-  const [creationType, setCreationType] = useState<"vless" | "realm">("vless")
+  const [creationType, setCreationType] = useState<"vless" | "realm" | null>(null)
   const [editingRealmId, setEditingRealmId] = useState<number | null>(null)
   const [deletingRealm, setDeletingRealm] = useState<RealmRule | null>(null)
   const [detail, setDetail] = useState<{ nodeId: number; ruleId?: number } | null>(null)
@@ -429,13 +425,14 @@ function ProxyPage({ nodes, site, refusal, search, go }: { nodes: Node[]; site: 
   const [nodeFilter, setNodeFilter] = useState("all")
   const [statusFilter, setStatusFilter] = useState("all")
   const [creating, setCreating] = useState(false)
+  const [creationBusy, setCreationBusy] = useState(false)
   const [editing, setEditing] = useState<Proxy | null>(null)
   const [deleting, setDeleting] = useState<Proxy | null>(null)
   const [removing, setRemoving] = useState(false)
   const [updatingProxyId, setUpdatingProxyId] = useState<number | null>(null)
   const drag = useDragOrder(items ?? [], "proxies", reload)
   const nodeById = new Map(nodes.map((node) => [node.id, node]))
-  const visible = proxyListItems(drag.order, realm.rules, realm.hosts, nodes, { query, node: nodeFilter, status: statusFilter, type: typeFilter })
+  const visible = proxyListItems(drag.order, realm.rules, nodes, { query, node: nodeFilter, status: statusFilter, type: typeFilter })
   const searching = query.trim() !== "" || nodeFilter !== "all" || statusFilter !== "all" || typeFilter !== "all"
   const tableLoading = loading || (!realm.loaded && !realm.error && typeFilter !== "vless")
   const changeTypeFilter = (type: string) => {
@@ -449,7 +446,7 @@ function ProxyPage({ nodes, site, refusal, search, go }: { nodes: Node[]; site: 
     catch (e) { toast.error((e as Error).message) }
     finally { setRealmBusy(false) }
   }
-  const setRealmEnabled = (rule: RealmRule, enabled: boolean) => realmAction(() => api(`/realm/rules/${rule.id}`, { method: "PUT", body: JSON.stringify({ node_id: rule.node_id, target_proxy_id: rule.target_proxy_id, name: rule.name, listen_host: rule.listen_host, listen_port: rule.listen_port, enabled }) }), enabled ? "Realm 规则已启用，等待应用" : "Realm 规则已停用，等待应用")
+  const setRealmEnabled = (rule: RealmRule, enabled: boolean) => realmAction(() => api(`/realm/rules/${rule.id}`, { method: "PUT", body: JSON.stringify({ node_id: rule.node_id, target_proxy_id: rule.target_proxy_id, name: rule.name, address_type: rule.address_type, address: rule.address, listen_port: rule.listen_port, enabled }) }), enabled ? "Realm 规则已启用，等待应用" : "Realm 规则已停用，等待应用")
   const realmSaved = () => { void realm.reload(); reload() }
 
   async function remove() {
@@ -496,7 +493,7 @@ function ProxyPage({ nodes, site, refusal, search, go }: { nodes: Node[]; site: 
           <StatusFilter value={statusFilter} onChange={setStatusFilter} labels={[["all", "全部状态"], ["enabled", "已启用"], ["disabled", "已停用"]]} />
         </div>
         {realm.hosts.length > 0 && <select aria-label="节点 Realm 服务" className="h-9 max-w-48 rounded-md border bg-background px-2 text-sm" value="" onChange={(e) => { if (e.target.value) setDetail({ nodeId: Number(e.target.value) }) }}><option value="">节点 Realm 服务…</option>{realm.hosts.map((h) => <option key={h.node_id} value={h.node_id}>{nodeById.get(h.node_id)?.name ?? h.name}</option>)}</select>}
-        <Button disabled={!nodes.length} onClick={() => { setCreationType("vless"); setCreating(true) }}><Plus /> 新增代理</Button>
+        <Button disabled={!nodes.length} onClick={() => { setCreationType(null); setCreating(true) }}><Plus /> 新增代理</Button>
       </div>
 
       {realm.error && <div role="alert" className="text-sm text-destructive">读取 Realm 配置失败：{realm.error}，保留上次结果。<Button size="sm" variant="outline" className="ml-2" onClick={() => void realm.reload()}>重试</Button></div>}
@@ -582,9 +579,12 @@ function ProxyPage({ nodes, site, refusal, search, go }: { nodes: Node[]; site: 
         </Table>
       </Card>
 
-      {creating && creationType === "vless" && <ProxyForm nodes={nodes} proxy={null} onClose={() => setCreating(false)} onSaved={reload} onTypeChange={setCreationType} />}
-      {creating && creationType === "realm" && realm.loaded && items !== null && <RealmProxyForm rule={null} nodes={nodes} proxies={items ?? []} hosts={realm.hosts} rules={realm.rules} ready={realm.loaded && !realm.error && items !== null && !error} site={site} refusal={refusal} onClose={() => setCreating(false)} onSaved={realmSaved} onRefresh={realm.reload} onTypeChange={setCreationType} />}
-      {creating && creationType === "realm" && (!realm.loaded || items === null) && <Dialog open onOpenChange={(open) => { if (!open) setCreating(false) }}><DialogContent><DialogHeader><DialogTitle>新增 Realm 代理</DialogTitle><DialogDescription>{realm.error || error || "正在读取节点与代理配置…"}</DialogDescription></DialogHeader><div className="flex gap-2"><Button variant="outline" onClick={() => { void realm.reload(); reload() }}>重试读取</Button><Button variant="ghost" onClick={() => setCreationType("vless")}>返回 VLESS Reality</Button></div></DialogContent></Dialog>}
+      {creating && <ProxyDialog busy={creationBusy} onClose={() => setCreating(false)}>
+        {creationType === null ? <><DialogHeader className="px-6 pt-6 pb-4"><DialogTitle>选择代理类型</DialogTitle><DialogDescription>选择类型后进入详细配置。</DialogDescription></DialogHeader><div className="grid gap-3 px-6 pb-6 sm:grid-cols-2"><Button className="h-auto min-h-24 flex-col gap-2" variant="outline" onClick={() => setCreationType("vless")}><strong>VLESS Reality</strong><span className="text-xs text-muted-foreground">配置节点上的代理服务</span></Button><Button className="h-auto min-h-24 flex-col gap-2" variant="outline" onClick={() => setCreationType("realm")}><strong>Realm 转发</strong><span className="text-xs text-muted-foreground">监听端口转发到已有代理</span></Button></div></>
+        : creationType === "vless" ? <ProxyForm embedded nodes={nodes} proxy={null} onClose={() => setCreating(false)} onSaved={reload} onBack={() => setCreationType(null)} onBusyChange={setCreationBusy} />
+        : realm.loaded && items !== null ? <RealmProxyForm embedded rule={null} nodes={nodes} proxies={items ?? []} hosts={realm.hosts} rules={realm.rules} ready={realm.loaded && !realm.error && !error} site={site} refusal={refusal} onClose={() => setCreating(false)} onSaved={realmSaved} onRefresh={realm.reload} onBack={() => setCreationType(null)} onBusyChange={setCreationBusy} />
+        : <><DialogHeader className="px-6 pt-6"><DialogTitle>新增 Realm 代理</DialogTitle><DialogDescription>{realm.error || error || "正在读取节点与代理配置…"}</DialogDescription></DialogHeader><div className="flex gap-2 p-6"><Button variant="outline" onClick={() => { void realm.reload(); reload() }}>重试读取</Button><Button variant="ghost" onClick={() => setCreationType(null)}>返回选择类型</Button></div></>}
+      </ProxyDialog>}
       {editingRealm && <RealmProxyForm key={editingRealm.id} rule={editingRealm} nodes={nodes} proxies={items ?? []} hosts={realm.hosts} rules={realm.rules} ready={realm.loaded && !realm.error && items !== null && !error} site={site} refusal={refusal} onClose={() => setEditingRealmId(null)} onSaved={realmSaved} onRefresh={realm.reload} />}
       {detailHost && <RealmEntryDialog key={detailHost.node_id} host={detailHost} rule={detailRule} rules={realm.rules} traffic={realm.traffic} site={site} refusal={refusal} onClose={() => setDetail(null)} onSaved={realm.reload} />}
       {deletingRealm && <ConfirmDialog title={`删除 Realm 代理「${deletingRealm.name}」？`} description="当前转发规则和订阅入口将移除；目标代理、入口节点、其他转发规则及历史流量保留。" confirmLabel="删除 Realm 代理" busy={realmBusy} onClose={() => setDeletingRealm(null)} onConfirm={() => { void realmAction(async () => { await api(`/realm/rules/${deletingRealm.id}`, { method: "DELETE" }); setDeletingRealm(null) }, "已删除 Realm 规则，等待同步") }} />}

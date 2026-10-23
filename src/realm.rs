@@ -212,18 +212,13 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-        db.realm_save_host(&RealmHostInput {
-            node_id: source,
-            public_address: "relay.example.com".into(),
-            enabled: true,
-            takeover: true,
-        })
-        .unwrap();
+        db.realm_save_host(&RealmHostInput { node_id: source, enabled: true }).unwrap();
         let rule = RealmRuleInput {
             node_id: source,
             target_proxy_id: proxy,
             name: "relay".into(),
-            listen_host: "0.0.0.0".into(),
+            address_type: "domain".into(),
+            address: "relay.example.com".into(),
             listen_port: 24443,
             enabled: true,
         };
@@ -263,7 +258,7 @@ mod tests {
         app.commands.complete(next["id"].as_str().unwrap(),source,42,Ok(json!({"installed":true,"managed":true,"running":true,"enabled":true,"revision":apply["params"]["revision"],"digest":apply["params"]["digest"]})));
         tick(&app, &mut slots).unwrap();
         let newest: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
-        assert_eq!(newest["params"]["config"]["endpoints"][0]["listen"], "0.0.0.0:24444");
+        assert_eq!(newest["params"]["config"]["endpoints"][0]["listen"], "[::]:24444");
     }
     #[test]
     fn reconnect_adopts_confirmed_state_and_disabling_sends_stop() {
@@ -279,14 +274,7 @@ mod tests {
         app.commands.complete(cmd["id"].as_str().unwrap(),source,7,Ok(json!({"installed":true,"managed":true,"running":true,"enabled":true,"revision":desired.revision,"digest":desired.digest})));
         tick(&app, &mut slots).unwrap();
         assert_eq!(app.db.realm_hosts().unwrap()[0]["applied_revision"], desired.revision);
-        app.db
-            .realm_save_host(&RealmHostInput {
-                node_id: source,
-                public_address: "relay.example.com".into(),
-                enabled: false,
-                takeover: true,
-            })
-            .unwrap();
+        app.db.realm_save_host(&RealmHostInput { node_id: source, enabled: false }).unwrap();
         app.db.realm_request(source, false).unwrap();
         tick(&app, &mut slots).unwrap();
         let cmd: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();

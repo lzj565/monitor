@@ -285,7 +285,7 @@ CREATE TABLE IF NOT EXISTS proxy_node_traffic (
 /// cannot: `open` runs `SCHEMA` before migrating, and on an older file the
 /// column is not there yet. `an_upgraded_release_matches_a_fresh_database`
 /// holds every migration to these rules, starting from v1.0.0's schema.
-pub(super) const SCHEMA_VERSION: i64 = 23;
+pub(super) const SCHEMA_VERSION: i64 = 24;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -620,10 +620,8 @@ pub(super) fn migrate(conn: &Connection, from: i64) -> Result<()> {
         PRIMARY KEY(user_id,proxy_id)
     )",
     )?;
+    prepare_realm_schema(&tx)?;
     tx.execute_batch(REALM_SCHEMA)?;
-    if !tx.prepare("SELECT * FROM realm_hosts LIMIT 0")?.column_names().contains(&"traffic_recheck") {
-        tx.execute_batch("ALTER TABLE realm_hosts ADD COLUMN traffic_recheck TEXT NOT NULL DEFAULT ''; ALTER TABLE realm_rules ADD COLUMN traffic_key TEXT NOT NULL DEFAULT '';")?;
-    }
     tx.execute_batch(REALM_TRAFFIC_SCHEMA)?;
     tx.execute("UPDATE realm_rules SET traffic_key=lower(hex(randomblob(16))) WHERE traffic_key=''", [])?;
     tx.execute("INSERT OR IGNORE INTO realm_traffic_rules(key,node_id,rule_id,name) SELECT traffic_key,node_id,id,name FROM realm_rules",[])?;

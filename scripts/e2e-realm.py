@@ -64,8 +64,8 @@ with tempfile.TemporaryDirectory() as d:
   proxy=request(admin,f'/api/nodes/{target}/proxies',{'name':'test-Reality','protocol':'vless','address_type':'ipv4','address':'127.0.0.1','port':target_port,'enabled':True,'config':{'reality':{'enabled':True,'server_name':'www.example.com','server_port':443,'private_key':'A'*43,'public_key':'B'*43,'short_id':'abcd'}}},'POST')[1]['id']
   uid=request(admin,'/api/users',{'username':'realm-e2e','password':'temporary-test-password','enabled':True},'POST')[1]['id']
   request(admin,f'/api/users/{uid}/proxies/{proxy}',{'enabled':True},'PUT')
-  request(admin,'/api/realm/hosts',{'node_id':source,'public_address':'127.0.0.1','enabled':True,'takeover':True},'PUT')
-  listen_port=free_port();rule=request(admin,'/api/realm/rules',{'node_id':source,'target_proxy_id':proxy,'name':'test-route','listen_host':'0.0.0.0','listen_port':listen_port,'enabled':True},'POST')[1]['id']
+  request(admin,'/api/realm/hosts',{'node_id':source,'enabled':True},'PUT')
+  listen_port=free_port();rule=request(admin,'/api/realm/rules',{'node_id':source,'target_proxy_id':proxy,'name':'test-route','address_type':'ipv4','address':'127.0.0.1','listen_port':listen_port,'enabled':True},'POST')[1]['id']
   # Optional controlled failure backend: count every invocation and refuse it.
   if os.environ.get('REALM_TEST_NO_NFT'):
    (binpath/'nft').write_text('#!/bin/sh\necho probe >> /tmp/nft-probes\necho unavailable >&2\nexit 1\n');(binpath/'nft').chmod(0o755)
@@ -122,7 +122,7 @@ with tempfile.TemporaryDirectory() as d:
     assert (data['rules'][0]['up'],data['rules'][0]['down'])==totals,('loopback counted',totals,data)
     print('PASS: real nft input/output counters received by Hub; both directions positive; loopback excluded')
     original_key=data['rules'][0]['key'];listen_port=free_port()
-    request(admin,f'/api/realm/rules/{rule}',{'node_id':source,'target_proxy_id':proxy,'name':'test-route-edited','listen_host':'0.0.0.0','listen_port':listen_port,'enabled':True},'PUT')
+    request(admin,f'/api/realm/rules/{rule}',{'node_id':source,'target_proxy_id':proxy,'name':'test-route-edited','address_type':'ipv4','address':'127.0.0.1','listen_port':listen_port,'enabled':True},'PUT')
     for _ in range(200):
      host=request(admin,'/api/realm/hosts')[1]['items'][0]
      if not host['pending'] and host['status'].get('running'):break
@@ -140,7 +140,7 @@ with tempfile.TemporaryDirectory() as d:
   items=request(user,'/api/user/me/proxies')[1]['items'];assert len(items)==2 and any(p['id']==-rule for p in items)
   links=request(user,'/api/user/me/subscription')[1];clash=request(user,links['clash'])[1];assert b'127.0.0.1' in clash and ('Realm' in clash.decode())
   sing=request(user,links['sing_box'])[1];assert len([p for p in sing['outbounds'] if p['type']=='vless'])==2
-  request(admin,'/api/realm/hosts',{'node_id':source,'public_address':'127.0.0.1','enabled':False,'takeover':True},'PUT')
+  request(admin,'/api/realm/hosts',{'node_id':source,'enabled':False},'PUT')
   assert len(request(user,'/api/user/me/proxies')[1]['items'])==1
   for _ in range(160):
    host=request(admin,'/api/realm/hosts')[1]['items'][0]

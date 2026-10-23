@@ -24,7 +24,7 @@ Agent 需要已有 nft 命令、内核 nftables 支持及 CAP_NET_ADMIN。仅操
 - `realm.traffic.v1` 能力协商。Hub 仅在 Realm 已确认应用且监听集合一致后配置统计。
 - 每帧最多 128 条，Hub 上限 48 KiB；Agent 分批重放历史，ACK 精确匹配 collector / 行 ID / revision。行 ID 不复用，避免旧 ACK 确认新记录。
 - Hub 唯一键 `(node_id, collector, traffic_key, minute)`，仅更新更高 revision 且不回退的累计值，重传不重复累加。持久化后才 ACK。校验节点归属、时间、数值和批量大小。备份恢复后可能缺少离线队列对应的规则身份，这类记录不猜测归属，确认丢弃并显示“无法归属记录”，避免阻断重连。
-- Hub schema 23，兼容旧备份迁移。旧 Agent 仍可管理 Realm，页面提示升级后才能监控。需要同时更新 Hub、Agent；没有在本次工作中发布或部署。
+- Hub schema 24；无旧 Realm 数据迁移，仅重建空的旧配置表，运行状态保留，非空旧配置或流量历史拒绝升级。旧 Agent 仍可管理 Realm，页面提示升级后才能监控。需要同时更新 Hub、Agent；没有在本次工作中发布或部署。
 
 ## 验证
 
