@@ -135,20 +135,29 @@ impl App {
 
     /// Whether a session cookie may be marked Secure. With `--site` this follows
     /// its scheme; without one the hub does not know the address it was reached
-    /// on and must rely on the request: a TLS-terminating proxy sets
-    /// `X-Forwarded-Proto`, while a hub answering plain HTTP directly has no such
-    /// header. Marking the cookie Secure over plain HTTP would cause the browser
-    /// to discard the session.
+    /// on and must rely on the request, where three headers can say https: the
+    /// browser's `Origin`, a TLS-terminating proxy's `X-Forwarded-Proto`, and
+    /// Cloudflare's `CF-Visitor`. A hub answering plain HTTP directly sees none.
+    /// Marking the cookie Secure over plain HTTP would cause the browser to
+    /// discard the session.
     ///
-    /// The header is supplied by the trusted reverse proxy, so the listener must
-    /// remain publicly unreachable for a caller not to set its own. A proxy that
-    /// sends none leaves the flag off, which costs the flag rather than the
-    /// session; `--site https://...` sets it regardless.
+    /// Any one of them suffices. A false https costs only the sender's own
+    /// session, while a missed one leaves the cookie in the clear -- and each
+    /// header alone misses a common shape: a proxy behind a TLS edge rewrites
+    /// `X-Forwarded-Proto` to its own `http` hop, `CF-Visitor` exists only behind
+    /// Cloudflare, and `Origin` is absent from the navigation that ends GitHub
+    /// sign-in. Only that last case still depends on the proxies; `--site
+    /// https://...` sets the flag regardless.
     pub fn secure_cookies(&self, headers: &HeaderMap) -> bool {
         if !self.site.is_empty() {
             return !self.site.starts_with("http://");
         }
-        forwarded_proto(headers) == Some("https")
+        let header = |name| headers.get(name).and_then(|v| v.to_str().ok());
+        header("origin").is_some_and(|o| o.starts_with("https://"))
+            || forwarded_proto(headers) == Some("https")
+            || header("cf-visitor")
+                .and_then(|v| serde_json::from_str::<serde_json::Value>(v).ok())
+                .is_some_and(|v| v["scheme"] == "https")
     }
 }
 
@@ -177,7 +186,8 @@ async fn install_script() -> Response {
 ///
 /// This URL is fetched on an anonymous request, so setting it redirects that
 /// path. It remains within the bounds `agent_binary` already enforces: four
-/// concurrent transfers, a 120-second timeout, and a streamed body.
+/// concurrent transfers, a response within [`RELAY_HEAD`], a capped body and a
+/// signature.
 fn release_url(app: &App, arch: &str) -> String {
     proxied(
         app,
@@ -201,8 +211,9 @@ pub fn proxied(app: &App, url: String) -> String {
 ///
 /// This route takes no credentials, and one request costs an outbound fetch from
 /// GitHub plus 1.8 MB of egress -- the most expensive operation an anonymous
-/// caller can request. Streaming bounds the memory each transfer holds; this
-/// bounds how many may run, closing the same gap as the password gate in `auth`.
+/// caller can request. Each transfer holds the binary whole while it is
+/// verified, at most [`MAX_AGENT_BINARY`]; this bounds how many may run, closing
+/// the same gap as the password gate in `auth`.
 ///
 /// Four, because a node installs once: the load is a burst, not a sustained
 /// workload. A batch install or upgrade sent to many machines at once -- by an
@@ -223,7 +234,12 @@ static RELAY_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(RE
 /// transfer, four slots drain some 120 queued machines within it.
 const RELAY_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Longest a relay may hold its permit.
+/// Longest a request may take to produce its response head, the wait for a
+/// slot included: below the 60 s nginx allows. The binary is verified whole
+/// before the head is sent, so the download from GitHub falls within it.
+const RELAY_HEAD: std::time::Duration = std::time::Duration::from_secs(55);
+
+/// Longest a relay may hold its permit once the response is under way.
 ///
 /// Deliberately generous, since a node on a slow link must still transfer
 /// 1.8 MB; what it rules out is a transfer that never completes.
@@ -272,48 +288,127 @@ impl<S: futures_core::Stream + Unpin> futures_core::Stream for Metered<S> {
     }
 }
 
+/// The key the agent's release job signs each binary with (ed25519, the raw 32
+/// bytes). Rotating it takes a hub release.
+const AGENT_SIGNING_KEY: [u8; 32] = [
+    0x9a, 0x7c, 0x5e, 0x29, 0xf8, 0x79, 0x5a, 0x0a, 0x72, 0x12, 0x3e, 0xe1, 0xf0, 0x6a, 0x93, 0x41, 0xf2,
+    0x95, 0x34, 0xdb, 0xc2, 0x85, 0xb9, 0xab, 0xbe, 0xe6, 0xa0, 0x06, 0xdc, 0x65, 0xee, 0xef,
+];
+
+/// Far above the 1.8 MB an agent weighs; bounds what a proxy can make the hub
+/// hold, four at a time under [`RELAY_GATE`].
+const MAX_AGENT_BINARY: usize = 16 << 20;
+
+/// Whether `signature` is `key`'s over `binary`.
+fn signed(key: &[u8], binary: &[u8], signature: &[u8]) -> bool {
+    use ring::signature::{UnparsedPublicKey, ED25519};
+    UnparsedPublicKey::new(&ED25519, key).verify(binary, signature).is_ok()
+}
+
+/// Whether `binary` is an ELF executable for `arch`. A signature covers the
+/// bytes alone, so a mirror could answer one architecture's request with the
+/// other's signed binary, and `install.sh` would replace a running agent with
+/// one that cannot start.
+fn built_for(binary: &[u8], arch: &str) -> bool {
+    let machine: u16 = if arch == "aarch64" { 183 } else { 62 };
+    binary.get(18..20).is_some_and(|m| u16::from_le_bytes([m[0], m[1]]) == machine)
+}
+
+/// One GET of a release asset, whole, refused past `max` bytes.
+async fn fetch_asset(app: &App, url: &str, what: &str, max: usize) -> Result<Vec<u8>, String> {
+    let who = if url.starts_with("https://github.com/") { "GitHub" } else { "the GitHub proxy" };
+    // The default client timeout is sized for API calls; the caller bounds the
+    // download as a whole.
+    let mut res = app.http.get(url).timeout(RELAY_HEAD).send().await.map_err(|e| {
+        warn!("fetching {url} failed: {e:#}");
+        "the hub could not reach GitHub or its GitHub proxy; its log has the details".to_owned()
+    })?;
+    if !res.status().is_success() {
+        return Err(format!("{who} answered {} for the {what}", res.status()));
+    }
+    let too_large = || format!("{who} sent more than {max} bytes for the {what}");
+    let declared = res.content_length().unwrap_or(0);
+    if declared > max as u64 {
+        return Err(too_large());
+    }
+    let mut body = Vec::with_capacity(declared as usize);
+    loop {
+        match res.chunk().await {
+            Ok(Some(chunk)) if body.len() + chunk.len() <= max => body.extend_from_slice(&chunk),
+            Ok(Some(_)) => return Err(too_large()),
+            Ok(None) => return Ok(body),
+            Err(e) => {
+                warn!("reading {url} failed: {e:#}");
+                return Err("the agent download was cut off; try again".to_owned());
+            }
+        }
+    }
+}
+
+/// The verified binary as a one-item body, so [`metered`] holds the permit
+/// until it has been sent.
+struct Once(Option<axum::body::Bytes>);
+
+impl futures_core::Stream for Once {
+    type Item = Result<axum::body::Bytes, std::convert::Infallible>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        std::task::Poll::Ready(self.0.take().map(Ok))
+    }
+}
+
 /// Serves the agent binary from the hub itself, so a node that can reach the hub
 /// can install without reaching GitHub: IPv6-only machines cannot resolve
 /// github.com, and neither can blocked networks.
 ///
-/// ponytail: these bytes are relayed unverified, and `install.sh` executes them
-/// as root on every node. Fetched directly from github.com that is TLS's
-/// concern; through the panel's `github_proxy` it rests on the mirror alone,
-/// which the setting holds to https:// and states where it is entered. A
-/// checksum fetched alongside proves nothing, as whoever can replace the binary
-/// can replace that too, and a digest pinned into the hub build was evaluated
-/// and not adopted: it would tie every agent release to a hub release.
+/// `install.sh` executes these bytes as root on every node, and through the
+/// panel's `github_proxy` they come from a mirror the operator does not run. So
+/// the binary is held whole and relayed only under the release job's signature,
+/// fetched from the same place: a mirror can withhold or replace either, but
+/// cannot produce a signature that verifies. The key is the hub's, not the
+/// release's, so an agent release needs no hub release.
 async fn agent_binary(State(app): State<Shared>, Path(arch): Path<String>) -> Response {
     if !matches!(arch.as_str(), "x86_64" | "aarch64") {
         return api::answer(StatusCode::NOT_FOUND, "unknown architecture");
     }
+    let asked = tokio::time::Instant::now();
     let Ok(Ok(permit)) = tokio::time::timeout(RELAY_WAIT, RELAY_GATE.acquire()).await else {
         return api::answer(StatusCode::SERVICE_UNAVAILABLE, "too many downloads in flight, try again");
     };
     let url = release_url(&app, &arch);
-    // The default client timeout is sized for API calls, not a 1.8 MB download.
-    let fetched = app.http.get(&url).timeout(std::time::Duration::from_secs(120)).send().await;
+    let sig = format!("{url}.sig");
+    // English, as `install.sh` prints it after its own English line.
+    let fetched = async {
+        let (binary, signature) = tokio::try_join!(
+            fetch_asset(&app, &url, "agent binary", MAX_AGENT_BINARY),
+            fetch_asset(&app, &sig, "agent signature", 64),
+        )?;
+        if !signed(&AGENT_SIGNING_KEY, &binary, &signature) || !built_for(&binary, &arch) {
+            warn!("{url} does not match its signature or architecture; not relayed");
+            return Err(
+                "the agent binary failed its signature check, so the hub refused to relay it".to_owned()
+            );
+        }
+        Ok(binary)
+    };
+    let budget = RELAY_HEAD.saturating_sub(asked.elapsed());
+    let Ok(fetched) = tokio::time::timeout(budget, fetched).await else {
+        warn!("fetching {url} took longer than {} s; not relayed", RELAY_HEAD.as_secs());
+        return api::answer(
+            StatusCode::BAD_GATEWAY,
+            "GitHub or the GitHub proxy was too slow to deliver the agent before the response deadline",
+        );
+    };
     match fetched {
-        // Streamed rather than collected: holding each release in full would put
-        // a few hundred parallel requests within reach of the unit file's memory
-        // ceiling. Passing the bytes through costs one buffer per request.
-        Ok(res) if res.status().is_success() => (
+        Ok(binary) => (
             [(header::CONTENT_TYPE, "application/octet-stream")],
-            axum::body::Body::from_stream(metered(Box::pin(res.bytes_stream()), permit)),
+            axum::body::Body::from_stream(metered(Once(Some(binary.into())), permit)),
         )
             .into_response(),
-        Ok(res) => api::answer(
-            StatusCode::BAD_GATEWAY,
-            format!("GitHub answered {} for the agent release", res.status()),
-        ),
-        // English, as `install.sh` prints it after its own English line.
-        Err(e) => {
-            warn!("relaying the agent from {url} failed: {e:#}");
-            api::answer(
-                StatusCode::BAD_GATEWAY,
-                "the hub could not reach GitHub or its GitHub proxy; its log has the details",
-            )
-        }
+        Err(refusal) => api::answer(StatusCode::BAD_GATEWAY, refusal),
     }
 }
 
@@ -460,9 +555,11 @@ fn parse_args() -> Result<Args> {
                      reverse proxy is already right. It is needed where agents reach the\n\
                      hub by another name than the panel's; where the panel is opened\n\
                      through an SSH tunnel, whose loopback address no node can reach and\n\
-                     which adds no node without it; and where the proxy sends no\n\
-                     X-Forwarded-Proto, since it then sets the session cookie's Secure\n\
-                     flag. A value that is not an https:// domain disables adding nodes.\n\
+                     which adds no node without it; and where GitHub sign-in sits behind\n\
+                     proxies that do not report https -- no X-Forwarded-Proto, or a CDN\n\
+                     other than Cloudflare ahead of an nginx that rewrites it to http --\n\
+                     since it then sets the session cookie's Secure flag. A value that is\n\
+                     not an https:// domain disables adding nodes.\n\
                      --reset-password replaces the emergency password, signs every session\n\
                      out, prints the new password and exits. The database must exist.",
                     env!("CARGO_PKG_VERSION")
@@ -491,6 +588,41 @@ fn parse_args() -> Result<Args> {
     })
 }
 
+/// The soft open-file limit the hub asks for. Every agent holds one descriptor,
+/// every open page another, and every request in flight a third. 65536 leaves
+/// about 65 for each of the 1000 nodes a hub is sized for.
+const NOFILE_TARGET: u64 = 65_536;
+
+/// Raises the soft open-file limit toward [`NOFILE_TARGET`], capped by the hard
+/// one. systemd and Docker start a process at a soft limit of 1024, which Rust
+/// does not raise as Go does: with about a thousand connections `accept` fails
+/// with EMFILE, which the server retries silently, and the hub stops answering
+/// without logging a line (measured: 846 of 1000 agents connected, `/api/me`
+/// unanswered).
+fn raise_open_files() {
+    use rustix::process::{getrlimit, setrlimit, Resource};
+    let mut limit = getrlimit(Resource::Nofile);
+    // Unlimited needs nothing.
+    let Some(soft) = limit.current else { return };
+    let wanted = limit.maximum.map_or(NOFILE_TARGET, |hard| hard.min(NOFILE_TARGET));
+    let mut now = soft;
+    if soft < wanted {
+        limit.current = Some(wanted);
+        match setrlimit(Resource::Nofile, limit) {
+            Ok(()) => now = wanted,
+            Err(e) => warn!("open-file limit could not be raised from {soft}: {e}"),
+        }
+    }
+    if now < NOFILE_TARGET {
+        warn!(
+            "open-file limit is {now}, and the hub stops accepting connections near it. Raise \
+             LimitNOFILE for the service, or --ulimit nofile for the container"
+        );
+    } else if now > soft {
+        info!("open-file limit raised from {soft} to {now}");
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -512,6 +644,8 @@ async fn main() -> Result<()> {
         println!("Emergency password: {}", new_password(&Db::open(&args.database)?)?);
         return Ok(());
     }
+    // After the two arguments that print and exit, so their output stays theirs.
+    raise_open_files();
     std::fs::create_dir_all(&args.themes)?;
     if let Err(e) = db::temp_files_beside(&args.database) {
         warn!("SQLite keeps its temporary files in its default directory: {e:#}");
@@ -546,13 +680,11 @@ async fn main() -> Result<()> {
     // advertises. This one derives from the socket actually open, and the two
     // diverge in the deployment that needs it most: `--site https://...` with
     // --listen left at its wildcard default prints nothing while the port answers
-    // plain HTTP to anyone who finds it. The X-Forwarded-Proto cookie flag
-    // assumes the proxy cannot be bypassed.
+    // plain HTTP to anyone who finds it.
     else if !args.listen.ip().is_loopback() {
         warn!(
             "listening on {} in the clear. If a TLS proxy fronts this hub, callers can still reach \
-             this port directly and set their own X-Forwarded-Proto. Close it so the proxy is the \
-             only way in: {close}",
+             this port directly, without TLS. Close it so the proxy is the only way in: {close}",
             args.listen
         );
     }
@@ -627,7 +759,7 @@ async fn main() -> Result<()> {
         .layer(tower_http::limit::RequestBodyLimitLayer::new(64 * 1024))
         // The two chunked uploads, merged after that layer rather than beneath
         // it. They raise the ceiling on a single request to `api::MAX_CHUNK`,
-        // not on the file behind it: a 256 MiB backup arrives as 64 of the
+        // not on the file behind it: a 1 GiB backup arrives as 256 of the
         // panel's 4 MiB pieces, so no reverse proxy needs to know the database
         // size. The whole-file ceilings live on `total` and are checked on the
         // first request.
@@ -697,12 +829,14 @@ async fn main() -> Result<()> {
                 .layer(axum::middleware::map_response(api::api_json_errors))
                 .with_state(app.clone()),
         )
+        .layer(axum::middleware::from_fn(api::same_origin_writes))
         .layer(axum::middleware::map_response(api::plain_errors))
-        // Agents, merged after that layer: `install.sh` and the agent print these
+        // Agents, merged after those layers: `install.sh` and the agent print these
         // replies beside their own English output, so they are left as written.
         .merge(
             Router::new()
                 .route("/api/agent/ws", get(agent_ws::handler))
+                .route("/api/agent/echo", get(agent_ws::echo))
                 .route("/api/agent/register", post(api::agent_register))
                 .route("/install.sh", get(install_script))
                 .route("/agent/{arch}", get(agent_binary))
@@ -770,8 +904,7 @@ fn advertised_url(site: &str, listen: SocketAddr) -> String {
 /// This host's own address on its outbound route. Asking the kernel to route a
 /// datagram it never sends is the cheapest way to select one interface among
 /// several, and it answers without any network traffic. Behind NAT it yields the
-/// private address, since the hub cannot know its public one, which is why
-/// install-hub.sh prints the address it looked up instead.
+/// private address, since the hub cannot know its public one; `--site` states it.
 fn outbound_ip() -> Option<IpAddr> {
     [("0.0.0.0:0", "1.1.1.1:80"), ("[::]:0", "[2606:4700:4700::1111]:80")].into_iter().find_map(
         |(bind, route_to)| {
@@ -999,7 +1132,41 @@ fn compressible() -> impl Predicate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use axum::http::{StatusCode, Uri};
+
+    #[test]
+    fn only_a_binary_signed_with_the_key_is_relayed() {
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
+        let pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let key = pair.public_key().as_ref();
+        let binary = b"\x7fELF agent".to_vec();
+        let signature = pair.sign(&binary);
+        assert!(signed(key, &binary, signature.as_ref()));
+        let mut swapped = binary.clone();
+        swapped[5] ^= 1;
+        assert!(!signed(key, &swapped, signature.as_ref()), "a replaced binary");
+        assert!(!signed(&AGENT_SIGNING_KEY, &binary, signature.as_ref()), "another key's signature");
+        assert!(!signed(key, &binary, &[]), "no signature");
+        let mut elf = vec![0u8; 64];
+        elf[18] = 62;
+        assert!(built_for(&elf, "x86_64") && !built_for(&elf, "aarch64"), "the other architecture's binary");
+    }
+
+    /// The limit only moves up, so raising it here cannot disturb another test.
+    #[test]
+    fn the_soft_open_file_limit_reaches_the_target_or_the_hard_one() {
+        use rustix::process::{getrlimit, Resource};
+        raise_open_files();
+        let limit = getrlimit(Resource::Nofile);
+        let wanted = limit.maximum.map_or(NOFILE_TARGET, |hard| hard.min(NOFILE_TARGET));
+        assert!(
+            limit.current.is_none_or(|soft| soft >= wanted),
+            "soft limit {:?} below {wanted}",
+            limit.current
+        );
+    }
 
     fn app(site: &str) -> App {
         App::new(
@@ -1119,11 +1286,11 @@ mod tests {
         assert_eq!(spa("/node/7").await.status(), StatusCode::OK);
     }
 
-    /// What determines the Secure flag: `--site` when set, otherwise the proxy in
-    /// front -- the default ip:port deployment, where the hub does not know its
-    /// own address.
+    /// What determines the Secure flag: `--site` when set, otherwise the request
+    /// -- the default ip:port deployment, where the hub does not know its own
+    /// address.
     #[test]
-    fn the_cookie_flag_follows_site_when_it_is_set_and_the_proxy_when_it_is_not() {
+    fn the_cookie_flag_follows_site_when_it_is_set_and_the_request_when_it_is_not() {
         // Local development: no Secure flag, or the browser discards the cookie
         // entirely.
         for local in ["http://127.0.0.1:28080", "http://localhost:28080", "http://[::1]:28080"] {
@@ -1144,13 +1311,28 @@ mod tests {
         assert!(exposed_over_plain_http("http://127.0.0.1:28080@hub.example.com"));
         assert!(!app("http://127.0.0.1:28080@hub.example.com").secure_cookies(&proto(None)));
 
-        // Without --site the proxy's header is the only indication of scheme.
+        // Without --site the request's headers are the only indication of scheme.
         let bare = app("");
         assert!(!bare.secure_cookies(&proto(None)), "plain HTTP, answered directly");
         assert!(bare.secure_cookies(&proto(Some("https"))));
         // Chained proxies append, so the browser's own hop is the first value.
         assert!(bare.secure_cookies(&proto(Some("https, http"))));
         assert!(!bare.secure_cookies(&proto(Some("http, https"))));
+
+        // A TLS edge ahead of nginx's `X-Forwarded-Proto $scheme`: the header
+        // reads http, yet the browser is on https. Its own Origin says so on
+        // every write, Cloudflare's CF-Visitor on every request.
+        let with = |name: &str, value: &str| {
+            let mut headers = proto(Some("http"));
+            headers.insert(name.parse::<header::HeaderName>().unwrap(), value.parse().unwrap());
+            headers
+        };
+        assert!(bare.secure_cookies(&with("origin", "https://hub.example.com")));
+        assert!(bare.secure_cookies(&with("cf-visitor", r#"{"scheme":"https"}"#)));
+        assert!(!bare.secure_cookies(&with("origin", "http://hub.example.com")));
+        assert!(!bare.secure_cookies(&with("cf-visitor", r#"{"scheme":"http"}"#)));
+        assert!(bare.secure_cookies(&with("cf-visitor", r#"{ "scheme": "https" }"#)), "re-serialized");
+        assert!(!bare.secure_cookies(&with("origin", "null")));
     }
 
     /// A hub serving in the clear must report it, and a wildcard listener is not

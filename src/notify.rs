@@ -6,7 +6,7 @@
 //! crossing the threshold and the full allowance, expiry dates approaching or
 //! rolled forward, and a sign-in to the panel.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -494,14 +494,16 @@ fn batch(event: &'static str, mark: &str, what: &str, items: Vec<(&str, String)>
     Some(Note { event, node, title, message, ..Default::default() })
 }
 
+/// Per node, the billing period and the traffic step last announced in it, as
+/// JSON, so that a step crossed while the hub was stopped is announced on its
+/// return and one announced before is not repeated. Read every sweep rather
+/// than held in memory, so a restored database brings its own. Outside
+/// `notify_`, whose keys the panel reads and writes.
+const TRAFFIC_ALERTED: &str = "traffic_alerted";
+
 /// Sweep state that need not outlive the process.
 #[derive(Default)]
 pub struct Watch {
-    /// Set after the first sweep, which records the traffic steps already reached
-    /// without announcing them again after a restart.
-    primed: bool,
-    /// Per node, the billing period and the traffic step last announced in it.
-    traffic: HashMap<i64, (String, i64)>,
     /// Per absent node, when a sweep first found it absent. Absence is measured
     /// from here rather than from `last_seen`, which an agent reporting every few
     /// minutes leaves minutes old: measured from that, a restart of such an agent
@@ -542,15 +544,11 @@ pub async fn watch(app: Shared) {
 fn sweep(app: &App, watch: &mut Watch, now: i64) -> Result<Vec<Note>> {
     let online: HashSet<i64> = app.agents.read().unwrap_or_else(|e| e.into_inner()).keys().copied().collect();
     let nodes = app.db.nodes()?;
-    // Node ids are rowids, which SQLite hands to the next node created once the
-    // newest is deleted; state kept under a deleted id would pass that node's
-    // absence, return and traffic step to the new one.
-    // ponytail: a delete and a create within one SWEEP still inherit; key by
-    // creation time if that ever matters.
+    // A deleted node's id is never issued again (`db::next_id`); this only
+    // keeps the maps from growing with deleted nodes.
     let ids: HashSet<i64> = nodes.iter().map(|n| n.id).collect();
     watch.absent.retain(|id, _| ids.contains(id));
     watch.returned.retain(|id, _| ids.contains(id));
-    watch.traffic.retain(|id, _| ids.contains(id));
     let grace = number(app, "notify_grace") * 60;
     let armed = !channels(app).is_empty();
     let (mut down, mut up) = (Vec::new(), Vec::new());
@@ -586,6 +584,24 @@ fn sweep(app: &App, watch: &mut Watch, now: i64) -> Result<Vec<Note>> {
     let percent = number(app, "notify_traffic");
     let mut metered = Vec::new();
     let traffic = if percent > 0 && armed { app.db.all_traffic() } else { HashMap::new() };
+    // A failed read skips the section: taken for "nothing stored", it would
+    // record this sweep's crossings without announcing them.
+    let stored = match app.db.lookup(TRAFFIC_ALERTED) {
+        Ok(stored) => stored,
+        Err(e) => {
+            warn!("reading the traffic steps announced failed: {e:#}");
+            return Ok(notes);
+        }
+    };
+    // None when nothing was stored: a hub upgraded from a release that kept the
+    // steps in memory, or a database restored from one, records the steps
+    // already reached rather than announcing every one again. Ordered, so that
+    // unchanged state serializes to unchanged text.
+    let alerted: Option<BTreeMap<i64, (String, i64)>> =
+        stored.as_deref().and_then(|s| serde_json::from_str(s).ok());
+    let primed = alerted.is_some();
+    let mut alerted = alerted.unwrap_or_default();
+    alerted.retain(|id, _| ids.contains(id));
     for node in nodes.iter().filter(|n| n.traffic_limit > 0) {
         let Some(t) = traffic.get(&node.id) else { continue };
         let used = t.month_used(&node.traffic_mode);
@@ -600,9 +616,9 @@ fn sweep(app: &App, watch: &mut Watch, now: i64) -> Result<Vec<Note>> {
         };
         // A step below the one recorded is a manual correction; storing it lets the
         // same crossing be announced again.
-        let last = watch.traffic.insert(node.id, (t.month_start.clone(), step));
+        let last = alerted.insert(node.id, (t.month_start.clone(), step));
         let told = last.is_some_and(|(period, last)| period == t.month_start && last >= step);
-        if step == 0 || told || !watch.primed {
+        if step == 0 || told || !primed {
             continue;
         }
         let mode = match node.traffic_mode.as_str() {
@@ -620,8 +636,16 @@ fn sweep(app: &App, watch: &mut Watch, now: i64) -> Result<Vec<Note>> {
         );
         metered.push((node.name.as_str(), detail));
     }
+    // Announced only once recorded: unrecorded, the next sweep would announce
+    // the same step again, every 30 seconds while writes fail.
+    let state = serde_json::to_string(&alerted)?;
+    if stored.as_ref() != Some(&state) {
+        if let Err(e) = app.db.set(TRAFFIC_ALERTED, &state) {
+            warn!("saving the traffic steps announced failed: {e:#}");
+            return Ok(notes);
+        }
+    }
     notes.extend(batch("traffic", "⚠️", "流量提醒", metered));
-    watch.primed = true;
     Ok(notes)
 }
 
@@ -735,7 +759,7 @@ mod tests {
         node(&app, "b", true, now - 600);
         let quiet = node(&app, "quiet", false, now - 600);
         let brief = node(&app, "brief", true, now - 600);
-        let mut watch = Watch { primed: true, ..Default::default() };
+        let mut watch = Watch::default();
 
         // Nothing is marked while no channel could carry the alert, so the nodes
         // are still reported once one is configured.
@@ -775,7 +799,7 @@ mod tests {
         let now = 1_000_000;
         let id = node(&app, "slow", true, now - 240);
         connect(&app, id);
-        let mut watch = Watch { primed: true, ..Default::default() };
+        let mut watch = Watch::default();
         assert!(sweep(&app, &mut watch, now).unwrap().is_empty());
         app.agents.write().unwrap().remove(&id);
         assert!(sweep(&app, &mut watch, now + 30).unwrap().is_empty(), "absent for one sweep");
@@ -789,7 +813,7 @@ mod tests {
         let t = 1_000_000;
         with_channel(&app);
         let id = node(&app, "flappy", true, t);
-        let mut watch = Watch { primed: true, ..Default::default() };
+        let mut watch = Watch::default();
         let mut at = |now: i64| -> Vec<&'static str> {
             sweep(&app, &mut watch, now).unwrap().into_iter().map(|n| n.event).collect()
         };
@@ -833,7 +857,7 @@ mod tests {
         assert_eq!(at(t + 11_180), ["offline"], "the next absence keeps the ordinary grace period");
     }
 
-    /// A deleted node's id goes to the next node created, and a node's first
+    /// A node created after a delete gets a fresh id, and a node's first
     /// connection is not a return from an outage: either would put a new node on
     /// the flapping grace period or suppress its first traffic alert.
     #[test]
@@ -848,7 +872,9 @@ mod tests {
             let patch = TrafficPatch { month_rx: Some(90 * gb), month_tx: Some(0), ..Default::default() };
             app.db.set_traffic(id, &patch).unwrap();
         };
-        let mut watch = Watch { primed: true, ..Default::default() };
+        // Primed, as on a hub that has stored steps before.
+        app.db.set(TRAFFIC_ALERTED, "{}").unwrap();
+        let mut watch = Watch::default();
         let mut at = |now: i64| -> Vec<&'static str> {
             sweep(&app, &mut watch, now).unwrap().into_iter().map(|n| n.event).collect()
         };
@@ -860,7 +886,7 @@ mod tests {
         assert!(at(t + 30).is_empty());
 
         let new = node(&app, "new", true, 0);
-        assert_eq!(new, old, "the id is reused");
+        assert_ne!(new, old, "a deleted node's id is not issued again");
         metered(new);
         assert_eq!(at(t + 60), ["traffic"]);
         connect(&app, new);
@@ -899,7 +925,7 @@ mod tests {
             "a crossing made before the channel existed"
         );
         let mut watch = Watch::default();
-        assert!(titles(&mut watch).is_empty(), "the first sweep after a start records, it does not repeat");
+        assert!(titles(&mut watch).is_empty(), "a restart does not repeat a step announced before it");
         used(10 * gb).unwrap();
         assert!(titles(&mut watch).is_empty(), "below the threshold");
         used(81 * gb).unwrap();
@@ -913,6 +939,40 @@ mod tests {
         used(100 * gb).unwrap();
         assert_eq!(titles(&mut watch), ["⚠️ t 流量提醒 已用 100%"]);
         assert!(titles(&mut watch).is_empty());
+    }
+
+    #[test]
+    fn steps_crossed_while_the_hub_was_stopped_are_announced_on_its_return() {
+        let app = app();
+        with_channel(&app);
+        let id = node(&app, "t", false, 0);
+        let gb = 1i64 << 30;
+        app.db.update_node(id, &NodePatch { traffic_limit: Some(100 * gb), ..Default::default() }).unwrap();
+        let used = |month_rx: i64| {
+            let patch = TrafficPatch { month_rx: Some(month_rx), month_tx: Some(0), ..Default::default() };
+            app.db.set_traffic(id, &patch).unwrap();
+        };
+        let shares = |watch: &mut Watch| -> Vec<String> {
+            let notes = sweep(&app, watch, 0).unwrap().into_iter().filter(|n| n.event == "traffic");
+            notes.map(|n| n.message.split('，').next().unwrap().to_owned()).collect()
+        };
+
+        // Upgraded from a release that stored nothing: recorded, not announced.
+        used(85 * gb);
+        assert!(shares(&mut Watch::default()).is_empty());
+        // 80 % recorded before the restart, 100 % reached after it.
+        used(100 * gb);
+        assert_eq!(shares(&mut Watch::default()), ["已用 100%"]);
+        assert!(shares(&mut Watch::default()).is_empty(), "announced once");
+        // 70 % when stopped, 100 % on return.
+        used(70 * gb);
+        shares(&mut Watch::default());
+        used(100 * gb);
+        assert_eq!(shares(&mut Watch::default()), ["已用 100%"]);
+        // A restored database brings its own steps to the running sweep.
+        let mut watch = Watch::default();
+        app.db.set(TRAFFIC_ALERTED, "{}").unwrap();
+        assert_eq!(shares(&mut watch), ["已用 100%"]);
     }
 
     #[test]

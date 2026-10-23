@@ -339,20 +339,27 @@ struct ProxyTrafficSnapshot {
     inbounds: HashMap<String, crate::db::ProxyTrafficCounter>,
 }
 
+/// The node a request's bearer token belongs to, or the 401 text. The same
+/// text whether the token is malformed or merely unknown.
+fn authenticate(app: &App, headers: &HeaderMap) -> Result<i64, &'static str> {
+    let token = bearer(headers).ok_or("missing token")?;
+    match app.db.node_by_token(token) {
+        Ok(Some(id)) => Ok(id),
+        _ => Err("invalid token"),
+    }
+}
+
 pub async fn handler(
     State(app): State<Shared>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    let Some(token) = bearer(&headers) else {
-        return crate::api::answer(StatusCode::UNAUTHORIZED, "missing token");
+    let node_id = match authenticate(&app, &headers) {
+        Ok(id) => id,
+        Err(refusal) => return crate::api::answer(StatusCode::UNAUTHORIZED, refusal),
     };
-    let Ok(Some(node_id)) = app.db.node_by_token(token) else {
-        // The same response whether the token is malformed or merely unknown.
-        return crate::api::answer(StatusCode::UNAUTHORIZED, "invalid token");
-    };
-    let ip = node_ip(&headers, peer.ip()).to_string();
+    let ip = node_ip(&app, &headers, peer.ip()).to_string();
 
     upgrade.read_buffer_size(crate::api::SOCKET_BUFFER).max_message_size(crate::api::MAX_FRAME).on_upgrade(
         move |socket| async move {
@@ -361,6 +368,38 @@ pub async fn handler(
             }
         },
     )
+}
+
+/// A glimpse rather than a session: an agent whose session runs over one
+/// address family connects here over the other, so the hub can record the
+/// address it appears at there. An interface holding only a private address of
+/// that family -- NAT66, a ULA behind a masquerading host -- says nothing of
+/// where it exits, and the session, arriving in one family, cannot.
+///
+/// A route of its own rather than a query on the session's: a hub from before
+/// this one would take `?echo` for a session, retire the live one, and flap the
+/// node on every connect, where it answers an unknown path with 404 and the
+/// agent goes without. Authenticated like a session, so no anonymous path, and
+/// it opens none: whatever is running is left alone.
+pub async fn echo(
+    State(app): State<Shared>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    let node_id = match authenticate(&app, &headers) {
+        Ok(id) => id,
+        Err(refusal) => return crate::api::answer(StatusCode::UNAUTHORIZED, refusal),
+    };
+    // A proxy that wrote nothing leaves the proxy's own address here, which
+    // would replace an exit recorded earlier with one the panel never shows.
+    let ip = node_ip(&app, &headers, peer.ip());
+    if public(ip) {
+        if let Err(e) = app.db.set_ip_other(node_id, &ip.to_string()) {
+            warn!("node {node_id}: storing the address seen in the other family failed: {e:#}");
+        }
+    }
+    upgrade.on_upgrade(|_| async {})
 }
 
 /// Extracts the node token from `Authorization: Bearer <token>`.
@@ -832,6 +871,8 @@ pub struct Reading {
     epoch: String,
     counters: (i64, i64),
     arrival: Arrival,
+    /// When the machine booted, from the uptime reported with the counters.
+    booted: Option<i64>,
     /// Whether this reading has been booked into the traffic row.
     booked: bool,
 }
@@ -873,7 +914,7 @@ impl Reading {
 /// while another node's booking waits on the database. Per-node locks if a slow
 /// query ever holds reports up behind one.
 fn file(app: &App, node_id: i64, reading: Reading) -> Result<()> {
-    let book = |r: &Reading| app.db.accumulate(node_id, &r.epoch, r.counters, r.arrival.at);
+    let book = |r: &Reading| app.db.accumulate(node_id, &r.epoch, r.counters, r.arrival.at, r.booted);
     let mut held = app.readings.lock().unwrap_or_else(|e| e.into_inner());
     // Whether the held reading, then this one, is booked.
     let (book_last, book_this) = match held.get(&node_id) {
@@ -898,7 +939,7 @@ fn file(app: &App, node_id: i64, reading: Reading) -> Result<()> {
 pub fn book_held(app: &App, node: Option<i64>) {
     let mut held = app.readings.lock().unwrap_or_else(|e| e.into_inner());
     for (id, reading) in held.iter_mut().filter(|(id, r)| !r.booked && node.is_none_or(|n| n == **id)) {
-        match app.db.accumulate(*id, &reading.epoch, reading.counters, reading.arrival.at) {
+        match app.db.accumulate(*id, &reading.epoch, reading.counters, reading.arrival.at, reading.booted) {
             Ok(_) => reading.booked = true,
             Err(e) => warn!("node {id}: booking its last reading failed: {e:#}"),
         }
@@ -932,7 +973,13 @@ fn report(app: &App, node_id: i64, metrics: serde_json::Value, arrival: Arrival)
         .and_then(|v| v.as_str())
         .filter(|e| !e.is_empty())
         .zip(counter("net_rx_total").zip(counter("net_tx_total")))
-        .map(|(epoch, counters)| Reading { epoch: epoch.to_owned(), counters, arrival, booked: false });
+        .map(|(epoch, counters)| {
+            // The agent reports 0 where /proc/uptime cannot be read, which is
+            // no boot time: taken as one, every epoch change would book.
+            let uptime = metrics.get("uptime").and_then(|v| v.as_i64()).filter(|up| *up > 0);
+            let booted = uptime.map(|up| arrival.at.timestamp() - up);
+            Reading { epoch: epoch.to_owned(), counters, arrival, booted, booked: false }
+        });
     let span = reading.as_ref().map(|r| (r.epoch.clone(), r.counters));
     if let Some(reading) = reading {
         file(app, node_id, reading)?;
@@ -1046,6 +1093,22 @@ mod tests {
                 &crate::auth::random_token(),
             )
             .unwrap()
+    }
+
+    #[test]
+    fn a_token_opens_the_route_only_for_its_node() {
+        let app = app();
+        let token = crate::auth::random_token();
+        let id = app.db.create_node(&Node { name: "n".into(), ..Default::default() }, &token).unwrap();
+        let with = |value: &str| {
+            let mut h = HeaderMap::new();
+            h.insert("authorization", value.parse().unwrap());
+            h
+        };
+        assert_eq!(authenticate(&app, &with(&format!("Bearer {token}"))).ok(), Some(id));
+        for refused in [HeaderMap::new(), with("Bearer nope"), with("Basic abc")] {
+            assert!(authenticate(&app, &refused).is_err());
+        }
     }
 
     /// A connected agent, the precondition for filing any report: the session
@@ -1310,8 +1373,45 @@ mod tests {
         assert_eq!(total_rx(&app, id), 1_000);
     }
 
+    /// The hub stopped at 60 s and, back at 3600 s, finds the node rebooted at
+    /// 1800 s: the bytes since that boot are booked, not discarded.
+    #[test]
+    fn a_reboot_while_the_hub_was_down_keeps_the_bytes_since_boot() {
+        let app = app();
+        let (id, _held) = connect(&app);
+        let report = |boot: &str, rx: i64, uptime: i64| {
+            json!({
+                "jsonrpc": "2.0", "method": "report",
+                "params": {"boot_id": boot, "cpu": 1, "load": [0, 0, 0], "mem_used": 1,
+                           "uptime": uptime, "net_rx_total": rx, "net_tx_total": 0}
+            })
+            .to_string()
+        };
+        let mut session = Session::default();
+        send(&app, id, &mut session, 0, &report("k1/d", 900_000, 50_000)).unwrap();
+        send(&app, id, &mut session, 60, &report("k1/d", 901_000, 50_060)).unwrap();
+        assert_eq!(total_rx(&app, id), 1_000);
+
+        app.readings.lock().unwrap().clear();
+        let mut session = Session::default();
+        send(&app, id, &mut session, 3_600, &report("k2/d", 5_000, 1_800)).unwrap();
+        assert_eq!(total_rx(&app, id), 6_000);
+
+        // A second machine on the token, one with no uptime to report among
+        // them: each swap only realigns.
+        for (i, (epoch, uptime)) in
+            [("k3/d", 900_000), ("k4/d", 0), ("k2/d", 1_900), ("k4/d", 0)].iter().enumerate()
+        {
+            let mut session = Session::default();
+            let secs = 3_660 + i as u64 * 30;
+            send(&app, id, &mut session, secs, &report(epoch, 80_000_000_000, *uptime)).unwrap();
+        }
+        assert_eq!(total_rx(&app, id), 6_000);
+    }
+
     /// The lifetime total must never decrease, and must never book bytes nobody
-    /// moved. The two figures behind it arrive from another repository's binary
+    /// moved. The counters behind it, and the uptime that decides whether a new
+    /// epoch's reading is booked whole, arrive from another repository's binary
     /// and are the only report fields that mutate state outliving the
     /// connection.
     #[test]
@@ -1555,9 +1655,13 @@ mod tests {
 
         for (second, epoch, rx, tx) in readings {
             let arrival = at(second);
-            file(&app, held, Reading { epoch: epoch.into(), counters: (rx, tx), arrival, booked: false })
-                .unwrap();
-            app.db.accumulate(every, epoch, (rx, tx), arrival.at).unwrap();
+            file(
+                &app,
+                held,
+                Reading { epoch: epoch.into(), counters: (rx, tx), arrival, booted: None, booked: false },
+            )
+            .unwrap();
+            app.db.accumulate(every, epoch, (rx, tx), arrival.at, None).unwrap();
         }
         book_held(&app, Some(held));
 
@@ -1620,8 +1724,13 @@ mod tests {
         let app = app();
         let (a, b) = (node(&app), node(&app));
         for (id, rx) in [(a, 1_000), (b, 5_000)] {
-            let reading =
-                |rx, secs| Reading { epoch: "e".into(), counters: (rx, 0), arrival: at(secs), booked: false };
+            let reading = |rx, secs| Reading {
+                epoch: "e".into(),
+                counters: (rx, 0),
+                arrival: at(secs),
+                booted: None,
+                booked: false,
+            };
             file(&app, id, reading(rx, 0)).unwrap();
             file(&app, id, reading(rx + 700, 5)).unwrap();
         }

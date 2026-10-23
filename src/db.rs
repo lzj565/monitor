@@ -10,7 +10,18 @@ use chrono::{DateTime, Datelike, Local, NaiveDate, Utc};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::RuntimeFlavor;
-use tracing::info;
+use tracing::{info, warn};
+
+/// A string an agent reported, cut down to what may be shown. Control
+/// characters break the panel's rows, and the characters markup is made of are
+/// dropped because the value reaches a theme from a machine nobody has vouched
+/// for: a theme that sets it as HTML would otherwise run a node's script in the
+/// hub's origin, beside the administrator's session. No real OS name, kernel,
+/// CPU model or host name contains any of them. `chars()` rather than bytes, so
+/// the cut falls on a character boundary.
+pub fn reported_text(raw: &str, max: usize) -> String {
+    raw.chars().filter(|c| !c.is_control() && !matches!(c, '<' | '>' | '"' | '\'')).take(max).collect()
+}
 
 pub struct Db {
     /// A read-only connection to the same file, for the history charts. A week
@@ -72,6 +83,11 @@ CREATE TABLE IF NOT EXISTS node (
   swap_total INTEGER NOT NULL DEFAULT 0, disk_total INTEGER NOT NULL DEFAULT 0,
   agent_version TEXT NOT NULL DEFAULT '', ip TEXT NOT NULL DEFAULT '',
   ipv4 TEXT NOT NULL DEFAULT '', ipv6 TEXT NOT NULL DEFAULT '',
+  -- Where the hub saw the node in the address family `ip` is not in, from the
+  -- short connection an agent makes over it (`agent_ws::echo`).
+  -- Empty until one has arrived, and left as it was when none does: the family
+  -- it belongs to must still be held on an interface for it to be shown.
+  ip_other TEXT NOT NULL DEFAULT '',
   -- ISO 3166-1 alpha-2, looked up from `country_ip` once per address. Empty
   -- until the lookup answers, and empty is what a node whose country nobody
   -- could tell stays: the public page just leaves the badge off.
@@ -595,6 +611,10 @@ fn migrate_public_remark(conn: &Connection) -> Result<()> {
     add_column(conn, "node", "public_remark TEXT NOT NULL DEFAULT ''")
 }
 
+fn migrate_other_ip(conn: &Connection) -> Result<()> {
+    add_column(conn, "node", "ip_other TEXT NOT NULL DEFAULT ''")
+}
+
 /// Brings a database already in service up to `SCHEMA_VERSION` and stamps it.
 /// `from` is its current version, so a fresh file passes `SCHEMA_VERSION` and
 /// receives only the stamp.
@@ -667,6 +687,7 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     migrate_to_20(&tx)?;
     migrate_history(&tx)?;
     migrate_public_remark(&tx)?;
+    migrate_other_ip(&tx)?;
     seed_default_admin(&tx)?;
     if from < 18 {
         migrate_to_18(&tx)?;
@@ -1078,6 +1099,10 @@ pub struct Node {
     pub agent_version: String,
     #[serde(default)]
     pub ip: String,
+    /// Likewise the address the hub saw, in the family `ip` is not; see the
+    /// column.
+    #[serde(default)]
+    pub ip_other: String,
     /// Reported by the agent from its own interfaces, unlike `ip`, which is
     /// merely the address the agent's connection originated from.
     #[serde(default)]
@@ -1541,6 +1566,12 @@ impl Db {
         restrict(path);
 
         migrate(&conn, if fresh { SCHEMA_VERSION } else { version })?;
+        // A file from a release that kept no high marks gets them now, from its
+        // rows. Otherwise deleting the newest node or probe before the next one
+        // is created would lose its id, and `next_id` would issue it again.
+        for table in ID_TABLES {
+            put_setting(&conn, &format!("{table}_id_issued"), &issued(&conn, table)?.to_string())?;
+        }
         let reader = match main_file(&conn) {
             file if file.is_empty() => None,
             file => Some(Mutex::new(read_only(&file)?)),
@@ -1597,12 +1628,7 @@ impl Db {
     }
 
     pub fn set(&self, key: &str, value: &str) -> Result<()> {
-        self.conn().execute(
-            "INSERT INTO setting (key, value) VALUES (?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![key, value],
-        )?;
-        Ok(())
+        put_setting(&self.conn(), key, value)
     }
 
     // ---- nodes ----
@@ -2635,13 +2661,14 @@ impl Db {
     pub fn create_node(&self, n: &Node, token: &str) -> Result<i64> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
+        let id = next_id(&tx, "node")?;
         tx.execute(
             // A new node belongs at the end. The caller sends sort 0, which would
             // tie with whatever the last reorder placed first.
-            "INSERT INTO node (name, token, sort, public, price, currency, billing_cycle,
+            "INSERT INTO node (id, name, token, sort, public, price, currency, billing_cycle,
                                expires_at, remark, traffic_limit, traffic_mode, traffic_reset_day, created_at,
                                group_name)
-             VALUES (?1,?2,(SELECT COALESCE(MAX(sort),-1)+1 FROM node),?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+             VALUES (?14,?1,?2,(SELECT COALESCE(MAX(sort),-1)+1 FROM node),?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             params![
                 n.name,
                 token,
@@ -2655,10 +2682,15 @@ impl Db {
                 n.traffic_mode,
                 n.traffic_reset_day,
                 Utc::now().timestamp(),
-                n.group
+                n.group,
+                id
             ],
         )?;
-        let id = tx.last_insert_rowid();
+        // Only a registration without `--name` arrives unnamed; the panel
+        // requires a name.
+        if n.name.is_empty() {
+            tx.execute("UPDATE node SET name = ?1 WHERE id = ?2", params![format!("节点 {id}"), id])?;
+        }
         tx.execute("INSERT INTO traffic (node_id) VALUES (?1)", [id])?;
         tx.execute(
             "INSERT INTO ping_node (task_id, node_id) SELECT id, ?1 FROM ping_task WHERE auto_join",
@@ -2798,9 +2830,7 @@ impl Db {
         let conn = self.conn();
         // `ping_record` carries no foreign key -- it is WITHOUT ROWID and keyed
         // for the chart query -- so it is cleared explicitly; the other history
-        // tables cascade. SQLite reassigns a deleted node's id to the next node
-        // created, which would otherwise inherit the removed machine's latency
-        // chart.
+        // tables cascade.
         conn.execute("DELETE FROM ping_record WHERE node_id = ?1", [id])?;
         Ok(conn.execute("DELETE FROM node WHERE id = ?1", [id])? > 0)
     }
@@ -2826,23 +2856,12 @@ impl Db {
     /// moves to `country_prev_ip` / `country_prev` if it had an answer, and a
     /// source equal to that address takes its answer back without a lookup.
     pub fn save_facts(&self, id: i64, f: &serde_json::Value, ip: &str, source: &str) -> Result<bool> {
-        // The same rule `api::agent_register` applies to the name it receives:
-        // these values come from an unvouched machine, control characters break
-        // the panel's rows, and the length must be bounded. Six of them -- os,
-        // kernel, arch, virt, cpu_name, agent_version -- go straight into the
-        // anonymous public frame, which is rebuilt and pushed to every viewer
-        // every two seconds, so without a ceiling one node would determine that
-        // frame's size. 128 rather than 64: a real PRETTY_NAME runs to about 60
-        // characters and a CPU model to about 50.
-        let s = |k: &str| {
-            f.get(k)
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .chars()
-                .filter(|c| !c.is_control())
-                .take(128)
-                .collect::<String>()
-        };
+        // Six of these -- os, kernel, arch, virt, cpu_name, agent_version -- go
+        // straight into the anonymous public frame, which is rebuilt and pushed to
+        // every viewer every two seconds, so without a ceiling one node would
+        // determine that frame's size. 128 rather than 64: a real PRETTY_NAME runs
+        // to about 60 characters and a CPU model to about 50.
+        let s = |k: &str| reported_text(f.get(k).and_then(|v| v.as_str()).unwrap_or(""), 128);
         let n = |k: &str| f.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
         let conn = self.conn();
         conn.execute(
@@ -2877,6 +2896,16 @@ impl Db {
         )?;
         let blank: bool = conn.query_row("SELECT country = '' FROM node WHERE id=?1", [id], |r| r.get(0))?;
         Ok(blank && !source.is_empty())
+    }
+
+    /// Records where the hub saw a node over the address family its session is
+    /// not in. Kept apart from `save_facts`, which an agent's hello rewrites: the
+    /// two arrive on different connections, in no fixed order.
+    pub fn set_ip_other(&self, id: i64, ip: &str) -> Result<()> {
+        // Unchanged is not written: a reconnecting agent, or a token holder
+        // repeating the request, would otherwise cost a write transaction each.
+        self.conn().execute("UPDATE node SET ip_other=?2 WHERE id=?1 AND ip_other<>?2", params![id, ip])?;
+        Ok(())
     }
 
     /// Whether the node still lacks a country for `source`: false once a lookup
@@ -2992,12 +3021,16 @@ impl Db {
     /// The billing reset day is read here rather than passed in: it is one join
     /// from a row this already reads, and fetching it separately would cost every
     /// booking a second acquisition of the single write connection.
+    ///
+    /// `booted` is when the machine started, by the hub's clock: the arrival
+    /// less the reported uptime.
     pub fn accumulate(
         &self,
         node_id: i64,
         boot_id: &str,
         (rx, tx): (i64, i64),
         at: DateTime<Local>,
+        booted: Option<i64>,
     ) -> Result<Traffic> {
         let conn = self.conn();
         let (
@@ -3013,10 +3046,11 @@ impl Db {
             mut day_tx,
             day_start,
             reset_day,
+            last_seen,
         ) = conn
             .prepare_cached(
                 "SELECT t.boot_id, t.last_rx, t.last_tx, t.total_rx, t.total_tx, t.month_rx, t.month_tx,
-                    t.month_start, t.day_rx, t.day_tx, t.day_start, n.traffic_reset_day
+                    t.month_start, t.day_rx, t.day_tx, t.day_start, n.traffic_reset_day, n.last_seen
                  FROM traffic t JOIN node n ON n.id = t.node_id WHERE t.node_id=?1",
             )?
             .query_row([node_id], |r| {
@@ -3033,6 +3067,7 @@ impl Db {
                     r.get::<_, i64>(9)?,
                     r.get::<_, String>(10)?,
                     r.get::<_, u32>(11)?,
+                    r.get::<_, i64>(12)?,
                 ))
             })?;
 
@@ -3047,10 +3082,27 @@ impl Db {
         // twice. A changed boot_id means the counters restarted, that the agent
         // now sums a different set of interfaces (it appends a digest of them,
         // so a device joining the sum is caught as well as one leaving it), or,
-        // indistinguishably from here, that a second machine shares the token.
-        // Realigning costs the seconds since the reboot; the alternative costs
-        // hundreds of gigabytes against a total that only increases.
-        let (d_rx, d_tx) = if prev_boot.is_empty() || prev_boot != boot_id {
+        // indistinguishably from the epoch alone, that a second machine shares
+        // the token. Booking the reading would cost hundreds of gigabytes
+        // against a total that only increases.
+        //
+        // Except for a machine that booted after the hub last heard from this
+        // token: its counters started from zero while unobserved, so the reading
+        // is exactly the bytes since boot -- a reboot during a hub outage would
+        // otherwise lose the whole outage. A second machine sharing the token
+        // booted before the other's last report, and an epoch whose kernel part
+        // is unchanged is a different set of interfaces, not a restart. The
+        // bytes between the last booking and the reboot remain lost.
+        // `last_seen` trails the last report by up to a minute, so a machine
+        // booted within it books its own bytes since boot, once; the next
+        // report from the other moves `last_seen` past both boots.
+        let unseen_boot = !prev_boot.is_empty()
+            && prev_boot.split('/').next() != boot_id.split('/').next()
+            && booted.is_some_and(|b| last_seen > 0 && b > last_seen);
+        let (d_rx, d_tx) = if unseen_boot {
+            info!("node {node_id} restarted after it was last seen; booking its counters since boot");
+            (rx, tx)
+        } else if prev_boot.is_empty() || prev_boot != boot_id {
             // Logged in either case: on a healthy node this is a reboot or the
             // agent summing a different set of interfaces, while one every few
             // seconds indicates two machines sharing a token or counted
@@ -3188,10 +3240,10 @@ impl Db {
     /// the seven-day window integrated to 53.69 GB against the 27.52 GB the
     /// minutes hold, while averaging gives 28.02 GB, matching the accumulator.
     ///
-    /// `swap_used`, `tcp`, `udp` and `procs` are stored but not returned, as
-    /// nothing draws them from history. The columns are retained deliberately,
-    /// in the hourly tier as well; `load1` was the fifth and has been removed,
-    /// see `migrate_to_2`.
+    /// `swap_used`, `tcp`, `udp` and `procs` are returned although the official
+    /// themes draw none of them from history: a theme the hub does not ship may.
+    /// The counts are rounded, as in `fold_next`; a truncated mean would show
+    /// a socket held half the bucket as none.
     ///
     /// The stamp is the bucket's start rather than a row inside it, so every
     /// series lands on one grid and the probe rows below can be shared.
@@ -3237,6 +3289,8 @@ impl Db {
                 "net_rx": r.get::<_, i64>(4)?, "net_tx": r.get::<_, i64>(5)?,
                 "net_rx_max": r.get::<_, i64>(6)?, "net_tx_max": r.get::<_, i64>(7)?,
                 "cpu_max": r.get::<_, f64>(8)?, "minutes": r.get::<_, i64>(9)?,
+                "swap_used": r.get::<_, i64>(10)?, "tcp": r.get::<_, i64>(11)?,
+                "udp": r.get::<_, i64>(12)?, "procs": r.get::<_, i64>(13)?,
             }))
         };
         if !span.hourly {
@@ -3245,7 +3299,9 @@ impl Db {
                         CAST(AVG(disk_used) AS INTEGER),
                         CAST(AVG(net_rx) AS INTEGER), CAST(AVG(net_tx) AS INTEGER),
                         MAX(MAX(net_rx, net_rx_max)), MAX(MAX(net_tx, net_tx_max)),
-                        MAX(MAX(cpu, cpu_max)), COUNT(*)
+                        MAX(MAX(cpu, cpu_max)), COUNT(*), CAST(AVG(swap_used) AS INTEGER),
+                        CAST(ROUND(AVG(tcp)) AS INTEGER), CAST(ROUND(AVG(udp)) AS INTEGER),
+                        CAST(ROUND(AVG(procs)) AS INTEGER)
                  FROM metric WHERE node_id=?1 AND ts>=?2 GROUP BY ts/?3 ORDER BY ts/?3",
             )?;
             let rows = stmt.query_map(params![node_id, span.since, span.step], row)?;
@@ -3254,13 +3310,18 @@ impl Db {
         let rolled = rolled(&conn)?.unwrap_or(i64::MIN);
         let mut stmt = conn.prepare_cached(
             "SELECT (MIN(ts)/?3)*?3, SUM(cpu*w)/SUM(w), SUM(mem_used*w)/SUM(w), SUM(disk_used*w)/SUM(w),
-                    SUM(net_rx*w)/SUM(w), SUM(net_tx*w)/SUM(w), MAX(rx_max), MAX(tx_max), MAX(cpu_top), SUM(w)
+                    SUM(net_rx*w)/SUM(w), SUM(net_tx*w)/SUM(w), MAX(rx_max), MAX(tx_max), MAX(cpu_top), SUM(w),
+                    SUM(swap_used*w)/SUM(w), CAST(ROUND(SUM(tcp*w)*1.0/SUM(w)) AS INTEGER),
+                    CAST(ROUND(SUM(udp*w)*1.0/SUM(w)) AS INTEGER),
+                    CAST(ROUND(SUM(procs*w)*1.0/SUM(w)) AS INTEGER)
              FROM (SELECT ts, minutes AS w, cpu, mem_used, disk_used, net_rx, net_tx,
-                          net_rx_max AS rx_max, net_tx_max AS tx_max, cpu_max AS cpu_top
+                          net_rx_max AS rx_max, net_tx_max AS tx_max, cpu_max AS cpu_top,
+                          swap_used, tcp, udp, procs
                    FROM metric_hour WHERE node_id=?1 AND ts>=?2 AND ts<?4
                    UNION ALL
                    SELECT ts, 1, cpu, mem_used, disk_used, net_rx, net_tx,
-                          MAX(net_rx, net_rx_max), MAX(net_tx, net_tx_max), MAX(cpu, cpu_max)
+                          MAX(net_rx, net_rx_max), MAX(net_tx, net_tx_max), MAX(cpu, cpu_max),
+                          swap_used, tcp, udp, procs
                    FROM metric WHERE node_id=?1
                         AND ts>=MAX(?2, ?4, (SELECT MAX(ts) FROM metric WHERE node_id=?1) - ?5))
              GROUP BY ts/?3 ORDER BY ts/?3",
@@ -3512,12 +3573,13 @@ impl Db {
             t.id
         } else {
             // At the end, as in `create_node`.
+            let id = next_id(&tx, "ping_task")?;
             tx.execute(
-                "INSERT INTO ping_task (name, target, interval, auto_join, sort)
-                 VALUES (?1,?2,?3,?4,(SELECT COALESCE(MAX(sort),-1)+1 FROM ping_task))",
-                params![t.name, t.target, t.interval, t.auto_join],
+                "INSERT INTO ping_task (id, name, target, interval, auto_join, sort)
+                 VALUES (?5,?1,?2,?3,?4,(SELECT COALESCE(MAX(sort),-1)+1 FROM ping_task))",
+                params![t.name, t.target, t.interval, t.auto_join, id],
             )?;
-            tx.last_insert_rowid()
+            id
         };
         let added: Vec<i64> = match &t.base {
             Some(base) if t.id > 0 => {
@@ -3620,11 +3682,7 @@ impl Db {
     /// Deletes a probe and the results filed under it.
     ///
     /// `ping_record` carries no foreign key, so it is cleared explicitly, as in
-    /// `delete_node`; `ping_hour` cascades. SQLite reassigns a deleted probe's
-    /// id to the next one created, and the chart selects on `task_id IN
-    /// (assignments for this node)`: without this the new probe would draw the
-    /// removed one's latency under its own name, with its timeouts folded into
-    /// the loss figure.
+    /// `delete_node`; `ping_hour` cascades.
     ///
     /// Each delete is a scan -- the keys begin at `node_id` -- bounded by the
     /// week of minute rows and the hourly tier, for an action taken manually a
@@ -3696,12 +3754,12 @@ impl Db {
     /// being WITHOUT ROWID and keyed for the chart query. Two cases arrive
     /// without an assignment. A result already in flight when the panel deleted
     /// its probe, which would otherwise land after `delete_ping_task` swept the
-    /// history and be inherited by whichever probe SQLite assigns the id to next.
+    /// history and stay behind under an id no probe holds.
     /// And a node token in the wrong hands: `task_id` is chosen by the reporter,
     /// so without the test the rows it could create would be unbounded.
     ///
     /// The chart's `task_id IN (assignments)` filter hides both afterwards, but
-    /// does not prevent the write, its storage, or the id being reused.
+    /// does not prevent the write or its storage.
     pub fn insert_pings(&self, node_id: i64, results: &[(i64, i64, i64)]) -> Result<()> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
@@ -4059,12 +4117,26 @@ impl Db {
     /// half a database behind.
     ///
     /// Call [`Db::check_backup`] first, as it is what brings `src` to this
-    /// build's schema; the copy is then the last step and nothing after it can
-    /// fail. Like the other two, this reads and writes the whole file and belongs
-    /// off the runtime.
+    /// build's schema; the copy is then the last step that can fail. Like the
+    /// other two, this reads and writes the whole file and belongs off the
+    /// runtime.
+    ///
+    /// The live file's id high marks outlast the copy: an id issued after the
+    /// backup was taken may still key the hub's memory -- the offline sweep, the
+    /// country lookup -- and an older mark would issue it again.
     pub fn restore_from(&self, src: &str) -> Result<()> {
         let mut conn = self.conn();
+        let live = ID_TABLES.map(|table| issued(&conn, table));
         conn.restore(rusqlite::MAIN_DB, src, None::<fn(rusqlite::backup::Progress)>)?;
+        for (table, live) in ID_TABLES.into_iter().zip(live) {
+            let kept = live.and_then(|live| {
+                let id = issued(&conn, table)?.max(live);
+                put_setting(&conn, &format!("{table}_id_issued"), &id.to_string())
+            });
+            if let Err(e) = kept {
+                warn!("keeping the {table} id high mark across the restore failed: {e:#}");
+            }
+        }
         Ok(())
     }
 
@@ -4290,6 +4362,30 @@ fn port_in_use(conn: &Connection, node_id: i64, port: i64, except: Option<i64>) 
     )?)
 }
 
+/// The id for a new row of `table`: one past every id it has issued, deleted
+/// rows included. SQLite's default reissues the highest id once its row is
+/// deleted, and state the hub keeps by id -- the offline sweep's absence and
+/// return times, an editor opened before the delete -- would pass to the new
+/// row. The high mark lives in `setting`, so a backup carries it; without one,
+/// as after an upgrade, the table's own highest id stands in.
+fn next_id(tx: &rusqlite::Transaction<'_>, table: &str) -> Result<i64> {
+    let id = issued(tx, table)? + 1;
+    put_setting(tx, &format!("{table}_id_issued"), &id.to_string())?;
+    Ok(id)
+}
+
+/// The highest id `table` has issued, by its high mark or its rows.
+fn issued(conn: &Connection, table: &str) -> Result<i64> {
+    Ok(conn.query_row(
+        &format!(
+            "SELECT MAX(COALESCE((SELECT CAST(value AS INTEGER) FROM setting WHERE key = ?1), 0),
+                        COALESCE((SELECT MAX(id) FROM {table}), 0))"
+        ),
+        [format!("{table}_id_issued")],
+        |r| r.get(0),
+    )?)
+}
+
 fn parse_json(r: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<serde_json::Value> {
     let raw: String = r.get(index)?;
     serde_json::from_str(&raw).map_err(|error| {
@@ -4352,6 +4448,18 @@ fn row_to_user(r: &rusqlite::Row<'_>) -> rusqlite::Result<User> {
     })
 }
 
+/// The tables whose ids [`next_id`] issues.
+const ID_TABLES: [&str; 2] = ["node", "ping_task"];
+
+fn put_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO setting (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, value],
+    )?;
+    Ok(())
+}
+
 fn row_to_node(r: &rusqlite::Row<'_>) -> Node {
     let s = |i: &str| r.get::<_, String>(i).unwrap_or_default();
     let n = |i: &str| r.get::<_, i64>(i).unwrap_or(0);
@@ -4381,6 +4489,7 @@ fn row_to_node(r: &rusqlite::Row<'_>) -> Node {
         disk_total: n("disk_total"),
         agent_version: s("agent_version"),
         ip: s("ip"),
+        ip_other: s("ip_other"),
         ipv4: s("ipv4"),
         ipv6: s("ipv6"),
         country: s("country"),
@@ -4648,10 +4757,10 @@ mod tests {
             db.create_node(&Node { name: "backed-up".into(), ..Default::default() }, "token-kept").unwrap();
         db.backup_into(&copy).unwrap();
 
-        // Everything after the copy must disappear on restore, including a node
-        // that reclaimed the deleted one's id.
+        // Everything after the copy must disappear on restore.
         db.delete_node(kept).unwrap();
-        db.create_node(&Node { name: "after".into(), ..Default::default() }, "token-after").unwrap();
+        let after =
+            db.create_node(&Node { name: "after".into(), ..Default::default() }, "token-after").unwrap();
 
         db.check_backup(&copy).unwrap();
         db.restore_from(&copy).unwrap();
@@ -4662,8 +4771,9 @@ mod tests {
 
         // The connection remains the hub's: it can write, it is on the schema this
         // build expects, and it retains the journal mode the hub opened with --
-        // the copy `VACUUM INTO` wrote is not in WAL mode.
-        node(&db, 1);
+        // the copy `VACUUM INTO` wrote is not in WAL mode. Nor does it issue
+        // again an id the live file had issued.
+        assert!(node(&db, 1) > after, "an id issued before the restore is not issued again");
         let conn = db.conn();
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(),
@@ -5390,12 +5500,14 @@ mod tests {
                 "DROP TABLE metric_hour; DROP TABLE ping_hour;
                  ALTER TABLE metric DROP COLUMN cpu_max;
                  ALTER TABLE node DROP COLUMN public_remark;
+                 ALTER TABLE node DROP COLUMN ip_other;
                  PRAGMA user_version = 20;",
             )
             .unwrap();
             migrate(&conn, 20).unwrap();
             assert!(columns_of(&conn, "metric").unwrap().contains("cpu_max"));
             assert!(columns_of(&conn, "node").unwrap().contains("public_remark"));
+            assert!(columns_of(&conn, "node").unwrap().contains("ip_other"));
             for table in HOURLY_TABLES {
                 assert!(!columns_of(&conn, table).unwrap().is_empty());
             }
@@ -5792,20 +5904,20 @@ mod tests {
         let id = node(&db, 1);
 
         // The first report only establishes the baseline.
-        let t = db.accumulate(id, "boot-a", (5_000, 3_000), Local::now()).unwrap();
+        let t = db.accumulate(id, "boot-a", (5_000, 3_000), Local::now(), None).unwrap();
         assert_eq!((t.total_rx, t.total_tx), (0, 0));
 
-        let t = db.accumulate(id, "boot-a", (9_000, 6_000), Local::now()).unwrap();
+        let t = db.accumulate(id, "boot-a", (9_000, 6_000), Local::now(), None).unwrap();
         assert_eq!((t.total_rx, t.total_tx), (4_000, 3_000));
 
         // Reboot: a new boot_id with counters restarting near zero. The total must
         // not fall back to the fresh value, and the 700 bytes moved before the
         // first report are not booked, nothing having measured them.
-        let t = db.accumulate(id, "boot-b", (700, 400), Local::now()).unwrap();
+        let t = db.accumulate(id, "boot-b", (700, 400), Local::now(), None).unwrap();
         assert_eq!((t.total_rx, t.total_tx), (4_000, 3_000), "a reboot must not reset the total");
 
         // Counting resumes from the new baseline.
-        let t = db.accumulate(id, "boot-b", (1_700, 900), Local::now()).unwrap();
+        let t = db.accumulate(id, "boot-b", (1_700, 900), Local::now(), None).unwrap();
         assert_eq!((t.total_rx, t.total_tx), (5_000, 3_500));
         assert_eq!((t.month_rx, t.month_tx), (5_000, 3_500));
     }
@@ -5820,45 +5932,64 @@ mod tests {
         let id = node(&db, 1);
         let (a, b) = (100_000_000_000, 80_000_000_000); // two lifetime counters
 
-        db.accumulate(id, "boot-a", (a, a), Local::now()).unwrap();
-        let t = db.accumulate(id, "boot-a", (a + 1_000, a + 1_000), Local::now()).unwrap();
+        db.accumulate(id, "boot-a", (a, a), Local::now(), None).unwrap();
+        let t = db.accumulate(id, "boot-a", (a + 1_000, a + 1_000), Local::now(), None).unwrap();
         assert_eq!(t.total_rx, 1_000, "the real machine's own traffic still counts");
 
         // Every swap presents a boot_id with no baseline, so every swap books
         // nothing.
         for round in 0..3 {
-            db.accumulate(id, "boot-b", (b + round, b + round), Local::now()).unwrap();
-            db.accumulate(id, "boot-a", (a + 1_000 + round, a + 1_000 + round), Local::now()).unwrap();
+            db.accumulate(id, "boot-b", (b + round, b + round), Local::now(), None).unwrap();
+            db.accumulate(id, "boot-a", (a + 1_000 + round, a + 1_000 + round), Local::now(), None).unwrap();
         }
         let t = db.all_traffic()[&id].clone();
         assert!(t.total_rx < 10_000, "six swaps booked {} bytes, not a lifetime counter", t.total_rx);
+    }
+
+    /// A machine that rebooted while the hub was not hearing from it books its
+    /// counters since boot; a second machine on the token, booted before the
+    /// last report, and a change of interfaces alone do not.
+    #[test]
+    fn a_reboot_after_the_node_was_last_seen_books_the_counters_since_boot() {
+        let db = db();
+        let id = node(&db, 1);
+        let now = Local::now();
+        let total = |epoch: &str, counters: i64, booted: i64| {
+            db.accumulate(id, epoch, (counters, counters), now, Some(booted)).unwrap().total_rx
+        };
+        assert_eq!(total("k1/a", 500_000_000_000, 0), 0, "a first reading is a baseline");
+        db.touch_seen(id, 1_000, &serde_json::Value::Null).unwrap();
+        assert_eq!(total("k1/b", 600_000_000_000, 2_000), 0, "the interfaces changed, the kernel did not");
+        assert_eq!(total("k2/b", 80_000_000_000, 900), 0, "booted before the node was last seen");
+        assert_eq!(total("k3/b", 7_000, 2_000), 7_000, "booted after it, from zero");
+        assert_eq!(total("k3/b", 7_500, 2_000), 7_500);
     }
 
     #[test]
     fn a_shrinking_reading_re_aligns_instead_of_re_counting_history() {
         let db = db();
         let id = node(&db, 1);
-        db.accumulate(id, "boot-a", (10_000, 10_000), Local::now()).unwrap();
-        let t = db.accumulate(id, "boot-a", (12_000, 12_000), Local::now()).unwrap();
+        db.accumulate(id, "boot-a", (10_000, 10_000), Local::now(), None).unwrap();
+        let t = db.accumulate(id, "boot-a", (12_000, 12_000), Local::now(), None).unwrap();
         assert_eq!((t.total_rx, t.total_tx), (2_000, 2_000));
 
         // The same boot with a reduced reading: an interface included in the sum
         // has gone, so this is the remainder of the machine's history rather than
         // new bytes.
-        let t = db.accumulate(id, "boot-a", (500, 500), Local::now()).unwrap();
+        let t = db.accumulate(id, "boot-a", (500, 500), Local::now(), None).unwrap();
         assert_eq!((t.total_rx, t.total_tx), (2_000, 2_000));
 
         // Aligned to the smaller baseline, counting resumes from there.
-        let t = db.accumulate(id, "boot-a", (900, 900), Local::now()).unwrap();
+        let t = db.accumulate(id, "boot-a", (900, 900), Local::now(), None).unwrap();
         assert_eq!((t.total_rx, t.total_tx), (2_400, 2_400));
 
         // A new boot realigns identically, for the same reason: it has no baseline
         // either.
-        let t = db.accumulate(id, "boot-b", (300, 300), Local::now()).unwrap();
+        let t = db.accumulate(id, "boot-b", (300, 300), Local::now(), None).unwrap();
         assert_eq!((t.total_rx, t.total_tx), (2_400, 2_400));
 
         // One direction shrinking does not deprive the other of its increment.
-        let t = db.accumulate(id, "boot-b", (100, 900), Local::now()).unwrap();
+        let t = db.accumulate(id, "boot-b", (100, 900), Local::now(), None).unwrap();
         assert_eq!((t.total_rx, t.total_tx), (2_400, 3_000));
     }
 
@@ -5869,21 +6000,21 @@ mod tests {
     fn day_and_month_restart_independently_while_the_total_keeps_climbing() {
         let db = db();
         let id = node(&db, 1);
-        db.accumulate(id, "boot-a", (0, 0), Local::now()).unwrap();
-        let t = db.accumulate(id, "boot-a", (8_000, 4_000), Local::now()).unwrap();
+        db.accumulate(id, "boot-a", (0, 0), Local::now(), None).unwrap();
+        let t = db.accumulate(id, "boot-a", (8_000, 4_000), Local::now(), None).unwrap();
         assert_eq!((t.day_rx, t.day_tx), (8_000, 4_000));
         assert_eq!((t.month_rx, t.month_tx), (8_000, 4_000));
 
         // Midnight passes, forced through the stored date the rollover reads.
         db.conn().execute("UPDATE traffic SET day_start='1999-01-01' WHERE node_id=?1", [id]).unwrap();
-        let t = db.accumulate(id, "boot-a", (9_500, 4_600), Local::now()).unwrap();
+        let t = db.accumulate(id, "boot-a", (9_500, 4_600), Local::now(), None).unwrap();
         assert_eq!((t.day_rx, t.day_tx), (1_500, 600), "a new day counts only this report's delta");
         assert_eq!(t.month_rx, 9_500, "the month is not a day");
         assert_eq!(t.total_rx, 9_500, "and the total is neither");
 
         // The billing period then rolls over, partway through that same day.
         db.conn().execute("UPDATE traffic SET month_start='1999-01-01' WHERE node_id=?1", [id]).unwrap();
-        let t = db.accumulate(id, "boot-a", (10_000, 4_700), Local::now()).unwrap();
+        let t = db.accumulate(id, "boot-a", (10_000, 4_700), Local::now(), None).unwrap();
         assert_eq!((t.month_rx, t.month_tx), (500, 100), "a new period counts only this report's delta");
         assert_eq!((t.day_rx, t.day_tx), (2_000, 700), "the day carries on across a billing rollover");
         assert_eq!(t.total_rx, 10_000, "lifetime total is untouched by either rollover");
@@ -5900,28 +6031,29 @@ mod tests {
         let db = db();
         let id = node(&db, 20);
         let on = |d: u32| Local.with_ymd_and_hms(2026, 9, d, 12, 0, 0).unwrap();
-        db.accumulate(id, "boot-a", (1_000, 0), on(24)).unwrap();
-        db.accumulate(id, "boot-a", (3_000, 0), on(24)).unwrap();
-        let t = db.accumulate(id, "boot-a", (3_500, 0), on(23)).unwrap();
+        db.accumulate(id, "boot-a", (1_000, 0), on(24), None).unwrap();
+        db.accumulate(id, "boot-a", (3_000, 0), on(24), None).unwrap();
+        let t = db.accumulate(id, "boot-a", (3_500, 0), on(23), None).unwrap();
         assert_eq!(t.day_rx, 2_500, "a reading dated the day before does not restart today");
         assert_eq!(t.month_start, "2026-09-20");
 
         // The reset day moves to the 1st: the period now starts earlier, and a
         // reading dated after the stamp still switches to it.
         db.update_node(id, &NodePatch { traffic_reset_day: Some(1), ..Default::default() }).unwrap();
-        let t = db.accumulate(id, "boot-a", (4_000, 0), on(24)).unwrap();
+        let t = db.accumulate(id, "boot-a", (4_000, 0), on(24), None).unwrap();
         assert_eq!((t.month_start.as_str(), t.month_rx), ("2026-09-01", 500));
 
         // A correction stamps the current period; a reading from the one before,
         // held over the boundary, lands on top of it rather than discarding it.
         db.set_traffic(id, &TrafficPatch { month_rx: Some(10_000), ..Default::default() }).unwrap();
-        let t = db.accumulate(id, "boot-a", (4_500, 0), Local::now() - chrono::Duration::days(40)).unwrap();
+        let t =
+            db.accumulate(id, "boot-a", (4_500, 0), Local::now() - chrono::Duration::days(40), None).unwrap();
         assert_eq!(t.month_rx, 10_500, "the correction survives a reading dated before it");
 
         // A clock a year ahead stamps its own day and period. Once it is stepped
         // back, the next reading returns the row to today.
-        db.accumulate(id, "boot-a", (5_000, 0), Local::now() + chrono::Duration::days(365)).unwrap();
-        db.accumulate(id, "boot-a", (5_200, 0), Local::now()).unwrap();
+        db.accumulate(id, "boot-a", (5_000, 0), Local::now() + chrono::Duration::days(365), None).unwrap();
+        db.accumulate(id, "boot-a", (5_200, 0), Local::now(), None).unwrap();
         let t = db.all_traffic().remove(&id).unwrap();
         assert_eq!((t.day_rx, t.month_rx), (200, 200), "today reads what moved today, not zero");
     }
@@ -5933,8 +6065,8 @@ mod tests {
     fn a_node_that_went_quiet_before_a_boundary_reads_as_zero_this_period() {
         let db = db();
         let id = node(&db, 1);
-        db.accumulate(id, "boot-a", (0, 0), Local::now()).unwrap();
-        db.accumulate(id, "boot-a", (8_000, 4_000), Local::now()).unwrap();
+        db.accumulate(id, "boot-a", (0, 0), Local::now(), None).unwrap();
+        db.accumulate(id, "boot-a", (8_000, 4_000), Local::now(), None).unwrap();
         assert_eq!(db.all_traffic()[&id].day_rx, 8_000, "still today, so it still counts");
 
         // Offline across both boundaries, with no report to restart either.
@@ -5987,11 +6119,16 @@ mod tests {
             ..Default::default()
         };
         let task = db.save_ping_task(&probe(vec![id])).unwrap();
-        db.accumulate(id, "b", (10, 10), Local::now()).unwrap();
+        db.accumulate(id, "b", (10, 10), Local::now(), None).unwrap();
         db.insert_metric(id, 1, &serde_json::json!({"cpu": 1.0})).unwrap();
         db.insert_pings(id, &[(task, 1, 42)]).unwrap();
         db.delete_node(id).unwrap();
         assert!(db.node(id).unwrap().is_none());
+        let pings = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM ping_record WHERE node_id = ?1", [id], |r| r.get::<_, i64>(0))
+            .unwrap();
+        assert_eq!(pings, 0, "ping_record has no foreign key to cascade through");
         assert_eq!(db.metrics(id, Span::minutes(0, 60)).unwrap().len(), 0);
         assert!(!db.all_traffic().contains_key(&id));
         // Ticked in an editor opened before the delete: named, not a 500.
@@ -6003,22 +6140,10 @@ mod tests {
             "{gone:#}"
         );
 
-        // `ping_record` has no foreign key to cascade through, and SQLite reassigns
-        // the deleted id to the next node created: without the sweep in
-        // `delete_node` the new machine would draw the old one's chart.
-        let fresh = node(&db, 1);
-        assert_eq!(fresh, id, "the id is reused, which is what makes this reachable");
-        db.save_ping_task(&PingTask { id: task, nodes: vec![fresh], ..probe(vec![]) }).unwrap();
-        assert!(
-            db.ping_records(fresh, Span::minutes(0, 60)).unwrap().0.is_empty(),
-            "and it starts with no history"
-        );
+        assert_ne!(node(&db, 1), id, "a deleted node's id is not issued again");
     }
 
-    /// The mirror of the sweep above, on the other key of the same table. SQLite
-    /// reuses a deleted probe's id as well, and the chart selects on a node's
-    /// assignments, so the removed probe's samples would reappear under the new
-    /// probe's name with its timeouts folded into the new loss figure.
+    /// The mirror of the sweep above, on the other key of the same table.
     #[test]
     fn deleting_a_probe_takes_its_history_with_it() {
         let db = db();
@@ -6034,18 +6159,52 @@ mod tests {
         let old = db.save_ping_task(&probe("tokyo")).unwrap();
         db.insert_pings(id, &[(old, 1, 999)]).unwrap();
         db.delete_ping_task(old).unwrap();
+        let pings = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM ping_record WHERE task_id = ?1", [old], |r| r.get::<_, i64>(0))
+            .unwrap();
+        assert_eq!(pings, 0, "ping_record has no foreign key to cascade through");
 
         let fresh = db.save_ping_task(&probe("singapore")).unwrap();
-        assert_eq!(fresh, old, "the id is reused, which is what makes this reachable");
-        assert!(
-            db.ping_records(id, Span::minutes(0, 60)).unwrap().0.is_empty(),
-            "and it starts with no history"
-        );
+        assert_ne!(fresh, old, "a deleted probe's id is not issued again");
+    }
+
+    /// A database from a release without high marks: the newest node and probe
+    /// deleted before anything is created keep their ids out of circulation.
+    #[test]
+    fn an_upgraded_database_does_not_reissue_the_newest_ids() {
+        let file = std::env::temp_dir().join(format!("monitor-marks-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let path = file.to_str().unwrap();
+        let db = Db::open(path).unwrap();
+        let (_, newest) = (node(&db, 1), node(&db, 1));
+        let probe = |name: &str| PingTask {
+            name: name.into(),
+            target: "1.1.1.1:443".into(),
+            interval: 60,
+            nodes: vec![newest],
+            ..Default::default()
+        };
+        let task = db.save_ping_task(&probe("tokyo")).unwrap();
+        // As the release before the marks left it.
+        db.conn().execute("DELETE FROM setting WHERE key LIKE '%_id_issued'", []).unwrap();
+        drop(db);
+
+        let db = Db::open(path).unwrap();
+        db.delete_ping_task(task).unwrap();
+        db.delete_node(newest).unwrap();
+        assert!(node(&db, 1) > newest, "the newest node's id is issued again");
+        assert!(db.save_ping_task(&probe("osaka")).is_err(), "the probe names a deleted node");
+        let other = node(&db, 1);
+        let fresh = db.save_ping_task(&PingTask { nodes: vec![other], ..probe("osaka") }).unwrap();
+        assert!(fresh > task, "the newest probe's id is issued again");
+        drop(db);
+        std::fs::remove_file(&file).unwrap();
     }
 
     /// An earlier build deleting a node or a probe runs only its own statements,
     /// those of v1.3.1 below, and knows nothing of `ping_hour`. Rows it leaves
-    /// would be drawn under the next node or probe given the id, once the newer
+    /// would stay behind under an id no node or probe holds, once the newer
     /// build is back.
     #[test]
     fn an_earlier_builds_deletes_clear_the_hourly_probe_rows() {
@@ -6132,8 +6291,7 @@ mod tests {
         assert_eq!(rows().unwrap(), 1, "nothing else reaches the table");
 
         // Deleting the probe also ends its node's results, so one already in flight
-        // cannot land after the sweep and be inherited by the next probe to take
-        // the id.
+        // cannot land after the sweep and stay behind under an id no probe holds.
         db.delete_ping_task(task).unwrap();
         db.insert_pings(mine, &[(task, 2, 42)]).unwrap();
         assert_eq!(rows().unwrap(), 0, "a late result for a deleted probe is dropped");
@@ -6152,6 +6310,32 @@ mod tests {
         let stored = db.node(id).unwrap().unwrap();
         assert_eq!(stored.os.chars().count(), 128);
         assert_eq!(stored.hostname, "xy", "control characters break the panel's rows");
+
+        db.save_facts(id, &serde_json::json!({"os": "<img src=x onerror=\"a()\">'Debian'"}), "ip", "")
+            .unwrap();
+        assert_eq!(
+            db.node(id).unwrap().unwrap().os,
+            "img src=x onerror=a()Debian",
+            "no markup reaches a theme"
+        );
+    }
+
+    /// The address seen in the other family arrives on its own connection, in no
+    /// fixed order against the hello, and must not be wiped by it.
+    #[test]
+    fn the_address_seen_in_the_other_family_survives_a_hello() {
+        let db = db();
+        let id = node(&db, 1);
+        db.set_ip_other(id, "2001:db8:1::9").unwrap();
+        db.save_facts(
+            id,
+            &serde_json::json!({"ipv4": "10.0.0.5", "ipv6": "fd00::5"}),
+            "203.0.113.9",
+            "203.0.113.9",
+        )
+        .unwrap();
+        let stored = db.node(id).unwrap().unwrap();
+        assert_eq!((stored.ip.as_str(), stored.ip_other.as_str()), ("203.0.113.9", "2001:db8:1::9"));
     }
 
     /// A correction must survive the node's return. `all_traffic` gates the month
@@ -6162,7 +6346,7 @@ mod tests {
     fn a_month_correction_is_stamped_with_the_period_it_was_made_in() {
         let db = db();
         let id = node(&db, 1);
-        db.accumulate(id, "boot-a", (0, 0), Local::now()).unwrap();
+        db.accumulate(id, "boot-a", (0, 0), Local::now(), None).unwrap();
         // A node silent since before its reset day still holds the old period.
         db.conn().execute("UPDATE traffic SET month_start='1999-01-01' WHERE node_id=?1", [id]).unwrap();
 
@@ -6179,7 +6363,7 @@ mod tests {
         let t = db.all_traffic().remove(&id).unwrap();
         assert_eq!((t.month_rx, t.month_tx), (300, 100), "the correction reads back as this period's");
 
-        let t = db.accumulate(id, "boot-a", (500, 50), Local::now()).unwrap();
+        let t = db.accumulate(id, "boot-a", (500, 50), Local::now(), None).unwrap();
         assert_eq!((t.month_rx, t.month_tx), (800, 150), "and the next report adds to it");
         assert_eq!((t.total_rx, t.total_tx), (4_500, 2_050));
     }
@@ -6205,8 +6389,8 @@ mod tests {
         assert_eq!(n.price, 0.0);
         assert_eq!(n.expires_at, None);
 
-        db.accumulate(id, "boot", (0, 0), Local::now()).unwrap();
-        db.accumulate(id, "boot", (120_000, 10_000), Local::now()).unwrap();
+        db.accumulate(id, "boot", (0, 0), Local::now(), None).unwrap();
+        db.accumulate(id, "boot", (120_000, 10_000), Local::now(), None).unwrap();
         db.set_traffic(id, &TrafficPatch { month_tx: Some(3_000), ..Default::default() }).unwrap();
         let t = db.all_traffic().remove(&id).unwrap();
         assert_eq!((t.total_rx, t.total_tx, t.month_rx, t.month_tx), (120_000, 10_000, 120_000, 3_000));
@@ -6315,8 +6499,8 @@ mod tests {
         // Six hours whose values vary within each hour, with minutes missing so
         // the hours carry different weights, and a probe that loses rounds.
         let start = 472_224 * 3_600;
-        // Per hour, the columns the chart does not return, to check the tier
-        // keeps them.
+        // Per hour, the columns the official themes do not draw, to check the
+        // tier keeps them.
         let mut kept: [Vec<[i64; 4]>; 6] = Default::default();
         for m in (0..6 * 60).filter(|m| m % 17 != 3 && !(100..130).contains(m)) {
             let ts = start + m * 60;
@@ -6348,7 +6532,7 @@ mod tests {
                 );
                 assert!((g["cpu"].as_f64().unwrap() - w["cpu"].as_f64().unwrap()).abs() < 1e-9, "{g} {w}");
                 let slack = if step == 3_600 { 0 } else { 1 };
-                for key in ["mem_used", "disk_used", "net_rx", "net_tx"] {
+                for key in ["mem_used", "disk_used", "net_rx", "net_tx", "swap_used", "tcp", "udp", "procs"] {
                     let d = g[key].as_i64().unwrap() - w[key].as_i64().unwrap();
                     assert!(d.abs() <= slack, "{key} at {step}s: {g} {w}");
                 }
@@ -6392,7 +6576,7 @@ mod tests {
         let held: usize = kept.iter().map(Vec::len).sum();
         assert_eq!(points.iter().map(|p| p["minutes"].as_i64().unwrap()).sum::<i64>(), held as i64);
         assert_eq!(points.iter().map(|p| p["cpu_max"].as_f64().unwrap()).fold(0.0, f64::max), 9.0 + 10.0);
-        // The columns the chart does not return are kept as each hour's mean,
+        // The columns the official themes do not draw are kept as each hour's mean,
         // swap truncated like the other bytes and the counts rounded.
         let stored: Vec<[i64; 4]> = db
             .conn()
@@ -6434,8 +6618,8 @@ mod tests {
     fn prune_drops_history_but_never_traffic_totals() {
         let db = db();
         let id = node(&db, 1);
-        db.accumulate(id, "b", (100, 100), Local::now()).unwrap();
-        db.accumulate(id, "b", (900, 900), Local::now()).unwrap();
+        db.accumulate(id, "b", (100, 100), Local::now(), None).unwrap();
+        db.accumulate(id, "b", (900, 900), Local::now(), None).unwrap();
         let old = Utc::now().timestamp() - 40 * 86_400;
         db.insert_metric(id, old, &serde_json::json!({"cpu": 1.0})).unwrap();
         db.insert_metric(id, Utc::now().timestamp(), &serde_json::json!({"cpu": 2.0})).unwrap();
@@ -6574,7 +6758,7 @@ mod tests {
         let upgraded = dump(&db.conn());
         assert_eq!(
             upgraded.len(),
-            PRE_RESOURCE_TABLES.len() + 2,
+            PRE_RESOURCE_TABLES.len() + 2 + ID_TABLES.len(),
             "every old row survives, admin is seeded, and the reset marker is recorded: {upgraded:#?}"
         );
 

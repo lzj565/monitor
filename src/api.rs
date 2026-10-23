@@ -4,9 +4,10 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
-use axum::extract::{ConnectInfo, FromRequestParts, Path, Query, State};
+use axum::extract::{ConnectInfo, FromRequestParts, Path, Query, Request, State};
 use axum::http::request::Parts;
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, Method, StatusCode};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use chrono::{DateTime, Local, NaiveDate, Utc};
@@ -82,6 +83,32 @@ impl FromRequestParts<Shared> for UserAuth {
         }
         Err(api_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "登录已失效，请重新登录"))
     }
+}
+
+/// Whether a page other than the panel sent this request. `SameSite=Lax` holds
+/// a cookie back from other *sites*, but a sibling subdomain of the hub's
+/// registrable domain is the same site: its script may send a request without a
+/// body (`no-cors`, no preflight) and the cookie goes along, which suffices for
+/// a token reset or a vacuum. Browsers name where a request came from in
+/// `Sec-Fetch-Site`; only `same-origin` is the panel itself. The header is
+/// absent from a client that is not a browser, from a browser too old to send
+/// it, and from every browser on a plain-http address other than loopback; the
+/// last two are not told apart from the panel.
+fn from_other_origin(headers: &HeaderMap) -> bool {
+    headers.get("sec-fetch-site").is_some_and(|site| site != "same-origin")
+}
+
+fn cross_site_write(method: &Method, headers: &HeaderMap) -> bool {
+    !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) && from_other_origin(headers)
+}
+
+/// Refuses writes from another origin before any handler sees them, so a route
+/// added later is covered without remembering to ask.
+pub async fn same_origin_writes(request: Request, next: Next) -> Response {
+    if cross_site_write(request.method(), request.headers()) {
+        return answer(StatusCode::FORBIDDEN, "请求来自其他网站，已拒绝");
+    }
+    next.run(request).await
 }
 
 /// Marks a response whose text was written for the reader; see [`plain_errors`].
@@ -1080,21 +1107,21 @@ pub(crate) const PUBLIC_METRICS: [&str; 18] = [
 
 /// The addresses the panel shows for a node, each with where it comes from: at
 /// most one per family, v4 first, the one the machine is reached by. The agent
-/// reports its interfaces; `ip` is where its connection arrived from, in dotted
-/// form for IPv4.
+/// reports its interfaces; `exits` are where the hub saw it: the address its
+/// session arrived from, and the one a short second connection arrived from in
+/// the other family, each in dotted form for IPv4.
 ///
 /// Per family an address set by hand comes first, then a public one on the
 /// interface. Failing both, where the interface holds only a private address of
-/// the family the connection used -- NAT, or a proxy in front -- the
-/// connection's public address, its exit, stands in. An exit in a family the
-/// interface does not hold is a translator such as NAT64 or WARP and is left
-/// out.
+/// that family -- NAT, or a proxy in front -- the public address the hub saw in
+/// it, its exit, stands in. An exit in a family the interface does not hold is a
+/// translator such as NAT64 or WARP and is left out.
 ///
 /// Private addresses appear only when nothing public is known, as where hub and
-/// node share a network and they are all there is. `ip` alone is the fallback
-/// for an agent reporting no interface.
+/// node share a network and they are all there is. The session's own exit alone
+/// is the fallback for an agent reporting no interface.
 fn addresses<'a>(
-    ip: &'a str,
+    exits: [&'a str; 2],
     (ipv4, ipv6): (&'a str, &'a str),
     (pin4, pin6): (&'a str, &'a str),
 ) -> Vec<(&'a str, &'static str)> {
@@ -1105,10 +1132,10 @@ fn addresses<'a>(
             Some((pin, "manual"))
         } else if public(held, v6) {
             Some((held, "interface"))
-        } else if !held.is_empty() && public(ip, v6) {
-            Some((ip, "exit"))
-        } else {
+        } else if held.is_empty() {
             None
+        } else {
+            exits.into_iter().find(|ip| public(ip, v6)).map(|exit| (exit, "exit"))
         }
     };
     let shown: Vec<_> = [family(pin4, ipv4, false), family(pin6, ipv6, true)].into_iter().flatten().collect();
@@ -1119,7 +1146,7 @@ fn addresses<'a>(
     if !held.is_empty() {
         return held;
     }
-    [ip].into_iter().filter(|a| !a.is_empty()).map(|a| (a, "connection")).collect()
+    [exits[0]].into_iter().filter(|a| !a.is_empty()).map(|a| (a, "connection")).collect()
 }
 
 /// One node as the UI consumes it: stored config, live metrics and the hub's
@@ -1227,11 +1254,12 @@ fn node_view(
     if full {
         let held = (node.ipv4.as_str(), node.ipv6.as_str());
         let (pin4, pin6) = (node.ipv4_pin.as_str(), node.ipv6_pin.as_str());
-        let shown = addresses(&node.ip, held, (pin4, pin6));
+        let exits = [node.ip.as_str(), node.ip_other.as_str()];
+        let shown = addresses(exits, held, (pin4, pin6));
         // What each family shows with its own pin cleared and the other's kept,
         // for the edit form to offer as the fallback.
         let auto = |pins, v6: bool| {
-            addresses(&node.ip, held, pins)
+            addresses(exits, held, pins)
                 .into_iter()
                 .find(|(a, _)| a.contains(':') == v6)
                 .map_or("", |(a, _)| a)
@@ -1278,6 +1306,22 @@ pub async fn nodes(State(app): State<Shared>, headers: HeaderMap) -> Response {
     // The same rendered frame the browser streams receive, for the same reason:
     // otherwise every visitor would rebuild every node's row against the
     // connection the agents write through.
+    //
+    // Compressed likewise, once per frame: left to the compression layer, every
+    // request deflates the whole list again, about 6 ms of CPU for a thousand
+    // nodes, and this route answers anyone. Already encoded, the layer passes
+    // it through without adding the Vary it adds to what it compresses.
+    if !full && accepts_gzip(&headers) {
+        return (
+            [
+                (header::CONTENT_TYPE, "application/json"),
+                (header::CONTENT_ENCODING, "gzip"),
+                (header::VARY, "accept-encoding"),
+            ],
+            live_gzip(&app),
+        )
+            .into_response();
+    }
     let mut res =
         ([(header::CONTENT_TYPE, "application/json")], axum::body::Bytes::from(live_snapshot(&app, full)))
             .into_response();
@@ -1461,7 +1505,7 @@ pub struct Frame {
     /// The millisecond it was built.
     at: i64,
     json: Utf8Bytes,
-    /// `json` gzipped, made by the first stream that asks for it.
+    /// `json` gzipped, made by the first stream or `/api/nodes` request that asks for it.
     gzip: Option<axum::body::Bytes>,
 }
 
@@ -1494,10 +1538,29 @@ fn live_snapshot(app: &App, full: bool) -> Utf8Bytes {
     current(app, full, |frame| frame.json.clone())
 }
 
-/// The public frame gzipped, for streams opened with `?gzip`. A hundred
-/// reporting nodes are about 110 KB of JSON every two seconds, 15 KB compressed,
-/// for each page left open. Compressed once per frame, about a millisecond at
-/// that size, however many streams take it.
+/// Whether `Accept-Encoding` lists gzip with a nonzero weight. A wildcard is
+/// not read as gzip: browsers name gzip itself, and any other request is still
+/// compressed by the compression layer.
+fn accepts_gzip(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(header::ACCEPT_ENCODING)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|coding| {
+            let mut parts = coding.split(';').map(str::trim);
+            let name = parts.next().unwrap_or_default();
+            let weight = parts
+                .find_map(|p| p.strip_prefix("q=").or_else(|| p.strip_prefix("Q=")))
+                .map_or(1.0, |q| q.parse::<f32>().unwrap_or(0.0));
+            (name.eq_ignore_ascii_case("gzip") || name.eq_ignore_ascii_case("x-gzip")) && weight > 0.0
+        })
+}
+
+/// The public frame gzipped, for streams opened with `?gzip` and for
+/// `/api/nodes`. A hundred reporting nodes are about 110 KB of JSON every two
+/// seconds, 15 KB compressed, for each page left open. Compressed once per
+/// frame, about a millisecond at that size, however many streams take it.
 fn live_gzip(app: &App) -> axum::body::Bytes {
     current(app, false, |frame| {
         frame
@@ -1549,6 +1612,31 @@ pub struct Stream {
     gzip: Option<String>,
 }
 
+/// How many anonymous streams may be open at once. The fourth bound of the
+/// anonymous paths, beside `HISTORY_GATE`, `main::RELAY_GATE` and
+/// `auth::PASSWORD_GATE`: a stream holds a descriptor and a task for as long as
+/// its page stays open, and at a hundred nodes sends about 7 KB/s of compressed
+/// frames, 55 KB/s to a page that does not ask for gzip. A thousand pages are
+/// 7 to 55 MB/s outbound. Beyond it a page falls back to polling `/api/nodes`,
+/// whose rendered frame every viewer shares.
+const PUBLIC_STREAMS: usize = 1000;
+static PUBLIC_STREAM_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(PUBLIC_STREAMS);
+
+/// A send that blocks this long has no reader left: the pages treat 10 s
+/// without a frame as a lost stream and open another. A peer that vanished
+/// without a FIN would otherwise keep its slot until TCP gives up, about
+/// 15 minutes.
+const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The slot a new stream holds until it ends. A session is the operator's own
+/// and is not counted, so whoever holds one can always open the panel.
+fn stream_slot(session: Option<&str>) -> Result<Option<tokio::sync::SemaphorePermit<'static>>, ()> {
+    if session.is_some() {
+        return Ok(None);
+    }
+    PUBLIC_STREAM_GATE.try_acquire().map(Some).map_err(|_| ())
+}
+
 /// Live stream for the browser. Each connection runs its own timer -- simpler to
 /// reason about than a fan-out channel -- over a shared snapshot, so a timer
 /// costs no more than a send.
@@ -1560,19 +1648,32 @@ pub async fn live_ws(
 ) -> Response {
     // The digest rather than the result: signing out must reach a stream already
     // running, and only the row it names can report whether it has.
-    let session = current_session(&headers).filter(|hash| app.db.session_valid(hash));
+    // A sibling subdomain's script opens this with the cookie too, and a
+    // WebSocket is not held back by CORS: it would read the admin frame. Such a
+    // handshake is answered as an anonymous one.
+    let session = current_session(&headers)
+        .filter(|_| !from_other_origin(&headers))
+        .filter(|hash| app.db.session_valid(hash));
     if session.is_none() && !app.public_page() {
         return answer(StatusCode::UNAUTHORIZED, "需要登录后查看");
     }
-    upgrade
-        .read_buffer_size(SOCKET_BUFFER)
-        .max_message_size(MAX_FRAME)
-        .on_upgrade(move |socket| stream_live(app, socket, session, stream.gzip.is_some()))
+    let Ok(slot) = stream_slot(session.as_deref()) else {
+        return answer(StatusCode::SERVICE_UNAVAILABLE, "同时在线的访客太多，请稍后再试");
+    };
+    upgrade.read_buffer_size(SOCKET_BUFFER).max_message_size(MAX_FRAME).on_upgrade(move |socket| async move {
+        // Held until the stream ends.
+        let _slot = slot;
+        stream_live(app, socket, session, stream.gzip.is_some()).await
+    })
 }
 
 async fn stream_live(app: Shared, mut socket: WebSocket, session: Option<String>, gzip: bool) {
     // The panel and both official themes treat 10 s without a frame as a lost
-    // stream and reconnect, so the interval must stay well below that.
+    // stream and reconnect, so the interval must stay well below that. Not one
+    // second to match the agent's default report: that would double what every
+    // open page costs -- a hundred nodes are 15 KB a frame compressed, 110 KB for
+    // the panel, which is never compressed -- while history, the mean and peak of
+    // every report in its minute, would gain nothing.
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
     // A delayed tick, for instance behind a vacuum holding the database, is
     // followed by one frame rather than by every tick it missed: those would
@@ -1603,7 +1704,7 @@ async fn stream_live(app: Shared, mut socket: WebSocket, session: Option<String>
         } else {
             Message::Text(live_snapshot(&app, full))
         };
-        if socket.send(frame).await.is_err() {
+        if !matches!(tokio::time::timeout(SEND_TIMEOUT, socket.send(frame)).await, Ok(Ok(()))) {
             break;
         }
     }
@@ -1687,15 +1788,6 @@ fn provisioning_allowed(app: &App, headers: &HeaderMap) -> Result<(), &'static s
         debug!("provisioning refused: Origin {origin:?} is not an https domain entry");
         return Err(PROVISIONING_DENIED);
     }
-    // States that the request belongs to the page it addresses, which `Origin`
-    // alone does not: the panel is the only caller, and a page elsewhere holds no
-    // session here anyway, `SameSite=Lax` keeping the cookie from it. Browsers
-    // predating the header send none, and the origin above remains the test.
-    let fetch_site = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok());
-    if fetch_site.is_some_and(|site| site != "same-origin") {
-        debug!("provisioning refused: Sec-Fetch-Site {fetch_site:?} is not same-origin");
-        return Err(PROVISIONING_DENIED);
-    }
     Ok(())
 }
 
@@ -1722,6 +1814,22 @@ fn group_error(group: &mut String) -> Option<&'static str> {
     *group = group.trim().to_owned();
     if group.chars().count() > MAX_GROUP || group.chars().any(char::is_control) {
         return Some("分组名最多 13 个字，不能含控制字符");
+    }
+    None
+}
+
+/// Node and probe names, as a panel row, a theme card and a chart legend show
+/// them. Refused rather than truncated, as a group name is.
+const MAX_NAME: usize = 64;
+
+/// Trims a node name, or refuses it.
+fn name_error(name: &mut String) -> Option<&'static str> {
+    *name = name.trim().to_owned();
+    if name.is_empty() {
+        return Some("请填写节点名称");
+    }
+    if name.chars().count() > MAX_NAME {
+        return Some("节点名称最多 64 个字");
     }
     None
 }
@@ -1755,11 +1863,8 @@ fn billing_error(currency: Option<&mut String>, cycle: Option<&mut String>) -> O
 /// check both the single and the batch write pass through, so the two accept
 /// exactly the same values.
 fn patch_error(node: &mut NodePatch) -> Option<&'static str> {
-    if let Some(name) = &mut node.name {
-        *name = name.trim().to_owned();
-        if name.is_empty() {
-            return Some("请填写节点名称");
-        }
+    if let Some(message) = node.name.as_mut().and_then(name_error) {
+        return Some(message);
     }
     if let Some(group) = &mut node.group {
         if let Some(message) = group_error(group) {
@@ -2099,17 +2204,13 @@ pub async fn create_node(
         return answer(StatusCode::FORBIDDEN, refusal);
     }
     let Ok(Json(mut node)) = body else { return bad("节点数据格式不对") };
-    if node.name.trim().is_empty() {
-        return bad("请填写节点名称");
-    }
-    if let Some(message) =
-        node_limits(Some(node.traffic_reset_day), Some(node.price), Some(node.traffic_limit))
-            .or_else(|| group_error(&mut node.group))
-            .or_else(|| billing_error(Some(&mut node.currency), Some(&mut node.billing_cycle)))
+    if let Some(message) = name_error(&mut node.name)
+        .or_else(|| node_limits(Some(node.traffic_reset_day), Some(node.price), Some(node.traffic_limit)))
+        .or_else(|| group_error(&mut node.group))
+        .or_else(|| billing_error(Some(&mut node.currency), Some(&mut node.billing_cycle)))
     {
         return bad(message);
     }
-    node.name = node.name.trim().to_owned();
     let token = random_token();
     match app.db.create_node(&node, &token) {
         // Usable immediately: the install dialog reads the token as it opens, so
@@ -2173,7 +2274,7 @@ pub async fn agent_register(
     // a POSIX `sh`.
     name: String,
 ) -> Response {
-    let ip = client_ip(&headers, peer.ip());
+    let ip = client_ip(&app, &headers, peer.ip());
     // Counted separately from the sign-in page: a batch install started with a
     // stale key is a misconfigured deploy rather than an attack on the panel, and
     // a shared counter would lock the operator out of their own hub for LOCKOUT.
@@ -2223,11 +2324,11 @@ pub async fn agent_register(
         Ok(_) => {}
     }
 
-    // The name comes from a machine not yet vouched for: control characters would
-    // break the panel's rows, and the length must be bounded. `chars()` rather
-    // than bytes, so the cut falls on a character boundary.
-    let name: String = name.trim().chars().filter(|c| !c.is_control()).take(64).collect();
-    let name = if name.is_empty() { "unnamed".to_owned() } else { name };
+    // The name comes from a machine not yet vouched for, and is shown to every
+    // visitor until the operator renames the node. Trimmed last: a name made of
+    // markup characters and spaces must come out empty, not as a blank, and
+    // `create_node` names an empty one after the node's id.
+    let name = db::reported_text(&name, MAX_NAME).trim().to_owned();
     // Field defaults live in `Node`'s serde attributes and nowhere else.
     // `Node::default()` is a different set of values -- private, reset day 0 --
     // and a node registered here must match one added through the panel.
@@ -2388,14 +2489,11 @@ pub async fn delete_node(_: Admin, State(app): State<Shared>, Path(id): Path<i64
         Err(e) => return fail(e),
     }
     // The token is checked only at the handshake, so deleting the row does not
-    // end a connection already open on it; dropping the sender does. Without
-    // this the agent would keep reporting under an id SQLite reassigns to the
-    // next node created, which would then appear online on another node's
-    // metrics. Dropped after the delete, so the reconnect that follows finds no
-    // token to accept. The same reasoning applies in `reset_token` below.
+    // end a connection already open on it; dropping the sender does. Dropped
+    // after the delete, so the reconnect that follows finds no token to accept.
+    // The same reasoning applies in `reset_token` below.
     app.agents.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
-    // Its held reading as well, which would otherwise be booked into the node
-    // that inherits the id.
+    // Its held reading as well, which no node would book.
     app.readings.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
     invalidate_snapshot(&app);
     Json(json!({"ok": true})).into_response()
@@ -2508,6 +2606,9 @@ pub async fn save_ping_task(_: Admin, State(app): State<Shared>, Json(mut task):
     if task.name.is_empty() || task.target.is_empty() {
         return bad("请填写名称和目标");
     }
+    if task.name.chars().count() > MAX_NAME {
+        return bad("名称最多 64 个字");
+    }
     // A TCP probe requires an explicit port; a bare host would silently never
     // connect.
     if !valid_target(&task.target) {
@@ -2580,6 +2681,7 @@ const READABLE_SETTINGS: &[&str] = &[
     "update_notice",
     "favicon",
     "touch_icon",
+    "origin_cdn_only",
 ];
 
 // ---- the database itself ----
@@ -2844,7 +2946,10 @@ async fn restore(app: &Shared, path: &str) -> Result<(), anyhow::Error> {
     let (app, source) = (app.clone(), path.to_owned());
     tokio::task::spawn_blocking(move || {
         app.db.check_backup(&source)?;
-        app.db.restore_from(&source)
+        app.db.restore_from(&source)?;
+        // A statement about where this hub is reachable from, which the file
+        // cannot carry to a different machine; the operator confirms it again.
+        app.db.set("origin_cdn_only", "off")
     })
     .await?
 }
@@ -3328,8 +3433,17 @@ pub async fn delete_session(_: Admin, State(app): State<Shared>, Path(id): Path<
     }
 }
 
-pub async fn settings(_: Admin, State(app): State<Shared>) -> Json<Value> {
+pub async fn settings(
+    _: Admin,
+    State(app): State<Shared>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+) -> Json<Value> {
     let mut out = serde_json::Map::new();
+    // The address this request is taken for under the saved `origin_cdn_only`,
+    // so the admin can see whether the switch recognizes them: behind a CDN the
+    // proxy's own address means it does not.
+    out.insert("your_address".into(), json!(client_ip(&app, &headers, peer.ip()).to_string()));
     for key in READABLE_SETTINGS {
         out.insert((*key).to_owned(), json!(app.db.get(key).unwrap_or_default()));
     }
@@ -3391,6 +3505,9 @@ fn setting_error(app: &App, key: &str, value: &Value) -> Option<String> {
         }
         "admin_password" if value.len() < 12 => Some("密码至少 12 位".into()),
         "admin_password" => None,
+        "origin_cdn_only" if !matches!(value, "" | "on" | "off") => {
+            Some("源站只允许 CDN 访问：取值是 on 或 off".into())
+        }
         k if k.starts_with("notify_") => crate::notify::setting_error(k, value),
         k if READABLE_SETTINGS.contains(&k) || k == "github_client_secret" => None,
         _ => Some(format!("没有这个设置项：{key}")),
@@ -3446,10 +3563,34 @@ mod tests {
         ])
     }
 
+    /// A sibling subdomain is the same site, so `SameSite=Lax` lets its bodiless
+    /// POST carry the session; only `Sec-Fetch-Site` tells it from the panel.
+    #[test]
+    fn a_write_from_another_origin_is_refused() {
+        let from = |site: &str| {
+            HeaderMap::from_iter([(header::HeaderName::from_static("sec-fetch-site"), site.parse().unwrap())])
+        };
+        for site in ["same-site", "cross-site", "none"] {
+            assert!(cross_site_write(&Method::POST, &from(site)), "{site}");
+            assert!(cross_site_write(&Method::DELETE, &from(site)), "{site}");
+        }
+        assert!(!cross_site_write(&Method::POST, &from("same-origin")));
+        assert!(!cross_site_write(&Method::POST, &HeaderMap::new()), "not a browser, or one too old to say");
+        assert!(
+            !cross_site_write(&Method::GET, &from("cross-site")),
+            "reads are answered to the page that cannot read them"
+        );
+        // A WebSocket handshake is a GET that the page can read.
+        assert!(from_other_origin(&from("same-site")));
+        assert!(!from_other_origin(&from("same-origin")));
+        assert!(!from_other_origin(&HeaderMap::new()));
+    }
+
     fn app() -> App {
         App::for_test(Db::open(":memory:").unwrap())
     }
 
+    #[allow(clippy::result_large_err)]
     async fn portal_auth(app: &Shared, token: Option<&str>) -> Result<UserAuth, Response> {
         let mut request = axum::http::Request::builder();
         if let Some(token) = token {
@@ -3656,6 +3797,10 @@ mod tests {
         assert_eq!(sing_box["outbounds"][1]["flow"], "xtls-rprx-vision");
     }
 
+    fn peer() -> ConnectInfo<std::net::SocketAddr> {
+        ConnectInfo("198.51.100.7:40000".parse().unwrap())
+    }
+
     /// Taken by every test that calls `metrics`. `HISTORY_GATE` is process-wide,
     /// and a test holding all of its permits would refuse a parallel one with a
     /// 503. Tokio's mutex, since the guard is held across awaits.
@@ -3726,10 +3871,6 @@ mod tests {
         let mut headers = good.clone();
         headers.remove(header::ORIGIN);
         assert_eq!(provisioning_allowed(&app, &headers), Err(ORIGIN_MISSING));
-        // A request sent from a page elsewhere.
-        headers = good.clone();
-        headers.insert("sec-fetch-site", "cross-site".parse().unwrap());
-        assert!(provisioning_allowed(&app, &headers).is_err());
 
         // Both panel paths refuse, and neither leaves anything behind.
         headers = good.clone();
@@ -3824,6 +3965,16 @@ mod tests {
         for refused in [0, -1, 4, 3_601, i64::MAX] {
             assert_eq!(save(refused).await.status(), StatusCode::BAD_REQUEST, "{refused}");
         }
+        let long = PingTask {
+            name: "名".repeat(MAX_NAME + 1),
+            target: "1.1.1.1:443".into(),
+            interval: 60,
+            ..Default::default()
+        };
+        assert_eq!(
+            save_ping_task(Admin, State(app.clone()), Json(long)).await.status(),
+            StatusCode::BAD_REQUEST
+        );
         assert!(app.db.ping_tasks().unwrap().is_empty(), "a refused interval must not store a probe");
 
         // Both ends of the range still save, storing exactly what was sent.
@@ -3927,6 +4078,7 @@ mod tests {
         let live = dir.join("live.db").to_string_lossy().into_owned();
         let app = std::sync::Arc::new(App::for_test(Db::open(&live).unwrap()));
         node(&app, "kept", true);
+        app.db.set("origin_cdn_only", "on").unwrap();
 
         // What a restore actually receives: a backup of a hub database.
         let copy = format!("{live}.copy");
@@ -3944,6 +4096,11 @@ mod tests {
         .await;
         assert_eq!(done.status(), StatusCode::OK);
         assert_eq!(app.db.nodes().unwrap().len(), 1, "the backup went in");
+        assert_eq!(
+            app.db.get("origin_cdn_only").as_deref(),
+            Some("off"),
+            "the premise is the operator's to restate"
+        );
 
         // The database and its journal are the only files that may remain.
         let left: Vec<String> = std::fs::read_dir(&dir)
@@ -4257,7 +4414,7 @@ mod tests {
     #[test]
     fn a_node_shows_the_address_it_is_reached_by() {
         let rows = |ip, held, pins| -> Vec<String> {
-            addresses(ip, held, pins).into_iter().map(|(a, source)| format!("{a} {source}")).collect()
+            addresses([ip, ""], held, pins).into_iter().map(|(a, source)| format!("{a} {source}")).collect()
         };
         let none = ("", "");
         // A public interface is the machine; a different exit in front of it is a
@@ -4279,6 +4436,18 @@ mod tests {
         );
         // ...and over v6 by an older one reporting the ULA ahead of it.
         assert_eq!(rows("2401:b60:1c::5", ("10.10.1.5", "fd42:43af::1"), none), ["2401:b60:1c::5 exit"]);
+        // NAT66: a private v4 and a ULA v6, the session over v4 and a second
+        // connection over v6. Each exit stands in for its own family's address,
+        // and the one in a family the interface lacks is a translator again.
+        let both = |held| -> Vec<String> {
+            addresses(["203.0.113.7", "2001:db8:1::9"], held, none)
+                .into_iter()
+                .map(|(a, source)| format!("{a} {source}"))
+                .collect()
+        };
+        assert_eq!(both(("10.0.0.5", "fd00::5")), ["203.0.113.7 exit", "2001:db8:1::9 exit"]);
+        assert_eq!(both(("10.0.0.5", "")), ["203.0.113.7 exit"]);
+        assert_eq!(both(("10.0.0.5", "2401:b60:1c::5")), ["203.0.113.7 exit", "2401:b60:1c::5 interface"]);
         // Behind a transparent proxy the exit is the proxy's; the home line can
         // only be set by hand.
         let home = ("192.168.1.5", "2409:8a1e::5");
@@ -4500,10 +4669,7 @@ mod tests {
     }
 
     /// Deleting a node must reach the connection it opened, for the same reason
-    /// rotating its token does, and more urgently: SQLite reassigns the freed id
-    /// to the next node created. Left connected, the old machine reports under
-    /// that id, so an undeployed node appears online with another machine's
-    /// metrics, and its traffic and history are booked to it.
+    /// rotating its token does, and a node created afterwards inherits nothing.
     #[tokio::test]
     async fn deleting_a_node_closes_its_session_so_the_next_id_does_not_inherit_it() {
         let app = std::sync::Arc::new(app());
@@ -4519,9 +4685,8 @@ mod tests {
             "the deleted node's agent must be told to go"
         );
 
-        // SQLite reuses the id; nothing of the old machine may accompany it.
         let fresh = node(&app, "fresh", true);
-        assert_eq!(fresh, old, "the fixture only means anything if the id is reused");
+        assert_ne!(fresh, old, "a deleted node's id is not issued again");
         let nodes = visible_nodes(&app, true).unwrap();
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0]["online"], json!(false), "a node nobody deployed is not online");
@@ -4609,6 +4774,7 @@ mod tests {
             json!({"name": "x", "billing_cycle": "0m"}),
             json!({"name": "x", "billing_cycle": "1201m"}),
             json!({"name": "x", "billing_cycle": "weekly"}),
+            json!({"name": "名".repeat(MAX_NAME + 1)}),
         ] {
             let created = create_node(
                 Admin,
@@ -4690,6 +4856,39 @@ mod tests {
         let cache = |res: Response| res.headers().get(header::CACHE_CONTROL).cloned();
         assert_eq!(cache(nodes(State(app.clone()), signed_in).await).unwrap(), "no-store, no-transform");
         assert_eq!(cache(nodes(State(app), HeaderMap::new()).await), None, "the public list compresses");
+    }
+
+    /// The public list a browser asks for gzipped is the stream's compressed
+    /// frame, the same bytes for every request until the frame expires.
+    #[tokio::test]
+    async fn the_public_node_list_reuses_the_compressed_frame() {
+        let app = std::sync::Arc::new(app());
+        node(&app, "listed", true);
+        let ask = |encoding: &'static str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::ACCEPT_ENCODING, encoding.parse().unwrap());
+            headers
+        };
+        let res = nodes(State(app.clone()), ask("br, gzip, deflate")).await;
+        assert_eq!(res.headers()[header::CONTENT_ENCODING], "gzip");
+        assert_eq!(res.headers()[header::VARY], "accept-encoding");
+        let body = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        assert_eq!(body, live_gzip(&app), "the frame the streams send");
+
+        for refused in ["identity", "gzip;q=0", "br", "*"] {
+            let res = nodes(State(app.clone()), ask(refused)).await;
+            assert!(res.headers().get(header::CONTENT_ENCODING).is_none(), "{refused}");
+        }
+        assert!(nodes(State(app.clone()), ask("GZIP; q=0.5"))
+            .await
+            .headers()
+            .contains_key(header::CONTENT_ENCODING));
+
+        // The admin list is never compressed, asked or not.
+        app.db.create_session(&sha256("live-token"), Utc::now().timestamp() + 3_600).unwrap();
+        let mut signed_in = ask("gzip");
+        signed_in.insert(header::COOKIE, format!("{}=live-token", crate::auth::COOKIE).parse().unwrap());
+        assert!(nodes(State(app), signed_in).await.headers().get(header::CONTENT_ENCODING).is_none());
     }
 
     #[test]
@@ -4863,6 +5062,35 @@ mod tests {
         assert_eq!(app.db.nodes().unwrap().len(), 1);
     }
 
+    /// The name comes from an unvouched machine: markup characters are dropped,
+    /// and what that leaves is trimmed. None at all, the machine's hostname
+    /// withheld by `install.sh`, names the node after its id.
+    #[tokio::test]
+    async fn a_registered_name_loses_markup_and_is_never_blank() {
+        let app = std::sync::Arc::new(app());
+        open_register(Admin, State(app.clone()), panel_headers()).await;
+        let key = app.db.get("register_key").unwrap();
+        for (sent, stored) in
+            [("", "节点 1"), ("< >", "节点 2"), ("<b>web</b>", "bweb/b"), ("Tom's \"VPS\"", "Toms VPS")]
+        {
+            let mut headers = HeaderMap::new();
+            headers.insert("authorization", format!("Bearer {key}").parse().unwrap());
+            let reply = agent_register(
+                State(app.clone()),
+                ConnectInfo("198.51.100.7:40000".parse().unwrap()),
+                headers,
+                sent.to_owned(),
+            )
+            .await;
+            let token = String::from_utf8(
+                axum::body::to_bytes(reply.into_body(), usize::MAX).await.unwrap().to_vec(),
+            )
+            .unwrap();
+            let id = app.db.node_by_token(&token).unwrap().expect("token opens a node");
+            assert_eq!(app.db.node(id).unwrap().unwrap().name, stored, "sent {sent:?}");
+        }
+    }
+
     /// The ceiling on the anonymous route: a leaked key cannot fill the table.
     #[tokio::test]
     async fn one_window_stops_registering_at_the_limit() {
@@ -4889,8 +5117,8 @@ mod tests {
     fn a_node_view_carries_traffic_even_while_offline() {
         let app = app();
         let id = node(&app, "n", true);
-        app.db.accumulate(id, "b", (100, 100), Local::now()).unwrap();
-        app.db.accumulate(id, "b", (900, 500), Local::now()).unwrap();
+        app.db.accumulate(id, "b", (100, 100), Local::now(), None).unwrap();
+        app.db.accumulate(id, "b", (900, 500), Local::now(), None).unwrap();
         app.db.touch_seen(id, 1_700_000_000, &serde_json::Value::Null).unwrap();
 
         let view = &visible_nodes(&app, true).unwrap()[0];
@@ -4946,6 +5174,17 @@ mod tests {
         assert_eq!(live["swap_total"], 0, "swapoff means zero, not the gigabyte that was there at connect");
         assert_eq!(live["disk_total"], live["metrics"]["disk_total"], "one number, not two");
         assert_eq!(app.db.node(id).unwrap().unwrap().disk_total, 30i64 << 30, "and no extra write to get it");
+    }
+
+    /// Only anonymous streams are counted, and a slot comes back when its
+    /// stream ends. `PUBLIC_STREAM_GATE` is touched by no other test.
+    #[test]
+    fn anonymous_streams_past_the_gate_are_refused_and_a_session_is_not() {
+        let held: Vec<_> = (0..PUBLIC_STREAMS).map(|_| stream_slot(None).expect("up to the limit")).collect();
+        assert!(stream_slot(None).is_err(), "the stream past the limit must be refused");
+        assert!(stream_slot(Some("hash")).is_ok(), "a session opens its stream with every slot taken");
+        drop(held);
+        assert!(stream_slot(None).is_ok(), "a finished stream gives its slot back");
     }
 
     /// `span` bounds one window; this bounds how many are built concurrently.
@@ -5199,8 +5438,9 @@ mod tests {
     #[tokio::test]
     async fn a_fresh_hub_answers_settings_that_it_will_take_back() {
         let app = std::sync::Arc::new(app());
-        let Json(read) = settings(Admin, State(app.clone())).await;
+        let Json(read) = settings(Admin, State(app.clone()), peer(), HeaderMap::new()).await;
         assert_eq!(read["retention_days"], "30", "the default belongs in the answer, not in each caller");
+        assert_eq!(read["your_address"], "198.51.100.7");
 
         // Exactly what the panel sends, on a hub where nothing was ever set.
         let echoed = json!({
@@ -5233,7 +5473,8 @@ mod tests {
         app.db.set("notify_webhook_url", "https://hooks.example/url-secret").unwrap();
         app.db.set("notify_webhook_headers", "Authorization: header-secret").unwrap();
 
-        let Json(body) = settings(Admin, axum::extract::State(std::sync::Arc::new(app))).await;
+        let Json(body) =
+            settings(Admin, axum::extract::State(std::sync::Arc::new(app)), peer(), HeaderMap::new()).await;
         assert_eq!(body["github_client_id"], "public-id");
         assert_eq!(body["github_secret_set"], true);
         assert_eq!(body["notify_webhook_url_set"], true);
