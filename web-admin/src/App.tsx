@@ -11,24 +11,19 @@ import { Skeleton } from "@/components/ui/skeleton"
 import { TooltipProvider } from "@/components/ui/tooltip"
 import { api, provisionRefusal, useNodes } from "@/lib/api"
 
+import { normaliseRoute } from "@/lib/admin-route"
+
 type Me = { authed: boolean; principal: "anonymous" | "admin" | "user"; github: boolean; site_name: string; public_page: boolean; site: string }
 
-// `/admin` alone is not a page; it is normalised to the first section so that a
-// bookmark and the OAuth redirect both resolve to a real route.
-function normalise(p: string) {
-  if (p === "/admin" || p === "/admin/") return "/admin/nodes"
-  if (p === "/user" || p === "/user/") return "/user/center"
-  return p.replace(/\/$/, "") || "/admin/nodes"
+function currentRoute() {
+  const route = normaliseRoute(location.pathname, location.search)
+  if (route.path !== location.pathname || route.search !== location.search) history.replaceState({}, "", route.path + route.search + location.hash)
+  return route
 }
-
 function usePath() {
-  const [route, setRoute] = useState(() => {
-    const start = normalise(location.pathname)
-    if (start !== location.pathname) history.replaceState({}, "", start + location.search)
-    return { path: start, search: location.search }
-  })
+  const [route, setRoute] = useState(currentRoute)
   useEffect(() => {
-    const sync = () => setRoute({ path: normalise(location.pathname), search: location.search })
+    const sync = () => setRoute(currentRoute())
     addEventListener("popstate", sync)
     return () => removeEventListener("popstate", sync)
   }, [])
@@ -37,9 +32,9 @@ function usePath() {
     route.search,
     useCallback((next: string) => {
       const target = new URL(next, location.origin)
-      const path = normalise(target.pathname)
-      history.pushState({}, "", path + target.search + target.hash)
-      setRoute({ path, search: target.search })
+      const route = normaliseRoute(target.pathname, target.search)
+      history.pushState({}, "", route.path + route.search + target.hash)
+      setRoute(route)
     }, []),
   ] as const
 }
