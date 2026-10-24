@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react"
+import { useEffect, useId, useState } from "react"
 import { toast } from "sonner"
 import { api, type Node } from "@/lib/api"
 import { createProxy, updateProxy, type Proxy, type AddressType } from "@/lib/resources"
@@ -7,7 +7,7 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog"
 import { ProxyDialog } from "@/components/ProxyDialog"
-import { Switch } from "@/components/ui/switch"
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 
 type Host = { node_id: number; revision: number; applied_revision: number; capable: boolean; online: boolean; last_error: string; traffic_error?: string; status: { running?: boolean; installed?: boolean } }
 export function MieruForm({ proxy, nodes, embedded, onClose, onSaved, onBack, onBusyChange }: { proxy: Proxy | null; nodes: Node[]; embedded?: boolean; onClose: () => void; onSaved: () => void; onBack?: () => void; onBusyChange?: (busy: boolean) => void }) {
@@ -15,36 +15,80 @@ export function MieruForm({ proxy, nodes, embedded, onClose, onSaved, onBack, on
   const [name, setName] = useState(proxy?.name ?? "mieru")
   const [address, setAddress] = useState(proxy?.address ?? nodes[0]?.addresses?.[0]?.address ?? "")
   const [port, setPort] = useState(proxy?.port ?? 24061)
-  const [enabled, setEnabled] = useState(proxy?.enabled ?? true)
+  const fieldId = useId()
+  const editing = proxy !== null
   const [busy, setBusy] = useState(false)
   const [hosts, setHosts] = useState<Host[]>([])
   const [error, setError] = useState("")
   useEffect(() => {
+    if (!editing) return
     const controller = new AbortController()
     const load = () => api<{ items: Host[] }>("/mieru/hosts", { signal: controller.signal }).then((v) => { setHosts(v.items); setError("") }).catch((e: Error) => { if (!controller.signal.aborted) setError(e.message) })
     void load(); const timer = setInterval(() => void load(), 5000)
     return () => { controller.abort(); clearInterval(timer) }
-  }, [])
+  }, [editing])
   const host = hosts.find((h) => h.node_id === nodeId)
   async function save(e: React.FormEvent) {
     e.preventDefault(); setBusy(true); onBusyChange?.(true)
     try {
       const address_type: AddressType = address.includes(":") ? "ipv6" : /^\d+\.\d+\.\d+\.\d+$/.test(address) ? "ipv4" : "domain"
-      const draft = { name, address, address_type, port, enabled, include_node_name: proxy?.include_node_name ?? true, protocol: "mieru" as const, flow: "" as const, config: { transport: "tcp" as const } }
+      const draft = { name, address, address_type, port, enabled: proxy?.enabled ?? true, include_node_name: proxy?.include_node_name ?? true, protocol: "mieru" as const, flow: "" as const, config: { transport: "tcp" as const } }
       if (proxy) await updateProxy(proxy.id, draft, nodeId); else await createProxy(nodeId, draft)
-      toast.success("已保存 mieru，等待节点同步；没有有效授权用户时服务保持停止")
+      toast.success("代理已保存，等待同步")
       onSaved(); onClose()
     } catch (e) { toast.error((e as Error).message) } finally { setBusy(false); onBusyChange?.(false) }
   }
-  const form = <><DialogHeader className="px-6 pt-6"><DialogTitle>{proxy ? "编辑 mieru 代理" : "新增 mieru 代理"}</DialogTitle><DialogDescription>每节点最多一条 mieru 代理，使用单端口 TCP。请先在节点安装选项中安装 mieru。</DialogDescription></DialogHeader><form className="space-y-4 p-6" onSubmit={(e) => void save(e)}>
-    <Label>节点<select className="mt-2 block w-full rounded border bg-background p-2" value={nodeId} disabled={busy} onChange={(e) => setNodeId(Number(e.target.value))}>{nodes.map((n) => <option key={n.id} value={n.id}>{n.name}</option>)}</select></Label>
-    <Label>名称<Input className="mt-2" required maxLength={128} value={name} onChange={(e) => setName(e.target.value)} /></Label>
-    <Label>对外地址<Input className="mt-2" required value={address} onChange={(e) => setAddress(e.target.value.trim())} /></Label>
-    <Label>TCP 端口<Input className="mt-2" required type="number" min={1025} max={65535} value={port} onChange={(e) => setPort(Number(e.target.value))} /></Label>
-    <Label>启用<Switch checked={enabled} onCheckedChange={setEnabled} disabled={busy} /></Label>
-    <p role="status" className="text-sm text-muted-foreground">{error || (host ? !host.online ? "节点离线，等待重连" : !host.capable ? "需要升级 Agent" : host.status.installed === false ? "未安装 mieru，请运行节点安装命令" : host.last_error || host.traffic_error || `期望版本 ${host.revision} / 已应用 ${host.applied_revision} · ${host.status.running ? "运行中" : "已停止"}` : "保存后开始同步")}</p>
-    <div className="flex justify-end gap-2">{onBack && <Button type="button" variant="ghost" disabled={busy} onClick={onBack}>返回</Button>}<Button type="button" variant="outline" disabled={busy} onClick={onClose}>取消</Button><Button disabled={busy}>保存</Button></div>
-  </form></>
+  const statusError = error || host?.last_error || host?.traffic_error
+  const statusText = error || (host
+    ? !host.online ? "节点离线，等待重连"
+      : !host.capable ? "需要升级 Agent"
+        : host.status.installed === false ? "未安装 mieru"
+          : statusError || (host.revision !== host.applied_revision ? "配置同步中" : host.status.running ? "运行中" : "已停止")
+    : "正在读取节点状态")
+  const form = (
+    <form className="flex min-h-0 flex-1 flex-col" onSubmit={(e) => void save(e)}>
+      <DialogHeader className="shrink-0 px-6 pt-6 pb-5 text-left">
+        <DialogTitle className="whitespace-nowrap pr-6">{editing ? "编辑 mieru 代理" : "新增 mieru 代理"}</DialogTitle>
+        <DialogDescription className="whitespace-nowrap text-xs">TCP · 每节点一个代理</DialogDescription>
+      </DialogHeader>
+      <div className="min-h-0 flex-1 space-y-5 overflow-y-auto px-6 pb-6">
+        <div className="space-y-2">
+          <Label htmlFor={`${fieldId}-name`} className="whitespace-nowrap">代理名称</Label>
+          <Input id={`${fieldId}-name`} autoFocus={!editing} required maxLength={128} disabled={busy} value={name} placeholder="例如：香港 mieru" onChange={(e) => setName(e.target.value)} />
+        </div>
+        <div className="space-y-2">
+          <Label htmlFor={`${fieldId}-node`} className="whitespace-nowrap">所属节点</Label>
+          <Select value={String(nodeId || "")} disabled={busy || !nodes.length} onValueChange={(value) => setNodeId(Number(value))}>
+            <SelectTrigger id={`${fieldId}-node`} className="w-full min-w-0"><SelectValue placeholder="选择节点" /></SelectTrigger>
+            <SelectContent position="popper">
+              {nodes.map((node) => <SelectItem key={node.id} value={String(node.id)}><span className="truncate" title={node.name}>{node.name}</span></SelectItem>)}
+            </SelectContent>
+          </Select>
+        </div>
+        <div className="grid min-w-0 grid-cols-1 gap-5 sm:grid-cols-[minmax(0,1fr)_7.5rem] sm:gap-3">
+          <div className="min-w-0 space-y-2">
+            <Label htmlFor={`${fieldId}-address`} className="whitespace-nowrap">连接地址</Label>
+            <Input id={`${fieldId}-address`} required disabled={busy} value={address} placeholder="域名或 IP 地址" onChange={(e) => setAddress(e.target.value.trim())} />
+          </div>
+          <div className="min-w-0 space-y-2">
+            <Label htmlFor={`${fieldId}-port`} className="whitespace-nowrap">端口</Label>
+            <Input id={`${fieldId}-port`} required disabled={busy} type="number" min={1025} max={65535} value={port} onChange={(e) => setPort(Number(e.target.value))} />
+          </div>
+        </div>
+        {editing && <div className={`flex min-w-0 items-center gap-2 rounded-md bg-muted/40 px-3 py-2.5 text-xs ${statusError ? "text-destructive" : "text-muted-foreground"}`}>
+          <span aria-hidden="true" className={`size-1.5 shrink-0 rounded-full ${statusError ? "bg-destructive" : host?.status.running ? "bg-emerald-500" : "bg-muted-foreground/50"}`} />
+          <p role="status" className="min-w-0 truncate" title={statusText}>{statusText}</p>
+        </div>}
+      </div>
+      <div className="flex shrink-0 items-center justify-between gap-3 border-t bg-muted/20 px-6 py-4">
+        <div>{onBack && <Button type="button" variant="ghost" disabled={busy} onClick={onBack}>返回</Button>}</div>
+        <div className="flex shrink-0 items-center gap-2">
+          <Button type="button" variant="outline" disabled={busy} onClick={onClose}>取消</Button>
+          <Button disabled={busy || !nodeId}>{busy ? "保存中…" : "保存"}</Button>
+        </div>
+      </div>
+    </form>
+  )
   return embedded ? form : <ProxyDialog busy={busy} onClose={onClose}>{form}</ProxyDialog>
 }
 
