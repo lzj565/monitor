@@ -7,6 +7,7 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { Input } from "@/components/ui/input"
 import { Switch } from "@/components/ui/switch"
 import { TableCell, TableRow } from "@/components/ui/table"
+import { getComponents } from "@/lib/node-components"
 import { api, type Node } from "@/lib/api"
 import type { Proxy } from "@/lib/resources"
 import { realmHostStatus, saveRealmRule, nodeProxyAddress, defaultProxyAddressType, type RealmHost, type RealmHostDraft, type RealmRule, type RealmRuleDraft } from "@/lib/realm-management"
@@ -65,7 +66,7 @@ function Field({ title, children }: { title: string; children: React.ReactNode }
 }
 function EntryWarning({ host }: { host?: RealmHost }) {
   if (!host) return <p className="text-sm text-muted-foreground">保存后面板管理安装器创建的 Realm 配置，并在首次应用前自动备份；节点离线或未安装时等待同步。</p>
-  if (!host.online || !host.capable || host.status.installed === false || host.status.managed === false) return <p role="status" className="text-sm text-amber-600">{realmHostStatus(host)}。请使用下方安装命令安装 Realm，并在需要时升级 Agent；保存规则后等待同步。</p>
+  if (!host.online || !host.capable || host.status.installed === false || host.status.managed === false) return <p role="status" className="text-sm text-amber-600">{realmHostStatus(host)}。请先在节点安装选项中开启并保存 Realm，再执行安装命令。</p>
   return null
 }
 function InstallCommand({ nodeId, site, refusal }: { nodeId: number; site: string; refusal: string }) {
@@ -73,11 +74,16 @@ function InstallCommand({ nodeId, site, refusal }: { nodeId: number; site: strin
   const [busy, setBusy] = useState(false)
   const install = async () => {
     setBusy(true)
-    try { const { token } = await api<{ token: string }>(`/nodes/${nodeId}/token`); setCommand(installCommand(site, token, undefined, undefined, true)) }
+    setCommand("")
+    try {
+      const [credential, profile] = await Promise.all([api<{ token: string }>(`/nodes/${nodeId}/token`), getComponents(nodeId)])
+      if (!profile.install.realm) { toast.error("请先在节点安装选项中开启并保存 Realm"); return }
+      setCommand(installCommand(site, credential.token, undefined, undefined))
+    }
     catch (e) { toast.error((e as Error).message) }
     finally { setBusy(false) }
   }
-  return <div className="space-y-2"><Button type="button" size="sm" variant="outline" disabled={!nodeId || !!refusal || busy} title={refusal} onClick={() => void install()}>安装 / 升级命令</Button>{command && <><p className="text-xs text-muted-foreground">在所选入口节点执行。安装 Realm 本身不会赋予旧 Agent 管理能力，旧 Agent 需一起升级。</p><textarea aria-label="Realm 安装命令" readOnly className="min-h-24 w-full rounded border bg-muted p-3 font-mono text-xs" value={command} /></>}</div>
+  return <div className="space-y-2"><Button type="button" size="sm" variant="outline" disabled={!nodeId || !!refusal || busy} title={refusal} onClick={() => void install()}>安装 / 升级命令</Button>{command && <><p className="text-xs text-muted-foreground">在所选入口节点执行，按已保存的安装选项安装或卸载组件。</p><textarea aria-label="Realm 安装命令" readOnly className="min-h-24 w-full rounded border bg-muted p-3 font-mono text-xs" value={command} /></>}</div>
 }
 
 export function RealmProxyForm({ rule, nodes, proxies, hosts, rules, ready, site, refusal, onClose, onSaved, onRefresh, onBack, embedded, onBusyChange }: {

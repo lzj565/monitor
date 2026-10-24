@@ -1701,8 +1701,8 @@ fn an_upgraded_release_matches_a_fresh_database() {
     let upgraded = dump(&db.conn());
     assert_eq!(
         upgraded.len(),
-        PRE_RESOURCE_TABLES.len() + 2 + ID_TABLES.len(),
-        "every old row survives, admin is seeded, and the reset marker is recorded: {upgraded:#?}"
+        PRE_RESOURCE_TABLES.len() + 2 + ID_TABLES.len() + 3,
+        "every old row survives, three default components and admin are seeded, and the reset marker is recorded: {upgraded:#?}"
     );
 
     // An earlier build opening the file stamps its own version, so the next

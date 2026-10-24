@@ -29,6 +29,7 @@ mod api;
 mod auth;
 mod blocking;
 mod command;
+mod components;
 mod db;
 mod frontend;
 mod mieru;
@@ -723,6 +724,7 @@ async fn main() -> Result<()> {
 
     let router = Router::new()
         // Read paths; the public page reaches these unauthenticated.
+        .route("/api/nodes/{id}/components", get(components::get).put(components::save))
         .route("/api/mieru/hosts", get(mieru::hosts))
         .route("/api/mieru/hosts/{id}/config", get(mieru::preview))
         .route("/api/users/{id}/mieru-credential", get(mieru::credential).post(mieru::reset_credential))
@@ -857,6 +859,7 @@ async fn main() -> Result<()> {
             Router::new()
                 .route("/api/agent/ws", get(agent_ws::handler))
                 .route("/api/agent/echo", get(agent_ws::echo))
+                .route("/api/agent/components", get(components::installer))
                 .route("/api/agent/register", post(api::agent_register))
                 .route("/install.sh", get(install_script))
                 .route("/agent/{arch}", get(agent_binary))

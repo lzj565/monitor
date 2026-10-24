@@ -14,6 +14,7 @@ ROOT="/opt/monitor"
 BIN="$ROOT/monitor-agent"
 CONFIG_DIR="$ROOT/config"
 ENV_FILE="$CONFIG_DIR/agent.env"
+REGISTRATION_FILE="$CONFIG_DIR/registration.env"
 UNIT_FILE="/etc/systemd/system/monitor-agent.service"
 RC_FILE="/etc/init.d/monitor-agent"
 LOG_FILE="/var/log/monitor-agent.log"
@@ -592,6 +593,45 @@ RC
 }
 # END mieru helpers
 
+# BEGIN component profile helpers
+# Keep a newly issued token across a later profile/download failure, without replacing the running Agent env.
+pending_registration_token() {
+    [ -f "$REGISTRATION_FILE" ] && [ ! -L "$REGISTRATION_FILE" ] || return 0
+    PENDING_SERVER=$(sed -n 's/^MONITOR_SERVER=//p' "$REGISTRATION_FILE")
+    [ "${PENDING_SERVER%/}" = "${SERVER%/}" ] || return 0
+    sed -n 's/^MONITOR_TOKEN=//p' "$REGISTRATION_FILE"
+}
+cache_registration() {
+    [ ! -L "$CONFIG_DIR" ] && [ ! -L "$REGISTRATION_FILE" ] || fail "registration cache path is a symlink"
+    install -d -m 0755 "$CONFIG_DIR"
+    REGISTRATION_STAGED=$(mktemp "$CONFIG_DIR/.registration.XXXXXX") || fail "cannot stage registration cache"
+    (umask 077; printf 'MONITOR_SERVER=%s\nMONITOR_TOKEN=%s\n' "$SERVER" "$TOKEN" > "$REGISTRATION_STAGED") || fail "cannot save registration cache"
+    chmod 0600 "$REGISTRATION_STAGED"
+    mv -f "$REGISTRATION_STAGED" "$REGISTRATION_FILE"
+}
+
+load_component_profile() {
+    info "读取节点已保存的安装选项"
+    curl -fsSL --max-time 30 -H "Authorization: Bearer $TOKEN" "${SERVER%/}/api/agent/components" -o "$TMP_DIR/components.profile" || fail "cannot read saved component choices; no programs or services changed"
+    PROFILE_SINGBOX_COUNT=0 PROFILE_REALM_COUNT=0 PROFILE_MIERU_COUNT=0
+    PROFILE_REALM='' PROFILE_MIERU=''
+    while IFS= read -r PROFILE_LINE || [ -n "$PROFILE_LINE" ]; do
+        case "$PROFILE_LINE" in
+            singbox=1) PROFILE_SINGBOX_COUNT=$((PROFILE_SINGBOX_COUNT + 1)) ;;
+            realm=0) PROFILE_REALM_COUNT=$((PROFILE_REALM_COUNT + 1)); PROFILE_REALM=--no-realm ;;
+            realm=1) PROFILE_REALM_COUNT=$((PROFILE_REALM_COUNT + 1)); PROFILE_REALM=--realm ;;
+            mieru=0) PROFILE_MIERU_COUNT=$((PROFILE_MIERU_COUNT + 1)); PROFILE_MIERU=--no-mieru ;;
+            mieru=1) PROFILE_MIERU_COUNT=$((PROFILE_MIERU_COUNT + 1)); PROFILE_MIERU=--mieru ;;
+            *) fail "invalid saved component choices" ;;
+        esac
+    done < "$TMP_DIR/components.profile"
+    [ "$PROFILE_SINGBOX_COUNT:$PROFILE_REALM_COUNT:$PROFILE_MIERU_COUNT" = 1:1:1 ] || fail "incomplete saved component choices"
+    [ -n "$REALM_OPTION" ] || REALM_OPTION=$PROFILE_REALM
+    [ -n "$MIERU_OPTION" ] || MIERU_OPTION=$PROFILE_MIERU
+    SINGBOX_OPTION=--sing-box
+}
+# END component profile helpers
+
 while [ $# -gt 0 ]; do
 	# A flag with no argument: under set -u, `$2` aborts with the shell's own
 	# message rather than the usage below, and `shift 2` cannot proceed.
@@ -612,7 +652,8 @@ while [ $# -gt 0 ]; do
     --mieru | --no-mieru)
         [ -z "$MIERU_OPTION" ] || [ "$MIERU_OPTION" = "$1" ] || { echo "conflicting mieru flags" >&2; exit 2; }
         MIERU_OPTION=$1; shift ;;
-    --sing-box | --skip-sing-box)
+    --skip-sing-box) echo "sing-box is required; --skip-sing-box is no longer supported" >&2; exit 2 ;;
+    --sing-box)
         [ -z "$SINGBOX_OPTION" ] || [ "$SINGBOX_OPTION" = "$1" ] || { echo "conflicting sing-box flags" >&2; exit 2; }
         SINGBOX_OPTION=$1; shift ;;
 	--realm | --no-realm)
@@ -622,8 +663,8 @@ while [ $# -gt 0 ]; do
 	esac
 done
 
-[ -n "$SINGBOX_OPTION" ] || { if [ -f "$ROOT/.skip-sing-box" ]; then SINGBOX_OPTION=--skip-sing-box; else SINGBOX_OPTION=--sing-box; fi; }
-[ -n "$MIERU_OPTION" ] || { [ ! -f "$ROOT/.mieru-managed" ] || MIERU_OPTION=--mieru; }
+SINGBOX_OPTION=--sing-box
+
 step 0 "检查系统环境"
 [ "$(id -u)" = 0 ] || { CURRENT_STEP="检查系统环境"; FAIL_REASON="请使用 root 用户运行安装程序"; fail "$FAIL_REASON"; }
 if [ -r /etc/os-release ]; then
@@ -658,7 +699,7 @@ if [ -n "$UNINSTALL" ]; then
 	rc-service monitor-agent stop 2>/dev/null || true
 	rc-update del monitor-agent default >/dev/null 2>&1 || true
 	systemctl disable --now monitor-agent 2>/dev/null || true
-	rm -f "$UNIT_FILE" "$RC_FILE" "$LOG_FILE" "$BIN" "$BIN.old" "$ENV_FILE" "$ROOT/agent.env"
+	rm -f "$UNIT_FILE" "$RC_FILE" "$LOG_FILE" "$BIN" "$BIN.old" "$ENV_FILE" "$REGISTRATION_FILE" "$ROOT/agent.env"
 	systemctl daemon-reload 2>/dev/null || true
 	userdel monitor-agent 2>/dev/null || deluser monitor-agent 2>/dev/null || true
 	rmdir "$CONFIG_DIR" "$ROOT" 2>/dev/null || true
@@ -705,8 +746,8 @@ if [ -n "$UPGRADE" ]; then
 fi
 
 [ -n "$SERVER" ] && { [ -n "$TOKEN" ] || [ -n "$REGISTER" ]; } || {
-	echo "usage: install.sh --server URL (--token TOKEN | --register KEY) [--interval SECONDS] [--iface LIST] [--insecure] [--realm | --no-realm] [--mieru | --no-mieru] [--sing-box | --skip-sing-box]" >&2
-	echo "       install.sh --upgrade [--iface LIST] [--interval SECONDS] [--realm | --no-realm] [--mieru | --no-mieru] [--sing-box | --skip-sing-box]" >&2
+	echo "usage: install.sh --server URL (--token TOKEN | --register KEY) [--interval SECONDS] [--iface LIST] [--insecure] [--realm | --no-realm] [--mieru | --no-mieru] [--sing-box]" >&2
+	echo "       install.sh --upgrade [--iface LIST] [--interval SECONDS] [--realm | --no-realm] [--mieru | --no-mieru] [--sing-box]" >&2
 	echo "       install.sh --uninstall" >&2
 	echo "--name NAME names the node --register creates, which is otherwise named after its id. < > \" ' are dropped from it; the panel renames a node freely" >&2
 	exit 2
@@ -857,7 +898,7 @@ success "下载完成"
 # a machine half-upgraded.
 API_PORT_HELPER=$TMP_AGENT
 info "checking sing-box V2Ray API port..."
-if [ "$SINGBOX_OPTION" != --skip-sing-box ]; then select_singbox_api_port || fail "$FAIL_REASON"; else SINGBOX_API_PORT=9001; fi
+select_singbox_api_port || fail "$FAIL_REASON"
 
 # Downloaded before the registration below, because that step spends a node: the
 # key returns a token and the panel gains a row, while the env file recording it
@@ -882,6 +923,8 @@ if [ -z "$TOKEN" ]; then
 	if [ "${CACHED%/}" = "${SERVER%/}" ]; then
 		HELD=$(sed -n 's/^[[:space:]]*MONITOR_TOKEN=//p' "$ENV_FILE" 2>/dev/null || true)
 	fi
+    PENDING_TOKEN=$(pending_registration_token)
+    [ -z "$PENDING_TOKEN" ] || HELD=$PENDING_TOKEN
 	# --name as given, which the hub trims and bounds. The hostname is not sent
 	# in its place: it often carries the machine's address or the provider's
 	# label, and the name reaches the public page. Without one the hub names
@@ -893,8 +936,11 @@ if [ -z "$TOKEN" ]; then
 	# error share one exit status under --fail. A request that got no response
 	# stops here, with curl's own message. The name travels on stdin: as an
 	# argument, one beginning with @ would be read as a file to send.
+    REGISTER_REALM=0 REGISTER_MIERU=0
+    [ "$REALM_OPTION" != --realm ] || REGISTER_REALM=1
+    [ "$MIERU_OPTION" != --mieru ] || REGISTER_MIERU=1
 	REPLY=$(printf '%s' "$NAME" | curl -sS --max-time 30 -w '\n%{http_code}' -H "Authorization: Bearer $REGISTER" \
-		-H "X-Node-Token: $HELD" --data-binary @- "${SERVER%/}/api/agent/register" 2>/dev/null) || { FAIL_REASON="向 Hub 注册 monitor-agent 失败"; exit 1; }
+		-H "X-Node-Token: $HELD" -H "X-Install-Realm: $REGISTER_REALM" -H "X-Install-Mieru: $REGISTER_MIERU" --data-binary @- "${SERVER%/}/api/agent/register" 2>/dev/null) || { FAIL_REASON="向 Hub 注册 monitor-agent 失败"; exit 1; }
 	CODE=$(printf '%s\n' "$REPLY" | tail -n 1)
 	TOKEN=$(printf '%s\n' "$REPLY" | sed '$d')
 	if [ "$CODE" != 200 ]; then
@@ -905,12 +951,17 @@ if [ -z "$TOKEN" ]; then
 		exit 1
 	fi
 	[ -n "$TOKEN" ] || { FAIL_REASON="Hub 响应中没有 token"; fail "$FAIL_REASON"; }
+    cache_registration
 	if [ "$TOKEN" = "$HELD" ]; then
-		info "此主机已注册，保留当前 token 和面板中的名称"
+        # Batch defaults are only for new registrations. Existing nodes retain their saved profile.
+        REALM_OPTION='' MIERU_OPTION=''
+		info "此主机已注册，保留当前 token、名称和安装选择"
 	elif [ -n "$HELD" ]; then
 		warn "旧 token 已不再对应有效节点，本次已注册为新节点；如旧节点仍存在，请在面板删除"
 	fi
 fi
+
+load_component_profile
 
 # Keep the existing registration and credential flow above intact. Stage the
 # validated agent beside its destination and rename atomically so a failed copy
@@ -924,10 +975,9 @@ success "monitor-agent binary 安装完成"
 
 # The system package binary is left in place, while the Agent and service use
 # this release's self-built binary with V2Ray API support.
-SING_BOX_SOURCE=skipped
-SING_BOX_STATUS=skipped
+SING_BOX_SOURCE=installer
+SING_BOX_STATUS=unknown
 SING_BOX_VER=""
-if [ "$SINGBOX_OPTION" != --skip-sing-box ]; then
 step 2 "检查 sing-box"
 set_singbox_memory_limit
 SING_BOX_SOURCE="installer"
@@ -1016,12 +1066,10 @@ detail "Agent 路径" "$SING_BOX"
 detail "版本" "$SING_BOX_VER"
 success "自构建 sing-box 安装及配置校验完成"
 
-fi
 manage_realm
 manage_mieru
 
 step 3 "初始化系统服务"
-if [ "$SINGBOX_OPTION" != --skip-sing-box ]; then
 if [ "$INIT" = systemd ]; then
 	if { [ -e "$SING_BOX_UNIT" ] || [ -L "$SING_BOX_UNIT" ]; } &&
 		! grep -F "$SING_BOX" "$SING_BOX_UNIT" >/dev/null 2>&1 &&
@@ -1069,8 +1117,7 @@ RC
 	chmod 0755 "$SING_BOX_RC"
 fi
 
-fi
-if [ "$SINGBOX_OPTION" = --skip-sing-box ]; then touch "$ROOT/.skip-sing-box"; else rm -f "$ROOT/.skip-sing-box"; fi
+rm -f "$ROOT/.skip-sing-box"
 
 # The token lives in a root-only environment file rather than the unit, keeping
 # it out of `systemctl cat` and the world-readable journal. 0600 root is what
@@ -1087,6 +1134,7 @@ ENV
 	[ -z "$IFACE" ] || printf 'MONITOR_IFACE=%s\n' "$IFACE" >>"$ENV_FILE"
 )
 chmod 0600 "$ENV_FILE"
+[ "$(pending_registration_token)" != "$TOKEN" ] || rm -f "$REGISTRATION_FILE"
 
 # The new agent is not running. The binary it replaced is put back and started
 # again, so a failed upgrade leaves the machine reporting as before; the unit

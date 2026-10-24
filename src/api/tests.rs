@@ -2171,3 +2171,80 @@ async fn deleting_last_vless_still_clears_singbox_on_a_mixed_node() {
     assert_eq!(config["inbounds"], json!([]));
     assert!(sync_node_config_on_connect(&app, node));
 }
+
+#[tokio::test]
+async fn component_profile_api_and_installer_token_are_scoped_to_the_node() {
+    let app = std::sync::Arc::new(app());
+    let node = app
+        .db
+        .create_node(&crate::db::Node { name: "profile".into(), ..Default::default() }, "profile-token")
+        .unwrap();
+    let body = serde_json::from_value(json!({"singbox":true,"realm":true,"mieru":false})).unwrap();
+    let saved =
+        portal_json(crate::components::save(Admin, State(app.clone()), Path(node), Ok(Json(body))).await)
+            .await;
+    assert_eq!(saved["install"], json!({"singbox":true,"realm":true,"mieru":false}));
+    assert_eq!(saved["components"][1]["installed"], false);
+    let bad_choice = serde_json::from_value(json!({"singbox":false,"realm":false,"mieru":false})).unwrap();
+    assert_eq!(
+        crate::components::save(Admin, State(app.clone()), Path(node), Ok(Json(bad_choice))).await.status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        crate::components::installer(State(app.clone()), HeaderMap::new()).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let mut headers = HeaderMap::new();
+    headers.insert(header::AUTHORIZATION, "Bearer profile-token".parse().unwrap());
+    let response = crate::components::installer(State(app.clone()), headers).await;
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    assert_eq!(
+        axum::body::to_bytes(response.into_body(), 4096).await.unwrap(),
+        "singbox=1\nrealm=1\nmieru=0\n"
+    );
+    let loaded = portal_json(crate::components::get(Admin, State(app.clone()), Path(node)).await).await;
+    assert_eq!(loaded["install"], saved["install"]);
+}
+#[tokio::test]
+async fn registration_records_batch_choices_and_reruns_do_not_reset_them() {
+    let app = std::sync::Arc::new(app());
+    open_register(Admin, State(app.clone()), panel_headers()).await;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::AUTHORIZATION,
+        format!("Bearer {}", app.db.get("register_key").unwrap()).parse().unwrap(),
+    );
+    headers.insert("x-install-realm", "1".parse().unwrap());
+    headers.insert("x-install-mieru", "1".parse().unwrap());
+    let result = agent_register(
+        State(app.clone()),
+        ConnectInfo("198.51.100.7:40000".parse().unwrap()),
+        headers.clone(),
+        "batch".into(),
+    )
+    .await;
+    assert_eq!(result.status(), StatusCode::OK);
+    let token =
+        String::from_utf8(axum::body::to_bytes(result.into_body(), 4096).await.unwrap().to_vec()).unwrap();
+    let id = app.db.node_by_token(&token).unwrap().unwrap();
+    assert_eq!(
+        app.db.component_choices(id).unwrap(),
+        Some(crate::db::InstallChoices { singbox: true, realm: true, mieru: true })
+    );
+    headers.insert("x-node-token", token.parse().unwrap());
+    headers.insert("x-install-realm", "0".parse().unwrap());
+    headers.insert("x-install-mieru", "0".parse().unwrap());
+    assert_eq!(
+        agent_register(
+            State(app.clone()),
+            ConnectInfo("198.51.100.7:40000".parse().unwrap()),
+            headers,
+            "rerun".into()
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    assert!(app.db.component_choices(id).unwrap().unwrap().realm);
+    assert!(app.db.component_choices(id).unwrap().unwrap().mieru);
+}

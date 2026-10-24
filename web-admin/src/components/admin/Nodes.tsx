@@ -13,6 +13,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { AdminConfirmDialog as ConfirmDialog, AdminSearchInput } from "@/components/AdminShared"
 import { DragHandle, useDragOrder } from "@/components/DragOrder"
 import { api, badIfaceName, changes, currentIface, GIB, ifaceChoice, ifaceSpec, inGroup, provisioningSite, trafficCorrection, type IfaceChoice, type Node } from "@/lib/api"
+import { NodeComponents } from "./NodeComponents"
 import { realmArg } from "@/lib/realm"
 import { bytes, cycleMonths, FOREVER, money, uptime } from "@/lib/format"
 import { TRAFFIC_FIELDS, TRAFFIC_MODES, nameText, copy, Addresses, searchNodes, useGroupFilter, GroupFilter, NodePicker, Command, Field, OptionRow, GroupInput } from "./Shared"
@@ -455,15 +456,14 @@ export function scriptCommand(site: string, args: (site: string) => string[]) {
   return site && `curl -fsSL ${site}/install.sh | sh -s -- ${args(site).join(" ")}`
 }
 
-// Built here rather than fetched: the node list already carries the token, so
-// viewing an install command is a read rather than an action. Reissuing one to
-// display it would take the running agent offline.
-export function installCommand(site: string, token: string, seconds: number | undefined, iface: string | undefined, realm?: boolean, mieru?: boolean, singbox = true) {
-  return scriptCommand(site, (s) => [`--server ${s}`, `--token ${token}`, ...intervalArg(seconds), ...ifaceArg(iface), ...realmArg(realm), ...(mieru === undefined ? [] : [mieru ? "--mieru" : "--no-mieru"]), ...(singbox ? ["--sing-box"] : ["--skip-sing-box"])])
+// Read the existing token; the installer fetches saved choices when executed.
+// Generating a command never reissues credentials or changes services.
+export function installCommand(site: string, token: string, seconds: number | undefined, iface: string | undefined) {
+  return scriptCommand(site, (s) => [`--server ${s}`, `--token ${token}`, ...intervalArg(seconds), ...ifaceArg(iface)])
 }
 
 function RealmOption({ on, setOn }: { on: boolean; setOn: (on: boolean) => void }) {
-  return <OptionRow title="安装 Realm" hint="开启后安装，配置转发规则后手动启动。关闭后执行命令会卸载本安装程序管理的 Realm，配置保留。">
+  return <OptionRow title="安装 Realm" hint="关闭后卸载托管组件，配置保留。">
     <Switch checked={on} onCheckedChange={setOn} aria-label="安装 Realm" />
   </OptionRow>
 }
@@ -482,8 +482,8 @@ export function ifaceArg(iface: string | undefined) {
 // within the window it opened, and each machine exchanges it for a token of its
 // own, so unlike an install command this text is no one's credential and can be
 // sent to every machine as it is.
-export function registerCommand(site: string, key: string, seconds: number | undefined, iface: string | undefined, realm?: boolean, mieru?: boolean, singbox = true) {
-  return scriptCommand(site, (s) => [`--server ${s}`, `--register ${key}`, ...intervalArg(seconds), ...ifaceArg(iface), ...realmArg(realm), ...(mieru === undefined ? [] : [mieru ? "--mieru" : "--no-mieru"]), ...(singbox ? ["--sing-box"] : ["--skip-sing-box"])])
+export function registerCommand(site: string, key: string, seconds: number | undefined, iface: string | undefined, realm?: boolean, mieru?: boolean) {
+  return scriptCommand(site, (s) => [`--server ${s}`, `--register ${key}`, ...intervalArg(seconds), ...ifaceArg(iface), ...realmArg(realm ?? false), mieru ? "--mieru" : "--no-mieru"])
 }
 
 // Carries no token, so it is the same for every node and remains valid after the
@@ -564,9 +564,8 @@ export function RegisterDialog({ site, reg, onClose }: {
   const iface = useIfaceOption(undefined)
   const interval = useIntervalOption()
   const [realm, setRealm] = useState(false)
-  const [mieru, setMieru] = useState<boolean | undefined>(undefined)
-  const [singbox, setSingbox] = useState(true)
-  const command = reg.left > 0 && iface.valid ? registerCommand(site, reg.key, interval.flag, iface.flag, realm, mieru, singbox) : ""
+  const [mieru, setMieru] = useState(false)
+  const command = reg.left > 0 && iface.valid ? registerCommand(site, reg.key, interval.flag, iface.flag, realm, mieru) : ""
   const clock = `${Math.floor(reg.left / 60)}:${String(reg.left % 60).padStart(2, "0")}`
 
   return (
@@ -586,8 +585,8 @@ export function RegisterDialog({ site, reg, onClose }: {
             <IntervalOption option={interval} batch />
             <IfaceOption option={iface} batch />
             <RealmOption on={realm} setOn={setRealm} />
-            <OptionRow title="安装 mieru" hint="开启安装 mita，配置及授权后启动；切换为关闭会卸载托管程序，配置保留。未操作时保留原状态。"><Switch checked={mieru ?? false} onCheckedChange={setMieru} aria-label="安装 mieru" /></OptionRow>
-            <OptionRow title="安装 sing-box" hint="关闭跳过安装与启动，已有程序保留；重新开启会恢复安装管理。"><Switch checked={singbox} onCheckedChange={setSingbox} aria-label="安装 sing-box" /></OptionRow>
+            <OptionRow title="安装 mieru" hint="关闭后卸载托管组件，配置保留。"><Switch checked={mieru} onCheckedChange={setMieru} aria-label="安装 mieru" /></OptionRow>
+            <OptionRow title="sing-box" hint="每次安装和升级均安装"><Badge variant="secondary">必装</Badge></OptionRow>
           </section>
           {reg.left > 0 ? (
             <section className="space-y-2 border-t pt-5">
@@ -735,9 +734,7 @@ export function InstallDialog({ node, site, onClose, onRotated }: {
   const [confirmRotate, setConfirmRotate] = useState(false)
   const iface = useIfaceOption(currentIface(node))
   const interval = useIntervalOption(node.interval)
-  const [realm, setRealm] = useState(false)
-  const [mieru, setMieru] = useState<boolean | undefined>(undefined)
-  const [singbox, setSingbox] = useState(true)
+  const [componentsReady, setComponentsReady] = useState(false)
 
   // Read as the dialog opens rather than carried in the node list, where it
   // would share an answer with strings agents report. A token rotated meanwhile
@@ -750,8 +747,8 @@ export function InstallDialog({ node, site, onClose, onRotated }: {
     return () => { live = false }
   }, [node.id])
 
-  const command = token && iface.valid ? installCommand(site, token, interval.flag, iface.flag, realm, mieru, singbox) : ""
-  const placeholder = token ? "网卡名有误，改正后显示命令" : unread ? `读取凭证失败：${unread}` : "正在读取凭证…"
+  const command = token && iface.valid && componentsReady ? installCommand(site, token, interval.flag, iface.flag) : ""
+  const placeholder = token ? !componentsReady ? "请先读取并保存安装选项" : "网卡名有误，改正后显示命令" : unread ? `读取凭证失败：${unread}` : "正在读取凭证…"
 
   async function rotate() {
     setRotating(true)
@@ -786,9 +783,7 @@ export function InstallDialog({ node, site, onClose, onRotated }: {
             <h3 className="text-sm font-medium">安装选项</h3>
             <IntervalOption option={interval} />
             <IfaceOption option={iface} />
-            <RealmOption on={realm} setOn={setRealm} />
-            <OptionRow title="安装 mieru" hint="开启安装 mita，配置及授权后启动；切换为关闭会卸载托管程序，配置保留。未操作时保留原状态。"><Switch checked={mieru ?? false} onCheckedChange={setMieru} aria-label="安装 mieru" /></OptionRow>
-            <OptionRow title="安装 sing-box" hint="关闭跳过安装与启动，已有程序保留；重新开启会恢复安装管理。"><Switch checked={singbox} onCheckedChange={setSingbox} aria-label="安装 sing-box" /></OptionRow>
+            <NodeComponents nodeId={node.id} onReady={setComponentsReady} />
           </section>
           <section className="space-y-2 border-t pt-5">
             <h3 className="text-sm font-medium">安装命令</h3>

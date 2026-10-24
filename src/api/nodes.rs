@@ -145,8 +145,27 @@ pub async fn agent_register(
         Ok(node) => node,
         Err(e) => return script_fail(e),
     };
+    let flag = |key: &str| -> Result<bool, &'static str> {
+        match headers.get(key).map(|h| h.to_str()) {
+            None | Some(Ok("0")) => Ok(false),
+            Some(Ok("1")) => Ok(true),
+            _ => Err("invalid component registration option"),
+        }
+    };
+    let realm = match flag("x-install-realm") {
+        Ok(v) => v,
+        Err(r) => return bad(r),
+    };
+    let mieru = match flag("x-install-mieru") {
+        Ok(v) => v,
+        Err(r) => return bad(r),
+    };
     let token = random_token();
-    match app.db.create_node(&node, &token) {
+    match app.db.create_node_with_components(
+        &node,
+        &token,
+        &crate::db::InstallChoices { singbox: true, realm, mieru },
+    ) {
         Ok(_) => {
             app.registrations.clear(ip);
             invalidate_snapshot(&app);

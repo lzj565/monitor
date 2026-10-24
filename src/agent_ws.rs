@@ -76,6 +76,7 @@ impl Arrival {
 /// a whole `--interval`.
 #[derive(Debug)]
 pub struct Agent {
+    pub components_capable: bool,
     pub mieru_capable: bool,
     pub mieru_traffic_capable: bool,
     pub realm_capable: bool,
@@ -108,6 +109,7 @@ pub struct Agent {
 impl Agent {
     pub fn new(session: u64, tx: mpsc::Sender<String>) -> Self {
         Self {
+            components_capable: false,
             mieru_capable: false,
             mieru_traffic_capable: false,
             realm_capable: false,
@@ -246,6 +248,7 @@ struct Session {
     last_report: Option<Instant>,
     last_proxy_traffic: Option<Instant>,
     last_mieru_traffic: Option<Instant>,
+    last_components: Option<Instant>,
     /// Last user counters from this live core, used to detect new traffic for
     /// an expired account without scanning users on a timer.
     last_user_counters: HashMap<String, crate::db::ProxyTrafficCounter>,
@@ -351,7 +354,7 @@ struct ProxyTrafficSnapshot {
 
 /// The node a request's bearer token belongs to, or the 401 text. The same
 /// text whether the token is malformed or merely unknown.
-fn authenticate(app: &App, headers: &HeaderMap) -> Result<i64, &'static str> {
+pub(crate) fn authenticate(app: &App, headers: &HeaderMap) -> Result<i64, &'static str> {
     let token = bearer(headers).ok_or("missing token")?;
     match app.db.node_by_token(token) {
         Ok(Some(id)) => Ok(id),
@@ -647,6 +650,9 @@ fn dispatch(
                     agent.mieru_traffic_capable = rpc.params["capabilities"]
                         .as_array()
                         .is_some_and(|caps| caps.iter().any(|v| v.as_str() == Some("mieru.traffic.v1")));
+                    agent.components_capable = rpc.params["capabilities"]
+                        .as_array()
+                        .is_some_and(|caps| caps.iter().any(|v| v.as_str() == Some("components.v1")));
                     agent.mieru_capable = rpc.params["capabilities"]
                         .as_array()
                         .is_some_and(|caps| caps.iter().any(|v| v.as_str() == Some("mieru.v1")));
@@ -667,6 +673,24 @@ fn dispatch(
             debug!("node {node_id}: a report within {REPORT_SPACING:?} of the last was dropped")
         }
         "report" => report(app, node_id, rpc.params, arrival)?,
+        "components.status" if session.greeted => {
+            let current = app
+                .agents
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&node_id)
+                .is_some_and(|a| a.session == session.tag && a.components_capable);
+            if current
+                && session
+                    .last_components
+                    .is_none_or(|last| arrival.tick.duration_since(last) >= Duration::from_secs(15))
+            {
+                let observations: HashMap<String, crate::db::ComponentObservation> =
+                    serde_json::from_value(rpc.params)?;
+                app.db.record_components(node_id, &observations, arrival.at.timestamp())?;
+                session.last_components = Some(arrival.tick);
+            }
+        }
         "realm.traffic" => {
             let agents = app.agents.read().unwrap_or_else(|e| e.into_inner());
             let current = agents
@@ -1279,6 +1303,35 @@ mod tests {
         let (tx, rx) = mpsc::channel(4);
         app.agents.write().unwrap().insert(id, Agent::new(1, tx));
         (id, rx)
+    }
+
+    #[test]
+    fn component_inventory_requires_current_capable_session_and_never_changes_choices() {
+        let app = app();
+        let (id, _rx) = connect(&app);
+        let mut session = Session { tag: 1, ..Default::default() };
+        let frame = |installed| {
+            json!({"jsonrpc":"2.0","method":"components.status","params":{"realm":{"installed":installed,"managed":installed,"running":installed,"version":"test"}}}).to_string()
+        };
+        send(&app, id, &mut session, 0, &frame(true)).unwrap();
+        assert!(app.db.component_profile(id).unwrap().unwrap()["components"][1]["checked_at"].is_null());
+        send(
+            &app,
+            id,
+            &mut session,
+            0,
+            &json!({"jsonrpc":"2.0","method":"hello","params":{"capabilities":["components.v1"]}})
+                .to_string(),
+        )
+        .unwrap();
+        send(&app, id, &mut session, 1, &frame(true)).unwrap();
+        assert_eq!(app.db.component_profile(id).unwrap().unwrap()["components"][1]["installed"], true);
+        send(&app, id, &mut session, 2, &frame(false)).unwrap();
+        assert_eq!(app.db.component_profile(id).unwrap().unwrap()["components"][1]["installed"], true);
+        app.agents.write().unwrap().get_mut(&id).unwrap().session = 2;
+        send(&app, id, &mut session, 17, &frame(false)).unwrap();
+        assert_eq!(app.db.component_profile(id).unwrap().unwrap()["components"][1]["installed"], true);
+        assert!(!app.db.component_choices(id).unwrap().unwrap().realm);
     }
 
     /// A frame arriving `ms` milliseconds after 23:58 on 31 January: a new minute

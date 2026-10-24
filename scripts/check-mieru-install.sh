@@ -18,6 +18,7 @@ systemctl() { echo "$*" >> "$ROOT/calls"; case "$1" in is-active) [ "$MOCK_RUNNI
 rc_service() { echo "$*" >> "$ROOT/calls"; case "$2" in status) [ "$MOCK_RUNNING" = 1 ] ;; restart) [ "${MOCK_RESTART_FAIL:-0}" = 0 ] ;; esac; }
 rc_update() { echo "$*" >> "$ROOT/calls"; }
 SERVER=https://hub.example.com
+export SERVER MIERU_STATE ARCH MIERU_OPTION
 for INIT in systemd openrc; do
  ROOT="$TEST_DIR/$INIT"; CONFIG_DIR="$ROOT/config"; TMP_DIR="$ROOT/tmp"; mkdir -p "$CONFIG_DIR" "$TMP_DIR"
  MOCK_RUNNING=0; MIERU_OPTION=''; MIERU_STATE=unchanged

@@ -1079,6 +1079,15 @@ impl Db {
     /// probe here, at most [`Self::MAX_PROBES_PER_NODE`] rows, a limit
     /// `save_ping_task` enforces.
     pub fn create_node(&self, n: &Node, token: &str) -> Result<i64> {
+        self.create_node_with_components(n, token, &InstallChoices::default())
+    }
+    pub fn create_node_with_components(
+        &self,
+        n: &Node,
+        token: &str,
+        choices: &InstallChoices,
+    ) -> Result<i64> {
+        choices.validate()?;
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let id = next_id(&tx, "node")?;
@@ -1111,6 +1120,7 @@ impl Db {
         if n.name.is_empty() {
             tx.execute("UPDATE node SET name = ?1 WHERE id = ?2", params![format!("节点 {id}"), id])?;
         }
+        seed_components(&tx, id, choices)?;
         tx.execute("INSERT INTO traffic (node_id) VALUES (?1)", [id])?;
         tx.execute(
             "INSERT INTO ping_node (task_id, node_id) SELECT id, ?1 FROM ping_task WHERE auto_join",

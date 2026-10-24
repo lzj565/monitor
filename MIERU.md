@@ -7,19 +7,19 @@
 先升级 Hub，再升级 Agent。面板的节点安装命令提供 mieru 和 sing-box 开关。命令行示例：
 
 ```sh
-# 安装 Agent 和 mieru，跳过 sing-box
-sh install.sh --server https://hub.example.com --token TOKEN --mieru --skip-sing-box
+# 安装 Agent、必装的 sing-box，以及 mieru（当次覆盖）
+sh install.sh --server https://hub.example.com --token TOKEN --mieru
 # 同时安装 sing-box、mieru 和 Realm
 sh install.sh --server https://hub.example.com --token TOKEN --sing-box --mieru --realm
-# 升级保留已选择的内核组合
+# 升级读取 Hub 已保存的安装选择
 sh install.sh --upgrade
-# 恢复 sing-box 安装管理
+# sing-box 每次安装及升级均为必装，保留兼容参数
 sh install.sh --upgrade --sing-box
 # 移除托管的 mita 程序及服务，配置和统计文件保留
 sh install.sh --upgrade --no-mieru
 ```
 
-旧命令默认继续安装 sing-box。`--skip-sing-box` 不删除或停止已有的 sing-box；`--no-mieru` 会停止服务。mieru 卸载后保留所有权标记，允许后续重新安装，拒绝接管系统中非本安装器管理的 mita。
+sing-box 固定必装，`--skip-sing-box` 已拒绝。省略组件参数时读取 Hub 保存的安装选择，关闭 Realm/mieru 会在执行时卸载托管组件。`--no-mieru` 可覆盖当次选择并停止服务。mieru 卸载后保留所有权标记，允许后续重新安装，拒绝接管系统中非本安装器管理的 mita。
 
 在代理列表新增 mieru，选择节点、对外地址和端口，然后给用户授权。没有有效授权用户时服务保持停止。每个用户的 mieru 密码自动生成，与面板登录密码独立；管理员可在用户列表的 mieru 按钮中复制及重置凭据。
 
@@ -28,7 +28,7 @@ Realm 规则直接选择 mieru 作为目标代理。用户门户提供原生 JSO
 ## 接口和存储
 
 - `proxies.protocol=mieru`，配置为 `{"transport":"tcp"}`；复用用户、授权及排序表。
-- 新增 `user_proxy_credentials`、`mieru_hosts`、`mieru_traffic_sources`，数据库版本为 25；纳入备份检查和恢复。
+- 新增 `user_proxy_credentials`、`mieru_hosts`、`mieru_traffic_sources`，数据库版本为 26；纳入备份检查和恢复。
 - `GET /api/mieru/hosts` 返回能力、在线、期望版本、已应用版本及错误。
 - `GET /api/mieru/hosts/{id}/config` 为管理员配置预览。
 - `GET/POST /api/users/{id}/mieru-credential` 为管理员读取/重置连接凭据。
@@ -65,7 +65,7 @@ sh scripts/check-api-port-selection.sh
 服务包装器不能安装到真实机器。容器中的测试数据和回环目标许可均仅用于测试；生产配置默认不允许代理到回环地址。真实 systemd/OpenRC 宿主机服务生命周期及 x86_64 真机运行仍需部署环境验收。
 
 
-### 本次本地验证（2026-10-24）
+### mieru 首次接入验证（2026-10-24，组件记录改动前）
 
 - Hub：236 项 Rust 测试通过，fmt 和严格 Clippy 通过。
 - Agent：62 项常规 Rust 测试通过，fmt 和严格 Clippy 通过；另一个默认忽略的真实 mita 集成测试已在一次性容器中单独执行通过。
@@ -76,3 +76,5 @@ sh scripts/check-api-port-selection.sh
 - 容器以测试服务包装器模拟 init 管理，因此不等同于真实 systemd/OpenRC 宿主机验收；x86_64 真机运行和生产部署未测。
 
 额外的 HTTP/WebSocket 验证脚本为 `scripts/e2e-mieru-management.py`，在同一个一次性容器中放置新 Hub/Agent 二进制后执行。`agent-test.pin` 保留已发布 Agent 的兼容性测试基线；发布含 mieru 的 Agent 后，再按实际发布资产更新该 pin，不能预先填写未发布资产的校验值。
+
+组件安装选择持久化、迁移默认值及状态上报详见 [NODE_COMPONENTS.md](NODE_COMPONENTS.md)。

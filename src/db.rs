@@ -103,6 +103,8 @@ impl Db {
     }
 }
 
+mod components;
+pub(super) use components::*;
 mod mieru;
 pub(super) use mieru::*;
 mod realm;
