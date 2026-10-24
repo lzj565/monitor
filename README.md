@@ -52,6 +52,8 @@ agent 卸载会删除新旧位置的 `agent.env`，保留 sing-box 配置。升�
 
 ## 开发与验证
 
+Mac 使用 Docker / OrbStack 重新编译、启动和重启 Hub，见 [本地启动命令](LOCAL_RUN.md)。
+
 后端按 API 业务、数据库查询及迁移分别放在 `src/api/`、`src/db/`；管理页面位于 `web-admin/src/components/admin/`，按路由加载。同步 HTTP 工作通过 `src/blocking.rs` 限制并发，并在阻塞线程执行。
 
 ```sh

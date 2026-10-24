@@ -132,12 +132,11 @@ export function RealmProxyForm({ rule, nodes, proxies, hosts, rules, ready, site
           <p className="text-xs text-muted-foreground">仅用于当前代理的客户端连接地址；监听默认支持 IPv4 / IPv6。</p>
         </section>
         {host?.enabled===false && <p className="text-sm text-amber-600">节点 Realm 服务总开关已停用，规则保存后需在入口服务设置中启用。</p>}
-        <div className="grid gap-3 sm:grid-cols-2">
-          <Field title="监听端口"><div className="flex gap-2"><Input aria-label="监听端口" type="number" required min={1} max={65535} step={1} value={draft.listen_port || ""} onChange={(e) => setDraft({ ...draft, listen_port: Number(e.target.value) })} /><Button type="button" variant="outline" onClick={() => setDraft({ ...draft, listen_port: 20000 + Math.floor(Math.random() * 45536) })}>随机</Button></div></Field>
+        <Field title="监听端口"><div className="flex gap-2"><Input aria-label="监听端口" type="number" required min={1} max={65535} step={1} value={draft.listen_port || ""} onChange={(e) => setDraft({ ...draft, listen_port: Number(e.target.value) })} /><Button type="button" variant="outline" onClick={() => setDraft({ ...draft, listen_port: 20000 + Math.floor(Math.random() * 45536) })}>随机</Button></div></Field>
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <Field title="目标节点"><select aria-label="目标节点" className={selectClass} required value={targetNodeId || ""} onChange={(e) => { setTargetNodeId(Number(e.target.value)); setDraft({ ...draft, target_proxy_id: 0 }) }}><option value="">选择目标节点</option>{nodes.filter((n) => n.id !== draft.node_id).map((n) => <option key={n.id} value={n.id}>{n.name}</option>)}</select></Field>
           <Field title="目标代理"><select aria-label="目标代理" className={selectClass} required value={draft.target_proxy_id || ""} onChange={(e) => setDraft({ ...draft, target_proxy_id: Number(e.target.value) })}><option value="">选择已有代理</option>{proxies.filter((p) => p.node_id === targetNodeId && p.node_id !== draft.node_id && (p.enabled || p.id === rule?.target_proxy_id)).map((p) => <option key={p.id} value={p.id}>{p.name} · {p.address}:{p.port}{p.enabled ? "" : "（已停用）"}</option>)}</select></Field>
         </div>
-        <label className="flex gap-2 text-sm"><input type="checkbox" checked={draft.enabled} onChange={(e) => setDraft({ ...draft, enabled: e.target.checked })} />启用当前转发规则</label>
         {draft.enabled && target && !target.enabled && <p role="alert" className="text-sm text-destructive">目标代理已停用，请选择其他代理或停用当前规则。</p>}
         <InstallCommand key={draft.node_id} nodeId={draft.node_id} site={site} refusal={refusal} />
         {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
