@@ -40,7 +40,7 @@ pub struct ProxyRequest {
     pub enabled: bool,
     #[serde(default)]
     pub flow: Option<String>,
-    pub config: VlessProxyConfig,
+    pub config: Value,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -69,8 +69,34 @@ impl ProxyRequest {
         if name.is_empty() || name.chars().count() > 128 {
             return Err(InputError::new("INVALID_PROXY_CONFIG", "name must contain 1 to 128 characters"));
         }
+        if self.protocol == "mieru" {
+            validate_address(&self.address_type, &self.address)?;
+            if self.port < 1025
+                || self.config != json!({"transport":"tcp"})
+                || self.flow.as_deref().is_some_and(|f| !f.is_empty())
+            {
+                return Err(InputError::new(
+                    "INVALID_PROXY_CONFIG",
+                    "mieru requires TCP, port 1025–65535 and an empty flow",
+                ));
+            }
+            return Ok(ProxyDraft {
+                name: name.into(),
+                include_node_name: self.include_node_name,
+                protocol: self.protocol,
+                address_type: self.address_type,
+                address: self.address,
+                port: self.port.into(),
+                enabled: self.enabled,
+                flow: Some(String::new()),
+                config: self.config,
+            });
+        }
         if self.protocol != "vless" {
-            return Err(InputError::new("INVALID_PROXY_PROTOCOL", "V1 only supports the vless protocol"));
+            return Err(InputError::new(
+                "INVALID_PROXY_PROTOCOL",
+                "Only VLESS and mieru protocols are supported",
+            ));
         }
         validate_address(&self.address_type, &self.address)?;
         if self.port == 0 {
@@ -79,7 +105,9 @@ impl ProxyRequest {
         if self.flow.as_deref().is_some_and(|flow| !flow.is_empty() && flow != DEFAULT_FLOW) {
             return Err(InputError::new("INVALID_PROXY_CONFIG", "flow must be empty or xtls-rprx-vision"));
         }
-        let reality = &self.config.reality;
+        let typed: VlessProxyConfig = serde_json::from_value(self.config.clone())
+            .map_err(|e| InputError::new("INVALID_PROXY_CONFIG", e.to_string()))?;
+        let reality = &typed.reality;
         if !reality.enabled {
             return Err(InputError::new("INVALID_PROXY_CONFIG", "V1 requires VLESS Reality to be enabled"));
         }
@@ -250,7 +278,7 @@ pub fn generate_config(db: &Db, node_id: i64, now: i64) -> anyhow::Result<Value>
     let mut inbounds = Vec::new();
     let mut stats_inbounds = Vec::new();
     let mut stats_users = BTreeSet::new();
-    for proxy in db.proxies_for_node(node_id)?.into_iter().filter(|p| p.enabled) {
+    for proxy in db.proxies_for_node(node_id)?.into_iter().filter(|p| p.enabled && p.protocol == "vless") {
         let config: VlessProxyConfig = serde_json::from_value(proxy.config.clone())
             .with_context(|| format!("stored VLESS config for proxy {} is invalid", proxy.id))?;
         let users: Vec<Value> = db
@@ -327,8 +355,8 @@ struct VlessUser {
     uuid: String,
 }
 
-pub fn vless_protocol(proxy: &db::Proxy) -> bool {
-    proxy.protocol == "vless"
+pub fn supported_protocol(proxy: &db::Proxy) -> bool {
+    matches!(proxy.protocol.as_str(), "vless" | "mieru")
 }
 
 #[cfg(test)]

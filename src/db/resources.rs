@@ -50,6 +50,15 @@ impl Db {
         if !node_exists {
             return Ok(Err(ProxyWriteIssue::NodeNotFound));
         }
+        if draft.protocol == "mieru"
+            && tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM proxies WHERE node_id=?1 AND protocol='mieru' AND id<>?2)",
+                params![node_id, -1],
+                |r| r.get::<_, bool>(0),
+            )?
+        {
+            return Ok(Err(ProxyWriteIssue::MieruInstanceConflict));
+        }
         if proxy_name_in_use(&tx, node_id, draft, None)? {
             return Ok(Err(ProxyWriteIssue::NameConflict));
         }
@@ -92,6 +101,15 @@ impl Db {
             conn.query_row("SELECT EXISTS(SELECT 1 FROM node WHERE id=?1)", [node_id], |r| r.get(0))?;
         if !node_exists {
             return Ok(Err(ProxyWriteIssue::NodeNotFound));
+        }
+        if draft.protocol == "mieru"
+            && conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM proxies WHERE node_id=?1 AND protocol='mieru' AND id<>?2)",
+                params![node_id, id],
+                |r| r.get::<_, bool>(0),
+            )?
+        {
+            return Ok(Err(ProxyWriteIssue::MieruInstanceConflict));
         }
         if proxy_name_in_use(&conn, node_id, draft, Some(id))? {
             return Ok(Err(ProxyWriteIssue::NameConflict));
@@ -423,7 +441,9 @@ impl Db {
         let tx = conn.transaction()?;
         reset_due_user_traffic(&tx, now)?;
         let proxy_ids = {
-            let mut stmt = tx.prepare("SELECT id FROM proxies WHERE node_id=?1 AND enabled=1 ORDER BY id")?;
+            let mut stmt = tx.prepare(
+                "SELECT id FROM proxies WHERE node_id=?1 AND enabled=1 AND protocol='vless' ORDER BY id",
+            )?;
             let rows = stmt.query_map([node_id], |r| r.get::<_, i64>(0))?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
@@ -432,7 +452,7 @@ impl Db {
                 "SELECT DISTINCT u.id,u.username FROM users u
                  JOIN user_proxy_authorizations a ON a.user_id=u.id
                  JOIN proxies p ON p.id=a.proxy_id
-                 WHERE p.node_id=?1 AND p.enabled=1 AND a.enabled=1 AND u.enabled=1
+                 WHERE p.node_id=?1 AND p.protocol='vless' AND p.enabled=1 AND a.enabled=1 AND u.enabled=1
                        AND (u.expires_at IS NULL OR u.expires_at>?2)
                  ORDER BY u.id",
             )?;
@@ -634,6 +654,7 @@ impl Db {
         let mut proxies = stmt
             .query_map(params![id, now], |r| {
                 Ok(UserPortalProxy {
+                    mieru_password: None,
                     id: r.get(0)?,
                     node_id: r.get(1)?,
                     node_name: r.get(2)?,
@@ -658,6 +679,11 @@ impl Db {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(stmt);
         drop(conn);
+        for proxy in &mut proxies {
+            if proxy.protocol == "mieru" {
+                proxy.mieru_password = Some(self.mieru_credential(id, false)?);
+            }
+        }
         let direct = proxies.clone();
         for entry in self.realm_subscription_entries()? {
             if let Some(base) = direct.iter().find(|p| p.id == entry.target_proxy_id) {
@@ -711,7 +737,7 @@ impl Db {
              FROM user_proxy_authorizations a
              JOIN proxies p ON p.id=a.proxy_id
              JOIN node n ON n.id=p.node_id
-             WHERE a.user_id=?1 AND a.enabled=1 AND p.enabled=1
+             WHERE a.user_id=?1 AND a.enabled=1 AND p.enabled=1 AND p.protocol='vless'
              ORDER BY (SELECT o.sort FROM user_proxy_order o WHERE o.user_id=a.user_id AND o.proxy_id=p.id) IS NULL,
                       (SELECT o.sort FROM user_proxy_order o WHERE o.user_id=a.user_id AND o.proxy_id=p.id),p.node_id,p.id",
         )?;
@@ -1015,7 +1041,7 @@ impl Db {
             "SELECT DISTINCT u.username FROM users u
              JOIN user_proxy_authorizations a ON a.user_id=u.id
              JOIN proxies p ON p.id=a.proxy_id
-             WHERE p.node_id=?1 AND p.enabled=1 AND a.enabled=1 AND u.enabled=1
+             WHERE p.node_id=?1 AND p.protocol='vless' AND p.enabled=1 AND a.enabled=1 AND u.enabled=1
                AND u.expires_at IS NOT NULL AND u.expires_at<=?2",
         )?;
         let rows = stmt.query_map(params![node_id, now], |r| r.get::<_, String>(0))?;

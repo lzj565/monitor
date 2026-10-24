@@ -45,6 +45,7 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
 
+      - run: sh scripts/check-mieru-install.sh
       - run: sh scripts/check-realm-install.sh
       - run: sh scripts/check-agent-unit.sh
       - run: sh scripts/check-api-port-selection.sh

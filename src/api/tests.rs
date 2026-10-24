@@ -2098,3 +2098,76 @@ async fn a_history_window_stops_at_the_retention_window() {
     assert_eq!(rows(&month), 30, "a month reaches back thirty days");
     assert_eq!(step(&month), 3_600, "in whole hours, as no hourly row may straddle two points");
 }
+
+#[tokio::test]
+async fn mieru_authorization_portal_export_and_legacy_subscription_are_separate() {
+    let app = std::sync::Arc::new(app());
+    let node = app
+        .db
+        .create_node(&crate::db::Node { name: "mieru-api".into(), ..Default::default() }, "mieru-test-token")
+        .unwrap();
+    let request=serde_json::from_value(json!({"name":"mieru","protocol":"mieru","address_type":"domain","address":"proxy.example.com","port":24061,"enabled":true,"config":{"transport":"tcp"}})).unwrap();
+    let response = create_proxy(ApiAdmin, State(app.clone()), Path(node), Ok(Json(request))).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let value: Value =
+        serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    let proxy = value["id"].as_i64().unwrap();
+    let user = app.db.user_login_record("admin").unwrap().unwrap().id;
+    let request = serde_json::from_value(json!({"enabled":true})).unwrap();
+    assert_eq!(
+        put_user_proxy(ApiAdmin, State(app.clone()), Path((user, proxy)), Ok(Json(request))).await.status(),
+        StatusCode::OK
+    );
+    let portal = portal_json(user_proxies(UserAuth(user), State(app.clone())).await).await;
+    let row = &portal["items"][0];
+    assert!(row["mieru_url"].as_str().unwrap().starts_with("mierus://"));
+    assert_eq!(row["mieru_config"]["profiles"][0]["servers"][0]["domainName"], "proxy.example.com");
+    assert!(row.get("vless_url").is_none());
+    assert!(row.get("mieru_password").is_none());
+    let token = app.db.user_subscription_token(user).unwrap().unwrap();
+    let native =
+        portal_json(subscription(State(app.clone()), Path((token.clone(), "mieru".into()))).await).await;
+    assert_eq!(native["profiles"].as_array().unwrap().len(), 1);
+    let legacy = portal_json(subscription(State(app.clone()), Path((token, "sing-box".into()))).await).await;
+    assert_eq!(legacy["outbounds"].as_array().unwrap().len(), 1);
+    assert_eq!(legacy["outbounds"][0]["type"], "direct");
+}
+
+#[tokio::test]
+async fn deleting_last_vless_still_clears_singbox_on_a_mixed_node() {
+    let app = std::sync::Arc::new(app());
+    let node = app
+        .db
+        .create_node(&crate::db::Node { name: "mixed".into(), ..Default::default() }, "mixed-test")
+        .unwrap();
+    let vless=app.db.create_proxy(node,&crate::db::ProxyDraft{name:"vless".into(),include_node_name:false,protocol:"vless".into(),address_type:"domain".into(),address:"proxy.example.com".into(),port:24060,enabled:true,flow:None,config:json!({"reality":{"enabled":true,"server_name":"example.com","server_port":443,"private_key":"A".repeat(43),"public_key":"B".repeat(43),"short_id":"abcd"}})}).unwrap().unwrap();
+    app.db
+        .create_proxy(
+            node,
+            &crate::db::ProxyDraft {
+                name: "mieru".into(),
+                include_node_name: false,
+                protocol: "mieru".into(),
+                address_type: "domain".into(),
+                address: "proxy.example.com".into(),
+                port: 24061,
+                enabled: true,
+                flow: None,
+                config: json!({"transport":"tcp"}),
+            },
+        )
+        .unwrap()
+        .unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    app.agents.write().unwrap().insert(node, crate::agent_ws::Agent::new(1, tx));
+    assert_eq!(sync_generated_nodes(&app, vec![node]).queued.len(), 1);
+    rx.try_recv().unwrap();
+    app.db.delete_proxy(vless).unwrap();
+    let report = sync_generated_nodes(&app, vec![node]);
+    assert_eq!(report.queued.len(), 1);
+    let command: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+    let config: Value = serde_json::from_str(command["params"]["content"].as_str().unwrap()).unwrap();
+    assert_eq!(config["inbounds"], json!([]));
+    assert!(sync_node_config_on_connect(&app, node));
+}

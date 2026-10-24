@@ -4,12 +4,14 @@ pub(super) const MAX_COMMAND_CONFIG: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 pub(super) struct QueuedNodeSync {
+    pub(super) core: &'static str,
     pub(super) node_id: i64,
     pub(super) command_id: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub(super) struct NeedsNodeSync {
+    pub(super) core: &'static str,
     pub(super) node_id: i64,
     pub(super) reason: &'static str,
 }
@@ -17,6 +19,7 @@ pub(super) struct NeedsNodeSync {
 #[derive(Debug, Clone, Default, Serialize)]
 pub(super) struct SyncReport {
     pub(super) queued: Vec<QueuedNodeSync>,
+    pub(super) pending: Vec<NeedsNodeSync>,
     pub(super) needs_sync: Vec<NeedsNodeSync>,
 }
 
@@ -60,6 +63,20 @@ pub async fn create_command(
             Ok(body) => body,
             Err(error) => return error.into_response(),
         };
+        if body.method.starts_with("mieru.") {
+            if body.method == "mieru.config.apply" {
+                return bad("请通过 mieru 代理页面应用配置");
+            }
+            if !app
+                .agents
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&node_id)
+                .is_some_and(|a| a.mieru_capable)
+            {
+                return bad("节点离线或 Agent 需要升级");
+            }
+        }
         if matches!(body.method.as_str(), "realm.config.apply" | "realm.restart" | "realm.traffic.configure")
         {
             return bad("请通过 Realm 页面应用配置和重启");
@@ -621,11 +638,11 @@ pub async fn replace_user_authorizations(
                 Ok(proxy) => proxy,
                 Err(response) => return response,
             };
-            if !proxy::vless_protocol(&proxy) {
+            if !proxy::supported_protocol(&proxy) {
                 return api_error(
                     StatusCode::BAD_REQUEST,
                     "INVALID_PROXY_PROTOCOL",
-                    "V1 only supports VLESS authorization",
+                    "Only VLESS and mieru authorization are supported",
                 );
             }
         }
@@ -672,11 +689,11 @@ pub async fn put_user_proxy(
             Ok(proxy) => proxy,
             Err(response) => return response,
         };
-        if !proxy::vless_protocol(&proxy) {
+        if !proxy::supported_protocol(&proxy) {
             return api_error(
                 StatusCode::BAD_REQUEST,
                 "INVALID_PROXY_PROTOCOL",
-                "V1 only supports VLESS authorization",
+                "Only VLESS and mieru authorization are supported",
             );
         }
         match app.db.put_authorization(user_id, proxy_id, &draft) {
@@ -750,20 +767,58 @@ pub(super) fn sync_generated_nodes(app: &Shared, node_ids: Vec<i64>) -> SyncRepo
     let mut report = SyncReport::default();
     let node_ids = node_ids.into_iter().collect::<std::collections::BTreeSet<_>>();
     for node_id in node_ids {
+        match app.db.mieru_desired(node_id) {
+            Ok(Some(_)) => {
+                report.pending.push(NeedsNodeSync { core: "mieru", node_id, reason: "reconciling" })
+            }
+            Err(_) => {
+                report.needs_sync.push(NeedsNodeSync { core: "mieru", node_id, reason: "config_error" })
+            }
+            _ => {}
+        }
+        let has_vless =
+            app.db.proxies_for_node(node_id).is_ok_and(|p| p.iter().any(|p| p.protocol == "vless"));
+        if has_vless {
+            if let Err(e) = app.db.set(&format!("singbox_managed_node_{node_id}"), "1") {
+                tracing::warn!("cannot record sing-box ownership: {e:#}");
+            }
+        }
+        if !has_vless
+            && app.db.get(&format!("singbox_managed_node_{node_id}")).is_none()
+            && app.db.mieru_managed(node_id).unwrap_or(false)
+        {
+            continue;
+        }
         match generated_node_config(app, node_id) {
             Ok(config) => {
                 match enqueue_generated_config_id(app, node_id, "singbox.config.apply", config.to_string()) {
-                    Ok(command_id) => report.queued.push(QueuedNodeSync { node_id, command_id }),
-                    Err(error) => report.needs_sync.push(NeedsNodeSync { node_id, reason: error.as_str() }),
+                    Ok(command_id) => {
+                        report.queued.push(QueuedNodeSync { core: "singbox", node_id, command_id })
+                    }
+                    Err(error) => report.needs_sync.push(NeedsNodeSync {
+                        core: "singbox",
+                        node_id,
+                        reason: error.as_str(),
+                    }),
                 }
             }
-            Err(_) => report.needs_sync.push(NeedsNodeSync { node_id, reason: "config_error" }),
+            Err(_) => {
+                report.needs_sync.push(NeedsNodeSync { core: "singbox", node_id, reason: "config_error" })
+            }
         }
     }
     report
 }
 
 pub(crate) fn sync_node_config_on_connect(app: &Shared, node_id: i64) -> bool {
+    if app
+        .db
+        .proxies_for_node(node_id)
+        .is_ok_and(|p| !p.is_empty() && p.iter().all(|p| p.protocol == "mieru"))
+        && app.db.get(&format!("singbox_managed_node_{node_id}")).is_none()
+    {
+        return true;
+    }
     let Ok(config) = generated_node_config(app, node_id) else { return false };
     enqueue_generated_config(app, node_id, "singbox.config.apply", config.to_string()).status().is_success()
 }

@@ -7,11 +7,11 @@ export type RealmRule = { traffic_key: string; id: number; node_id: number; targ
 export type RealmRuleDraft = Pick<RealmRule, "node_id" | "target_proxy_id" | "name" | "address_type" | "address" | "listen_port" | "enabled">
 export type RealmHostDraft = { node_id: number; enabled: boolean }
 export type ProxyListItem = { kind: "proxy"; key: string; proxy: Proxy } | { kind: "realm"; key: string; rule: RealmRule }
-export type ProxyTypeFilter = "all" | "vless" | "realm"
+export type ProxyTypeFilter = "all" | "vless" | "mieru" | "realm"
 
 export function proxyTypeFilter(search: string): ProxyTypeFilter {
   const type = new URLSearchParams(search).get("type")
-  return type === "realm" || type === "vless" ? type : "all"
+  return type === "realm" || type === "vless" || type === "mieru" ? type : "all"
 }
 export function realmHostStatus(host?: RealmHost): string {
   if (!host) return "等待入口配置"
@@ -33,7 +33,7 @@ export function proxyListItems(proxies: Proxy[], rules: RealmRule[], nodes: Node
   const needle = filters.query.trim().toLowerCase()
   return items.filter((item) => {
     const row = item.kind === "proxy" ? item.proxy : item.rule
-    if (filters.type !== "all" && filters.type !== (item.kind === "proxy" ? "vless" : "realm")) return false
+    if (filters.type !== "all" && filters.type !== (item.kind === "proxy" ? item.proxy.protocol : "realm")) return false
     if (filters.node !== "all" && filters.node !== String(row.node_id)) return false
     if (filters.status !== "all" && (filters.status === "enabled") !== row.enabled) return false
     const values = item.kind === "proxy"

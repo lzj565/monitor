@@ -42,6 +42,9 @@ UNINSTALL=""
 UPGRADE=""
 SINGBOX_API_PORT=""
 API_PORT_HELPER=""
+MIERU_OPTION=""
+MIERU_STATE=unchanged
+SINGBOX_OPTION=""
 REALM_OPTION=""
 REALM="$ROOT/realm"
 REALM_CONFIG="$CONFIG_DIR/realm.json"
@@ -319,6 +322,8 @@ print_summary() {
 		detail "Service" "$SERVICE_NAME"
 	fi
 	detail "Status" "$SING_BOX_STATUS"
+	printf '\nmieru\n'
+	detail "Status" "$MIERU_STATE"
 	printf '\nRealm\n'
 	detail "Status" "$REALM_STATE"
 	if [ "$REALM_STATE" != unchanged ]; then
@@ -466,6 +471,127 @@ RC
 }
 # END Realm helpers
 
+# BEGIN mieru helpers
+manage_mieru() {
+    [ -n "$MIERU_OPTION" ] || return 0
+    CURRENT_STEP=mieru
+    MIERU="$ROOT/mita"
+    MIERU_CONFIG="$CONFIG_DIR/mieru.json"
+    MIERU_UNIT=/etc/systemd/system/monitor-mieru.service
+    MIERU_RC=/etc/init.d/monitor-mieru
+    if [ ! -f "$ROOT/.mieru-managed" ] && [ ! -f "$ROOT/.mieru-preserved" ]; then
+        for path in "$MIERU" "$MIERU_CONFIG" "$MIERU_UNIT" "$MIERU_RC" /etc/mita /var/lib/mita /run/monitor-mieru; do
+            [ ! -e "$path" ] && [ ! -L "$path" ] || fail "mieru paths are not owned by monitor: $path"
+        done
+        if command -v mita >/dev/null 2>&1; then fail "an unmanaged mita installation already exists"; fi
+    fi
+    for path in "$MIERU" "$MIERU_CONFIG" "$ROOT/.mieru-managed" "$ROOT/.mieru-preserved" "$MIERU_UNIT" "$MIERU_RC"; do
+        [ ! -L "$path" ] || fail "mieru managed path is a symlink: $path"
+    done
+    if [ "$MIERU_OPTION" = --no-mieru ]; then
+        if [ -f "$ROOT/.mieru-managed" ]; then
+            if [ "$INIT" = systemd ]; then systemctl disable --now monitor-mieru || fail "cannot stop mieru"; else
+                rc-service monitor-mieru stop || fail "cannot stop mieru"
+                rc-update del monitor-mieru default >/dev/null 2>&1 || true
+            fi
+            touch "$ROOT/.mieru-preserved"
+            rm -f "$MIERU" "$MIERU_UNIT" "$MIERU_RC" "$ROOT/.mieru-managed"
+            [ "$INIT" != systemd ] || systemctl daemon-reload
+        fi
+        MIERU_STATE=uninstalled
+        return 0
+    fi
+    case "$ARCH" in
+        x86_64) MIERU_SHA=ea35fdef84bef1378f32b74a2d5a883d508a49dd4e64dba9a3a8363beed5798c ;;
+        aarch64) MIERU_SHA=853eb8c3221ce294afffd7d690dbece929c4e774ed3d81c209b71446b515d1c6 ;;
+        *) fail "unsupported mieru architecture" ;;
+    esac
+    curl -fsSL --max-time 300 "${SERVER%/}/mieru/$ARCH" -o "$TMP_DIR/mita.tar.gz" || fail "mita download failed"
+    [ "$(sha256sum "$TMP_DIR/mita.tar.gz" | awk '{print $1}')" = "$MIERU_SHA" ] || fail "mita checksum mismatch"
+    MIERU_MEMBER=$(tar -tzf "$TMP_DIR/mita.tar.gz" | sed -n '/^\(\.\/\)\{0,1\}mita$/p' | head -n 1)
+    [ -n "$MIERU_MEMBER" ] || fail "mita archive has no executable"
+    tar -xOzf "$TMP_DIR/mita.tar.gz" "$MIERU_MEMBER" > "$TMP_DIR/mita" || fail "cannot extract mita"
+    chmod 0755 "$TMP_DIR/mita"
+    "$TMP_DIR/mita" version | grep -F '3.39.0' >/dev/null || fail "mita version mismatch"
+    getent group mita >/dev/null 2>&1 || { groupadd --system mita 2>/dev/null || addgroup -S mita; }
+    id mita >/dev/null 2>&1 || { useradd --system -g mita --home-dir /nonexistent --shell /usr/sbin/nologin mita 2>/dev/null || adduser -S -D -H -G mita mita; }
+    mkdir -p /var/lib/mita /run/monitor-mieru
+    chown mita:mita /var/lib/mita /run/monitor-mieru
+    chmod 0750 /var/lib/mita /run/monitor-mieru
+    if [ ! -f "$MIERU_CONFIG" ]; then
+        (umask 077; printf '%s\n' '{"portBindings":[],"users":[],"loggingLevel":"WARN"}' > "$MIERU_CONFIG")
+    fi
+    chown mita:mita "$MIERU_CONFIG"
+    chmod 0600 "$MIERU_CONFIG"
+    # Keep the previous binary and running state until the replacement passes health checks.
+    MIERU_RUNNING=""
+    if [ "$INIT" = systemd ]; then systemctl is-active --quiet monitor-mieru && MIERU_RUNNING=1 || true; else rc-service monitor-mieru status >/dev/null 2>&1 && MIERU_RUNNING=1 || true; fi
+    [ ! -f "$MIERU" ] || cp -p "$MIERU" "$TMP_DIR/mita.old"
+    [ ! -f "$MIERU_UNIT" ] || cp -p "$MIERU_UNIT" "$TMP_DIR/mieru-unit.old"
+    [ ! -f "$MIERU_RC" ] || cp -p "$MIERU_RC" "$TMP_DIR/mieru-rc.old"
+    install -m 0755 "$TMP_DIR/mita" "$ROOT/.mita.$$"
+    mv -f "$ROOT/.mita.$$" "$MIERU"
+    if [ "$INIT" = systemd ]; then
+        cat > "$MIERU_UNIT" <<UNIT
+# Managed by monitor installer
+[Unit]
+Description=Monitor mieru server
+After=network-online.target
+Wants=network-online.target
+[Service]
+User=mita
+Group=mita
+RuntimeDirectory=monitor-mieru
+RuntimeDirectoryMode=0750
+Environment=MITA_CONFIG_JSON_FILE=$MIERU_CONFIG
+Environment=MITA_UDS_PATH=/run/monitor-mieru/mita.sock
+ExecStart=$MIERU run
+Restart=on-failure
+RestartSec=5
+[Install]
+WantedBy=multi-user.target
+UNIT
+        chmod 0644 "$MIERU_UNIT"
+        systemctl daemon-reload
+    else
+        cat > "$MIERU_RC" <<RC
+#!/sbin/openrc-run
+# Managed by monitor installer
+command="$MIERU"
+command_args="run"
+command_user="mita:mita"
+supervisor="supervise-daemon"
+respawn_delay=5
+export MITA_CONFIG_JSON_FILE="$MIERU_CONFIG"
+export MITA_UDS_PATH=/run/monitor-mieru/mita.sock
+start_pre() { checkpath --directory --owner mita:mita --mode 0750 /run/monitor-mieru; }
+depend() { need net; }
+RC
+        chmod 0755 "$MIERU_RC"
+    fi
+    touch "$ROOT/.mieru-managed"
+    if [ -n "$MIERU_RUNNING" ]; then
+        if [ "$INIT" = systemd ]; then
+            if ! systemctl restart monitor-mieru || ! systemctl is-active --quiet monitor-mieru; then
+                [ ! -f "$TMP_DIR/mita.old" ] || cp -p "$TMP_DIR/mita.old" "$MIERU"
+                [ ! -f "$TMP_DIR/mieru-unit.old" ] || cp -p "$TMP_DIR/mieru-unit.old" "$MIERU_UNIT"
+                systemctl daemon-reload
+                systemctl restart monitor-mieru || true
+                fail "mita upgrade failed; restored previous binary"
+            fi
+        else
+            if ! rc-service monitor-mieru restart || ! rc-service monitor-mieru status; then
+                [ ! -f "$TMP_DIR/mita.old" ] || cp -p "$TMP_DIR/mita.old" "$MIERU"
+                [ ! -f "$TMP_DIR/mieru-rc.old" ] || cp -p "$TMP_DIR/mieru-rc.old" "$MIERU_RC"
+                rc-service monitor-mieru restart || true
+                fail "mita upgrade failed; restored previous binary"
+            fi
+        fi
+    fi
+    MIERU_STATE=installed
+}
+# END mieru helpers
+
 while [ $# -gt 0 ]; do
 	# A flag with no argument: under set -u, `$2` aborts with the shell's own
 	# message rather than the usage below, and `shift 2` cannot proceed.
@@ -483,6 +609,12 @@ while [ $# -gt 0 ]; do
 	--insecure) INSECURE=1; shift ;;
 	--uninstall) UNINSTALL=1; shift ;;
 	--upgrade) UPGRADE=1; shift ;;
+    --mieru | --no-mieru)
+        [ -z "$MIERU_OPTION" ] || [ "$MIERU_OPTION" = "$1" ] || { echo "conflicting mieru flags" >&2; exit 2; }
+        MIERU_OPTION=$1; shift ;;
+    --sing-box | --skip-sing-box)
+        [ -z "$SINGBOX_OPTION" ] || [ "$SINGBOX_OPTION" = "$1" ] || { echo "conflicting sing-box flags" >&2; exit 2; }
+        SINGBOX_OPTION=$1; shift ;;
 	--realm | --no-realm)
 		[ -z "$REALM_OPTION" ] || [ "$REALM_OPTION" = "$1" ] || { echo "--realm and --no-realm are mutually exclusive" >&2; exit 2; }
 		REALM_OPTION=$1; shift ;;
@@ -490,6 +622,8 @@ while [ $# -gt 0 ]; do
 	esac
 done
 
+[ -n "$SINGBOX_OPTION" ] || { if [ -f "$ROOT/.skip-sing-box" ]; then SINGBOX_OPTION=--skip-sing-box; else SINGBOX_OPTION=--sing-box; fi; }
+[ -n "$MIERU_OPTION" ] || { [ ! -f "$ROOT/.mieru-managed" ] || MIERU_OPTION=--mieru; }
 step 0 "检查系统环境"
 [ "$(id -u)" = 0 ] || { CURRENT_STEP="检查系统环境"; FAIL_REASON="请使用 root 用户运行安装程序"; fail "$FAIL_REASON"; }
 if [ -r /etc/os-release ]; then
@@ -571,8 +705,8 @@ if [ -n "$UPGRADE" ]; then
 fi
 
 [ -n "$SERVER" ] && { [ -n "$TOKEN" ] || [ -n "$REGISTER" ]; } || {
-	echo "usage: install.sh --server URL (--token TOKEN | --register KEY) [--interval SECONDS] [--iface LIST] [--insecure] [--realm | --no-realm]" >&2
-	echo "       install.sh --upgrade [--iface LIST] [--interval SECONDS] [--realm | --no-realm]" >&2
+	echo "usage: install.sh --server URL (--token TOKEN | --register KEY) [--interval SECONDS] [--iface LIST] [--insecure] [--realm | --no-realm] [--mieru | --no-mieru] [--sing-box | --skip-sing-box]" >&2
+	echo "       install.sh --upgrade [--iface LIST] [--interval SECONDS] [--realm | --no-realm] [--mieru | --no-mieru] [--sing-box | --skip-sing-box]" >&2
 	echo "       install.sh --uninstall" >&2
 	echo "--name NAME names the node --register creates, which is otherwise named after its id. < > \" ' are dropped from it; the panel renames a node freely" >&2
 	exit 2
@@ -723,7 +857,7 @@ success "下载完成"
 # a machine half-upgraded.
 API_PORT_HELPER=$TMP_AGENT
 info "checking sing-box V2Ray API port..."
-select_singbox_api_port || fail "$FAIL_REASON"
+if [ "$SINGBOX_OPTION" != --skip-sing-box ]; then select_singbox_api_port || fail "$FAIL_REASON"; else SINGBOX_API_PORT=9001; fi
 
 # Downloaded before the registration below, because that step spends a node: the
 # key returns a token and the panel gains a row, while the env file recording it
@@ -790,6 +924,10 @@ success "monitor-agent binary 安装完成"
 
 # The system package binary is left in place, while the Agent and service use
 # this release's self-built binary with V2Ray API support.
+SING_BOX_SOURCE=skipped
+SING_BOX_STATUS=skipped
+SING_BOX_VER=""
+if [ "$SINGBOX_OPTION" != --skip-sing-box ]; then
 step 2 "检查 sing-box"
 set_singbox_memory_limit
 SING_BOX_SOURCE="installer"
@@ -878,9 +1016,12 @@ detail "Agent 路径" "$SING_BOX"
 detail "版本" "$SING_BOX_VER"
 success "自构建 sing-box 安装及配置校验完成"
 
+fi
 manage_realm
+manage_mieru
 
 step 3 "初始化系统服务"
+if [ "$SINGBOX_OPTION" != --skip-sing-box ]; then
 if [ "$INIT" = systemd ]; then
 	if { [ -e "$SING_BOX_UNIT" ] || [ -L "$SING_BOX_UNIT" ]; } &&
 		! grep -F "$SING_BOX" "$SING_BOX_UNIT" >/dev/null 2>&1 &&
@@ -928,6 +1069,8 @@ RC
 	chmod 0755 "$SING_BOX_RC"
 fi
 
+fi
+if [ "$SINGBOX_OPTION" = --skip-sing-box ]; then touch "$ROOT/.skip-sing-box"; else rm -f "$ROOT/.skip-sing-box"; fi
 
 # The token lives in a root-only environment file rather than the unit, keeping
 # it out of `systemctl cat` and the world-readable journal. 0600 root is what
@@ -992,7 +1135,7 @@ RC
 		rc-update add sing-box default >/dev/null
 		rc-service sing-box restart || { FAIL_REASON="sing-box 启动失败"; fail "$FAIL_REASON"; }
 		rc-service sing-box status >/dev/null 2>&1 || { FAIL_REASON="sing-box 未能进入运行状态"; fail "$FAIL_REASON"; }
-	else
+	elif [ "$SING_BOX_SOURCE" != skipped ]; then
 		rc-service sing-box status >/dev/null 2>&1 || warn "sing-box 已安装，但当前未检测到运行状态"
 	fi
 	rc-update add monitor-agent default >/dev/null
@@ -1006,7 +1149,9 @@ RC
 	rm -f "$BIN.old"
 	AGENT_STATUS=running
 	SING_BOX_STATUS=unknown
-	if rc-service sing-box status >/dev/null 2>&1; then SING_BOX_STATUS=running; else SING_BOX_STATUS=not-running; fi
+	if [ "$SING_BOX_SOURCE" != skipped ]; then
+		if rc-service sing-box status >/dev/null 2>&1; then SING_BOX_STATUS=running; else SING_BOX_STATUS=not-running; fi
+	fi
 	success "monitor-agent 安装并启动完成"
 	CURRENT_STEP=""
 	print_summary
@@ -1048,7 +1193,7 @@ if [ "$SING_BOX_SOURCE" = installer ]; then
 	systemctl enable sing-box.service >/dev/null
 	systemctl restart sing-box.service || { FAIL_REASON="sing-box 启动失败"; fail "$FAIL_REASON"; }
 	if systemctl is-active --quiet sing-box.service; then SING_BOX_STATUS=running; else FAIL_REASON="sing-box 未能进入 active 状态"; fail "$FAIL_REASON"; fi
-else
+elif [ "$SING_BOX_SOURCE" != skipped ]; then
 	if systemctl is-active --quiet sing-box.service; then SING_BOX_STATUS=running; else SING_BOX_STATUS=not-running; warn "sing-box 已安装，但当前未检测到运行状态"; fi
 fi
 systemctl daemon-reload

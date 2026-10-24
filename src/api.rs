@@ -200,6 +200,11 @@ fn map_proxy_issue(issue: ProxyWriteIssue) -> Response {
         ProxyWriteIssue::ProxyNotFound => {
             api_error(StatusCode::NOT_FOUND, "PROXY_NOT_FOUND", "proxy does not exist")
         }
+        ProxyWriteIssue::MieruInstanceConflict => api_error(
+            StatusCode::CONFLICT,
+            "MIERU_INSTANCE_CONFLICT",
+            "每个节点最多一条 mieru 代理，请编辑已有代理或选择其他节点",
+        ),
         ProxyWriteIssue::PortConflict => api_error(
             StatusCode::CONFLICT,
             "PROXY_PORT_CONFLICT",

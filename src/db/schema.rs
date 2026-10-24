@@ -285,7 +285,7 @@ CREATE TABLE IF NOT EXISTS proxy_node_traffic (
 /// cannot: `open` runs `SCHEMA` before migrating, and on an older file the
 /// column is not there yet. `an_upgraded_release_matches_a_fresh_database`
 /// holds every migration to these rules, starting from v1.0.0's schema.
-pub(super) const SCHEMA_VERSION: i64 = 24;
+pub(super) const SCHEMA_VERSION: i64 = 25;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -622,6 +622,13 @@ pub(super) fn migrate(conn: &Connection, from: i64) -> Result<()> {
     )?;
     prepare_realm_schema(&tx)?;
     tx.execute_batch(REALM_SCHEMA)?;
+    tx.execute_batch(MIERU_SCHEMA)?;
+    add_column(&tx, "mieru_hosts", "traffic_error TEXT NOT NULL DEFAULT ''")?;
+    add_column(&tx, "mieru_hosts", "traffic_received INTEGER NOT NULL DEFAULT 0")?;
+    if columns_of(&tx, "proxies")?.contains("protocol") {
+        tx.execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS idx_one_mieru_per_node ON proxies(node_id) WHERE protocol='mieru'")?;
+        tx.execute("INSERT OR IGNORE INTO setting(key,value) SELECT DISTINCT 'singbox_managed_node_' || node_id,'1' FROM proxies WHERE protocol='vless'",[])?;
+    }
     tx.execute_batch(REALM_TRAFFIC_SCHEMA)?;
     tx.execute("UPDATE realm_rules SET traffic_key=lower(hex(randomblob(16))) WHERE traffic_key=''", [])?;
     tx.execute("INSERT OR IGNORE INTO realm_traffic_rules(key,node_id,rule_id,name) SELECT traffic_key,node_id,id,name FROM realm_rules",[])?;
@@ -662,7 +669,7 @@ pub(super) fn seed_default_admin(conn: &Connection) -> Result<()> {
 }
 
 /// Every table a backup must carry before this build will restore it.
-pub(super) const TABLES: [&str; 21] = [
+pub(super) const TABLES: [&str; 24] = [
     "setting",
     "node",
     "proxies",
@@ -684,6 +691,9 @@ pub(super) const TABLES: [&str; 21] = [
     "realm_traffic_rules",
     "realm_traffic_buckets",
     "realm_traffic_status",
+    "user_proxy_credentials",
+    "mieru_hosts",
+    "mieru_traffic_sources",
 ];
 pub(super) const PRE_RESOURCE_TABLES: [&str; 8] =
     ["setting", "node", "traffic", "metric", "ping_task", "ping_node", "ping_record", "session"];

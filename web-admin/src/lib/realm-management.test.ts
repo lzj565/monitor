@@ -5,7 +5,7 @@ import type { Proxy } from "./resources.ts"
 import type { Node } from "./api.ts"
 
 const nodes = [{ id: 1, name: "入口", country: "HK" }, { id: 2, name: "出口", country: "JP" }] as Node[]
-const proxy = { id: 1, node_id: 2, name: "Reality", include_node_name: true, enabled: true, address: "target.example", port: 443 } as Proxy
+const proxy = { protocol: "vless", id: 1, node_id: 2, name: "Reality", include_node_name: true, enabled: true, address: "target.example", port: 443 } as Proxy
 const rule = { id: 1, node_id: 1, name: "中转", address_type: "domain", address: "relay.example", listen_port: 24443, target_proxy_id: 1, target_node_id: 2, target_name: "Reality", target_address: "target.example", target_port: 443, target_enabled: true, enabled: true } as RealmRule
 const filters = { query: "", node: "all", status: "all", type: "all" as const }
 const list = (changes = {}) => proxyListItems([proxy], [rule], nodes, { ...filters, ...changes })
@@ -45,3 +45,7 @@ let count=0
 await assert.rejects(saveRealmRule(async()=>{count++;throw new Error("port conflict")},null,draft),/port conflict/)
 assert.equal(count,1,"a failed save never writes or deletes shared node settings")
 console.log("Realm per-rule addresses, filters, default families and single-request save passed")
+
+const mieru = { ...proxy, id: 3, protocol: "mieru", config: { transport: "tcp" } } as Proxy
+assert.equal(proxyTypeFilter("?type=mieru"), "mieru")
+assert.deepEqual(proxyListItems([proxy, mieru], [rule], nodes, { query: "", node: "all", status: "all", type: "mieru" }).map((i) => i.kind === "proxy" && i.proxy.id), [3])

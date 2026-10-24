@@ -36,6 +36,7 @@ pub enum ProxyWriteIssue {
     NodeNotFound,
     ProxyNotFound,
     PortConflict,
+    MieruInstanceConflict,
     NameConflict,
 }
 
@@ -170,6 +171,8 @@ pub struct UserLoginRecord {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct UserPortalProxy {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mieru_password: Option<String>,
     pub realm_target_node_id: Option<i64>,
     pub id: i64,
     pub node_id: i64,

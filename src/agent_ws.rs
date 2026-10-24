@@ -76,6 +76,8 @@ impl Arrival {
 /// a whole `--interval`.
 #[derive(Debug)]
 pub struct Agent {
+    pub mieru_capable: bool,
+    pub mieru_traffic_capable: bool,
     pub realm_capable: bool,
     pub realm_traffic_capable: bool,
     /// Distinguishes one session on a node from the next; see [`release`].
@@ -106,6 +108,8 @@ pub struct Agent {
 impl Agent {
     pub fn new(session: u64, tx: mpsc::Sender<String>) -> Self {
         Self {
+            mieru_capable: false,
+            mieru_traffic_capable: false,
             realm_capable: false,
             realm_traffic_capable: false,
             session,
@@ -241,6 +245,7 @@ struct Session {
     greeted: bool,
     last_report: Option<Instant>,
     last_proxy_traffic: Option<Instant>,
+    last_mieru_traffic: Option<Instant>,
     /// Last user counters from this live core, used to detect new traffic for
     /// an expired account without scanning users on a timer.
     last_user_counters: HashMap<String, crate::db::ProxyTrafficCounter>,
@@ -639,6 +644,12 @@ fn dispatch(
                     agent.realm_traffic_capable = rpc.params["capabilities"]
                         .as_array()
                         .is_some_and(|caps| caps.iter().any(|v| v.as_str() == Some("realm.traffic.v1")));
+                    agent.mieru_traffic_capable = rpc.params["capabilities"]
+                        .as_array()
+                        .is_some_and(|caps| caps.iter().any(|v| v.as_str() == Some("mieru.traffic.v1")));
+                    agent.mieru_capable = rpc.params["capabilities"]
+                        .as_array()
+                        .is_some_and(|caps| caps.iter().any(|v| v.as_str() == Some("mieru.v1")));
                     agent.realm_capable = rpc.params["capabilities"]
                         .as_array()
                         .is_some_and(|caps| caps.iter().any(|v| v.as_str() == Some("realm.v1")));
@@ -664,6 +675,22 @@ fn dispatch(
             if let Some(agent) = current {
                 let ack = app.db.realm_traffic_record(node_id, &rpc.params)?;
                 let _ = agent.tx.try_send(ack.to_string());
+            }
+        }
+        "mieru.traffic" if session.greeted => {
+            let current = app
+                .agents
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&node_id)
+                .is_some_and(|a| a.session == session.tag && a.mieru_traffic_capable);
+            if current
+                && session
+                    .last_mieru_traffic
+                    .is_none_or(|last| arrival.tick.duration_since(last) >= PROXY_TRAFFIC_SPACING)
+            {
+                session.last_mieru_traffic = Some(arrival.tick);
+                app.db.record_mieru_traffic(node_id, &rpc.params, arrival.at.timestamp())?;
             }
         }
         "proxy.traffic" if !session.greeted => {

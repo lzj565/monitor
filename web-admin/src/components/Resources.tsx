@@ -1,3 +1,4 @@
+import { MieruForm, MieruCredential } from "./admin/Mieru"
 import { useAdminResources, useSharedProxies, useSharedUsers } from "@/components/AdminResources"
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { AlertTriangle, ChevronDown, ChevronRight, ChevronUp, Copy, Eye, EyeOff, Pencil, Plus, RefreshCw, Settings2, Trash2 } from "lucide-react"
@@ -58,6 +59,7 @@ function notifySync(message: string, sync: SyncReport | undefined, signal: Abort
     toast.success(message)
     return
   }
+  if (sync.pending?.length) toast.info(`mieru 配置已保存，等待 ${sync.pending.length} 个节点同步，可在代理编辑页查看结果`)
   const queued = sync.queued.length
   const offline = sync.needs_sync.filter((item) => item.reason === "offline").length
   const otherFailures = sync.needs_sync.length - offline
@@ -139,7 +141,7 @@ function StatusFilter({ value, onChange, labels }: {
 
 function realityReady(reality: Proxy["config"]["reality"]): boolean {
   return Boolean(
-    reality.server_name.trim()
+    reality?.server_name.trim()
     && Number.isInteger(reality.server_port) && reality.server_port > 0 && reality.server_port <= 65535
     && /^[0-9a-fA-F]{1,8}$/.test(reality.short_id)
     && /^[A-Za-z0-9_-]{43}$/.test(reality.private_key)
@@ -413,7 +415,7 @@ function ProxyPage({ nodes, site, refusal, search, go }: { nodes: Node[]; site: 
   const { items, error, loading, reload } = useAllProxies()
   const realm = useRealmProxies()
   const typeFilter = proxyTypeFilter(search)
-  const [creationType, setCreationType] = useState<"vless" | "realm" | null>(null)
+  const [creationType, setCreationType] = useState<"vless" | "mieru" | "realm" | null>(null)
   const [editingRealmId, setEditingRealmId] = useState<number | null>(null)
   const [deletingRealm, setDeletingRealm] = useState<RealmRule | null>(null)
   const [detail, setDetail] = useState<{ nodeId: number; ruleId?: number } | null>(null)
@@ -481,7 +483,7 @@ function ProxyPage({ nodes, site, refusal, search, go }: { nodes: Node[]; site: 
     <div className="space-y-4">
       <div className="flex flex-wrap items-center justify-end gap-2">
         <div className="mr-auto flex w-full flex-wrap items-center gap-2 sm:w-auto">
-          <Select value={typeFilter} onValueChange={changeTypeFilter}><SelectTrigger className="w-36" aria-label="按代理类型筛选"><SelectValue /></SelectTrigger><SelectContent position="popper"><SelectItem value="all">全部类型</SelectItem><SelectItem value="vless">VLESS Reality</SelectItem><SelectItem value="realm">Realm 转发</SelectItem></SelectContent></Select>
+          <Select value={typeFilter} onValueChange={changeTypeFilter}><SelectTrigger className="w-36" aria-label="按代理类型筛选"><SelectValue /></SelectTrigger><SelectContent position="popper"><SelectItem value="all">全部类型</SelectItem><SelectItem value="mieru">mieru</SelectItem><SelectItem value="vless">VLESS Reality</SelectItem><SelectItem value="realm">Realm 转发</SelectItem></SelectContent></Select>
           <AdminSearchInput value={query} onChange={setQuery} placeholder="搜索代理名称、地址或节点" />
           <Select value={nodeFilter} onValueChange={setNodeFilter}>
             <SelectTrigger className="w-36" aria-label="按节点筛选"><SelectValue /></SelectTrigger>
@@ -551,7 +553,7 @@ function ProxyPage({ nodes, site, refusal, search, go }: { nodes: Node[]; site: 
                   </TableCell>
                   <TableCell className="tnum px-3 text-sm">{proxy.port}</TableCell>
                   <TableCell className="w-28 max-w-28 px-3">
-                    <TooltipText text={reality.server_name} className="w-24 max-w-24 text-sm" />
+                    <TooltipText text={reality?.server_name ?? "TCP"} className="w-24 max-w-24 text-sm" />
                   </TableCell>
                   <TableCell className="px-3 text-center">
                     <Switch checked={proxy.enabled} disabled={updatingProxyId !== null} onCheckedChange={(enabled) => setProxyEnabled(proxy, enabled)} aria-label={`${proxy.enabled ? "停用" : "启用"}代理 ${proxyName}`} />
@@ -580,8 +582,9 @@ function ProxyPage({ nodes, site, refusal, search, go }: { nodes: Node[]; site: 
       </Card>
 
       {creating && <ProxyDialog busy={creationBusy} onClose={() => setCreating(false)}>
-        {creationType === null ? <><DialogHeader className="px-6 pt-6 pb-4"><DialogTitle>选择代理类型</DialogTitle><DialogDescription>选择类型后进入详细配置。</DialogDescription></DialogHeader><div className="grid gap-3 px-6 pb-6 sm:grid-cols-2"><Button className="h-auto min-h-24 flex-col gap-2" variant="outline" onClick={() => setCreationType("vless")}><strong>VLESS Reality</strong><span className="text-xs text-muted-foreground">配置节点上的代理服务</span></Button><Button className="h-auto min-h-24 flex-col gap-2" variant="outline" onClick={() => setCreationType("realm")}><strong>Realm 转发</strong><span className="text-xs text-muted-foreground">监听端口转发到已有代理</span></Button></div></>
+        {creationType === null ? <><DialogHeader className="px-6 pt-6 pb-4"><DialogTitle>选择代理类型</DialogTitle><DialogDescription>选择类型后进入详细配置。</DialogDescription></DialogHeader><div className="grid gap-3 px-6 pb-6 sm:grid-cols-2"><Button className="h-auto min-h-24 flex-col gap-2" variant="outline" onClick={() => setCreationType("vless")}><strong>VLESS Reality</strong><span className="text-xs text-muted-foreground">配置节点上的代理服务</span></Button><Button className="h-auto min-h-24 flex-col gap-2" variant="outline" onClick={() => setCreationType("mieru")}><strong>mieru</strong><span className="text-xs text-muted-foreground">单端口 TCP 代理</span></Button><Button className="h-auto min-h-24 flex-col gap-2" variant="outline" onClick={() => setCreationType("realm")}><strong>Realm 转发</strong><span className="text-xs text-muted-foreground">监听端口转发到已有代理</span></Button></div></>
         : creationType === "vless" ? <ProxyForm embedded nodes={nodes} proxy={null} onClose={() => setCreating(false)} onSaved={reload} onBack={() => setCreationType(null)} onBusyChange={setCreationBusy} />
+        : creationType === "mieru" ? <MieruForm embedded onBusyChange={setCreationBusy} proxy={null} nodes={nodes} onClose={() => setCreating(false)} onSaved={reload} onBack={() => setCreationType(null)} />
         : realm.loaded && items !== null ? <RealmProxyForm embedded rule={null} nodes={nodes} proxies={items ?? []} hosts={realm.hosts} rules={realm.rules} ready={realm.loaded && !realm.error && !error} site={site} refusal={refusal} onClose={() => setCreating(false)} onSaved={realmSaved} onRefresh={realm.reload} onBack={() => setCreationType(null)} onBusyChange={setCreationBusy} />
         : <><DialogHeader className="px-6 pt-6"><DialogTitle>新增 Realm 代理</DialogTitle><DialogDescription>{realm.error || error || "正在读取节点与代理配置…"}</DialogDescription></DialogHeader><div className="flex gap-2 p-6"><Button variant="outline" onClick={() => { void realm.reload(); reload() }}>重试读取</Button><Button variant="ghost" onClick={() => setCreationType(null)}>返回选择类型</Button></div></>}
       </ProxyDialog>}
@@ -589,10 +592,10 @@ function ProxyPage({ nodes, site, refusal, search, go }: { nodes: Node[]; site: 
       {detailHost && <RealmEntryDialog key={detailHost.node_id} host={detailHost} rule={detailRule} rules={realm.rules} traffic={realm.traffic} site={site} refusal={refusal} onClose={() => setDetail(null)} onSaved={realm.reload} />}
       {deletingRealm && <ConfirmDialog title={`删除 Realm 代理「${deletingRealm.name}」？`} description="当前转发规则和订阅入口将移除；目标代理、入口节点、其他转发规则及历史流量保留。" confirmLabel="删除 Realm 代理" busy={realmBusy} onClose={() => setDeletingRealm(null)} onConfirm={() => { void realmAction(async () => { await api(`/realm/rules/${deletingRealm.id}`, { method: "DELETE" }); setDeletingRealm(null) }, "已删除 Realm 规则，等待同步") }} />}
       {typeFilter !== "vless" && realm.traffic.rules.some((r) => !r.active) && <details className="space-y-3 rounded-lg border p-4"><summary className="cursor-pointer text-sm font-medium">已删除 Realm 规则的历史流量</summary>{realm.traffic.rules.filter((r) => !r.active && (nodeFilter === "all" || nodeFilter === String(r.node_id))).map((r) => <div key={r.key} className="space-y-1 border-t pt-3"><p className="text-sm">{nodeById.get(r.node_id)?.name ?? `节点 ${r.node_id}`} / {r.name}</p><TrafficSummary items={[r]} /></div>)}</details>}
-      {editing && <ProxyForm nodes={nodes} proxy={editing} onClose={() => setEditing(null)} onSaved={reload} />}
+      {editing && (editing.protocol === "mieru" ? <MieruForm nodes={nodes} proxy={editing} onClose={() => setEditing(null)} onSaved={reload} /> : <ProxyForm nodes={nodes} proxy={editing} onClose={() => setEditing(null)} onSaved={reload} />)}
       {deleting && <ConfirmDialog
         title={`删除代理「${displayProxyName(deleting, nodeById.get(deleting.node_id))}」？`}
-        description="删除会一并解除所有关联用户授权，并自动同步对应节点的 sing-box 配置。"
+        description="删除会一并解除所有关联用户授权，并自动同步对应节点的代理配置。"
         confirmLabel="删除代理"
         busy={removing}
         onClose={() => setDeleting(null)}
@@ -902,6 +905,7 @@ function UsersPage() {
     }
   }
 
+  const [mieruUser, setMieruUser] = useState<number | null>(null)
   async function setUserEnabled(user: User, enabled: boolean) {
     setUpdatingUserId(user.id)
     try {
@@ -974,7 +978,7 @@ function UsersPage() {
                 <TableCell className="whitespace-nowrap text-right">
                   <div className="flex items-center justify-end gap-1">
                     <Tooltip><TooltipTrigger asChild><Button type="button" variant="ghost" size="icon" className="size-8" aria-label={`重置用户 ${user.username} 的流量`} onClick={() => setTrafficUser(user)}><RefreshCw /></Button></TooltipTrigger><TooltipContent>重置流量</TooltipContent></Tooltip>
-                    <Button type="button" variant="ghost" size="icon" className="size-8" title="编辑用户" aria-label={`编辑用户 ${user.username}`} onClick={() => setEditing(user)}><Pencil /></Button>
+                    <Button type="button" variant="ghost" size="sm" className="text-xs" title="mieru 连接凭据" onClick={() => setMieruUser(user.id)}>mieru</Button><Button type="button" variant="ghost" size="icon" className="size-8" title="编辑用户" aria-label={`编辑用户 ${user.username}`} onClick={() => setEditing(user)}><Pencil /></Button>
                     <Button type="button" variant="ghost" size="icon" disabled={user.username === "admin"} title={user.username === "admin" ? "管理员不可删除" : "删除用户"} aria-label={user.username === "admin" ? "管理员不可删除" : `删除用户 ${user.username}`} className="size-8 text-destructive hover:text-destructive" onClick={() => setDeleting(user)}><Trash2 /></Button>
                   </div>
                 </TableCell>
@@ -989,6 +993,7 @@ function UsersPage() {
           </TableBody>
         </Table>
       </Card>
+      {mieruUser !== null && <MieruCredential userId={mieruUser} onClose={() => setMieruUser(null)} />}
       {creating && <UserForm user={null} onClose={() => setCreating(false)} onSaved={reload} />}
       {editing && <UserForm user={editing} onClose={() => setEditing(null)} onSaved={reload} />}
       {trafficUser && <UserTrafficDialog user={trafficUser} onClose={() => setTrafficUser(null)} onChanged={() => setTrafficRevision((value) => value + 1)} />}

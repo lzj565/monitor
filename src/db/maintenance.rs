@@ -159,7 +159,8 @@ impl Db {
             &TABLES
         };
         for table in required_tables.iter().filter(|t| {
-            !HOURLY_TABLES.contains(t)
+            !(version < 25 && ["user_proxy_credentials", "mieru_hosts", "mieru_traffic_sources"].contains(t))
+                && !HOURLY_TABLES.contains(t)
                 && (version >= 22 || !REALM_TABLES.contains(t))
                 && (version >= 23 || !REALM_TRAFFIC_TABLES.contains(t))
         }) {

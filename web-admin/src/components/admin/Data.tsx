@@ -27,6 +27,9 @@ export const DB_ROWS: [string, string][] = [
   ["ping_hour", "延迟小时汇总"],
   ["realm_hosts", "Realm 机器"],
   ["realm_rules", "Realm 规则"],
+  ["mieru_hosts", "mieru 节点"],
+  ["user_proxy_credentials", "代理凭据"],
+  ["mieru_traffic_sources", "mieru 流量基线"],
 ]
 
 export function Data() {

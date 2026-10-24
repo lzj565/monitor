@@ -20,13 +20,13 @@ export type Proxy = {
   sort: number
   name: string
   include_node_name: boolean
-  protocol: "vless"
+  protocol: "vless" | "mieru"
   address_type: AddressType
   address: string
   port: number
   enabled: boolean
   flow: Flow
-  config: { reality: RealityConfig }
+  config: { reality: RealityConfig; transport?: never } | { transport: "tcp"; reality?: never }
   created_at: number
   updated_at: number
   sync?: SyncReport
@@ -52,8 +52,9 @@ export type User = {
 }
 
 export type SyncReport = {
-  queued: Array<{ node_id: number; command_id: string }>
-  needs_sync: Array<{ node_id: number; reason: string }>
+  queued: Array<{ node_id: number; command_id: string; core?: string }>
+  pending?: Array<{ node_id: number; core: string; reason: string }>
+  needs_sync: Array<{ node_id: number; reason: string; core?: string }>
 }
 
 export type SyncResolution = {

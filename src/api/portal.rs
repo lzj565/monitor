@@ -64,6 +64,17 @@ pub async fn user_proxies(UserAuth(user_id): UserAuth, State(app): State<Shared>
                         proxy.include_node_name,
                         &proxy.node_country,
                     );
+                    if proxy.protocol == "mieru" {
+                        let password=proxy.mieru_password.as_deref().unwrap_or("");
+                        let username=format!("user-{user_id}");
+                        let config=crate::mieru::client_config(&username,password,&proxy.address,proxy.port,&label);
+                        let host=if proxy.address.contains(':'){format!("[{}]",proxy.address)}else{proxy.address.clone()};
+                        let link=format!("mierus://{}:{}@{}?profile={}&port={}&protocol=TCP",uri_component(&username),uri_component(password),host,uri_component(&label),proxy.port);
+                        let mut item=serde_json::to_value(&proxy).expect("portal proxy serializes");
+                        item.as_object_mut().unwrap().remove("mieru_password");
+                        item["mieru_url"]=json!(link);item["mieru_config"]=config;
+                        return item;
+                    }
                     let flow = if proxy.flow.is_empty() { proxy::DEFAULT_FLOW } else { &proxy.flow };
                     let host = if proxy.address.parse::<std::net::Ipv6Addr>().is_ok() {
                         format!("[{}]", proxy.address)
@@ -87,7 +98,7 @@ pub async fn user_proxies(UserAuth(user_id): UserAuth, State(app): State<Shared>
                     item["mihomo_yaml"] = json!(mihomo_yaml);
                     item
                 }).collect::<Vec<_>>();
-                Json(json!({"items": items})).into_response()
+                ([(header::CACHE_CONTROL,"no-store")],Json(json!({"items": items}))).into_response()
             }
             Err(error) => api_internal(error),
         }
@@ -125,6 +136,7 @@ pub async fn user_subscription_links(UserAuth(user_id): UserAuth, State(app): St
         Ok(Some(token)) => Json(json!({
             "clash": format!("/api/subscriptions/{token}/clash"),
             "sing_box": format!("/api/subscriptions/{token}/sing-box"),
+            "mieru": format!("/api/subscriptions/{token}/mieru"),
         }))
         .into_response(),
         Ok(None) => api_error(StatusCode::NOT_FOUND, "USER_NOT_FOUND", "user does not exist"),
@@ -278,6 +290,33 @@ pub async fn subscription(
             }
             Err(error) => return api_internal(error),
         };
+        if format == "mieru" {
+            return match app.db.active_user_portal_proxies(user_id, Utc::now().timestamp()) {
+                Ok(proxies) => {
+                    let profiles: Vec<Value> = proxies
+                        .iter()
+                        .filter(|p| p.protocol == "mieru")
+                        .map(|p| {
+                            crate::mieru::client_config(
+                                &format!("user-{user_id}"),
+                                p.mieru_password.as_deref().unwrap_or(""),
+                                &p.address,
+                                p.port,
+                                &format!("{}-{}", p.name, p.id),
+                            )["profiles"][0]
+                                .clone()
+                        })
+                        .collect();
+                    let active = profiles.first().map(|p| p["profileName"].clone()).unwrap_or(Value::Null);
+                    return (
+                        [(header::CACHE_CONTROL, "no-store")],
+                        Json(json!({"profiles":profiles,"activeProfile":active,"socks5Port":1080})),
+                    )
+                        .into_response();
+                }
+                Err(error) => api_internal(error),
+            };
+        }
         let (uuid, proxies) = match app.db.active_user_subscription(user_id, Utc::now().timestamp()) {
             Ok(Some(data)) => data,
             Ok(None) => return api_error(StatusCode::FORBIDDEN, "ACCOUNT_INACTIVE", "账号当前不可用"),

@@ -31,6 +31,7 @@ mod blocking;
 mod command;
 mod db;
 mod frontend;
+mod mieru;
 mod notify;
 mod proxy;
 mod realm;
@@ -716,11 +717,15 @@ async fn main() -> Result<()> {
     tokio::spawn(housekeeping(app.clone()));
     tokio::spawn(command::cleanup_loop(app.clone()));
     tokio::spawn(realm::reconcile(app.clone()));
+    tokio::spawn(mieru::reconcile(app.clone()));
     tokio::spawn(notify::deliver(app.clone(), inbox));
     tokio::spawn(notify::watch(app.clone()));
 
     let router = Router::new()
         // Read paths; the public page reaches these unauthenticated.
+        .route("/api/mieru/hosts", get(mieru::hosts))
+        .route("/api/mieru/hosts/{id}/config", get(mieru::preview))
+        .route("/api/users/{id}/mieru-credential", get(mieru::credential).post(mieru::reset_credential))
         .route("/api/realm/traffic", get(api::realm_traffic))
         .route("/api/realm/hosts", get(api::realm_hosts).put(api::realm_save_host))
         .route("/api/realm/hosts/{id}", delete(api::realm_delete_host))
@@ -857,6 +862,7 @@ async fn main() -> Result<()> {
                 .route("/agent/{arch}", get(agent_binary))
                 .route("/sing-box/{asset}", get(sing_box_asset))
                 .route("/realm/{asset}", get(realm_asset))
+                .route("/mieru/{asset}", get(mieru::asset))
                 .layer(tower_http::limit::RequestBodyLimitLayer::new(64 * 1024))
                 .with_state(app.clone()),
         )
