@@ -76,7 +76,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           repository: SagerNet/sing-box
-          ref: v1.14.1
+          ref: v1.14.4
           path: sing-box-source
           persist-credentials: false
       - uses: actions/setup-go@v6

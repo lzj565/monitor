@@ -1283,7 +1283,7 @@ mod tests {
         let mut session = Session { tag: 41, ..Session::default() };
         let response = json!({
             "type": "command_result", "id": command_id, "ok": true,
-            "result": {"installed": true, "running": true, "version": "1.14.1"}
+            "result": {"installed": true, "running": true, "version": "1.14.4"}
         });
         dispatch(&app, id, "ip", &response.to_string(), &mut session, at(0)).unwrap();
         let view = app.commands.get(response["id"].as_str().unwrap(), id).unwrap();

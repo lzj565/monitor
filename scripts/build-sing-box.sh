@@ -9,7 +9,7 @@ fi
 SOURCE_DIR=$1
 ARCH=$2
 OUTPUT=$3
-VERSION=1.14.1
+VERSION=1.14.4
 
 case "$ARCH" in
 amd64 | arm64) ;;

@@ -1777,7 +1777,7 @@ async fn command_api_enqueues_supported_action_and_returns_its_result() {
         command_id,
         id,
         17,
-        Ok(json!({"installed": true, "running": true, "version": "1.14.1"})),
+        Ok(json!({"installed": true, "running": true, "version": "1.14.4"})),
     ));
     let status = command_status(Admin, State(app), Path((id, command_id.to_owned()))).await;
     assert_eq!(status.status(), StatusCode::OK);
