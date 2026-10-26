@@ -36,12 +36,11 @@ type PortalProxy = {
   server_port: number
   vless_url: string
   mieru_url?: string
-  mieru_config?: object
   mihomo_yaml: string
   online: boolean
 }
 
-type SubscriptionLinks = { clash: string; sing_box: string; mieru: string }
+type SubscriptionLinks = { clash: string; sing_box: string }
 
 function displayDate(timestamp: number | null): string {
   if (timestamp === null) return "永久有效"
@@ -199,9 +198,8 @@ export function UserCenter({ siteName, dark, toggleTheme, signOut, returnToAdmin
           </div>
           <div className="grid gap-3 sm:grid-cols-2">
             {([
-              { key: "clash", title: "Clash / Mihomo", description: "VLESS 配置，适用于 Clash、Mihomo 客户端" },
+              { key: "clash", title: "Clash / Mihomo", description: "VLESS / mieru 配置，适用于 Mihomo 客户端" },
               { key: "sing_box", title: "Sing-box", description: "VLESS 配置，适用于 Sing-box 客户端" },
-              { key: "mieru", title: "mieru", description: "mieru 原生配置，包含直连与 Realm 入口" },
             ] as const).map(({ key, title, description }) => {
               const path = links?.[key]
               const url = path ? absoluteLink(path) : ""
@@ -252,7 +250,7 @@ export function UserCenter({ siteName, dark, toggleTheme, signOut, returnToAdmin
                       <td className="hidden px-3 py-3 font-mono xl:table-cell">{proxy.port}</td>
                       <td className="hidden px-3 py-3 xl:table-cell"><TooltipText text={proxy.server_name || "—"} className="font-mono text-xs" /></td>
                       <td className="hidden px-3 py-3 xl:table-cell"><Badge variant="outline" className={`font-normal ${proxy.online ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300" : "text-muted-foreground"}`}><span className={`size-1.5 rounded-full ${proxy.online ? "bg-emerald-500" : "bg-muted-foreground/50"}`} />{proxy.online ? "在线" : "离线"}</Badge></td>
-                      <td className="px-1 py-3 sm:px-3"><div className="flex items-center justify-center gap-0 sm:gap-1"><Button type="button" variant="ghost" size="icon" className="size-8 shrink-0" title={proxy.mieru_url ? "复制 mieru 分享链接" : "复制 VLESS URL"} aria-label={`复制 ${proxy.name} 的 VLESS URL`} onClick={() => void copy(proxy.mieru_url ?? proxy.vless_url, proxy.mieru_url ? "mieru 分享链接" : "VLESS URL")}><Link /></Button><Button type="button" variant="ghost" size="icon" className="size-8 shrink-0" title={proxy.mieru_config ? "复制 mieru 配置" : "复制 Mihomo 配置"} aria-label={`复制 ${proxy.name} 的 Mihomo 配置`} onClick={() => void copy(proxy.mieru_config ? JSON.stringify(proxy.mieru_config, null, 2) : proxy.mihomo_yaml, proxy.mieru_config ? "mieru 配置" : "Mihomo 配置")}><FileCode /></Button></div></td>
+                      <td className="px-1 py-3 sm:px-3"><div className="flex items-center justify-center gap-0 sm:gap-1"><Button type="button" variant="ghost" size="icon" className="size-8 shrink-0" title={proxy.mieru_url ? "复制 mieru 分享链接" : "复制 VLESS URL"} aria-label={`复制 ${proxy.name} 的${proxy.mieru_url ? " mieru 分享链接" : " VLESS URL"}`} onClick={() => void copy(proxy.mieru_url ?? proxy.vless_url, proxy.mieru_url ? "mieru 分享链接" : "VLESS URL")}><Link /></Button><Button type="button" variant="ghost" size="icon" className="size-8 shrink-0" title="复制 Mihomo 配置" aria-label={`复制 ${proxy.name} 的 Mihomo 配置`} onClick={() => void copy(proxy.mihomo_yaml, "Mihomo 配置")}><FileCode /></Button></div></td>
                     </tr>
                   ))}
                 </tbody>

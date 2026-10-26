@@ -103,6 +103,8 @@ impl Db {
     }
 }
 
+mod proxy_order;
+use proxy_order::*;
 mod components;
 pub(super) use components::*;
 mod mieru;

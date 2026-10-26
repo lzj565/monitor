@@ -14,15 +14,29 @@ pub struct MieruDesired {
     pub digest: String,
     pub content: String,
 }
+fn shared_mieru_password(conn: &Connection) -> Result<String> {
+    if let Some(password) = conn
+        .query_row("SELECT value FROM setting WHERE key='mieru_shared_password'", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .optional()?
+    {
+        return Ok(password);
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO setting(key,value) VALUES('mieru_shared_password',?1)",
+        [random_secret()],
+    )?;
+    Ok(conn.query_row("SELECT value FROM setting WHERE key='mieru_shared_password'", [], |r| r.get(0))?)
+}
+
 impl Db {
-    pub fn mieru_credential(&self, user: i64, reset: bool) -> Result<String> {
+    pub fn mieru_password(&self, reset: bool) -> Result<String> {
         let conn = self.conn();
-        conn.execute("INSERT INTO user_proxy_credentials(user_id,protocol,password) VALUES(?1,'mieru',?2) ON CONFLICT(user_id,protocol) DO UPDATE SET password=CASE WHEN ?3 THEN excluded.password ELSE password END",params![user,random_secret(),reset])?;
-        Ok(conn.query_row(
-            "SELECT password FROM user_proxy_credentials WHERE user_id=?1 AND protocol='mieru'",
-            [user],
-            |r| r.get(0),
-        )?)
+        if reset {
+            put_setting(&conn, "mieru_shared_password", &random_secret())?;
+        }
+        shared_mieru_password(&conn)
     }
     pub fn mieru_managed(&self, node: i64) -> Result<bool> {
         Ok(self.conn().query_row(
@@ -70,13 +84,8 @@ impl Db {
                 rows
             };
             anyhow::ensure!(ids.len() <= 4096, "mieru supports at most 4096 users per node");
+            let password = if ids.is_empty() { String::new() } else { shared_mieru_password(&tx)? };
             for user in ids {
-                tx.execute("INSERT OR IGNORE INTO user_proxy_credentials(user_id,protocol,password) VALUES(?1,'mieru',?2)",params![user,random_secret()])?;
-                let password: String = tx.query_row(
-                    "SELECT password FROM user_proxy_credentials WHERE user_id=?1 AND protocol='mieru'",
-                    [user],
-                    |r| r.get(0),
-                )?;
                 users.push(json!({"name":format!("user-{user}"),"password":password}));
             }
         }
@@ -221,14 +230,103 @@ mod tests {
         (db, node, user, proxy)
     }
     #[test]
+    fn shared_password_keeps_usernames_and_authorizations_separate() {
+        let (db, node, first, proxy) = fixture();
+        let second = db
+            .create_user(&UserDraft {
+                username: "second".into(),
+                password_hash: Some("hash".into()),
+                enabled: true,
+                expires_at: None,
+                traffic_limit: None,
+                device_limit: None,
+                traffic_reset_day: None,
+            })
+            .unwrap()
+            .unwrap();
+        db.put_authorization(second, proxy, &AuthorizationDraft { enabled: true, auth: None })
+            .unwrap()
+            .unwrap();
+        // Historical user credentials never determine the new shared password.
+        db.conn()
+            .execute(
+                "INSERT INTO user_proxy_credentials VALUES(?1,'mieru','old-individual-password')",
+                [first],
+            )
+            .unwrap();
+        let password = db.mieru_password(false).unwrap();
+        assert_ne!(password, "old-individual-password");
+        let desired = db.mieru_desired(node).unwrap().unwrap();
+        let config: Value = serde_json::from_str(&desired.content).unwrap();
+        let users = config["config"]["users"].as_array().unwrap();
+        assert_eq!(users.len(), 2);
+        assert_ne!(users[0]["name"], users[1]["name"]);
+        assert!(users.iter().all(|u| u["password"] == password));
+        for user in [first, second] {
+            assert_eq!(
+                db.active_user_portal_proxies(user, 0).unwrap()[0].mieru_password.as_deref(),
+                Some(password.as_str())
+            );
+        }
+        let node2 =
+            db.create_node(&Node { name: "other".into(), ..Default::default() }, "other-token").unwrap();
+        let request: crate::proxy::ProxyRequest = serde_json::from_value(json!({"name":"other","protocol":"mieru","address_type":"domain","address":"other.example.com","port":24062,"enabled":true,"config":{"transport":"tcp"}})).unwrap();
+        let proxy2 = db.create_proxy(node2, &request.into_draft().unwrap()).unwrap().unwrap();
+        db.put_authorization(first, proxy2, &AuthorizationDraft { enabled: true, auth: None })
+            .unwrap()
+            .unwrap();
+        let before = db.mieru_desired(node2).unwrap().unwrap();
+        let config: Value = serde_json::from_str(&before.content).unwrap();
+        assert_eq!(config["config"]["users"][0]["password"], password);
+        let reset = db.mieru_password(true).unwrap();
+        assert_ne!(password, reset);
+        for n in [node, node2] {
+            let current = db.mieru_desired(n).unwrap().unwrap();
+            let config: Value = serde_json::from_str(&current.content).unwrap();
+            assert!(config["config"]["users"].as_array().unwrap().iter().all(|u| u["password"] == reset));
+        }
+        assert!(db.mieru_desired(node2).unwrap().unwrap().revision > before.revision);
+        let sample = |seq, first_up, second_up| {
+            json!({"proxy_id":proxy,"epoch":"shared-password-test","seq":seq,"users":{
+            format!("user-{first}"):{"uplink":first_up,"downlink":0},
+            format!("user-{second}"):{"uplink":second_up,"downlink":0}
+        },"total":{"uplink":first_up+second_up,"downlink":0}})
+        };
+        db.record_mieru_traffic(node, &sample(1, 100, 200), 100).unwrap();
+        db.record_mieru_traffic(node, &sample(2, 110, 230), 101).unwrap();
+        assert_eq!(db.user_traffic_overview(first, 0, 102).unwrap()["uplink_bytes"], 10);
+        assert_eq!(db.user_traffic_overview(second, 0, 102).unwrap()["uplink_bytes"], 30);
+        db.put_authorization(first, proxy, &AuthorizationDraft { enabled: false, auth: None })
+            .unwrap()
+            .unwrap();
+        let current = db.mieru_desired(node).unwrap().unwrap();
+        let config: Value = serde_json::from_str(&current.content).unwrap();
+        assert_eq!(config["config"]["users"].as_array().unwrap().len(), 1);
+        assert_eq!(config["config"]["users"][0]["name"], format!("user-{second}"));
+        assert_eq!(config["config"]["users"][0]["password"], reset);
+    }
+
+    #[test]
+    fn shared_password_survives_restart() {
+        let file = std::env::temp_dir().join(format!("monitor-mieru-password-{}.db", rand::random::<u64>()));
+        let db = Db::open(file.to_str().unwrap()).unwrap();
+        let password = db.mieru_password(false).unwrap();
+        drop(db);
+        let db = Db::open(file.to_str().unwrap()).unwrap();
+        assert_eq!(db.mieru_password(false).unwrap(), password);
+        drop(db);
+        std::fs::remove_file(file).unwrap();
+    }
+
+    #[test]
     fn credentials_authorization_expiry_and_protocol_separation() {
         let (db, node, user, proxy) = fixture();
         let a = db.mieru_desired(node).unwrap().unwrap();
         let content: Value = serde_json::from_str(&a.content).unwrap();
         assert_eq!(content["config"]["users"][0]["name"], format!("user-{user}"));
-        let credential = db.mieru_credential(user, false).unwrap();
+        let credential = db.mieru_password(false).unwrap();
         assert_eq!(content["config"]["users"][0]["password"], credential);
-        assert_ne!(credential, db.mieru_credential(user, true).unwrap());
+        assert_ne!(credential, db.mieru_password(true).unwrap());
         let b = db.mieru_desired(node).unwrap().unwrap();
         assert!(b.revision > a.revision);
         assert_eq!(db.mieru_desired(node).unwrap().unwrap().revision, b.revision);

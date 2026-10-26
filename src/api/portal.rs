@@ -67,12 +67,12 @@ pub async fn user_proxies(UserAuth(user_id): UserAuth, State(app): State<Shared>
                     if proxy.protocol == "mieru" {
                         let password=proxy.mieru_password.as_deref().unwrap_or("");
                         let username=format!("user-{user_id}");
-                        let config=crate::mieru::client_config(&username,password,&proxy.address,proxy.port,&label);
+                        let mihomo_yaml = mihomo_proxy(user_id, &proxy);
                         let host=if proxy.address.contains(':'){format!("[{}]",proxy.address)}else{proxy.address.clone()};
                         let link=format!("mierus://{}:{}@{}?profile={}&port={}&protocol=TCP",uri_component(&username),uri_component(password),host,uri_component(&label),proxy.port);
                         let mut item=serde_json::to_value(&proxy).expect("portal proxy serializes");
                         item.as_object_mut().unwrap().remove("mieru_password");
-                        item["mieru_url"]=json!(link);item["mieru_config"]=config;
+                        item["mieru_url"]=json!(link);item["mihomo_yaml"]=json!(mihomo_yaml);
                         return item;
                     }
                     let flow = if proxy.flow.is_empty() { proxy::DEFAULT_FLOW } else { &proxy.flow };
@@ -87,12 +87,7 @@ pub async fn user_proxies(UserAuth(user_id): UserAuth, State(app): State<Shared>
                         uri_component(&proxy.server_name), proxy.public_key, proxy.short_id,
                         uri_component(flow), uri_component(&label),
                     );
-                    let mihomo_yaml = format!(
-                        "- name: {}\n  type: vless\n  server: {}\n  port: {}\n  uuid: {}\n  network: tcp\n  tls: true\n  udp: true\n  servername: {}\n  client-fingerprint: chrome\n  reality-opts:\n    public-key: {}\n    short-id: {}\n  flow: {}",
-                        yaml_string(&label), yaml_ip_or_string(&proxy.address), proxy.port,
-                        proxy.uuid, yaml_string(&proxy.server_name), yaml_string(&proxy.public_key),
-                        yaml_string(&proxy.short_id), yaml_string(flow),
-                    );
+                    let mihomo_yaml = mihomo_proxy(user_id, &proxy);
                     let mut item = serde_json::to_value(proxy).expect("portal proxy serializes");
                     item["vless_url"] = json!(vless_url);
                     item["mihomo_yaml"] = json!(mihomo_yaml);
@@ -136,7 +131,6 @@ pub async fn user_subscription_links(UserAuth(user_id): UserAuth, State(app): St
         Ok(Some(token)) => Json(json!({
             "clash": format!("/api/subscriptions/{token}/clash"),
             "sing_box": format!("/api/subscriptions/{token}/sing-box"),
-            "mieru": format!("/api/subscriptions/{token}/mieru"),
         }))
         .into_response(),
         Ok(None) => api_error(StatusCode::NOT_FOUND, "USER_NOT_FOUND", "user does not exist"),
@@ -218,17 +212,35 @@ pub(super) fn yaml_ip_or_string(value: &str) -> String {
     }
 }
 
-pub(super) fn clash_subscription(uuid: &str, proxies: &[crate::db::UserSubscriptionProxy]) -> String {
-    let mut out = String::from("proxies:\n");
-    let labels: Vec<_> = proxies.iter().map(subscription_label).collect();
-    for (proxy, name) in proxies.iter().zip(&labels) {
-        out.push_str(&format!(
-            "  - name: {}\n    type: vless\n    server: {}\n    port: {}\n    uuid: {}\n    network: tcp\n    tls: true\n    udp: true\n    servername: {}\n    client-fingerprint: chrome\n    reality-opts:\n      public-key: {}\n      short-id: {}\n",
-            yaml_string(name), yaml_ip_or_string(&proxy.address), proxy.port, uuid,
-            yaml_string(&proxy.server_name), yaml_string(&proxy.public_key), yaml_string(&proxy.short_id),
-        ));
-        let flow = if proxy.flow.is_empty() { proxy::DEFAULT_FLOW } else { &proxy.flow };
-        out.push_str(&format!("    flow: {}\n", yaml_string(flow)));
+pub(super) fn mihomo_proxy(user_id: i64, proxy: &crate::db::UserPortalProxy) -> String {
+    let name = crate::db::displayed_proxy_name(&proxy.name, proxy.include_node_name, &proxy.node_country);
+    if proxy.protocol == "mieru" {
+        return format!(
+            "- name: {}\n  type: mieru\n  server: {}\n  port: {}\n  transport: TCP\n  udp: true\n  username: {}\n  password: {}\n  multiplexing: MULTIPLEXING_OFF\n  handshake-mode: HANDSHAKE_NO_WAIT",
+            yaml_string(&name), yaml_ip_or_string(&proxy.address), proxy.port,
+            yaml_string(&format!("user-{user_id}")), yaml_string(proxy.mieru_password.as_deref().expect("authorized mieru proxy has credentials")),
+        );
+    }
+    let flow = if proxy.flow.is_empty() { proxy::DEFAULT_FLOW } else { &proxy.flow };
+    format!(
+        "- name: {}\n  type: vless\n  server: {}\n  port: {}\n  uuid: {}\n  network: tcp\n  tls: true\n  udp: true\n  servername: {}\n  client-fingerprint: chrome\n  reality-opts:\n    public-key: {}\n    short-id: {}\n  flow: {}",
+        yaml_string(&name), yaml_ip_or_string(&proxy.address), proxy.port, proxy.uuid,
+        yaml_string(&proxy.server_name), yaml_string(&proxy.public_key), yaml_string(&proxy.short_id), yaml_string(flow),
+    )
+}
+
+pub(super) fn clash_subscription(user_id: i64, proxies: &[crate::db::UserPortalProxy]) -> String {
+    let mut out = String::from(if proxies.is_empty() { "proxies: []\n" } else { "proxies:\n" });
+    let labels: Vec<_> = proxies
+        .iter()
+        .map(|p| crate::db::displayed_proxy_name(&p.name, p.include_node_name, &p.node_country))
+        .collect();
+    for proxy in proxies {
+        for line in mihomo_proxy(user_id, proxy).lines() {
+            out.push_str("  ");
+            out.push_str(line);
+            out.push('\n');
+        }
     }
     out.push_str("proxy-groups:\n  - name: Proxy\n    type: select\n    proxies:\n");
     for name in &labels {
@@ -290,41 +302,22 @@ pub async fn subscription(
             }
             Err(error) => return api_internal(error),
         };
-        if format == "mieru" {
-            return match app.db.active_user_portal_proxies(user_id, Utc::now().timestamp()) {
-                Ok(proxies) => {
-                    let profiles: Vec<Value> = proxies
-                        .iter()
-                        .filter(|p| p.protocol == "mieru")
-                        .map(|p| {
-                            crate::mieru::client_config(
-                                &format!("user-{user_id}"),
-                                p.mieru_password.as_deref().unwrap_or(""),
-                                &p.address,
-                                p.port,
-                                &format!("{}-{}", p.name, p.id),
-                            )["profiles"][0]
-                                .clone()
-                        })
-                        .collect();
-                    let active = profiles.first().map(|p| p["profileName"].clone()).unwrap_or(Value::Null);
-                    return (
-                        [(header::CACHE_CONTROL, "no-store")],
-                        Json(json!({"profiles":profiles,"activeProfile":active,"socks5Port":1080})),
-                    )
-                        .into_response();
-                }
-                Err(error) => api_internal(error),
-            };
-        }
-        let (uuid, proxies) = match app.db.active_user_subscription(user_id, Utc::now().timestamp()) {
-            Ok(Some(data)) => data,
-            Ok(None) => return api_error(StatusCode::FORBIDDEN, "ACCOUNT_INACTIVE", "账号当前不可用"),
-            Err(error) => return api_internal(error),
-        };
         let (content_type, body) = match format.as_str() {
-            "clash" => ("application/yaml; charset=utf-8", clash_subscription(&uuid, &proxies)),
+            "clash" => {
+                let proxies = match app.db.active_user_portal_proxies(user_id, Utc::now().timestamp()) {
+                    Ok(proxies) => proxies,
+                    Err(error) => return api_internal(error),
+                };
+                ("application/yaml; charset=utf-8", clash_subscription(user_id, &proxies))
+            }
             "sing-box" => {
+                let (uuid, proxies) = match app.db.active_user_subscription(user_id, Utc::now().timestamp()) {
+                    Ok(Some(data)) => data,
+                    Ok(None) => {
+                        return api_error(StatusCode::FORBIDDEN, "ACCOUNT_INACTIVE", "账号当前不可用")
+                    }
+                    Err(error) => return api_internal(error),
+                };
                 ("application/json; charset=utf-8", sing_box_subscription(&uuid, &proxies).to_string())
             }
             _ => return api_error(StatusCode::NOT_FOUND, "SUBSCRIPTION_FORMAT_NOT_FOUND", "订阅格式不存在"),

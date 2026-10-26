@@ -1,3 +1,4 @@
+import type { ReactNode, ComponentProps } from "react"
 import { useCallback, useEffect, useRef, useState } from "react"
 import { Pencil, Settings2, Trash2 } from "lucide-react"
 import { toast } from "sonner"
@@ -10,7 +11,7 @@ import { TableCell, TableRow } from "@/components/ui/table"
 import { getComponents } from "@/lib/node-components"
 import { api, type Node } from "@/lib/api"
 import type { Proxy } from "@/lib/resources"
-import { realmHostStatus, saveRealmRule, nodeProxyAddress, defaultProxyAddressType, type RealmHost, type RealmHostDraft, type RealmRule, type RealmRuleDraft } from "@/lib/realm-management"
+import { realmHostStatus, saveRealmRule, nodeProxyAddress, defaultProxyAddressType, type RealmHost, type RealmRule, type RealmRuleDraft } from "@/lib/realm-management"
 import { trafficBytes, trafficState, type Traffic, type TrafficRule, type TrafficStatus } from "@/lib/realm-traffic"
 import { ProxyDialog } from "../ProxyDialog"
 import { installCommand } from "./Nodes"
@@ -153,17 +154,17 @@ export function RealmProxyForm({ rule, nodes, proxies, hosts, rules, ready, site
   return embedded ? form : <ProxyDialog busy={saving} onClose={onClose}>{form}</ProxyDialog>
 }
 
-export function RealmProxyRow({ rule, host, nodes, busy, onEdit, onDelete, onDetail, onEnabled }: {
-  rule: RealmRule; host?: RealmHost; nodes: Node[]; busy: boolean;
+export function RealmProxyRow({ rowProps, dragHandle, rule, host, nodes, busy, onEdit, onDelete, onDetail, onEnabled }: {
+  rowProps?: ComponentProps<typeof TableRow>; dragHandle?: ReactNode; rule: RealmRule; host?: RealmHost; nodes: Node[]; busy: boolean;
   onEdit: () => void; onDelete: () => void; onDetail: () => void; onEnabled: (enabled: boolean) => void;
 }) {
   const node = nodes.find((n) => n.id === rule.node_id)
   const targetNode = nodes.find((n) => n.id === rule.target_node_id)
-  return <TableRow className="h-14">
-    <TableCell className="px-2" />
+  return <TableRow {...rowProps} className={`h-14 ${rowProps?.className ?? ""}`}>
+    <TableCell className="px-2">{dragHandle}</TableCell>
     <TableCell className="px-3"><div className="flex items-center gap-2"><span aria-hidden="true" className={`size-2 rounded-full ${node?.online ? "bg-emerald-500" : "bg-muted-foreground/40"}`} /><div><div className="font-medium">{node?.name ?? `节点 ${rule.node_id}`}</div>{node?.group && <div className="text-xs text-muted-foreground">{node.group}</div>}</div></div></TableCell>
     <TableCell className="px-3 font-medium">{rule.name}</TableCell>
-    <TableCell className="px-3"><Badge variant="outline">Realm 转发</Badge></TableCell>
+    <TableCell className="px-3"><Badge variant="outline" className="border-sky-500/35 bg-sky-500/10 font-medium text-sky-700 dark:text-sky-300">Realm 转发</Badge></TableCell>
     <TableCell className="max-w-64 px-3"><span className="block max-w-48 truncate" title={rule.address}>{rule.address ?? "—"}</span></TableCell>
     <TableCell className="tnum px-3 text-sm">{rule.listen_port}</TableCell>
     <TableCell className="px-3"><div className="max-w-56 truncate text-sm" title={`${targetNode?.name ?? ""} / ${rule.target_name}`}>→ {targetNode?.name ?? `节点 ${rule.target_node_id}`} / {rule.target_name}</div><div className="max-w-56 truncate text-xs text-muted-foreground" title={`${rule.target_address}:${rule.target_port}`}>{rule.target_address}:{rule.target_port}</div></TableCell>
@@ -181,43 +182,32 @@ export function TrafficSummary({ items, status }: { items: TrafficRule[]; status
   return <p className="text-xs text-muted-foreground">累计 ↑ {trafficBytes(sum("up"))} / ↓ {trafficBytes(sum("down"))} · 今日 {trafficBytes(sum("today"))} · 本月 {trafficBytes(sum("month"))} · 速率 ↑ {trafficBytes(upRate)}/s / ↓ {trafficBytes(downRate)}/s</p>
 }
 
-export function RealmEntryDialog({ host, rule, rules, traffic, site, refusal, onClose, onSaved }: {
-  host: RealmHost; rule?: RealmRule; rules: RealmRule[]; traffic: Traffic; site: string; refusal: string; onClose: () => void; onSaved: () => Promise<void>;
+function RealmTrafficCard({ title, items, status }: { title: string; items: TrafficRule[]; status?: TrafficStatus }) {
+  const known = items.some((item) => item.last_sample)
+  const total = (field: "up" | "down" | "today" | "month") => known ? items.reduce((sum, item) => sum + item[field], 0) : null
+  const live = items.length > 0 && items.every((item) => item.up_rate != null && item.down_rate != null)
+  const rate = (field: "up_rate" | "down_rate") => status ? status.fresh ? status[field] : null : live ? items.reduce((sum, item) => sum + item[field]!, 0) : null
+  return <section className="rounded-xl border bg-card p-4"><div className="mb-4 flex items-center justify-between gap-2"><h3 className="truncate text-sm font-medium" title={title}>{title}</h3>{status && <span className="shrink-0 text-xs text-muted-foreground">{trafficState(status)}</span>}</div><dl className="grid grid-cols-2 gap-x-4 gap-y-4 sm:grid-cols-4">{([
+    ["累计上传", total("up")], ["累计下载", total("down")], ["今日", total("today")], ["本月", total("month")],
+  ] as const).map(([label, value]) => <div key={label}><dt className="mb-1 whitespace-nowrap text-xs text-muted-foreground">{label}</dt><dd className="tnum whitespace-nowrap text-sm font-semibold">{trafficBytes(value)}</dd></div>)}</dl><div className="mt-4 flex flex-wrap gap-x-5 gap-y-1 border-t pt-3 text-xs text-muted-foreground"><span className="whitespace-nowrap">上传 ↑ {trafficBytes(rate("up_rate"))}/s</span><span className="whitespace-nowrap">下载 ↓ {trafficBytes(rate("down_rate"))}/s</span></div></section>
+}
+
+export function RealmEntryDialog({ host, rule, traffic, onClose }: {
+  host: RealmHost; rule?: RealmRule; traffic: Traffic; onClose: () => void;
 }) {
-  const [enabled, setEnabled] = useState(host.enabled)
-  const [confirmed, setConfirmed] = useState(false)
-  const [busy, setBusy] = useState(false)
-  const [preview, setPreview] = useState("")
-  const stats = traffic.hosts.find((h) => h.node_id === host.node_id)?.status
-  const changed = host.enabled !== enabled
-  const perform = async (work: () => Promise<unknown>, message: string) => {
-    setBusy(true)
-    try { await work(); toast.success(message); await onSaved() } catch (e) { toast.error((e as Error).message) }
-    finally { setBusy(false) }
-  }
-  const operation = (action: string) => api(`/realm/hosts/${host.node_id}/operations`, { method: "POST", body: JSON.stringify({ action }) })
-  return <Dialog open onOpenChange={(open) => { if (!open && !busy) onClose() }}><DialogContent className="max-h-[90svh] overflow-y-auto sm:max-w-2xl"><DialogHeader><DialogTitle>{host.name} · Realm 入口服务</DialogTitle><DialogDescription>入口节点共享服务设置。服务启停或重启会影响此节点全部 Realm 规则。</DialogDescription></DialogHeader>
-    <div className="space-y-4">
-      <p className="text-sm">{realmHostStatus(host)} · 期望 {host.desired_revision} / 已应用 {host.applied_revision} · {host.status.version ?? "版本未知"}</p>
-      <EntryWarning host={host} />
-      {host.last_error && <p role="alert" className="break-all text-sm text-destructive">{host.last_error}</p>}
-      <p className="text-xs text-muted-foreground">目标可达：{host.status.target_reachability === "reachable" ? "已检测目标可连接" : host.status.target_reachability === "unreachable" ? "检测目标不可连接" : host.status.target_reachability === "partial" ? "部分可连接 / 部分未检测" : "未检测"}。服务运行不代表完整代理链路可用。</p>
-      {rule && <section className="space-y-2"><h3 className="text-sm font-medium">{rule.name} · 规则流量</h3><TrafficSummary items={traffic.rules.filter((r) => r.key === rule.traffic_key)} /></section>}
-      <section className="space-y-2"><h3 className="text-sm font-medium">节点 Realm 流量</h3><p className="text-sm">{!host.online ? "节点离线" : !host.traffic_capable ? "需要升级 Agent 以监控" : trafficState(stats)}</p><TrafficSummary items={traffic.rules.filter((r) => r.node_id === host.node_id)} status={stats} /><p className="text-xs text-muted-foreground">采集缺口：{stats?.gaps ?? "—"} · 无法归属记录：{stats?.discarded_records ?? 0} · 最近采集：{stats?.last_sample ? new Date(stats.last_sample * 1000).toLocaleString() : "—"}</p><p className="text-xs text-muted-foreground">入口端口流量仅统计客户端侧 TCP，包含协议开销和重传，排除 loopback；与整机网卡分开，不用于用户扣费。今日 / 本月按 UTC，缺失时段不补算。</p></section>
-      <form className="space-y-3 rounded-md border p-3" onSubmit={(e) => { e.preventDefault(); if (!changed || !confirmed || busy) return; void perform(() => api("/realm/hosts", { method: "PUT", body: JSON.stringify({ node_id: host.node_id, enabled } satisfies RealmHostDraft) }), "已保存入口节点共享设置") }}>
-        <label className="flex gap-2 text-sm"><input type="checkbox" checked={enabled} onChange={(e) => { setEnabled(e.target.checked); setConfirmed(false) }} />启用入口 Realm 服务</label>
-        {changed && <label className="flex gap-2 text-sm"><input type="checkbox" required checked={confirmed} onChange={(e) => setConfirmed(e.target.checked)} />确认修改节点共享设置，影响全部 Realm 规则</label>}
-        <Button size="sm" disabled={!changed || !confirmed || busy}>保存共享设置</Button>
-      </form>
-      <div className="flex flex-wrap gap-2">
-        <Button size="sm" variant="outline" disabled={busy} onClick={() => void perform(() => operation("retry"), "已请求刷新状态并重试应用")}>刷新 / 重试</Button>
-        <Button size="sm" variant="outline" disabled={busy || !host.online || !host.traffic_capable} onClick={() => void perform(() => operation("traffic_recheck"), "已请求重新检测 nft 流量监控")}>重新检测流量监控</Button>
-        <Button size="sm" variant="outline" disabled={busy || !host.enabled || !host.status.running} onClick={() => { if (confirm("重启入口 Realm 服务？此节点全部 Realm 连接会暂时中断。")) void perform(() => operation("restart"), "已请求重启") }}>重启入口服务</Button>
-        <Button size="sm" variant="outline" disabled={busy} onClick={() => void perform(async () => { const data = await api<{ desired: unknown }>(`/realm/hosts/${host.node_id}/config`); setPreview(JSON.stringify(data.desired, null, 2)) }, "已读取配置预览")}>配置预览</Button>
-        <Button size="sm" variant="outline" disabled={busy || rules.some((r) => r.node_id === host.node_id) || host.status.running !== false || host.pending} onClick={() => { if (confirm("解除此节点的 Realm 面板管理？节点本身、Realm 程序和历史流量保留。")) void perform(async () => { await api(`/realm/hosts/${host.node_id}`, { method: "DELETE" }); onClose() }, "已解除 Realm 面板管理") }}>解除面板管理</Button>
-      </div>
-      <InstallCommand nodeId={host.node_id} site={site} refusal={refusal} />
-      {preview && <pre className="max-h-64 overflow-auto rounded border p-3 text-xs">{preview}</pre>}
-    </div>
+  const stats = traffic.hosts.find((item) => item.node_id === host.node_id)?.status
+  const version = host.status.version?.match(/(?:Realm\s+)?\d+\.\d+\.\d+/)?.[0] ?? "版本未知"
+  const reachability = host.status.target_reachability === "reachable" ? "目标可连接" : host.status.target_reachability === "unreachable" ? "目标不可连接" : host.status.target_reachability === "partial" ? "目标部分可连接" : "目标未检测"
+  return <Dialog open onOpenChange={(open) => { if (!open) onClose() }}><DialogContent className="flex max-h-[90svh] flex-col gap-0 overflow-hidden p-0 sm:max-w-xl">
+    <DialogHeader className="shrink-0 px-5 pt-5 pb-4 text-left"><DialogTitle className="truncate pr-6" title={host.name}>{host.name} · Realm</DialogTitle><DialogDescription>入口状态与流量</DialogDescription></DialogHeader>
+    <div className="min-h-0 space-y-4 overflow-y-auto px-5 pb-5">
+      <section className="space-y-3 rounded-xl bg-muted/40 p-4"><div className="flex flex-wrap items-center gap-2"><Badge variant="outline" className={host.status.running ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300" : ""}>{realmHostStatus(host)}</Badge><span className="text-xs text-muted-foreground">{version}</span><span className="ml-auto text-xs text-muted-foreground">同步 {host.applied_revision} / {host.desired_revision}</span></div><p className="text-xs text-muted-foreground">{reachability} · 不代表完整代理链路可用</p><EntryWarning host={host} />{host.last_error && <p role="alert" className="break-words text-sm text-destructive">{host.last_error}</p>}</section>
+      {rule && <RealmTrafficCard title={`${rule.name} · 规则流量`} items={traffic.rules.filter((item) => item.key === rule.traffic_key)} />}
+      <RealmTrafficCard title="节点 Realm 流量" items={traffic.rules.filter((item) => item.node_id === host.node_id)} status={stats} />
+      {(!host.online || !host.traffic_capable || (stats && !stats.fresh)) && <p role="status" className="text-xs text-amber-700 dark:text-amber-300">{!host.online ? "节点离线，显示最近记录" : !host.traffic_capable ? "升级 Agent 后可监控流量" : trafficState(stats)}</p>}
+      {!!((stats?.gaps ?? 0) || (stats?.discarded_records ?? 0)) && <p role="status" className="text-xs text-amber-700 dark:text-amber-300">采集缺口：{stats?.gaps ?? 0} · 无法归属记录：{stats?.discarded_records ?? 0}</p>}
+      <p className="text-xs text-muted-foreground">最近采集：{stats?.last_sample ? new Date(stats.last_sample * 1000).toLocaleString() : "—"}</p>
+      <details className="rounded-lg border px-3 py-2 text-xs text-muted-foreground"><summary className="cursor-pointer py-1">更多信息</summary><div className="space-y-2 pt-2"><p className="break-words">版本：{host.status.version ?? "未知"}</p><p>已应用 {host.applied_revision} / 期望 {host.desired_revision}</p><p>采集缺口：{stats?.gaps ?? "—"} · 无法归属记录：{stats?.discarded_records ?? 0}</p><p>仅统计入口客户端侧 TCP，包含协议开销和重传，排除 loopback；与整机网卡分开，不用于用户扣费。今日 / 本月按 UTC，缺失时段不补算。</p></div></details>
+    </div><DialogFooter className="shrink-0 border-t px-5 py-3"><Button variant="outline" onClick={onClose}>关闭</Button></DialogFooter>
   </DialogContent></Dialog>
 }

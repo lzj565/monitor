@@ -428,14 +428,33 @@ function ProxyPage({ nodes, site, refusal, search, go }: { nodes: Node[]; site: 
   const [statusFilter, setStatusFilter] = useState("all")
   const [creating, setCreating] = useState(false)
   const [creationBusy, setCreationBusy] = useState(false)
+  const [showMieruPassword, setShowMieruPassword] = useState(false)
   const [editing, setEditing] = useState<Proxy | null>(null)
   const [deleting, setDeleting] = useState<Proxy | null>(null)
   const [removing, setRemoving] = useState(false)
   const [updatingProxyId, setUpdatingProxyId] = useState<number | null>(null)
-  const drag = useDragOrder(items ?? [], "proxies", reload)
+  const [savedOrder, setSavedOrder] = useState<string[] | null>(null)
+  const [orderError, setOrderError] = useState("")
+  const [orderRevision, setOrderRevision] = useState(0)
+  const mixedItems = proxyListItems(items ?? [], realm.rules, nodes, { query: "", node: "all", status: "all", type: "all" }).map((item) => ({ ...item, id: item.key }))
+  const liveKeys = mixedItems.map((item) => item.id).sort().join(",")
+  useEffect(() => {
+    const controller = new AbortController()
+    const load = () => api<{ ids: string[] }>("/proxy-list/order", { signal: controller.signal }).then((result) => { setSavedOrder(result.ids); setOrderError("") }).catch((e: Error) => { if (!controller.signal.aborted) setOrderError(e.message) })
+    void load()
+    const timer = setInterval(() => { if (!document.hidden) void load() }, 5000)
+    return () => { controller.abort(); clearInterval(timer) }
+  }, [liveKeys, orderRevision])
+  const ranks = new Map(savedOrder?.map((id, rank) => [id, rank]))
+  mixedItems.sort((a, b) => (ranks.get(a.id) ?? Number.MAX_SAFE_INTEGER) - (ranks.get(b.id) ?? Number.MAX_SAFE_INTEGER))
+  const reloadOrder = () => { setOrderRevision((revision) => revision + 1); reload(); void realm.reload() }
+  const drag = useDragOrder(mixedItems, "proxy-list", reloadOrder)
   const nodeById = new Map(nodes.map((node) => [node.id, node]))
-  const visible = proxyListItems(drag.order, realm.rules, nodes, { query, node: nodeFilter, status: statusFilter, type: typeFilter })
+  const visibleKeys = new Set(proxyListItems(items ?? [], realm.rules, nodes, { query, node: nodeFilter, status: statusFilter, type: typeFilter }).map((item) => item.key))
+  const visible = drag.order.filter((item) => visibleKeys.has(item.key))
   const searching = query.trim() !== "" || nodeFilter !== "all" || statusFilter !== "all" || typeFilter !== "all"
+  const orderReady = savedOrder !== null && !orderError && !loading && !error && realm.loaded && !realm.error && [...savedOrder].sort().join(",") === liveKeys
+  const dragDisabled = searching || !orderReady
   const tableLoading = loading || (!realm.loaded && !realm.error && typeFilter !== "vless")
   const changeTypeFilter = (type: string) => {
     const params = new URLSearchParams(search)
@@ -495,9 +514,11 @@ function ProxyPage({ nodes, site, refusal, search, go }: { nodes: Node[]; site: 
           <StatusFilter value={statusFilter} onChange={setStatusFilter} labels={[["all", "全部状态"], ["enabled", "已启用"], ["disabled", "已停用"]]} />
         </div>
         {realm.hosts.length > 0 && <select aria-label="节点 Realm 服务" className="h-9 max-w-48 rounded-md border bg-background px-2 text-sm" value="" onChange={(e) => { if (e.target.value) setDetail({ nodeId: Number(e.target.value) }) }}><option value="">节点 Realm 服务…</option>{realm.hosts.map((h) => <option key={h.node_id} value={h.node_id}>{nodeById.get(h.node_id)?.name ?? h.name}</option>)}</select>}
+        {(typeFilter === "all" || typeFilter === "mieru") && <Button variant="outline" onClick={() => setShowMieruPassword(true)}>mieru 连接密码</Button>}
         <Button disabled={!nodes.length} onClick={() => { setCreationType(null); setCreating(true) }}><Plus /> 新增代理</Button>
       </div>
 
+      {orderError && <p role="alert" className="text-sm text-destructive">读取排序失败：{orderError}<Button variant="link" onClick={() => setOrderRevision((v) => v + 1)}>重试</Button></p>}
       {realm.error && <div role="alert" className="text-sm text-destructive">读取 Realm 配置失败：{realm.error}，保留上次结果。<Button size="sm" variant="outline" className="ml-2" onClick={() => void realm.reload()}>重试</Button></div>}
       <Card className="overflow-x-auto p-0">
         <Table className="table-auto min-w-max">
@@ -518,16 +539,16 @@ function ProxyPage({ nodes, site, refusal, search, go }: { nodes: Node[]; site: 
             {visible.map((item) => {
               if (item.kind === "realm") {
                 const rule = item.rule
-                return <RealmProxyRow key={item.key} rule={rule} host={realm.hosts.find((h) => h.node_id === rule.node_id)} nodes={nodes} busy={realmBusy} onEdit={() => setEditingRealmId(rule.id)} onDelete={() => setDeletingRealm(rule)} onDetail={() => setDetail({ nodeId: rule.node_id, ruleId: rule.id })} onEnabled={(enabled) => void setRealmEnabled(rule, enabled)} />
+                return <RealmProxyRow key={item.key} rowProps={drag.row(item.id)} dragHandle={<DragHandle {...drag.handle(item.id)} name={rule.name} disabled={dragDisabled} />} rule={rule} host={realm.hosts.find((h) => h.node_id === rule.node_id)} nodes={nodes} busy={realmBusy} onEdit={() => setEditingRealmId(rule.id)} onDelete={() => setDeletingRealm(rule)} onDetail={() => setDetail({ nodeId: rule.node_id, ruleId: rule.id })} onEnabled={(enabled) => void setRealmEnabled(rule, enabled)} />
               }
               const proxy = item.proxy
               const node = nodeById.get(proxy.node_id)
               const proxyName = displayProxyName(proxy, node)
               const reality = proxy.config.reality
               return (
-                <TableRow key={item.key} {...drag.row(proxy.id)} className="h-14">
+                <TableRow key={item.key} {...drag.row(item.id)} className="h-14">
                   <TableCell className="px-2">
-                    <DragHandle {...drag.handle(proxy.id)} name={proxyName} disabled={searching} title={searching ? "清空搜索和筛选后可拖动排序" : undefined} />
+                    <DragHandle {...drag.handle(item.id)} name={proxyName} disabled={dragDisabled} title={searching ? "清空搜索和筛选后可拖动排序" : undefined} />
                   </TableCell>
                   <TableCell className="px-3">
                     <div className="flex items-center gap-2">
@@ -581,6 +602,7 @@ function ProxyPage({ nodes, site, refusal, search, go }: { nodes: Node[]; site: 
         </Table>
       </Card>
 
+      {showMieruPassword && <MieruCredential onClose={() => setShowMieruPassword(false)} />}
       {creating && <ProxyDialog compact={creationType === null} busy={creationBusy} onClose={() => setCreating(false)}>
         {creationType === null ? <><DialogHeader className="px-5 pt-5 pb-3 text-left"><DialogTitle>选择代理类型</DialogTitle><DialogDescription>选择要创建的代理服务</DialogDescription></DialogHeader><div className="flex flex-col gap-2 px-5 pb-5">{([
           ["vless", "VLESS Reality", "配置节点上的代理服务"],
@@ -593,7 +615,7 @@ function ProxyPage({ nodes, site, refusal, search, go }: { nodes: Node[]; site: 
         : <><DialogHeader className="px-6 pt-6"><DialogTitle>新增 Realm 代理</DialogTitle><DialogDescription>{realm.error || error || "正在读取节点与代理配置…"}</DialogDescription></DialogHeader><div className="flex gap-2 p-6"><Button variant="outline" onClick={() => { void realm.reload(); reload() }}>重试读取</Button><Button variant="ghost" onClick={() => setCreationType(null)}>返回选择类型</Button></div></>}
       </ProxyDialog>}
       {editingRealm && <RealmProxyForm key={editingRealm.id} rule={editingRealm} nodes={nodes} proxies={items ?? []} hosts={realm.hosts} rules={realm.rules} ready={realm.loaded && !realm.error && items !== null && !error} site={site} refusal={refusal} onClose={() => setEditingRealmId(null)} onSaved={realmSaved} onRefresh={realm.reload} />}
-      {detailHost && <RealmEntryDialog key={detailHost.node_id} host={detailHost} rule={detailRule} rules={realm.rules} traffic={realm.traffic} site={site} refusal={refusal} onClose={() => setDetail(null)} onSaved={realm.reload} />}
+      {detailHost && <RealmEntryDialog key={detailHost.node_id} host={detailHost} rule={detailRule} traffic={realm.traffic} onClose={() => setDetail(null)} />}
       {deletingRealm && <ConfirmDialog title={`删除 Realm 代理「${deletingRealm.name}」？`} description="当前转发规则和订阅入口将移除；目标代理、入口节点、其他转发规则及历史流量保留。" confirmLabel="删除 Realm 代理" busy={realmBusy} onClose={() => setDeletingRealm(null)} onConfirm={() => { void realmAction(async () => { await api(`/realm/rules/${deletingRealm.id}`, { method: "DELETE" }); setDeletingRealm(null) }, "已删除 Realm 规则，等待同步") }} />}
       {typeFilter !== "vless" && realm.traffic.rules.some((r) => !r.active) && <details className="space-y-3 rounded-lg border p-4"><summary className="cursor-pointer text-sm font-medium">已删除 Realm 规则的历史流量</summary>{realm.traffic.rules.filter((r) => !r.active && (nodeFilter === "all" || nodeFilter === String(r.node_id))).map((r) => <div key={r.key} className="space-y-1 border-t pt-3"><p className="text-sm">{nodeById.get(r.node_id)?.name ?? `节点 ${r.node_id}`} / {r.name}</p><TrafficSummary items={[r]} /></div>)}</details>}
       {editing && (editing.protocol === "mieru" ? <MieruForm nodes={nodes} proxy={editing} onClose={() => setEditing(null)} onSaved={reload} /> : <ProxyForm nodes={nodes} proxy={editing} onClose={() => setEditing(null)} onSaved={reload} />)}
@@ -909,7 +931,6 @@ function UsersPage() {
     }
   }
 
-  const [mieruUser, setMieruUser] = useState<number | null>(null)
   async function setUserEnabled(user: User, enabled: boolean) {
     setUpdatingUserId(user.id)
     try {
@@ -982,7 +1003,7 @@ function UsersPage() {
                 <TableCell className="whitespace-nowrap text-right">
                   <div className="flex items-center justify-end gap-1">
                     <Tooltip><TooltipTrigger asChild><Button type="button" variant="ghost" size="icon" className="size-8" aria-label={`重置用户 ${user.username} 的流量`} onClick={() => setTrafficUser(user)}><RefreshCw /></Button></TooltipTrigger><TooltipContent>重置流量</TooltipContent></Tooltip>
-                    <Button type="button" variant="ghost" size="sm" className="text-xs" title="mieru 连接凭据" onClick={() => setMieruUser(user.id)}>mieru</Button><Button type="button" variant="ghost" size="icon" className="size-8" title="编辑用户" aria-label={`编辑用户 ${user.username}`} onClick={() => setEditing(user)}><Pencil /></Button>
+                    <Button type="button" variant="ghost" size="icon" className="size-8" title="编辑用户" aria-label={`编辑用户 ${user.username}`} onClick={() => setEditing(user)}><Pencil /></Button>
                     <Button type="button" variant="ghost" size="icon" disabled={user.username === "admin"} title={user.username === "admin" ? "管理员不可删除" : "删除用户"} aria-label={user.username === "admin" ? "管理员不可删除" : `删除用户 ${user.username}`} className="size-8 text-destructive hover:text-destructive" onClick={() => setDeleting(user)}><Trash2 /></Button>
                   </div>
                 </TableCell>
@@ -997,7 +1018,6 @@ function UsersPage() {
           </TableBody>
         </Table>
       </Card>
-      {mieruUser !== null && <MieruCredential userId={mieruUser} onClose={() => setMieruUser(null)} />}
       {creating && <UserForm user={null} onClose={() => setCreating(false)} onSaved={reload} />}
       {editing && <UserForm user={editing} onClose={() => setEditing(null)} onSaved={reload} />}
       {trafficUser && <UserTrafficDialog user={trafficUser} onClose={() => setTrafficUser(null)} onChanged={() => setTrafficRevision((value) => value + 1)} />}
@@ -1367,13 +1387,13 @@ function SubscriptionsPage({ nodes, search }: { nodes: Node[]; search: string })
                 const accesses = accessCache.get(user.id)
                 const rowError = accessErrors[user.id]
                 return <Fragment key={user.id}>
-                  <TableRow className="h-14">
+                  <TableRow className="h-14 cursor-pointer" onClick={(event) => { if (!(event.target as HTMLElement).closest("button, a, input, [role='switch']")) void toggleExpanded(user) }}>
                     <TableCell className="max-w-0 px-3">
                       <div className="flex min-w-0 items-center gap-2">
-                        <Button type="button" variant="ghost" size="icon-sm" className="size-7" aria-label={`${isExpanded ? "收起" : "展开"}${user.username}的节点`} aria-expanded={isExpanded} onClick={() => void toggleExpanded(user)}>
+                        <Button type="button" variant="ghost" className="h-auto min-w-0 flex-1 justify-start gap-2 px-0 py-2 text-left" aria-label={`${isExpanded ? "收起" : "展开"}${user.username}的节点`} aria-expanded={isExpanded} onClick={() => void toggleExpanded(user)}>
                           {isExpanded ? <ChevronDown /> : <ChevronRight />}
+                          <span className="truncate font-semibold">{user.username}</span>
                         </Button>
-                        <span className="truncate font-semibold">{user.username}</span>
                       </div>
                     </TableCell>
                     <TableCell className="px-3 text-sm"><Button type="button" variant="link" className="h-auto p-0" disabled={accessLoading.has(user.id) || proxiesLoading || !!proxyError} aria-label={`编辑 ${user.username} 的授权节点`} onClick={() => void openEdit(user)}>{accessLoading.has(user.id) ? "加载中..." : `${user.proxy_count} 个节点`}</Button></TableCell>

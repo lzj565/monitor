@@ -197,7 +197,29 @@ fn client_subscriptions_default_empty_flow_to_vision() {
     regional_proxy.node_country = "HK".into();
     assert_eq!(subscription_label(&regional_proxy), "🇭🇰HK-proxy-3");
     let uuid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
-    let clash = clash_subscription(uuid, &proxies);
+    let portal_proxy = |p: crate::db::UserSubscriptionProxy| crate::db::UserPortalProxy {
+        id: p.id,
+        node_id: 1,
+        node_name: p.node_name,
+        node_country: p.node_country,
+        node_group: String::new(),
+        name: p.name,
+        include_node_name: p.include_node_name,
+        address: p.address,
+        port: p.port,
+        protocol: "vless".into(),
+        address_type: "domain".into(),
+        uuid: uuid.into(),
+        server_name: p.server_name,
+        server_port: 443,
+        public_key: p.public_key,
+        short_id: p.short_id,
+        flow: p.flow,
+        online: false,
+        mieru_password: None,
+        realm_target_node_id: None,
+    };
+    let clash = clash_subscription(1, &proxies.iter().cloned().map(portal_proxy).collect::<Vec<_>>());
     assert!(clash.contains("flow: xtls-rprx-vision"));
     assert_eq!(clash.matches("flow:").count(), 2, "all proxies receive a Flow");
     assert!(clash.contains(&format!("uuid: {uuid}\n")), "UUID is an unquoted YAML scalar");
@@ -208,7 +230,8 @@ fn client_subscriptions_default_empty_flow_to_vision() {
     ipv6.address = "2001:db8::1".into();
     let mut domain = proxy(6, "");
     domain.address = "proxy.example.com".into();
-    let ip_yaml = clash_subscription(uuid, &[ipv4, ipv6, domain]);
+    let ip_yaml =
+        clash_subscription(1, &[ipv4, ipv6, domain].into_iter().map(portal_proxy).collect::<Vec<_>>());
     assert!(ip_yaml.contains("server: 192.0.2.1\n"));
     assert!(ip_yaml.contains("server: 2001:db8::1\n"));
     assert!(ip_yaml.contains("server: proxy.example.com\n"));
@@ -2100,7 +2123,7 @@ async fn a_history_window_stops_at_the_retention_window() {
 }
 
 #[tokio::test]
-async fn mieru_authorization_portal_export_and_legacy_subscription_are_separate() {
+async fn mieru_exports_in_clash_and_native_subscription_is_removed() {
     let app = std::sync::Arc::new(app());
     let node = app
         .db
@@ -2122,13 +2145,88 @@ async fn mieru_authorization_portal_export_and_legacy_subscription_are_separate(
     let portal = portal_json(user_proxies(UserAuth(user), State(app.clone())).await).await;
     let row = &portal["items"][0];
     assert!(row["mieru_url"].as_str().unwrap().starts_with("mierus://"));
-    assert_eq!(row["mieru_config"]["profiles"][0]["servers"][0]["domainName"], "proxy.example.com");
+    assert!(row.get("mieru_config").is_none());
+    let yaml = row["mihomo_yaml"].as_str().unwrap();
+    for expected in [
+        "type: mieru",
+        "server: proxy.example.com",
+        "port: 24061",
+        "transport: TCP",
+        "udp: true",
+        "multiplexing: MULTIPLEXING_OFF",
+        "handshake-mode: HANDSHAKE_NO_WAIT",
+    ] {
+        assert!(yaml.contains(expected), "missing {expected}");
+    }
+    assert!(yaml.contains(&format!("username: user-{user}")));
+    assert!(yaml.contains(&format!("password: {}", app.db.mieru_password(false).unwrap())));
     assert!(row.get("vless_url").is_none());
     assert!(row.get("mieru_password").is_none());
     let token = app.db.user_subscription_token(user).unwrap().unwrap();
-    let native =
-        portal_json(subscription(State(app.clone()), Path((token.clone(), "mieru".into()))).await).await;
-    assert_eq!(native["profiles"].as_array().unwrap().len(), 1);
+    let native = subscription(State(app.clone()), Path((token.clone(), "mieru".into()))).await;
+    assert_eq!(native.status(), StatusCode::NOT_FOUND);
+    let links = portal_json(user_subscription_links(UserAuth(user), State(app.clone())).await).await;
+    assert!(links.get("mieru").is_none());
+    let clash = subscription(State(app.clone()), Path((token.clone(), "clash".into()))).await;
+    assert_eq!(clash.status(), StatusCode::OK);
+    assert_eq!(clash.headers()[header::CACHE_CONTROL], "no-store");
+    let body = String::from_utf8(axum::body::to_bytes(clash.into_body(), usize::MAX).await.unwrap().to_vec())
+        .unwrap();
+    assert!(body.contains(&yaml.lines().map(|line| format!("  {line}\n")).collect::<String>()));
+    assert!(body.contains("proxy-groups:"));
+    assert!(!body.contains("type: vless"));
+    let relay = app
+        .db
+        .create_node(&crate::db::Node { name: "relay".into(), ..Default::default() }, "relay-token")
+        .unwrap();
+    app.db.realm_save_host(&crate::db::RealmHostInput { node_id: relay, enabled: true }).unwrap();
+    app.db
+        .realm_save_rule(
+            None,
+            &crate::db::RealmRuleInput {
+                node_id: relay,
+                target_proxy_id: proxy,
+                name: "relay".into(),
+                address_type: "domain".into(),
+                address: "relay.example.com".into(),
+                listen_port: 24443,
+                enabled: true,
+            },
+        )
+        .unwrap();
+    let desired = app.db.realm_desired(relay).unwrap();
+    app.db.realm_applied(&desired).unwrap();
+    let mut proxies = app.db.active_user_portal_proxies(user, Utc::now().timestamp()).unwrap();
+    assert_eq!(proxies.len(), 2);
+    let relayed = mihomo_proxy(user, &proxies[1]);
+    assert!(relayed.contains("server: relay.example.com"));
+    assert!(relayed.contains("port: 24443"));
+    assert!(relayed.contains("-realm"));
+    assert_eq!(proxies[0].mieru_password, proxies[1].mieru_password);
+    let mut vless = proxies[0].clone();
+    vless.protocol = "vless".into();
+    vless.name = "VLESS".into();
+    vless.id = 999;
+    proxies.push(vless);
+    let mixed = clash_subscription(user, &proxies);
+    assert_eq!(mixed.matches("type: mieru").count(), 2);
+    assert_eq!(mixed.matches("type: vless").count(), 1);
+    assert_eq!(mixed.matches("      - ").count(), 4);
+    let mut escaped = proxies[0].clone();
+    escaped.name = "name: #test".into();
+    escaped.address = "2001:db8::1".into();
+    escaped.mieru_password = Some("true".into());
+    let special = mihomo_proxy(user, &escaped);
+    assert!(special.contains("name: \"name: #test\""));
+    assert!(special.contains("password: \"true\""));
+    assert!(special.contains("server: 2001:db8::1"));
+    assert!(clash_subscription(user, &[]).starts_with("proxies: []\n"));
+    let request = serde_json::from_value(json!({"enabled":false})).unwrap();
+    assert_eq!(
+        put_user_proxy(ApiAdmin, State(app.clone()), Path((user, proxy)), Ok(Json(request))).await.status(),
+        StatusCode::OK
+    );
+    assert!(app.db.active_user_portal_proxies(user, Utc::now().timestamp()).unwrap().is_empty());
     let legacy = portal_json(subscription(State(app.clone()), Path((token, "sing-box".into()))).await).await;
     assert_eq!(legacy["outbounds"].as_array().unwrap().len(), 1);
     assert_eq!(legacy["outbounds"][0]["type"], "direct");
@@ -2247,4 +2345,21 @@ async fn registration_records_batch_choices_and_reruns_do_not_reset_them() {
     );
     assert!(app.db.component_choices(id).unwrap().unwrap().realm);
     assert!(app.db.component_choices(id).unwrap().unwrap().mieru);
+}
+
+#[tokio::test]
+async fn global_mieru_password_endpoint_is_stable_and_reset_is_global() {
+    let app = std::sync::Arc::new(app());
+    let response = crate::mieru::credential(Admin, State(app.clone())).await;
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    let first = portal_json(response).await;
+    assert!(first.get("username").is_none());
+    assert_eq!(first["password"], app.db.mieru_password(false).unwrap());
+    let second = portal_json(crate::mieru::credential(Admin, State(app.clone())).await).await;
+    assert_eq!(first, second);
+    let reset = crate::mieru::reset_credential(Admin, State(app.clone())).await;
+    assert_eq!(reset.headers()[header::CACHE_CONTROL], "no-store");
+    let reset = portal_json(reset).await;
+    assert_ne!(first["password"], reset["password"]);
+    assert_eq!(reset["password"], app.db.mieru_password(false).unwrap());
 }

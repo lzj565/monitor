@@ -285,7 +285,7 @@ CREATE TABLE IF NOT EXISTS proxy_node_traffic (
 /// cannot: `open` runs `SCHEMA` before migrating, and on an older file the
 /// column is not there yet. `an_upgraded_release_matches_a_fresh_database`
 /// holds every migration to these rules, starting from v1.0.0's schema.
-pub(super) const SCHEMA_VERSION: i64 = 26;
+pub(super) const SCHEMA_VERSION: i64 = 27;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -620,6 +620,7 @@ pub(super) fn migrate(conn: &Connection, from: i64) -> Result<()> {
         PRIMARY KEY(user_id,proxy_id)
     )",
     )?;
+    tx.execute_batch(PROXY_LIST_ORDER_SCHEMA)?;
     tx.execute_batch(COMPONENT_SCHEMA)?;
     tx.execute_batch("INSERT OR IGNORE INTO node_components(node_id,component,desired_installed) SELECT id,'singbox',1 FROM node UNION ALL SELECT id,'realm',0 FROM node UNION ALL SELECT id,'mieru',0 FROM node")?;
     prepare_realm_schema(&tx)?;
@@ -671,7 +672,7 @@ pub(super) fn seed_default_admin(conn: &Connection) -> Result<()> {
 }
 
 /// Every table a backup must carry before this build will restore it.
-pub(super) const TABLES: [&str; 25] = [
+pub(super) const TABLES: [&str; 26] = [
     "setting",
     "node",
     "proxies",
@@ -697,6 +698,7 @@ pub(super) const TABLES: [&str; 25] = [
     "mieru_hosts",
     "mieru_traffic_sources",
     "node_components",
+    "proxy_list_order",
 ];
 pub(super) const PRE_RESOURCE_TABLES: [&str; 8] =
     ["setting", "node", "traffic", "metric", "ping_task", "ping_node", "ping_record", "session"];

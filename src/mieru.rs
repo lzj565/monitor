@@ -138,14 +138,13 @@ pub async fn preview(_: Admin, State(app): State<Shared>, Path(id): Path<i64>) -
         Err(e) => api::fail(e),
     }).await
 }
-pub async fn reset_credential(_: Admin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
-    crate::blocking::response(move || match app.db.mieru_credential(id, true) {
-        Ok(password) => (
-            [(axum::http::header::CACHE_CONTROL, "no-store")],
-            Json(json!({"username":format!("user-{id}"),"password":password})),
-        )
-            .into_response(),
-        Err(_) => api::answer(axum::http::StatusCode::NOT_FOUND, "用户不存在"),
+pub async fn reset_credential(_: Admin, State(app): State<Shared>) -> Response {
+    crate::blocking::response(move || match app.db.mieru_password(true) {
+        Ok(password) => {
+            ([(axum::http::header::CACHE_CONTROL, "no-store")], Json(json!({"password":password})))
+                .into_response()
+        }
+        Err(_) => api::answer(axum::http::StatusCode::INTERNAL_SERVER_ERROR, "读取 mieru 全局密码失败"),
     })
     .await
 }
@@ -173,21 +172,13 @@ pub async fn asset(State(app): State<Shared>, Path(arch): Path<String>) -> Respo
     }
 }
 
-pub fn client_config(username: &str, password: &str, address: &str, port: i64, label: &str) -> Value {
-    let mut server = json!({"portBindings":[{"port":port,"protocol":"TCP"}]});
-    server[if address.parse::<std::net::IpAddr>().is_ok() { "ipAddress" } else { "domainName" }] =
-        json!(address);
-    json!({"profiles":[{"profileName":label,"user":{"name":username,"password":password},"servers":[server]}],"activeProfile":label,"socks5Port":1080})
-}
-
-pub async fn credential(_: Admin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
-    crate::blocking::response(move || match app.db.mieru_credential(id, false) {
-        Ok(password) => (
-            [(axum::http::header::CACHE_CONTROL, "no-store")],
-            Json(json!({"username":format!("user-{id}"),"password":password})),
-        )
-            .into_response(),
-        Err(_) => api::answer(axum::http::StatusCode::NOT_FOUND, "用户不存在"),
+pub async fn credential(_: Admin, State(app): State<Shared>) -> Response {
+    crate::blocking::response(move || match app.db.mieru_password(false) {
+        Ok(password) => {
+            ([(axum::http::header::CACHE_CONTROL, "no-store")], Json(json!({"password":password})))
+                .into_response()
+        }
+        Err(_) => api::answer(axum::http::StatusCode::INTERNAL_SERVER_ERROR, "读取 mieru 全局密码失败"),
     })
     .await
 }

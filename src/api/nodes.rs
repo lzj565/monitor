@@ -532,3 +532,29 @@ pub async fn set_node_ping_tasks(
     })
     .await
 }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyListOrder {
+    pub ids: Vec<String>,
+}
+
+pub async fn proxy_list_order(_: Admin, State(app): State<Shared>) -> Response {
+    crate::blocking::response(move || match app.db.proxy_list_order() {
+        Ok(ids) => ([(header::CACHE_CONTROL, "no-store")], Json(json!({"ids":ids}))).into_response(),
+        Err(e) => fail(e),
+    })
+    .await
+}
+
+pub async fn save_proxy_list_order(
+    _: Admin,
+    State(app): State<Shared>,
+    Json(order): Json<ProxyListOrder>,
+) -> Response {
+    crate::blocking::response(move || match app.db.save_proxy_list_order(&order.ids) {
+        Ok(()) => Json(json!({"ok":true})).into_response(),
+        Err(e) => fail(e),
+    })
+    .await
+}

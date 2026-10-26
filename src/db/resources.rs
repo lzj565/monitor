@@ -681,7 +681,7 @@ impl Db {
         drop(conn);
         for proxy in &mut proxies {
             if proxy.protocol == "mieru" {
-                proxy.mieru_password = Some(self.mieru_credential(id, false)?);
+                proxy.mieru_password = Some(self.mieru_password(false)?);
             }
         }
         let direct = proxies.clone();

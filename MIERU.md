@@ -21,9 +21,9 @@ sh install.sh --upgrade --no-mieru
 
 sing-box 固定必装，`--skip-sing-box` 已拒绝。省略组件参数时读取 Hub 保存的安装选择，关闭 Realm/mieru 会在执行时卸载托管组件。`--no-mieru` 可覆盖当次选择并停止服务。mieru 卸载后保留所有权标记，允许后续重新安装，拒绝接管系统中非本安装器管理的 mita。
 
-在代理列表新增 mieru，选择节点、对外地址和端口，然后给用户授权。没有有效授权用户时服务保持停止。每个用户的 mieru 密码自动生成，与面板登录密码独立；管理员可在用户列表的 mieru 按钮中复制及重置凭据。
+在代理列表新增 mieru，选择节点、对外地址和端口，然后给用户授权。没有有效授权用户时服务保持停止。所有用户共用一个自动生成的 mieru 密码，与面板登录密码独立；连接用户名仍为各自的 `user-{id}`。管理员在代理管理页的“mieru 连接密码”入口统一查看、复制和重置；用户列表不再提供配置入口。
 
-Realm 规则直接选择 mieru 作为目标代理。用户门户提供原生 JSON 配置和 `mierus://` 分享链接；原生 mieru 订阅包含直连及 Realm 入口。现有 Clash/Mihomo 和 sing-box 订阅只输出 VLESS。
+Realm 规则直接选择 mieru 作为目标代理。用户门户提供 Mihomo YAML 配置和 `mierus://` 分享链接；Clash / Mihomo 订阅包含 VLESS、mieru 直连及 Realm 入口。sing-box 订阅只输出 VLESS。mieru 使用 TCP、UDP 转发开启、MULTIPLEXING_OFF 和 HANDSHAKE_NO_WAIT。
 
 ## 接口和存储
 
@@ -31,8 +31,8 @@ Realm 规则直接选择 mieru 作为目标代理。用户门户提供原生 JSO
 - 新增 `user_proxy_credentials`、`mieru_hosts`、`mieru_traffic_sources`，数据库版本为 26；纳入备份检查和恢复。
 - `GET /api/mieru/hosts` 返回能力、在线、期望版本、已应用版本及错误。
 - `GET /api/mieru/hosts/{id}/config` 为管理员配置预览。
-- `GET/POST /api/users/{id}/mieru-credential` 为管理员读取/重置连接凭据。
-- `GET /api/subscriptions/{token}/mieru` 导出原生配置；沿用用户订阅令牌、停用和到期检查。
+- `GET/POST /api/mieru/credential` 为管理员读取/重置连接凭据。
+- `GET /api/subscriptions/{token}/clash` 统一导出 VLESS / mieru；沿用用户订阅令牌、停用和到期检查。独立 `/mieru` 订阅格式已移除，旧链接返回 404，需重新导入 Clash / Mihomo 链接。
 - `/mieru/x86_64`、`/mieru/aarch64` 中转官方发布文件；安装器使用固定 SHA256。
 - Agent 能力为 `mieru.v1`、`mieru.traffic.v1`；管理命令为 `mieru.status/config.get/config.check/config.apply/restart`。
 
@@ -42,7 +42,7 @@ mita 没有独立的只读配置校验命令，`replace config` 会通过 RPC �
 
 ## 流量口径
 
-每 5 秒读取一次 mita JSON 指标，超时 3 秒。用户名使用稳定的 `user-{id}`，不跟随登录名变化。mieru 原始计数基线与 sing-box 分离，增量事务写入现有用户、节点流量汇总。面板清零不清空 mita 指标或原始基线。
+每 5 秒读取一次 mita JSON 指标，超时 3 秒。用户名使用稳定的 `user-{id}`，不跟随登录名变化；所有用户共用一个全局随机密码，在代理管理页统一查看和重置。旧的个人密码不再使用，升级后需更新订阅。mieru 原始计数基线与 sing-box 分离，增量事务写入现有用户、节点流量汇总。面板清零不清空 mita 指标或原始基线。
 
 用户用量包含 VLESS 和 mieru。经 Realm 的连接只在目标 mieru 计用户用量；Realm 入口转发量和节点网卡流量独立展示，不加进用户用量。首次采样、计数回退和守护进程代次变化重新建立基线；缺失计数不清零，失败报告不入账。
 

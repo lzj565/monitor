@@ -40,10 +40,12 @@ with tempfile.TemporaryDirectory() as tmp:
      raise AssertionError(('reconciliation did not settle',h))
     await_state(True)
     portal=request('/api/user/me/proxies')['items'];assert len(portal)==1 and portal[0]['mieru_url'].startswith('mierus://')
-    links=request('/api/user/me/subscription');assert len(request(links['mieru'])['profiles'])==1
+    assert 'type: mieru' in portal[0]['mihomo_yaml'] and 'mieru_config' not in portal[0]
+    links=request('/api/user/me/subscription');assert 'mieru' not in links
+    assert b'type: mieru' in request(links['clash'])
     assert all(p['type']!='mieru' for p in request(links['sing_box'])['outbounds'])
-    old=request(f'/api/users/{admin}/mieru-credential')['password']
-    assert request(f'/api/users/{admin}/mieru-credential',{},'POST')['password']!=old
+    old=request('/api/mieru/credential')['password']
+    assert request('/api/mieru/credential',{},'POST')['password']!=old
     time.sleep(6);await_state(True)
     # Revocation empties the generated user set and stops the service without manual intervention.
     request(f'/api/users/{admin}/proxies/{proxy}',None,'DELETE')

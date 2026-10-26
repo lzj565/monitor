@@ -28,10 +28,12 @@ function slide(rows: HTMLTableSectionElement | null, update: () => void) {
 // Pointer events, not HTML5 drag and drop: a touch never starts a native drag,
 // and where Android synthesizes one from a long press, `dropEffect` reads
 // "none" on every release, so each drop would count as cancelled.
-export function useDragOrder<T extends { id: number }>(items: T[], path: string, reload: () => void) {
-  const [manualOrder, setManualOrder] = useState<number[]>([])
-  const [dragging, setDragging] = useState<number | null>(null)
-  const orderBeforeDrag = useRef<number[]>([])
+type OrderId = number | string
+
+export function useDragOrder<T extends { id: OrderId }>(items: T[], path: string, reload: () => void) {
+  const [manualOrder, setManualOrder] = useState<OrderId[]>([])
+  const [dragging, setDragging] = useState<OrderId | null>(null)
+  const orderBeforeDrag = useRef<OrderId[]>([])
   const body = useRef<HTMLTableSectionElement | null>(null)
   // The pointer that owns the drag, where it was pressed, and where it last
   // was: a scroll moves rows under a pointer that holds still.
@@ -132,7 +134,7 @@ export function useDragOrder<T extends { id: number }>(items: T[], path: string,
     }
   }, [dragging])
 
-  function move(id: number, to: number) {
+  function move(id: OrderId, to: number) {
     const next = [...ids()]
     const from = next.indexOf(id)
     if (from < 0 || to < 0 || to >= next.length || from === to) return
@@ -148,7 +150,7 @@ export function useDragOrder<T extends { id: number }>(items: T[], path: string,
     if (before.length) slide(body.current, () => setManualOrder(before))
   }
 
-  function save(next: number[]) {
+  function save(next: OrderId[]) {
     setDragging(null)
     const before = orderBeforeDrag.current
     if (!before.length || next.join() === before.join()) return
@@ -165,7 +167,7 @@ export function useDragOrder<T extends { id: number }>(items: T[], path: string,
 
   return {
     order,
-    row: (id: number) => ({
+    row: (id: OrderId) => ({
       "data-id": id,
       "data-dragging": dragging === id || undefined,
       // Opaque, with the dragged row beneath the rest: two rows crossing mid-slide
@@ -173,7 +175,7 @@ export function useDragOrder<T extends { id: number }>(items: T[], path: string,
       // drag, since the browser keeps it on whichever row reaches the start point.
       className: `relative z-1 bg-card transition-opacity data-[dragging]:z-0 data-[dragging]:opacity-40 ${dragging === null ? "" : "hover:bg-card"}`,
     }),
-    handle: (id: number) => ({
+    handle: (id: OrderId) => ({
       onPointerDown: (e: React.PointerEvent<HTMLButtonElement>) => {
         if (e.currentTarget.disabled || dragging !== null || e.button !== 0) return
         orderBeforeDrag.current = ids()

@@ -105,16 +105,16 @@ export function MieruForm({ proxy, nodes, embedded, onClose, onSaved, onBack, on
   return embedded ? form : <ProxyDialog busy={busy} onClose={onClose}>{form}</ProxyDialog>
 }
 
-export function MieruCredential({ userId, onClose }: { userId: number; onClose: () => void }) {
-  const [credential, setCredential] = useState<{ username: string; password: string } | null>(null)
+export function MieruCredential({ onClose }: { onClose: () => void }) {
+  const [credential, setCredential] = useState<{ password: string } | null>(null)
   const [error, setError] = useState("")
   const [busy, setBusy] = useState(false)
   const [show, setShow] = useState(false)
-  useEffect(() => { const controller = new AbortController(); void api<{ username: string; password: string }>(`/users/${userId}/mieru-credential`, { signal: controller.signal }).then(setCredential).catch((e: Error) => { if (!controller.signal.aborted) setError(e.message) }); return () => controller.abort() }, [userId])
+  useEffect(() => { const controller = new AbortController(); void api<{ password: string }>("/mieru/credential", { signal: controller.signal }).then(setCredential).catch((e: Error) => { if (!controller.signal.aborted) setError(e.message) }); return () => controller.abort() }, [])
   async function reset() {
-    if (!confirm("重置 mieru 连接密码？旧客户端配置需要重新导入，节点将在同步后使用新密码。")) return
+    if (!confirm("重置所有用户共用的 mieru 连接密码？全部 mieru 客户端需更新订阅，节点将在同步后使用新密码。")) return
     setBusy(true)
-    try { setCredential(await api(`/users/${userId}/mieru-credential`, { method: "POST" })); setError(""); toast.success("已重置，等待关联节点同步") } catch (e) { setError((e as Error).message) } finally { setBusy(false) }
+    try { setCredential(await api("/mieru/credential", { method: "POST" })); setError(""); toast.success("全局密码已重置，等待所有 mieru 节点同步") } catch (e) { setError((e as Error).message) } finally { setBusy(false) }
   }
-  return <ProxyDialog busy={busy} onClose={onClose}><DialogHeader className="p-6 pb-0"><DialogTitle>mieru 连接凭据</DialogTitle><DialogDescription>独立于面板登录密码；重置会更新该用户所有 mieru 节点。</DialogDescription></DialogHeader><div className="space-y-4 p-6">{error && <p role="alert" className="text-destructive">{error}</p>}<Label>连接用户名<Input readOnly value={credential?.username ?? ""} /></Label><Label>连接密码<Input readOnly type={show ? "text" : "password"} value={credential?.password ?? ""} /></Label><div className="flex justify-end gap-2"><Button variant="ghost" onClick={() => setShow(!show)}>{show ? "隐藏密码" : "显示密码"}</Button><Button variant="outline" disabled={!credential || busy} onClick={() => { if (credential) void navigator.clipboard.writeText(JSON.stringify(credential)).then(() => toast.success("已复制凭据"), () => setError("复制失败")) }}>复制凭据</Button><Button variant="destructive" disabled={busy || !credential} onClick={() => void reset()}>重置密码</Button></div></div></ProxyDialog>
+  return <ProxyDialog busy={busy} onClose={onClose}><DialogHeader className="p-6 pb-0"><DialogTitle>mieru 连接密码</DialogTitle><DialogDescription>所有用户共用此密码，连接用户名仍各自独立。重置会更新全部 mieru 节点。</DialogDescription></DialogHeader><div className="space-y-4 p-6">{error && <p role="alert" className="text-destructive">{error}</p>}<Label>连接密码<Input readOnly type={show ? "text" : "password"} value={credential?.password ?? ""} /></Label><div className="flex justify-end gap-2"><Button variant="ghost" onClick={() => setShow(!show)}>{show ? "隐藏密码" : "显示密码"}</Button><Button variant="outline" disabled={!credential || busy} onClick={() => { if (credential) void navigator.clipboard.writeText(credential.password).then(() => toast.success("已复制密码"), () => setError("复制失败")) }}>复制密码</Button><Button variant="destructive" disabled={busy || !credential} onClick={() => void reset()}>重置密码</Button></div></div></ProxyDialog>
 }
