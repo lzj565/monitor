@@ -371,7 +371,10 @@ manage_realm() {
 		if [ -e "$REALM" ] || [ -L "$REALM" ] || [ -e "$REALM_UNIT" ] || [ -L "$REALM_UNIT" ] || [ -e "$REALM_RC" ] || [ -L "$REALM_RC" ]; then
 			fail "Realm paths are not owned by monitor; refusing to overwrite or remove them"
 		fi
-		if [ "$REALM_OPTION" = --no-realm ]; then REALM_STATE=uninstalled; return 0; fi
+		if [ "$REALM_OPTION" = --no-realm ]; then
+			info "Realm 安装开关已关闭，未安装，跳过"
+			REALM_STATE=uninstalled; return 0
+		fi
 	fi
 	REALM_RUNNING=""
 	if [ "$INIT" = systemd ]; then
@@ -380,6 +383,7 @@ manage_realm() {
 		rc-service monitor-realm status >/dev/null 2>&1 && REALM_RUNNING=1
 	fi
 	if [ "$REALM_OPTION" = --no-realm ]; then
+		info "Realm 安装开关已关闭，正在卸载托管程序和服务"
 		if [ "$INIT" = systemd ]; then
 			if [ -e "$REALM_UNIT" ]; then
 				systemctl disable --now monitor-realm || fail "cannot stop/disable Realm"
@@ -395,6 +399,7 @@ manage_realm() {
 		rm -f "$REALM" "$REALM_UNIT" "$REALM_RC" "$ROOT/.realm-managed"
 		[ "$INIT" != systemd ] || systemctl daemon-reload
 		REALM_STATE=uninstalled
+		success "Realm 已卸载，配置保留"
 		return 0
 	fi
 	case "$ARCH" in
@@ -402,6 +407,7 @@ manage_realm() {
 	aarch64) REALM_SHA=f4c0318dd86854da483dcb7645b4f39cae2cc3f91c688fef969d53220b949488 ;;
 	*) fail "unsupported Realm architecture" ;;
 	esac
+	info "正在下载 Realm 2.9.6（${ARCH}）"
 	mkdir -p "$TMP_DIR/realm"
 	REALM_ARCHIVE="$TMP_DIR/realm.tar.gz"
 	TRIES=0
@@ -412,6 +418,7 @@ manage_realm() {
 		sleep 5
 	done
 	[ "$CODE" = 200 ] || fail "Realm download failed (HTTP $CODE)"
+	info "正在校验 Realm 安装包"
 	[ "$(sha256sum "$REALM_ARCHIVE" | awk '{print $1}')" = "$REALM_SHA" ] || fail "Realm checksum mismatch"
 	# Extract only the executable, never arbitrary archive paths.
 	REALM_MEMBER=$(tar -tzf "$REALM_ARCHIVE" | sed -n '/^\(\.\/\)\{0,1\}realm$/p' | head -n 1)
@@ -423,6 +430,7 @@ manage_realm() {
 		printf '%s\n' '{"log":{"level":"warn"},"endpoints":[]}' > "$REALM_CONFIG"
 		chmod 0600 "$REALM_CONFIG"
 	fi
+	info "正在安装 Realm 程序并配置服务"
 	REALM_STAGED="$ROOT/.realm.$$"
 	install -m 0755 "$TMP_DIR/realm/realm" "$REALM_STAGED"
 	mv -f "$REALM_STAGED" "$REALM"
@@ -462,12 +470,16 @@ RC
 	fi
 	REALM_STATE="installed; configure before starting"
 	if [ -n "$REALM_RUNNING" ]; then
+		info "正在重启 Realm 并检查运行状态"
 		if [ "$INIT" = systemd ]; then
 			systemctl restart monitor-realm && systemctl is-active --quiet monitor-realm || fail "Realm restart failed"
 		else
 			rc-service monitor-realm restart && rc-service monitor-realm status >/dev/null || fail "Realm restart failed"
 		fi
 		REALM_STATE=running
+		success "Realm 安装完成，服务运行中"
+	else
+		success "Realm 安装完成，服务未启动，等待配置"
 	fi
 }
 # END Realm helpers
@@ -491,6 +503,7 @@ manage_mieru() {
     done
     if [ "$MIERU_OPTION" = --no-mieru ]; then
         if [ -f "$ROOT/.mieru-managed" ]; then
+            info "mieru 安装开关已关闭，正在卸载托管程序和服务"
             if [ "$INIT" = systemd ]; then systemctl disable --now monitor-mieru || fail "cannot stop mieru"; else
                 rc-service monitor-mieru stop || fail "cannot stop mieru"
                 rc-update del monitor-mieru default >/dev/null 2>&1 || true
@@ -498,6 +511,9 @@ manage_mieru() {
             touch "$ROOT/.mieru-preserved"
             rm -f "$MIERU" "$MIERU_UNIT" "$MIERU_RC" "$ROOT/.mieru-managed"
             [ "$INIT" != systemd ] || systemctl daemon-reload
+            success "mieru 已卸载，配置和流量数据保留"
+        else
+            info "mieru 安装开关已关闭，未安装，跳过"
         fi
         MIERU_STATE=uninstalled
         return 0
@@ -507,13 +523,16 @@ manage_mieru() {
         aarch64) MIERU_SHA=853eb8c3221ce294afffd7d690dbece929c4e774ed3d81c209b71446b515d1c6 ;;
         *) fail "unsupported mieru architecture" ;;
     esac
+    info "正在下载 mieru 3.39.0（${ARCH}）"
     curl -fsSL --max-time 300 "${SERVER%/}/mieru/$ARCH" -o "$TMP_DIR/mita.tar.gz" || fail "mita download failed"
+    info "正在校验 mieru 安装包"
     [ "$(sha256sum "$TMP_DIR/mita.tar.gz" | awk '{print $1}')" = "$MIERU_SHA" ] || fail "mita checksum mismatch"
     MIERU_MEMBER=$(tar -tzf "$TMP_DIR/mita.tar.gz" | sed -n '/^\(\.\/\)\{0,1\}mita$/p' | head -n 1)
     [ -n "$MIERU_MEMBER" ] || fail "mita archive has no executable"
     tar -xOzf "$TMP_DIR/mita.tar.gz" "$MIERU_MEMBER" > "$TMP_DIR/mita" || fail "cannot extract mita"
     chmod 0755 "$TMP_DIR/mita"
     "$TMP_DIR/mita" version | grep -F '3.39.0' >/dev/null || fail "mita version mismatch"
+    info "正在安装 mieru 程序并配置服务"
     getent group mita >/dev/null 2>&1 || { groupadd --system mita 2>/dev/null || addgroup -S mita; }
     id mita >/dev/null 2>&1 || { useradd --system -g mita --home-dir /nonexistent --shell /usr/sbin/nologin mita 2>/dev/null || adduser -S -D -H -G mita mita; }
     mkdir -p /var/lib/mita /run/monitor-mieru
@@ -572,6 +591,7 @@ RC
     fi
     touch "$ROOT/.mieru-managed"
     if [ -n "$MIERU_RUNNING" ]; then
+        info "正在重启 mieru 并检查运行状态"
         if [ "$INIT" = systemd ]; then
             if ! systemctl restart monitor-mieru || ! systemctl is-active --quiet monitor-mieru; then
                 [ ! -f "$TMP_DIR/mita.old" ] || cp -p "$TMP_DIR/mita.old" "$MIERU"
@@ -590,6 +610,11 @@ RC
         fi
     fi
     MIERU_STATE=installed
+    if [ -n "$MIERU_RUNNING" ]; then
+        success "mieru 安装完成，服务运行中"
+    else
+        success "mieru 安装完成，服务未启动，等待配置"
+    fi
 }
 # END mieru helpers
 

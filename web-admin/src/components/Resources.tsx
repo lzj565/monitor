@@ -1,7 +1,7 @@
 import { MieruForm, MieruCredential } from "./admin/Mieru"
 import { useAdminResources, useSharedProxies, useSharedUsers } from "@/components/AdminResources"
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { AlertTriangle, ChevronDown, ChevronRight, ChevronUp, Copy, Eye, EyeOff, Pencil, Plus, RefreshCw, Settings2, Trash2 } from "lucide-react"
+import { AlertTriangle, ArrowRight, ChevronDown, ChevronRight, ChevronUp, Copy, Eye, EyeOff, Pencil, Plus, RefreshCw, Settings2, Trash2 } from "lucide-react"
 import { toast } from "sonner"
 
 import { ProxyDialog } from "@/components/ProxyDialog"
@@ -581,8 +581,12 @@ function ProxyPage({ nodes, site, refusal, search, go }: { nodes: Node[]; site: 
         </Table>
       </Card>
 
-      {creating && <ProxyDialog busy={creationBusy} onClose={() => setCreating(false)}>
-        {creationType === null ? <><DialogHeader className="px-6 pt-6 pb-4"><DialogTitle>选择代理类型</DialogTitle><DialogDescription>选择类型后进入详细配置。</DialogDescription></DialogHeader><div className="grid gap-3 px-6 pb-6 sm:grid-cols-2"><Button className="h-auto min-h-24 flex-col gap-2" variant="outline" onClick={() => setCreationType("vless")}><strong>VLESS Reality</strong><span className="text-xs text-muted-foreground">配置节点上的代理服务</span></Button><Button className="h-auto min-h-24 flex-col gap-2" variant="outline" onClick={() => setCreationType("mieru")}><strong>mieru</strong><span className="text-xs text-muted-foreground">单端口 TCP 代理</span></Button><Button className="h-auto min-h-24 flex-col gap-2" variant="outline" onClick={() => setCreationType("realm")}><strong>Realm 转发</strong><span className="text-xs text-muted-foreground">监听端口转发到已有代理</span></Button></div></>
+      {creating && <ProxyDialog compact={creationType === null} busy={creationBusy} onClose={() => setCreating(false)}>
+        {creationType === null ? <><DialogHeader className="px-5 pt-5 pb-3 text-left"><DialogTitle>选择代理类型</DialogTitle><DialogDescription>选择要创建的代理服务</DialogDescription></DialogHeader><div className="flex flex-col gap-2 px-5 pb-5">{([
+          ["vless", "VLESS Reality", "配置节点上的代理服务"],
+          ["mieru", "mieru", "单端口 TCP 代理"],
+          ["realm", "Realm 转发", "监听端口转发到已有代理"],
+        ] as const).map(([type, title, description]) => <Button key={type} className="group h-auto w-full justify-between gap-3 rounded-lg px-4 py-3 text-left" variant="outline" onClick={() => setCreationType(type)}><span className="flex min-w-0 flex-col gap-1"><strong className="whitespace-nowrap text-sm font-medium">{title}</strong><span className="whitespace-nowrap text-xs font-normal text-muted-foreground">{description}</span></span><ArrowRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground transition-transform group-hover:translate-x-0.5" /></Button>)}</div></>
         : creationType === "vless" ? <ProxyForm embedded nodes={nodes} proxy={null} onClose={() => setCreating(false)} onSaved={reload} onBack={() => setCreationType(null)} onBusyChange={setCreationBusy} />
         : creationType === "mieru" ? <MieruForm embedded onBusyChange={setCreationBusy} proxy={null} nodes={nodes} onClose={() => setCreating(false)} onSaved={reload} onBack={() => setCreationType(null)} />
         : realm.loaded && items !== null ? <RealmProxyForm embedded rule={null} nodes={nodes} proxies={items ?? []} hosts={realm.hosts} rules={realm.rules} ready={realm.loaded && !realm.error && !error} site={site} refusal={refusal} onClose={() => setCreating(false)} onSaved={realmSaved} onRefresh={realm.reload} onBack={() => setCreationType(null)} onBusyChange={setCreationBusy} />

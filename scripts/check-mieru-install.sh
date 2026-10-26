@@ -5,6 +5,8 @@ INSTALLER=${1:-install.sh}
 TEST_DIR=$(mktemp -d)
 trap 'rm -rf "$TEST_DIR"' EXIT
 fail() { echo "$*" >&2; exit 1; }
+info() { printf '%s\n' "$*"; }
+success() { printf '%s\n' "$*"; }
 eval "$(sed -n '/^# BEGIN mieru helpers$/,/^# END mieru helpers$/p' "$INSTALLER" | sed '1d;$d;s|/etc/systemd/system/monitor-mieru.service|$ROOT/unit|g;s|/etc/init.d/monitor-mieru|$ROOT/rc|g;s|/etc/mita|$ROOT/system-mita|g;s|/var/lib/mita|$ROOT/data|g;s|/run/monitor-mieru|$ROOT/run|g;s/rc-service/rc_service/g;s/rc-update/rc_update/g')"
 mkdir -p "$TEST_DIR/fixture"
 printf '#!/bin/sh\necho "mita 3.39.0"\n' > "$TEST_DIR/fixture/mita"

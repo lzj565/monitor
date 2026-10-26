@@ -2,6 +2,15 @@ use super::*;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+pub(super) fn realm_name(name: &str) -> String {
+    let name = name.trim();
+    if name.ends_with("-realm") {
+        name.to_owned()
+    } else {
+        format!("{name}-realm")
+    }
+}
+
 pub(super) const REALM_TABLES: [&str; 2] = ["realm_hosts", "realm_rules"];
 pub(super) const REALM_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS realm_hosts (
@@ -123,7 +132,7 @@ impl Db {
     pub fn realm_rules(&self) -> Result<Vec<Value>> {
         let conn = self.conn();
         let mut stmt=conn.prepare("SELECT r.id,r.node_id,r.target_proxy_id,r.name,r.listen_host,r.listen_port,r.enabled,p.node_id,p.name,p.address,p.port,p.enabled,r.traffic_key,r.address_type,r.address FROM realm_rules r JOIN proxies p ON p.id=r.target_proxy_id ORDER BY r.node_id,r.id")?;
-        let items=stmt.query_map([],|r|Ok(json!({"id":r.get::<_,i64>(0)?,"node_id":r.get::<_,i64>(1)?,"target_proxy_id":r.get::<_,i64>(2)?,"name":r.get::<_,String>(3)?,"listen_host":r.get::<_,String>(4)?,"listen_port":r.get::<_,i64>(5)?,"enabled":r.get::<_,bool>(6)?,"target_node_id":r.get::<_,i64>(7)?,"target_name":r.get::<_,String>(8)?,"target_address":r.get::<_,String>(9)?,"target_port":r.get::<_,i64>(10)?,"target_enabled":r.get::<_,bool>(11)?,"traffic_key":r.get::<_,String>(12)?,"address_type":r.get::<_,String>(13)?,"address":r.get::<_,String>(14)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let items=stmt.query_map([],|r|Ok(json!({"id":r.get::<_,i64>(0)?,"node_id":r.get::<_,i64>(1)?,"target_proxy_id":r.get::<_,i64>(2)?,"name":realm_name(&r.get::<_,String>(3)?),"listen_host":r.get::<_,String>(4)?,"listen_port":r.get::<_,i64>(5)?,"enabled":r.get::<_,bool>(6)?,"target_node_id":r.get::<_,i64>(7)?,"target_name":r.get::<_,String>(8)?,"target_address":r.get::<_,String>(9)?,"target_port":r.get::<_,i64>(10)?,"target_enabled":r.get::<_,bool>(11)?,"traffic_key":r.get::<_,String>(12)?,"address_type":r.get::<_,String>(13)?,"address":r.get::<_,String>(14)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(items)
     }
     pub fn realm_save_host(&self, body: &RealmHostInput) -> Result<()> {
@@ -421,11 +430,16 @@ mod tests {
         let (uuid, entries) = db.active_user_subscription(user, 0).unwrap().unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[1].id, -id);
+        assert!(entries[1].name.ends_with("-realm"));
+        assert_eq!(realm_name("  relay  "), "relay-realm");
+        assert_eq!(realm_name("relay-realm"), "relay-realm");
+        assert!(db.realm_rules().unwrap()[0]["name"].as_str().unwrap().ends_with("-realm"));
         assert_eq!(entries[1].address, "relay.example.com");
         assert_eq!(entries[0].public_key, entries[1].public_key);
         let portal = db.active_user_portal_proxies(user, 0).unwrap();
         assert_eq!(portal.len(), 2);
         assert_eq!(portal[1].uuid, uuid);
+        assert!(portal[1].name.ends_with("-realm"));
         let mut next = rule(source, proxy);
         next.listen_port = 20444;
         db.realm_save_rule(Some(id), &next).unwrap();

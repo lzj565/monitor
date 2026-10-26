@@ -7,6 +7,8 @@ TEST_DIR=$(mktemp -d)
 trap 'rm -rf "$TEST_DIR"' EXIT
 INSTALLER=$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd)/install.sh
 fail() { echo "$*" >&2; exit 1; }
+info() { printf '%s\n' "$*"; }
+success() { printf '%s\n' "$*"; }
 eval "$(sed -n '/# BEGIN Realm helpers/,/# END Realm helpers/p' "$INSTALLER" | sed '1d;$d;s/rc-service/rc_service/g;s/rc-update/rc_update/g')"
 mkdir -p "$TEST_DIR/fixture"
 printf '#!/bin/sh\necho "realm 2.9.6"\n' > "$TEST_DIR/fixture/realm"

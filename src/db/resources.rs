@@ -692,7 +692,7 @@ impl Db {
                 item.realm_target_node_id = Some(item.node_id);
                 item.node_id = entry.source_node_id;
                 item.node_name = entry.source_name.clone();
-                item.name = format!("{} · Realm {} #{}", base.name, entry.source_name, entry.id);
+                item.name = realm_name(&format!("{} · Realm {} #{}", base.name, entry.source_name, entry.id));
                 item.include_node_name = false;
                 item.address = entry.address;
                 item.address_type = if item.address.parse::<std::net::Ipv4Addr>().is_ok() {
@@ -765,7 +765,7 @@ impl Db {
             if let Some(base) = direct.iter().find(|p| p.id == entry.target_proxy_id) {
                 let mut item = base.clone();
                 item.id = -entry.id;
-                item.name = format!("{} · Realm {} #{}", base.name, entry.source_name, entry.id);
+                item.name = realm_name(&format!("{} · Realm {} #{}", base.name, entry.source_name, entry.id));
                 item.include_node_name = false;
                 item.address = entry.address;
                 item.port = entry.port;

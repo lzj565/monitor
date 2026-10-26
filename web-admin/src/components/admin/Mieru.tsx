@@ -2,6 +2,7 @@ import { useEffect, useId, useState } from "react"
 import { toast } from "sonner"
 import { api, type Node } from "@/lib/api"
 import { createProxy, updateProxy, type Proxy, type AddressType } from "@/lib/resources"
+import { defaultProxyAddressType, nodeProxyAddress } from "@/lib/realm-management"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -13,7 +14,16 @@ type Host = { node_id: number; revision: number; applied_revision: number; capab
 export function MieruForm({ proxy, nodes, embedded, onClose, onSaved, onBack, onBusyChange }: { proxy: Proxy | null; nodes: Node[]; embedded?: boolean; onClose: () => void; onSaved: () => void; onBack?: () => void; onBusyChange?: (busy: boolean) => void }) {
   const [nodeId, setNodeId] = useState(proxy?.node_id ?? nodes[0]?.id ?? 0)
   const [name, setName] = useState(proxy?.name ?? "mieru")
-  const [address, setAddress] = useState(proxy?.address ?? nodes[0]?.addresses?.[0]?.address ?? "")
+  const [addressType, setAddressType] = useState<AddressType>(proxy?.address_type ?? defaultProxyAddressType(nodes[0]))
+  const [customAddress, setCustomAddress] = useState(proxy?.address_type === "domain" ? proxy.address : "")
+  const selectedNode = nodes.find((node) => node.id === nodeId)
+  const address = addressType === "domain" ? customAddress : nodeProxyAddress(selectedNode, addressType) || (proxy?.node_id === nodeId && proxy.address_type === addressType ? proxy.address : "")
+  function changeNode(value: string) {
+    const nextId = Number(value)
+    const nextNode = nodes.find((node) => node.id === nextId)
+    setNodeId(nextId)
+    if (addressType !== "domain" && !nodeProxyAddress(nextNode, addressType)) setAddressType(defaultProxyAddressType(nextNode))
+  }
   const [port, setPort] = useState(proxy?.port ?? 24061)
   const fieldId = useId()
   const editing = proxy !== null
@@ -31,7 +41,7 @@ export function MieruForm({ proxy, nodes, embedded, onClose, onSaved, onBack, on
   async function save(e: React.FormEvent) {
     e.preventDefault(); setBusy(true); onBusyChange?.(true)
     try {
-      const address_type: AddressType = address.includes(":") ? "ipv6" : /^\d+\.\d+\.\d+\.\d+$/.test(address) ? "ipv4" : "domain"
+      const address_type = addressType
       const draft = { name, address, address_type, port, enabled: proxy?.enabled ?? true, include_node_name: proxy?.include_node_name ?? true, protocol: "mieru" as const, flow: "" as const, config: { transport: "tcp" as const } }
       if (proxy) await updateProxy(proxy.id, draft, nodeId); else await createProxy(nodeId, draft)
       toast.success("代理已保存，等待同步")
@@ -58,17 +68,20 @@ export function MieruForm({ proxy, nodes, embedded, onClose, onSaved, onBack, on
         </div>
         <div className="space-y-2">
           <Label htmlFor={`${fieldId}-node`} className="whitespace-nowrap">所属节点</Label>
-          <Select value={String(nodeId || "")} disabled={busy || !nodes.length} onValueChange={(value) => setNodeId(Number(value))}>
+          <Select value={String(nodeId || "")} disabled={busy || !nodes.length} onValueChange={changeNode}>
             <SelectTrigger id={`${fieldId}-node`} className="w-full min-w-0"><SelectValue placeholder="选择节点" /></SelectTrigger>
             <SelectContent position="popper">
               {nodes.map((node) => <SelectItem key={node.id} value={String(node.id)}><span className="truncate" title={node.name}>{node.name}</span></SelectItem>)}
             </SelectContent>
           </Select>
         </div>
-        <div className="grid min-w-0 grid-cols-1 gap-5 sm:grid-cols-[minmax(0,1fr)_7.5rem] sm:gap-3">
+        <div className="grid min-w-0 grid-cols-1 gap-5 sm:grid-cols-[minmax(0,1fr)_7.5rem] sm:items-end sm:gap-3">
           <div className="min-w-0 space-y-2">
             <Label htmlFor={`${fieldId}-address`} className="whitespace-nowrap">连接地址</Label>
-            <Input id={`${fieldId}-address`} required disabled={busy} value={address} placeholder="域名或 IP 地址" onChange={(e) => setAddress(e.target.value.trim())} />
+            <div className="flex gap-1" role="group" aria-label="连接地址类型">
+              {([["ipv4", "IPv4"], ["ipv6", "IPv6"], ["domain", "自定义"]] as const).map(([type, label]) => <Button key={type} type="button" size="sm" variant={addressType === type ? "default" : "outline"} aria-pressed={addressType === type} disabled={busy || (type !== "domain" && !nodeProxyAddress(selectedNode, type) && !(proxy?.node_id === nodeId && proxy.address_type === type && proxy.address))} onClick={() => setAddressType(type)}>{label}</Button>)}
+            </div>
+            <Input id={`${fieldId}-address`} required disabled={busy} readOnly={addressType !== "domain"} value={address} placeholder={addressType === "domain" ? "域名或 IP 地址" : "节点尚未上报此地址"} onChange={(e) => setCustomAddress(e.target.value.trim())} />
           </div>
           <div className="min-w-0 space-y-2">
             <Label htmlFor={`${fieldId}-port`} className="whitespace-nowrap">端口</Label>

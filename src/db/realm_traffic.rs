@@ -97,7 +97,7 @@ impl Db {
             Utc::now().date_naive().with_day(1).unwrap().and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp();
         let conn = self.conn();
         let mut stmt=conn.prepare("SELECT r.key,r.node_id,r.rule_id,r.name,EXISTS(SELECT 1 FROM realm_rules live WHERE live.traffic_key=r.key),COALESCE(SUM(b.up),0),COALESCE(SUM(b.down),0),COALESCE(SUM(CASE WHEN b.minute>=?1 THEN b.up+b.down ELSE 0 END),0),COALESCE(SUM(CASE WHEN b.minute>=?2 THEN b.up+b.down ELSE 0 END),0),MAX(b.sample) FROM realm_traffic_rules r LEFT JOIN realm_traffic_buckets b ON b.key=r.key GROUP BY r.key ORDER BY r.node_id,r.rule_id")?;
-        let mut rules=stmt.query_map(params![day,month],|r|Ok(json!({"key":r.get::<_,String>(0)?,"node_id":r.get::<_,i64>(1)?,"rule_id":r.get::<_,i64>(2)?,"name":r.get::<_,String>(3)?,"active":r.get::<_,bool>(4)?,"up":r.get::<_,i64>(5)?,"down":r.get::<_,i64>(6)?,"today":r.get::<_,i64>(7)?,"month":r.get::<_,i64>(8)?,"last_sample":r.get::<_,Option<i64>>(9)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut rules=stmt.query_map(params![day,month],|r|Ok(json!({"key":r.get::<_,String>(0)?,"node_id":r.get::<_,i64>(1)?,"rule_id":r.get::<_,i64>(2)?,"name":realm_name(&r.get::<_,String>(3)?),"active":r.get::<_,bool>(4)?,"up":r.get::<_,i64>(5)?,"down":r.get::<_,i64>(6)?,"today":r.get::<_,i64>(7)?,"month":r.get::<_,i64>(8)?,"last_sample":r.get::<_,Option<i64>>(9)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
         let mut stmt = conn.prepare("SELECT node_id,status,received FROM realm_traffic_status")?;
         let hosts = stmt
             .query_map([], |r| {
