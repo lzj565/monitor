@@ -1,4 +1,5 @@
 /// <reference types="node" />
+import { normalizeUserUuid } from "./user-uuid.ts"
 import assert from "node:assert/strict"
 import { formatTrafficBytes, trafficUsage } from "./traffic-usage.ts"
 import { parseResetDay, parseUserLimits } from "./user-limits.ts"
@@ -118,3 +119,6 @@ assert.equal(parseResetDay(""), 0)
 assert.equal(parseResetDay("1"), 1)
 assert.equal(parseResetDay("31"), 31)
 for (const value of ["0", "32", "1.5", "-1", "NaN"]) assert.throws(() => parseResetDay(value))
+
+assert.equal(normalizeUserUuid(" AAAAAAAA-BBBB-1CCC-8DDD-EEEEEEEEEEEE "), "aaaaaaaa-bbbb-1ccc-8ddd-eeeeeeeeeeee")
+for (const uuid of ["", "not-a-uuid", "00000000-0000-0000-0000-000000000000", "aaaaaaaabbbb4ccc8dddeeeeeeeeeeee", "gggggggg-bbbb-4ccc-8ddd-eeeeeeeeeeee"]) assert.throws(() => normalizeUserUuid(uuid))

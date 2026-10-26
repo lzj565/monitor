@@ -7,13 +7,14 @@ const browser = await chromium.launch({ executablePath: process.env.CHROME_PATH 
 const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } })
 page.setDefaultTimeout(10000)
 const ruleUpdates = []
+const userUpdates = []
 const errors = []; page.on('pageerror', e => errors.push(e.message))
 const nodes = [1,2].map(id => ({ id, name: id === 1 ? '目标节点' : 'HK-ali', addresses: [{ address: `192.0.2.${id}` }], country: 'HK', group: '', online: true, public: true, metrics: null, last_seen_ago: 0, month_used: 0, traffic_limit: 0, traffic_reset_day: 1, price: 0, expires_at: null, iface: '' }))
 const proxies = [1,2].map(id => ({ id, node_id: 1, name: id === 1 ? 'VLESS测试' : 'mieru测试', protocol: id === 1 ? 'vless' : 'mieru', address: 'target.example.com', address_type: 'domain', port: 24060+id, enabled: true, include_node_name: false, flow: '', config: { reality: { server_name: 'example.com' } } }))
 const rules = [{ id: 1, node_id: 2, target_proxy_id: 2, name: 'HK-HK-HK家宽-realm', custom_name: 'HK家宽', address_type: 'domain', address: 'relay.example.com', listen_port: 24443, enabled: true, target_node_id: 1, target_name: 'mieru测试', target_address: 'target.example.com', target_port: 24062, target_enabled: true, traffic_key: 'test-rule' }]
 const host = { node_id: 2, name: 'HK-ali', enabled: true, online: true, capable: true, traffic_capable: true, pending: false, desired_revision: 1, applied_revision: 1, last_error: '', status: { installed: true, managed: true, running: true, version: 'Realm 2.9.6 [brutal][batched-udp][proxy][balance]', target_reachability: 'reachable' } }
 const traffic = { hosts: [{ node_id: 2, status: { state: 'monitoring', fresh: true, gaps: 0, discarded_records: 0, last_sample: 1793000000, up_rate: 0, down_rate: 0 } }], rules: [{ key: 'test-rule', node_id: 2, rule_id: 1, name: 'HK家宽-realm', active: true, up: 2589982, down: 5064622, today: 1541406, month: 7654604, last_sample: 1793000000, up_rate: 0, down_rate: 0 }] }
-const users = [{ id: 7, username: 'test-user', enabled: true, proxy_count: 2, expires_at: null, traffic_limit: 0, device_limit: 0, traffic_reset_day: 0 }]
+const users = [{ uuid: '11111111-2222-4333-8444-555555555555', auto_authorize_new_proxies: false, id: 7, username: 'test-user', enabled: true, proxy_count: 2, expires_at: null, traffic_limit: 0, device_limit: 0, traffic_reset_day: 0 }]
 let password = 'fixture-shared-password'
 let order = ['proxy:1','proxy:2','realm:1']; let failOrder = false; const saves = []; const writes = []
 await page.routeWebSocket('**/api/ws', ws => ws.send(JSON.stringify({ nodes, admin: true })))
@@ -26,6 +27,11 @@ await page.route('**/api/**', async route => {
  else if (path === '/api/mieru/credential') { if (request.method() === 'POST') password = 'fixture-reset-password'; body = { password } }
  else if (path === '/api/proxies') body = { items: proxies }
  else if (path === '/api/users') body = { items: users }
+ else if (path === '/api/users/7') {
+  if (request.method() === 'PUT') { const data = request.postDataJSON(); userUpdates.push(data); Object.assign(users[0], data) }
+  body = { ...users[0], sync: { queued: [], needs_sync: [], pending: [] } }
+ }
+ else if (path === '/api/users/7/uuid') { users[0].uuid = '99999999-8888-4777-8666-555555555555'; body = { uuid: users[0].uuid, sync: { queued: [], needs_sync: [], pending: [] } } }
  else if (path === '/api/users/7/proxies') body = { items: proxies.map(proxy => ({ proxy, access: { enabled: true, auth: { flow: "xtls-rprx-vision" } } })) }
  else if (path === '/api/realm/hosts') body = { items: [host] }
  else if (path === '/api/realm/rules') body = { items: rules }
@@ -40,6 +46,26 @@ await page.route('**/api/**', async route => {
 })
 try {
  await page.goto(base + '/admin/proxies')
+ const toolbar = page.locator('[aria-label="代理筛选与操作"]')
+ await page.getByRole('button', { name: '新增代理', exact: true }).waitFor()
+ assert.equal(await page.getByRole('combobox', { name: '节点 Realm 服务', exact: true }).count(), 0)
+ for (const width of [1440,1280,1024,375]) {
+  await page.setViewportSize({ width, height: 1000 }); await page.waitForTimeout(100)
+  const bounds = await toolbar.boundingBox()
+  assert.ok(bounds.x >= 0 && bounds.x+bounds.width <= width)
+  assert.ok(await toolbar.evaluate(e => e.scrollWidth <= e.clientWidth))
+  if (width >= 1280) {
+   const filter = await page.getByRole('combobox', { name: '按代理类型筛选' }).boundingBox()
+   const add = await page.getByRole('button', { name: '新增代理', exact: true }).boundingBox()
+   assert.ok(Math.abs(filter.y-add.y) < 2, `toolbar wraps at ${width}px`)
+  }
+ }
+ await page.setViewportSize({ width: 1440, height: 1000 })
+ await page.screenshot({ path: '/tmp/proxy-toolbar-desktop.png', animations: 'disabled' })
+ await page.getByRole('button', { name: '新增代理', exact: true }).click()
+ await page.getByRole('dialog').getByRole('button', { name: /mieru/ }).waitFor()
+ await page.keyboard.press('Escape')
+
  await page.getByRole('button', { name: 'mieru 连接密码', exact: true }).click()
  const passwordDialog = page.getByRole('dialog')
  const passwordInput = passwordDialog.getByLabel('连接密码', { exact: true })
@@ -52,6 +78,11 @@ try {
  await page.waitForFunction(() => document.querySelector('input[type="text"][readonly]')?.value === 'fixture-reset-password')
  await page.keyboard.press('Escape'); await passwordDialog.waitFor({ state: 'hidden' })
 
+ for (const [type, label] of [['domain','自定义'],['ipv4','IPV4'],['ipv6','IPV6']]) {
+  rules[0].address_type = type; rules[0].address = type === 'ipv6' ? '2001:db8::1' : '192.0.2.1'
+  await page.reload(); await page.locator('tr[data-id="realm:1"]').getByText(label, { exact: true }).waitFor()
+ }
+ rules[0].address_type = 'domain'; rules[0].address = 'relay.example.com'; await page.reload()
  const realmHandle = page.getByRole('button', { name: '拖动 HK-HK-HK家宽-realm 排序', exact: true })
  await realmHandle.waitFor(); await page.waitForFunction(() => !document.querySelector('button[aria-label="拖动 HK-HK-HK家宽-realm 排序"]').disabled)
  // Real pointer drag moves Realm across both other protocol types.
@@ -94,7 +125,26 @@ try {
  await page.getByRole('switch', { name: '停用test-user的订阅授权', exact: true }).click(); assert.equal(await page.getByRole('button', { name: '收起test-user的节点' }).getAttribute('aria-expanded'), 'true')
  await page.getByRole('button', { name: '编辑 test-user 的授权节点', exact: true }).click(); await page.getByRole('dialog').waitFor(); assert.equal(await page.getByRole('button', { name: '收起test-user的节点', includeHidden: true }).getAttribute('aria-expanded'), 'true')
  await page.goto(base + '/admin/users'); await page.getByText('test-user', { exact: true }).waitFor(); assert.equal(await page.getByTitle('mieru 连接凭据', { exact: true }).count(), 0)
+ const openUser = async () => { await page.getByRole('button', { name: '编辑用户 test-user', exact: true }).click(); const d=page.getByRole('dialog'); await d.getByLabel('UUID', { exact: true }).waitFor(); return d }
+ let editUser = await openUser()
+ const before = users[0].uuid
+ await editUser.getByLabel('UUID', { exact: true }).fill('aaaaaaaa-bbbb-1ccc-8ddd-eeeeeeeeeeee')
+ await editUser.getByRole('button', { name: '取消', exact: true }).click(); assert.equal(users[0].uuid, before)
+ editUser = await openUser(); assert.equal(await editUser.getByLabel('UUID', { exact: true }).inputValue(), before)
+ await editUser.getByLabel('UUID', { exact: true }).fill('bad-uuid'); const count = userUpdates.length
+ await editUser.getByRole('button', { name: '保存修改', exact: true }).click(); assert.equal(userUpdates.length, count)
+ await editUser.getByLabel('UUID', { exact: true }).fill(' AAAAAAAA-BBBB-1CCC-8DDD-EEEEEEEEEEEE ')
+ page.once('dialog', d => d.dismiss()); await editUser.getByRole('button', { name: '保存修改', exact: true }).click(); assert.equal(userUpdates.length, count)
+ page.once('dialog', d => d.accept()); await editUser.getByRole('button', { name: '保存修改', exact: true }).click(); await editUser.waitFor({ state: 'hidden' })
+ assert.equal(userUpdates.at(-1).uuid, 'aaaaaaaa-bbbb-1ccc-8ddd-eeeeeeeeeeee')
+ editUser = await openUser(); await editUser.getByRole('button', { name: '重置 UUID', exact: true }).click()
+ const confirm = page.getByRole('dialog').filter({ has: page.getByRole('heading', { name: '确认重置 UUID？', exact: true }) })
+ await confirm.getByRole('button', { name: '重置 UUID', exact: true }).click(); await confirm.waitFor({ state: 'hidden' })
+ assert.equal(await editUser.getByLabel('UUID', { exact: true }).inputValue(), users[0].uuid)
+ await editUser.getByRole('button', { name: '保存修改', exact: true }).click(); await editUser.waitFor({ state: 'hidden' })
+ assert.equal(userUpdates.at(-1).uuid, undefined, 'saving after reset must not restore old UUID')
+ assert.equal(users[0].uuid, '99999999-8888-4777-8666-555555555555')
  assert.ok(!writes.some(path => path.startsWith('/api/realm/hosts')))
  assert.deepEqual(errors, [])
- console.log('PASS: cross-protocol drag, persistence, keyboard, filtering and read failure; read-only responsive Realm details; broad subscription expansion with isolated controls')
+ console.log('PASS: cross-protocol drag, persistence, keyboard, filtering and read failure; read-only responsive Realm details; broad subscription expansion; address badges and manual UUID cancel, validation, save, reset')
 } finally { await browser.close() }

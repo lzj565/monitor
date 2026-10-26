@@ -824,6 +824,20 @@ impl Db {
     }
 
     pub fn update_user(&self, id: i64, draft: &UserDraft) -> Result<std::result::Result<(), UserWriteIssue>> {
+        self.update_user_with_uuid(id, draft, None)
+    }
+
+    pub fn update_user_with_uuid(
+        &self,
+        id: i64,
+        draft: &UserDraft,
+        uuid: Option<&str>,
+    ) -> Result<std::result::Result<(), UserWriteIssue>> {
+        let uuid = match uuid.map(normalize_user_uuid) {
+            Some(None) => return Ok(Err(UserWriteIssue::InvalidUuid)),
+            Some(Some(value)) => Some(value),
+            None => None,
+        };
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let current: Option<(String, bool, Option<i64>)> = tx
@@ -845,14 +859,24 @@ impl Db {
         if conflict {
             return Ok(Err(UserWriteIssue::UsernameConflict));
         }
+        if let Some(uuid) = &uuid {
+            let conflict: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM users WHERE lower(uuid)=?1 AND id<>?2)",
+                params![uuid, id],
+                |r| r.get(0),
+            )?;
+            if conflict {
+                return Ok(Err(UserWriteIssue::UuidConflict));
+            }
+        }
         tx.execute(
             "UPDATE users SET username=?2,password_hash=COALESCE(?3,password_hash),enabled=?4,expires_at=?5,updated_at=?6,
                 traffic_limit=COALESCE(?7,traffic_limit),device_limit=COALESCE(?8,device_limit),
                 traffic_reset_period=CASE WHEN ?9 IS NOT NULL AND ?9<>traffic_reset_day THEN ?10 ELSE traffic_reset_period END,
-                traffic_reset_day=COALESCE(?9,traffic_reset_day) WHERE id=?1",
+                traffic_reset_day=COALESCE(?9,traffic_reset_day),uuid=COALESCE(?11,uuid) WHERE id=?1",
             params![id, draft.username, draft.password_hash, draft.enabled, draft.expires_at, Utc::now().timestamp(),
                 draft.traffic_limit, draft.device_limit, draft.traffic_reset_day,
-                user_reset_period(Utc::now().timestamp(), draft.traffic_reset_day.unwrap_or(0))?],
+                user_reset_period(Utc::now().timestamp(), draft.traffic_reset_day.unwrap_or(0))?, uuid],
         )?;
         if draft.password_hash.is_some()
             || current_enabled != draft.enabled

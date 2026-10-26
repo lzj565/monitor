@@ -1,3 +1,4 @@
+import { normalizeUserUuid } from "@/lib/user-uuid"
 import { MieruForm, MieruCredential } from "./admin/Mieru"
 import { useAdminResources, useSharedProxies, useSharedUsers } from "@/components/AdminResources"
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react"
@@ -500,22 +501,21 @@ function ProxyPage({ nodes, site, refusal, search, go }: { nodes: Node[]; site: 
 
   return (
     <div className="space-y-4">
-      <div className="flex flex-wrap items-center justify-end gap-2">
-        <div className="mr-auto flex w-full flex-wrap items-center gap-2 sm:w-auto">
-          <Select value={typeFilter} onValueChange={changeTypeFilter}><SelectTrigger className="w-36" aria-label="按代理类型筛选"><SelectValue /></SelectTrigger><SelectContent position="popper"><SelectItem value="all">全部类型</SelectItem><SelectItem value="mieru">mieru</SelectItem><SelectItem value="vless">VLESS Reality</SelectItem><SelectItem value="realm">Realm 转发</SelectItem></SelectContent></Select>
-          <AdminSearchInput value={query} onChange={setQuery} placeholder="搜索代理名称、地址或节点" />
-          <Select value={nodeFilter} onValueChange={setNodeFilter}>
-            <SelectTrigger className="w-36" aria-label="按节点筛选"><SelectValue /></SelectTrigger>
-            <SelectContent position="popper">
-              <SelectItem value="all">全部节点</SelectItem>
-              {nodes.map((node) => <SelectItem key={node.id} value={String(node.id)}>{node.name}</SelectItem>)}
-            </SelectContent>
-          </Select>
-          <StatusFilter value={statusFilter} onChange={setStatusFilter} labels={[["all", "全部状态"], ["enabled", "已启用"], ["disabled", "已停用"]]} />
+      <div className="flex min-w-0 flex-wrap items-center gap-2 xl:flex-nowrap" aria-label="代理筛选与操作">
+        <Select value={typeFilter} onValueChange={changeTypeFilter}><SelectTrigger className="w-28 shrink-0" aria-label="按代理类型筛选"><SelectValue /></SelectTrigger><SelectContent position="popper"><SelectItem value="all">全部类型</SelectItem><SelectItem value="mieru">mieru</SelectItem><SelectItem value="vless">VLESS Reality</SelectItem><SelectItem value="realm">Realm 转发</SelectItem></SelectContent></Select>
+        <AdminSearchInput className="min-w-40 flex-1 basis-40" value={query} onChange={setQuery} placeholder="搜索代理名称、地址或节点" />
+        <Select value={nodeFilter} onValueChange={setNodeFilter}>
+          <SelectTrigger className="w-28 shrink-0" aria-label="按节点筛选"><SelectValue /></SelectTrigger>
+          <SelectContent position="popper">
+            <SelectItem value="all">全部节点</SelectItem>
+            {nodes.map((node) => <SelectItem key={node.id} value={String(node.id)}>{node.name}</SelectItem>)}
+          </SelectContent>
+        </Select>
+        <StatusFilter value={statusFilter} onChange={setStatusFilter} labels={[["all", "全部状态"], ["enabled", "已启用"], ["disabled", "已停用"]]} />
+        <div className="ml-auto flex shrink-0 items-center gap-2">
+          {(typeFilter === "all" || typeFilter === "mieru") && <Button variant="outline" onClick={() => setShowMieruPassword(true)}>mieru 连接密码</Button>}
+          <Button disabled={!nodes.length} onClick={() => { setCreationType(null); setCreating(true) }}><Plus /> 新增代理</Button>
         </div>
-        {realm.hosts.length > 0 && <select aria-label="节点 Realm 服务" className="h-9 max-w-48 rounded-md border bg-background px-2 text-sm" value="" onChange={(e) => { if (e.target.value) setDetail({ nodeId: Number(e.target.value) }) }}><option value="">节点 Realm 服务…</option>{realm.hosts.map((h) => <option key={h.node_id} value={h.node_id}>{nodeById.get(h.node_id)?.name ?? h.name}</option>)}</select>}
-        {(typeFilter === "all" || typeFilter === "mieru") && <Button variant="outline" onClick={() => setShowMieruPassword(true)}>mieru 连接密码</Button>}
-        <Button disabled={!nodes.length} onClick={() => { setCreationType(null); setCreating(true) }}><Plus /> 新增代理</Button>
       </div>
 
       {orderError && <p role="alert" className="text-sm text-destructive">读取排序失败：{orderError}<Button variant="link" onClick={() => setOrderRevision((v) => v + 1)}>重试</Button></p>}
@@ -675,20 +675,27 @@ function UserForm({ user, onClose, onSaved }: {
   const uuidBusy = useRef(false)
   const [resettingUuid, setResettingUuid] = useState(false)
   const [uuid, setUuid] = useState(user?.uuid ?? "")
+  const savedUuid = useRef(user?.uuid ?? "")
 
   async function save(event: React.FormEvent) {
     event.preventDefault()
+    if (saving || uuidBusy.current) return
     if (!username.trim()) return toast.error("请填写用户名")
     if (!user && !password) return toast.error("请设置用户登录密码")
+    let nextUuid: string | undefined
     let day: number
     let limits: ReturnType<typeof parseUserLimits>
     try {
+      if (user) nextUuid = normalizeUserUuid(uuid)
       limits = parseUserLimits(trafficLimit, deviceLimit)
       day = parseResetDay(resetDay)
     } catch (error) {
       return toast.error((error as Error).message)
     }
+    const uuidChanged = nextUuid !== undefined && nextUuid !== savedUuid.current.toLowerCase()
+    if (uuidChanged && !window.confirm("修改 UUID 后，旧 UUID 在节点同步后失效，客户端需要更新订阅。确认保存？")) return
     const draft: UserDraft = {
+      ...(uuidChanged ? { uuid: nextUuid } : {}),
       username: username.trim(),
       ...(password ? { password } : {}),
       enabled: user?.enabled ?? true,
@@ -715,6 +722,7 @@ function UserForm({ user, onClose, onSaved }: {
     setResettingUuid(true)
     try {
       const result = await resetUserUuid(user.id)
+      savedUuid.current = result.uuid
       setUuid(result.uuid)
       setConfirmUuid(false)
       onSaved()
@@ -729,7 +737,7 @@ function UserForm({ user, onClose, onSaved }: {
 
   return (
     <>
-    <Dialog open onOpenChange={(open) => !open && !uuidBusy.current && onClose()}>
+    <Dialog open onOpenChange={(open) => !open && !saving && !uuidBusy.current && onClose()}>
       <DialogContent onOpenAutoFocus={(e) => e.preventDefault()} className="flex max-h-[85vh] w-full max-w-[calc(100%-2rem)] flex-col gap-0 overflow-hidden p-0 sm:max-w-2xl">
         <form className="flex min-h-0 flex-1 flex-col" onSubmit={save}>
           <DialogHeader className="shrink-0 px-6 pt-6 pb-4">
@@ -772,9 +780,9 @@ function UserForm({ user, onClose, onSaved }: {
           </Field>
 
           {user && (
-            <Field className="sm:col-span-2" label="UUID" hint="UUID 只用于代理认证；密码、资料和授权变更不会修改它。">
+            <Field className="sm:col-span-2" label="UUID" hint="UUID 用于 VLESS 认证；手动修改随保存生效，客户端需更新订阅。">
               <div className="flex flex-wrap items-center gap-3 rounded-md border bg-muted/30 px-3 py-2">
-                <code className="min-w-0 flex-1 break-all font-mono text-sm select-all">{uuid}</code>
+                <Input aria-label="UUID" required disabled={saving || resettingUuid} className="min-w-0 flex-1 font-mono text-sm" value={uuid} onChange={(event) => setUuid(event.target.value)} autoComplete="off" spellCheck={false} />
                 <div className="flex flex-wrap items-center gap-2">
                   <Button type="button" variant="ghost" size="icon" className="size-7" title="复制 UUID" aria-label="复制 UUID" disabled={!uuid} onClick={() => copyText(uuid)}><Copy className="size-3.5" /></Button>
                   <Button type="button" variant="ghost" size="icon" className="size-7" title="重置 UUID" aria-label="重置 UUID" disabled={resettingUuid || saving} onClick={() => setConfirmUuid(true)}><RefreshCw className="size-3.5" /></Button>
@@ -789,7 +797,7 @@ function UserForm({ user, onClose, onSaved }: {
 
           </div>
           <DialogFooter className="shrink-0 border-t px-6 py-4">
-            <Button type="button" variant="ghost" onClick={onClose}>取消</Button>
+            <Button type="button" variant="ghost" disabled={saving || resettingUuid} onClick={onClose}>取消</Button>
             <Button type="submit" disabled={saving || resettingUuid}>{user ? "保存修改" : "确认创建"}</Button>
           </DialogFooter>
         </form>

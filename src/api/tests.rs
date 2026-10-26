@@ -2363,3 +2363,82 @@ async fn global_mieru_password_endpoint_is_stable_and_reset_is_global() {
     assert_ne!(first["password"], reset["password"]);
     assert_eq!(reset["password"], app.db.mieru_password(false).unwrap());
 }
+
+#[tokio::test]
+async fn manual_uuid_updates_exports_and_online_offline_sync() {
+    let app = std::sync::Arc::new(app());
+    let user = app.db.user_login_record("admin").unwrap().unwrap().id;
+    let token = app.db.user_subscription_token(user).unwrap().unwrap();
+    let password = app.db.mieru_password(false).unwrap();
+    let mut nodes = Vec::new();
+    for port in [24461, 24462] {
+        let id = node(&app, &format!("uuid-node-{port}"), false);
+        let proxy = app.db.create_proxy(id, &crate::db::ProxyDraft {
+            name: format!("uuid-proxy-{port}"), include_node_name: false, protocol: "vless".into(), address_type: "domain".into(), address: "proxy.example.com".into(), port, enabled: true, flow: None,
+            config: json!({"reality":{"enabled":true,"server_name":"example.com","server_port":443,"private_key":"A".repeat(43),"public_key":"B".repeat(43),"short_id":"abcd"}}),
+        }).unwrap().unwrap();
+        app.db
+            .put_authorization(user, proxy, &crate::db::AuthorizationDraft { enabled: true, auth: None })
+            .unwrap()
+            .unwrap();
+        nodes.push(id);
+    }
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    app.agents.write().unwrap().insert(nodes[0], crate::agent_ws::Agent::new(1, tx));
+    let uuid = "aaaaaaaa-bbbb-1ccc-8ddd-eeeeeeeeeeee";
+    let request = serde_json::from_value(json!({"username":"admin","enabled":true,"expires_at":null,"uuid":format!(" {} ",uuid.to_uppercase())})).unwrap();
+    let body =
+        portal_json(update_user(ApiAdmin, State(app.clone()), Path(user), Ok(Json(request))).await).await;
+    assert_eq!(body["uuid"], uuid);
+    assert_eq!(body["sync"]["queued"][0]["node_id"], nodes[0]);
+    assert_eq!(body["sync"]["needs_sync"][0]["node_id"], nodes[1]);
+    let command: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+    assert!(command["params"]["content"].as_str().unwrap().contains(uuid));
+    assert_eq!(app.db.user_subscription_token(user).unwrap().unwrap(), token);
+    assert_eq!(app.db.mieru_password(false).unwrap(), password);
+    let portal = portal_json(user_proxies(UserAuth(user), State(app.clone())).await).await;
+    assert!(portal["items"][0]["vless_url"].as_str().unwrap().contains(uuid));
+    for format in ["clash", "sing-box"] {
+        let response = subscription(State(app.clone()), Path((token.clone(), format.into()))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body =
+            String::from_utf8(axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap().to_vec())
+                .unwrap();
+        assert!(body.contains(uuid));
+    }
+    for invalid in ["", "bad", "00000000-0000-0000-0000-000000000000"] {
+        let request = serde_json::from_value(
+            json!({"username":"admin","enabled":true,"expires_at":null,"uuid":invalid}),
+        )
+        .unwrap();
+        assert_eq!(
+            update_user(ApiAdmin, State(app.clone()), Path(user), Ok(Json(request))).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    let other = app
+        .db
+        .create_user(&crate::db::UserDraft {
+            username: "uuid-other".into(),
+            password_hash: Some("hash".into()),
+            enabled: true,
+            expires_at: None,
+            traffic_limit: None,
+            device_limit: None,
+            traffic_reset_day: None,
+        })
+        .unwrap()
+        .unwrap();
+    let other_uuid = app.db.user(other).unwrap().unwrap().uuid;
+    let request = serde_json::from_value(
+        json!({"username":"admin","enabled":true,"expires_at":null,"uuid":other_uuid}),
+    )
+    .unwrap();
+    let conflict = update_user(ApiAdmin, State(app.clone()), Path(user), Ok(Json(request))).await;
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    let body: Value =
+        serde_json::from_slice(&axum::body::to_bytes(conflict.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert_eq!(body["error"]["code"], "UUID_CONFLICT");
+    assert_eq!(app.db.user(user).unwrap().unwrap().uuid, uuid);
+}

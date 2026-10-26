@@ -137,7 +137,7 @@ function trafficSearch(options: ProxyTrafficListOptions): string {
   return query.toString()
 }
 
-export type UserDraft = Pick<User, "username" | "enabled" | "expires_at"> & Partial<Pick<User, "traffic_limit" | "device_limit" | "traffic_reset_day">> & { password?: string }
+export type UserDraft = Pick<User, "username" | "enabled" | "expires_at"> & Partial<Pick<User, "traffic_limit" | "device_limit" | "traffic_reset_day">> & { password?: string; uuid?: string }
 export type VlessAuth = { flow: Flow }
 export type UserProxyAuthorization = {
   proxy: Pick<Proxy, "id" | "node_id" | "name" | "include_node_name" | "protocol" | "address_type" | "address" | "port" | "enabled">

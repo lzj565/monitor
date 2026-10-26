@@ -525,6 +525,10 @@ pub async fn update_user(
             Ok(request) => request,
             Err(response) => return response,
         };
+        let uuid = match request.normalized_uuid() {
+            Ok(uuid) => uuid,
+            Err(error) => return api_input_error(error),
+        };
         let draft = match request.into_draft(false) {
             Ok(draft) => draft,
             Err(error) => return api_input_error(error),
@@ -533,12 +537,19 @@ pub async fn update_user(
             Ok(user) => user,
             Err(error) => return api_internal(error),
         };
-        let affects_config = old_user.as_ref().is_some_and(|user| {
-            user.username != draft.username
-                || user.enabled != draft.enabled
-                || user.expires_at != draft.expires_at
-        });
-        match app.db.update_user(id, &draft) {
+        // Always synchronize explicit UUID writes, including concurrent saves that
+        // may have changed the UUID since the snapshot above was read.
+        let affects_config = uuid.is_some()
+            || old_user.as_ref().is_some_and(|user| {
+                user.username != draft.username
+                    || user.enabled != draft.enabled
+                    || user.expires_at != draft.expires_at
+            });
+        let result = match uuid.as_deref() {
+            Some(uuid) => app.db.update_user_with_uuid(id, &draft, Some(uuid)),
+            None => app.db.update_user(id, &draft),
+        };
+        match result {
             Ok(Ok(())) => match app.db.user(id) {
                 Ok(Some(user)) => {
                     let sync = if affects_config {

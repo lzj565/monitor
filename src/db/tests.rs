@@ -2468,3 +2468,46 @@ fn a_node_edit_applies_only_the_probes_it_changed() {
     }
     assert!(db.set_node_ping_tasks(a, &[kept], &[kept, added]).unwrap());
 }
+
+#[test]
+fn manual_user_uuid_is_canonical_unique_and_atomic() {
+    let db = db();
+    let alice = db.create_user(&user_draft("manual-alice")).unwrap().unwrap();
+    let bob = db.create_user(&user_draft("manual-bob")).unwrap().unwrap();
+    let bob_uuid = db.user(bob).unwrap().unwrap().uuid;
+    let token = db.user_subscription_token(alice).unwrap();
+    let password = db.mieru_password(false).unwrap();
+    db.create_user_session("uuid-session", Utc::now().timestamp() + 3600, alice).unwrap();
+    let mut draft = user_draft("manual-alice");
+    draft.password_hash = None;
+    let uuid = "aaaaaaaa-bbbb-1ccc-8ddd-eeeeeeeeeeee";
+    assert_eq!(
+        db.update_user_with_uuid(alice, &draft, Some(&format!(" {} ", uuid.to_uppercase()))).unwrap(),
+        Ok(())
+    );
+    assert_eq!(db.user(alice).unwrap().unwrap().uuid, uuid);
+    assert_eq!(db.user_subscription_token(alice).unwrap(), token);
+    assert_eq!(db.mieru_password(false).unwrap(), password);
+    assert_eq!(db.session_principal("uuid-session"), Some(SessionPrincipal::User(alice)));
+    let mut conflicting = user_draft("unexpected-new-name");
+    conflicting.enabled = false;
+    assert_eq!(
+        db.update_user_with_uuid(alice, &conflicting, Some(&bob_uuid.to_uppercase())).unwrap(),
+        Err(UserWriteIssue::UuidConflict)
+    );
+    let current = db.user(alice).unwrap().unwrap();
+    assert_eq!(current.uuid, uuid);
+    assert_eq!(current.username, "manual-alice");
+    assert!(current.enabled);
+    assert_eq!(db.session_principal("uuid-session"), Some(SessionPrincipal::User(alice)));
+    for invalid in
+        ["", "00000000-0000-0000-0000-000000000000", "bad-uuid", "aaaaaaaabbbb1ccc8dddeeeeeeeeeeee"]
+    {
+        assert_eq!(
+            db.update_user_with_uuid(alice, &draft, Some(invalid)).unwrap(),
+            Err(UserWriteIssue::InvalidUuid)
+        );
+    }
+    assert_eq!(db.update_user(alice, &draft).unwrap(), Ok(()));
+    assert_eq!(db.user(alice).unwrap().unwrap().uuid, uuid);
+}

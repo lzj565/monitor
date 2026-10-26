@@ -221,6 +221,12 @@ fn map_user_issue(issue: UserWriteIssue) -> Response {
         UserWriteIssue::UserNotFound => {
             api_error(StatusCode::NOT_FOUND, "USER_NOT_FOUND", "user does not exist")
         }
+        UserWriteIssue::UuidConflict => {
+            api_error(StatusCode::CONFLICT, "UUID_CONFLICT", "UUID 已被其他用户使用")
+        }
+        UserWriteIssue::InvalidUuid => {
+            api_error(StatusCode::BAD_REQUEST, "INVALID_UUID", "请输入有效的非全零 UUID（8-4-4-4-12 格式）")
+        }
         UserWriteIssue::UsernameConflict => {
             api_error(StatusCode::CONFLICT, "USERNAME_CONFLICT", "username is already in use")
         }

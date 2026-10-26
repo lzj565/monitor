@@ -213,6 +213,8 @@ pub struct UserSubscriptionProxy {
 pub enum UserWriteIssue {
     UserNotFound,
     UsernameConflict,
+    UuidConflict,
+    InvalidUuid,
     AdminUsernameLocked,
     PasswordRequired,
 }
@@ -501,4 +503,21 @@ pub fn temp_files_beside(database: &str) -> Result<()> {
     let dir = dir.to_string_lossy().replace('\'', "''");
     Connection::open_in_memory()?.execute_batch(&format!("PRAGMA temp_store_directory = '{dir}'"))?;
     Ok(())
+}
+
+pub fn normalize_user_uuid(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.len() != 36
+        || !value.bytes().enumerate().all(|(i, b)| {
+            if [8, 13, 18, 23].contains(&i) {
+                b == b'-'
+            } else {
+                b.is_ascii_hexdigit()
+            }
+        })
+        || value.bytes().all(|b| b == b'0' || b == b'-')
+    {
+        return None;
+    }
+    Some(value.to_ascii_lowercase())
 }

@@ -13,6 +13,7 @@ import { api, type Node } from "@/lib/api"
 import type { Proxy } from "@/lib/resources"
 import { realmHostStatus, saveRealmRule, nodeProxyAddress, defaultProxyAddressType, type RealmHost, type RealmRule, type RealmRuleDraft } from "@/lib/realm-management"
 import { trafficBytes, trafficState, type Traffic, type TrafficRule, type TrafficStatus } from "@/lib/realm-traffic"
+import { ProxyAddressTypeBadge } from "@/components/ProxyBadges"
 import { ProxyDialog } from "../ProxyDialog"
 import { installCommand } from "./Nodes"
 
@@ -165,7 +166,7 @@ export function RealmProxyRow({ rowProps, dragHandle, rule, host, nodes, busy, o
     <TableCell className="px-3"><div className="flex items-center gap-2"><span aria-hidden="true" className={`size-2 rounded-full ${node?.online ? "bg-emerald-500" : "bg-muted-foreground/40"}`} /><div><div className="font-medium">{node?.name ?? `节点 ${rule.node_id}`}</div>{node?.group && <div className="text-xs text-muted-foreground">{node.group}</div>}</div></div></TableCell>
     <TableCell className="px-3 font-medium">{rule.name}</TableCell>
     <TableCell className="px-3"><Badge variant="outline" className="border-sky-500/35 bg-sky-500/10 font-medium text-sky-700 dark:text-sky-300">Realm 转发</Badge></TableCell>
-    <TableCell className="max-w-64 px-3"><span className="block max-w-48 truncate" title={rule.address}>{rule.address ?? "—"}</span></TableCell>
+    <TableCell className="max-w-64 px-3"><div className="flex min-w-0 items-center gap-2"><ProxyAddressTypeBadge addressType={rule.address_type} /><span className="max-w-48 truncate text-sm" title={rule.address}>{rule.address ?? "—"}</span></div></TableCell>
     <TableCell className="tnum px-3 text-sm">{rule.listen_port}</TableCell>
     <TableCell className="px-3"><div className="max-w-56 truncate text-sm" title={`${targetNode?.name ?? ""} / ${rule.target_name}`}>→ {targetNode?.name ?? `节点 ${rule.target_node_id}`} / {rule.target_name}</div><div className="max-w-56 truncate text-xs text-muted-foreground" title={`${rule.target_address}:${rule.target_port}`}>{rule.target_address}:{rule.target_port}</div></TableCell>
     <TableCell className="px-3 text-center"><div className="flex flex-col items-center gap-1"><Switch checked={rule.enabled} disabled={busy} onCheckedChange={onEnabled} aria-label={`${rule.enabled ? "停用" : "启用"} Realm 代理 ${rule.name}`} /><span className="text-xs text-muted-foreground">{!rule.enabled ? "已停用" : !rule.target_enabled ? "目标代理已停用" : realmHostStatus(host)}</span></div></TableCell>

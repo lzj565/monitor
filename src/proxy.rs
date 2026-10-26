@@ -192,6 +192,7 @@ fn valid_reality_key(value: &str) -> bool {
 #[serde(deny_unknown_fields)]
 pub struct UserRequest {
     pub username: String,
+    pub uuid: Option<String>,
     #[serde(default)]
     pub password: Option<String>,
     pub enabled: bool,
@@ -202,7 +203,21 @@ pub struct UserRequest {
 }
 
 impl UserRequest {
+    pub fn normalized_uuid(&self) -> Result<Option<String>, InputError> {
+        self.uuid
+            .as_deref()
+            .map(|value| {
+                db::normalize_user_uuid(value).ok_or_else(|| {
+                    InputError::new("INVALID_UUID", "请输入有效的非全零 UUID（8-4-4-4-12 格式）")
+                })
+            })
+            .transpose()
+    }
     pub fn into_draft(self, creating: bool) -> Result<UserDraft, InputError> {
+        self.normalized_uuid()?;
+        if creating && self.uuid.is_some() {
+            return Err(InputError::new("INVALID_UUID", "新增用户的 UUID 由系统自动生成"));
+        }
         if self.traffic_limit.is_some_and(|n| !(0..=9_007_199_254_740_991).contains(&n))
             || self.device_limit.is_some_and(|n| !(0..=9_007_199_254_740_991).contains(&n))
             || self.traffic_reset_day.is_some_and(|n| n > 31)
@@ -487,14 +502,19 @@ mod tests {
         assert_eq!(request(None).into_draft(false).unwrap().password_hash, None);
         assert_eq!(request(Some("")).into_draft(false).unwrap().password_hash, None);
         assert!(request(Some("secret")).into_draft(false).unwrap().password_hash.is_some());
-        assert!(
+        let uuid_request = || {
             serde_json::from_value::<UserRequest>(json!({
-                "username":"client", "uuid":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+                "username":"client", "uuid":" AAAAAAAA-BBBB-1CCC-8DDD-EEEEEEEEEEEE ",
                 "enabled":true,"expires_at":null,"password":"secret"
             }))
-            .is_err(),
-            "UUID is not accepted in the generic user write API"
+            .unwrap()
+        };
+        assert!(uuid_request().into_draft(true).is_err(), "creation still generates its UUID");
+        assert_eq!(
+            uuid_request().normalized_uuid().unwrap().as_deref(),
+            Some("aaaaaaaa-bbbb-1ccc-8ddd-eeeeeeeeeeee")
         );
+        assert!(uuid_request().into_draft(false).is_ok());
     }
 
     #[test]
