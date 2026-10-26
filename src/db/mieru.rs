@@ -385,6 +385,8 @@ mod tests {
         let (db, node, user, proxy) = fixture();
         let relay =
             db.create_node(&Node { name: "relay".into(), ..Default::default() }, "relay-token").unwrap();
+        db.conn().execute("UPDATE node SET country='MY' WHERE id=?1", [node]).unwrap();
+        db.conn().execute("UPDATE node SET country='HK' WHERE id=?1", [relay]).unwrap();
         db.realm_save_rule(
             None,
             &RealmRuleInput {
@@ -402,6 +404,9 @@ mod tests {
         db.realm_applied(&desired).unwrap();
         let portal = db.active_user_portal_proxies(user, Utc::now().timestamp()).unwrap();
         assert_eq!(portal.len(), 2);
+        assert_eq!(portal[1].name, "HK-MY-entry-realm");
+        assert_eq!(db.realm_rules().unwrap()[0]["name"], "HK-MY-entry-realm");
+        assert_eq!(db.realm_rules().unwrap()[0]["custom_name"], "entry");
         assert_eq!(portal[1].protocol, "mieru");
         assert_eq!(portal[1].address, "relay.example.com");
         assert_eq!(portal[0].mieru_password, portal[1].mieru_password);

@@ -3,12 +3,56 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 pub(super) fn realm_name(name: &str) -> String {
-    let name = name.trim();
-    if name.ends_with("-realm") {
-        name.to_owned()
+    format!("{}-realm", name.trim().trim_end_matches("-realm"))
+}
+
+fn region(code: &str) -> String {
+    let code = code.trim();
+    if code.len() == 2 && code.bytes().all(|b| b.is_ascii_alphabetic()) {
+        code.to_ascii_uppercase()
     } else {
-        format!("{name}-realm")
+        "XX".into()
     }
+}
+
+fn route_name(source: &str, target: &str, custom: &str) -> String {
+    realm_name(&format!("{}-{}-{}", region(source), region(target), custom.trim().trim_end_matches("-realm")))
+}
+
+fn unique_realm_names(rows: Vec<(i64, String)>) -> HashMap<i64, String> {
+    let reserved: HashSet<_> = rows.iter().map(|(_, name)| name.clone()).collect();
+    let mut used = HashSet::new();
+    let mut names = HashMap::new();
+    let mut ordinals = HashMap::new();
+    for (id, base) in rows {
+        let mut name = base.clone();
+        if used.contains(&name) {
+            let number = ordinals.entry(base.clone()).or_insert(2);
+            loop {
+                name = format!("{}-{number}-realm", base.trim_end_matches("-realm"));
+                *number += 1;
+                if !reserved.contains(&name) && !used.contains(&name) {
+                    break;
+                }
+            }
+        }
+        used.insert(name.clone());
+        names.insert(id, name);
+    }
+    names
+}
+
+pub(super) fn realm_display_names(conn: &Connection) -> Result<HashMap<i64, String>> {
+    let mut stmt = conn.prepare("SELECT r.id,r.name,COALESCE(NULLIF(s.country_pin,''),s.country),COALESCE(NULLIF(t.country_pin,''),t.country) FROM realm_rules r JOIN proxies p ON p.id=r.target_proxy_id JOIN node s ON s.id=r.node_id JOIN node t ON t.id=p.node_id ORDER BY r.id")?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                route_name(&r.get::<_, String>(2)?, &r.get::<_, String>(3)?, &r.get::<_, String>(1)?),
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(unique_realm_names(rows))
 }
 
 pub(super) const REALM_TABLES: [&str; 2] = ["realm_hosts", "realm_rules"];
@@ -131,8 +175,9 @@ impl Db {
     }
     pub fn realm_rules(&self) -> Result<Vec<Value>> {
         let conn = self.conn();
+        let names = realm_display_names(&conn)?;
         let mut stmt=conn.prepare("SELECT r.id,r.node_id,r.target_proxy_id,r.name,r.listen_host,r.listen_port,r.enabled,p.node_id,p.name,p.address,p.port,p.enabled,r.traffic_key,r.address_type,r.address FROM realm_rules r JOIN proxies p ON p.id=r.target_proxy_id ORDER BY r.node_id,r.id")?;
-        let items=stmt.query_map([],|r|Ok(json!({"id":r.get::<_,i64>(0)?,"node_id":r.get::<_,i64>(1)?,"target_proxy_id":r.get::<_,i64>(2)?,"name":realm_name(&r.get::<_,String>(3)?),"listen_host":r.get::<_,String>(4)?,"listen_port":r.get::<_,i64>(5)?,"enabled":r.get::<_,bool>(6)?,"target_node_id":r.get::<_,i64>(7)?,"target_name":r.get::<_,String>(8)?,"target_address":r.get::<_,String>(9)?,"target_port":r.get::<_,i64>(10)?,"target_enabled":r.get::<_,bool>(11)?,"traffic_key":r.get::<_,String>(12)?,"address_type":r.get::<_,String>(13)?,"address":r.get::<_,String>(14)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let items=stmt.query_map([],|r|Ok(json!({"id":r.get::<_,i64>(0)?,"node_id":r.get::<_,i64>(1)?,"target_proxy_id":r.get::<_,i64>(2)?,"name":names.get(&r.get::<_,i64>(0)?),"custom_name":r.get::<_,String>(3)?,"listen_host":r.get::<_,String>(4)?,"listen_port":r.get::<_,i64>(5)?,"enabled":r.get::<_,bool>(6)?,"target_node_id":r.get::<_,i64>(7)?,"target_name":r.get::<_,String>(8)?,"target_address":r.get::<_,String>(9)?,"target_port":r.get::<_,i64>(10)?,"target_enabled":r.get::<_,bool>(11)?,"traffic_key":r.get::<_,String>(12)?,"address_type":r.get::<_,String>(13)?,"address":r.get::<_,String>(14)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(items)
     }
     pub fn realm_save_host(&self, body: &RealmHostInput) -> Result<()> {
@@ -241,11 +286,21 @@ impl Db {
             [saved],
         )?;
         tx.execute("INSERT INTO realm_traffic_rules(key,node_id,rule_id,name) SELECT traffic_key,node_id,id,name FROM realm_rules WHERE id=?1 ON CONFLICT(key) DO UPDATE SET name=excluded.name",[saved])?;
+        if let Some(name) = realm_display_names(&tx)?.get(&saved) {
+            tx.execute("UPDATE realm_traffic_rules SET name=?2 WHERE rule_id=?1", params![saved, name])?;
+        }
         tx.commit()?;
         Ok(saved)
     }
     pub fn realm_delete_rule(&self, id: i64) -> Result<bool> {
-        Ok(self.conn().execute("DELETE FROM realm_rules WHERE id=?1", [id])? > 0)
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        if let Some(name) = realm_display_names(&tx)?.get(&id) {
+            tx.execute("UPDATE realm_traffic_rules SET name=?2 WHERE rule_id=?1", params![id, name])?;
+        }
+        let deleted = tx.execute("DELETE FROM realm_rules WHERE id=?1", [id])? > 0;
+        tx.commit()?;
+        Ok(deleted)
     }
     pub fn realm_refs(&self, node: Option<i64>, proxy: Option<i64>) -> Result<Vec<Value>> {
         let conn = self.conn();
@@ -373,9 +428,16 @@ impl Db {
     }
     pub fn realm_subscription_entries(&self) -> Result<Vec<RealmEntry>> {
         let conn = self.conn();
+        let names = realm_display_names(&conn)?;
         let mut stmt=conn.prepare("SELECT e.value FROM realm_hosts h JOIN json_each(h.applied_entries) e JOIN realm_rules r ON r.id=json_extract(e.value,'$.id') AND r.node_id=h.node_id JOIN proxies p ON p.id=r.target_proxy_id WHERE h.enabled=1 AND r.enabled=1 AND p.enabled=1 AND p.node_id<>r.node_id AND p.id=json_extract(e.value,'$.target_proxy_id') AND p.address=json_extract(e.value,'$.target_address') AND p.port=json_extract(e.value,'$.target_port') ORDER BY h.node_id,r.id")?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        rows.into_iter().map(|s| serde_json::from_str(&s).map_err(Into::into)).collect()
+        rows.into_iter()
+            .map(|s| {
+                let mut entry: RealmEntry = serde_json::from_str(&s)?;
+                entry.name = names.get(&entry.id).context("missing Realm display name")?.clone();
+                Ok(entry)
+            })
+            .collect()
     }
 }
 #[cfg(test)]
@@ -418,6 +480,62 @@ mod tests {
             enabled: true,
         }
     }
+    #[test]
+    fn route_names_use_regions_custom_names_and_global_collision_resolution() {
+        assert_eq!(route_name("hk", "my", " NTT "), "HK-MY-NTT-realm");
+        assert_eq!(route_name("HK", "HK", "NTT-realm-realm"), "HK-HK-NTT-realm");
+        assert_eq!(route_name("", "invalid", "HK-NTT"), "XX-XX-HK-NTT-realm");
+        let rows = vec![
+            (1, "HK-MY-NTT-realm".into()),
+            (2, "HK-MY-NTT-realm".into()),
+            (3, "HK-MY-NTT-2-realm".into()),
+        ];
+        let names = unique_realm_names(rows);
+        assert_eq!(names[&1], "HK-MY-NTT-realm");
+        assert_eq!(names[&2], "HK-MY-NTT-3-realm");
+        assert_eq!(names[&3], "HK-MY-NTT-2-realm");
+
+        let (db, source, target, proxy, user) = fixture();
+        db.conn().execute("UPDATE node SET country='HK' WHERE id=?1", [source]).unwrap();
+        db.conn().execute("UPDATE node SET country='MY' WHERE id=?1", [target]).unwrap();
+        let mut input = rule(source, proxy);
+        input.name = "NTT".into();
+        let id = db.realm_save_rule(None, &input).unwrap();
+        let desired = db.realm_desired(source).unwrap();
+        db.realm_applied(&desired).unwrap();
+        let check = |expected: &str| {
+            let rules = db.realm_rules().unwrap();
+            let row = rules.iter().find(|r| r["id"] == id).unwrap();
+            assert_eq!(row["name"], expected);
+            assert_eq!(row["custom_name"], "NTT");
+            assert_eq!(db.active_user_portal_proxies(user, 0).unwrap()[1].name, expected);
+            assert_eq!(db.active_user_subscription(user, 0).unwrap().unwrap().1[1].name, expected);
+            assert_eq!(db.realm_traffic().unwrap()["rules"][0]["name"], expected);
+        };
+        check("HK-MY-NTT-realm");
+        // Current node metadata changes names even if Agent still holds the old applied snapshot.
+        db.conn().execute("UPDATE node SET country_pin='SG' WHERE id=?1", [source]).unwrap();
+        check("SG-MY-NTT-realm");
+        db.conn().execute("UPDATE node SET country='',country_pin='' WHERE id=?1", [target]).unwrap();
+        check("SG-XX-NTT-realm");
+        // Rename without publishing a new Agent snapshot: displayed names follow the live rule.
+        input.name = "new-name-realm".into();
+        db.realm_save_rule(Some(id), &input).unwrap();
+        assert_eq!(db.active_user_portal_proxies(user, 0).unwrap()[1].name, "SG-XX-new-name-realm");
+        assert_eq!(db.realm_rules().unwrap()[0]["custom_name"], "new-name-realm");
+        // Different users see the same global rule ordinal, never an authorization-dependent name.
+        input.name = "new-name".into();
+        input.listen_port += 1;
+        let second = db.realm_save_rule(None, &input).unwrap();
+        let rules = db.realm_rules().unwrap();
+        assert_eq!(rules.iter().find(|r| r["id"] == second).unwrap()["name"], "SG-XX-new-name-2-realm");
+        db.realm_delete_rule(second).unwrap();
+        let history = db.realm_traffic().unwrap();
+        let deleted = history["rules"].as_array().unwrap().iter().find(|r| r["rule_id"] == second).unwrap();
+        assert_eq!(deleted["name"], "SG-XX-new-name-2-realm");
+        assert_eq!(deleted["active"], false);
+    }
+
     #[test]
     fn publication_requires_matching_ack_and_live_authorization() {
         let (db, source, _, proxy, user) = fixture();

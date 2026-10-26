@@ -23,7 +23,7 @@ sing-box 固定必装，`--skip-sing-box` 已拒绝。省略组件参数时读�
 
 在代理列表新增 mieru，选择节点、对外地址和端口，然后给用户授权。没有有效授权用户时服务保持停止。所有用户共用一个自动生成的 mieru 密码，与面板登录密码独立；连接用户名仍为各自的 `user-{id}`。管理员在代理管理页的“mieru 连接密码”入口统一查看、复制和重置；用户列表不再提供配置入口。
 
-Realm 规则直接选择 mieru 作为目标代理。用户门户提供 Mihomo YAML 配置和 `mierus://` 分享链接；Clash / Mihomo 订阅包含 VLESS、mieru 直连及 Realm 入口。sing-box 订阅只输出 VLESS。mieru 使用 TCP、UDP 转发开启、MULTIPLEXING_OFF 和 HANDSHAKE_NO_WAIT。
+Realm 规则直接选择 mieru 作为目标代理。Realm 显示名称统一为“入口地区-落地地区-自定义名称-realm”，例如 `HK-MY-NTT-realm`；地区优先手动设置，缺失时为 `XX`，重名时在后缀前添加序号。编辑和保存使用原始自定义名称，不保存自动前缀。用户门户提供 Mihomo YAML 配置和 `mierus://` 分享链接；Clash / Mihomo 订阅包含 VLESS、mieru 直连及 Realm 入口。sing-box 订阅只输出 VLESS。mieru 使用 TCP、UDP 转发开启、MULTIPLEXING_OFF 和 HANDSHAKE_NO_WAIT。
 
 ## 接口和存储
 

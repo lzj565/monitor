@@ -93,7 +93,7 @@ export function RealmProxyForm({ rule, nodes, proxies, hosts, rules, ready, site
 }) {
   const initialNodeId = rule?.node_id ?? nodes[0]?.id ?? 0
   const initialNode=nodes.find((n)=>n.id===initialNodeId)
-  const [draft, setDraft] = useState<RealmRuleDraft>(() => rule ? { node_id: rule.node_id, target_proxy_id: rule.target_proxy_id, name: rule.name, address_type: rule.address_type, address: rule.address, listen_port: rule.listen_port, enabled: rule.enabled } : { node_id: initialNodeId, target_proxy_id: 0, name: "", address_type: defaultProxyAddressType(initialNode), address: "", listen_port: 0, enabled: true })
+  const [draft, setDraft] = useState<RealmRuleDraft>(() => rule ? { node_id: rule.node_id, target_proxy_id: rule.target_proxy_id, name: rule.custom_name, address_type: rule.address_type, address: rule.address, listen_port: rule.listen_port, enabled: rule.enabled } : { node_id: initialNodeId, target_proxy_id: 0, name: "", address_type: defaultProxyAddressType(initialNode), address: "", listen_port: 0, enabled: true })
   const [customAddress, setCustomAddress] = useState(rule?.address_type === "domain" ? rule.address : "")
   const [targetNodeId, setTargetNodeId] = useState(rule?.target_node_id ?? 0)
   const [saving, setSaving] = useState(false)

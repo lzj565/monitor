@@ -467,7 +467,7 @@ function ProxyPage({ nodes, site, refusal, search, go }: { nodes: Node[]; site: 
     catch (e) { toast.error((e as Error).message) }
     finally { setRealmBusy(false) }
   }
-  const setRealmEnabled = (rule: RealmRule, enabled: boolean) => realmAction(() => api(`/realm/rules/${rule.id}`, { method: "PUT", body: JSON.stringify({ node_id: rule.node_id, target_proxy_id: rule.target_proxy_id, name: rule.name, address_type: rule.address_type, address: rule.address, listen_port: rule.listen_port, enabled }) }), enabled ? "Realm 规则已启用，等待应用" : "Realm 规则已停用，等待应用")
+  const setRealmEnabled = (rule: RealmRule, enabled: boolean) => realmAction(() => api(`/realm/rules/${rule.id}`, { method: "PUT", body: JSON.stringify({ node_id: rule.node_id, target_proxy_id: rule.target_proxy_id, name: rule.custom_name, address_type: rule.address_type, address: rule.address, listen_port: rule.listen_port, enabled }) }), enabled ? "Realm 规则已启用，等待应用" : "Realm 规则已停用，等待应用")
   const realmSaved = () => { void realm.reload(); reload() }
 
   async function remove() {

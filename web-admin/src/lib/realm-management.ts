@@ -3,7 +3,7 @@ import type { Node } from "./api"
 import type { Proxy } from "./resources"
 
 export type RealmHost = { node_id: number; name: string; enabled: boolean; desired_revision: number; applied_revision: number; pending: boolean; online: boolean; capable: boolean; traffic_capable: boolean; last_error: string; status: { installed?: boolean; managed?: boolean; version?: string; running?: boolean; enabled?: boolean; target_reachability?: string; targets_checked?: number; targets_total?: number } }
-export type RealmRule = { traffic_key: string; id: number; node_id: number; target_proxy_id: number; name: string; address_type: "ipv4" | "ipv6" | "domain"; address: string; listen_port: number; enabled: boolean; target_node_id: number; target_name: string; target_address: string; target_port: number; target_enabled: boolean }
+export type RealmRule = { traffic_key: string; id: number; node_id: number; target_proxy_id: number; name: string; custom_name: string; address_type: "ipv4" | "ipv6" | "domain"; address: string; listen_port: number; enabled: boolean; target_node_id: number; target_name: string; target_address: string; target_port: number; target_enabled: boolean }
 export type RealmRuleDraft = Pick<RealmRule, "node_id" | "target_proxy_id" | "name" | "address_type" | "address" | "listen_port" | "enabled">
 export type RealmHostDraft = { node_id: number; enabled: boolean }
 export type ProxyListItem = { kind: "proxy"; key: string; proxy: Proxy } | { kind: "realm"; key: string; rule: RealmRule }
