@@ -472,6 +472,9 @@ fn unpack<R: Read>(archive: R, into: &Path) -> Result<()> {
     }
     fs::create_dir(into)?;
     let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(archive).take(MAX_STREAM));
+    // Modes come from the packer's machine: a theme packed under umask 000
+    // would otherwise leave scripts the panel runs writable by every local user.
+    archive.set_mask(0o022);
     let entries = unpack_entries(&mut archive, into);
     let mut rest = archive.into_inner();
     // Read to the end, where gzip keeps its checksum. The entries stop at tar's
@@ -496,6 +499,10 @@ fn unpack<R: Read>(archive: R, into: &Path) -> Result<()> {
 
 fn unpack_entries<R: Read>(archive: &mut tar::Archive<R>, into: &Path) -> Result<()> {
     let mut expanded = 0u64;
+    // Every directory the entries create, named or not: unpacking a file
+    // creates each missing parent, so one entry 1000 levels deep writes 1000
+    // directories.
+    let (mut files, mut dirs) = (0, std::collections::HashSet::new());
     for (seen, entry) in archive.entries()?.enumerate() {
         // Only reading happens here, so every failure is the archive's.
         let mut entry = entry.context(crate::Shown(DAMAGED.into()))?;
@@ -525,6 +532,22 @@ fn unpack_entries<R: Read>(archive: &mut tar::Archive<R>, into: &Path) -> Result
         expanded += size;
         if metadata {
             continue;
+        }
+        let path = entry.path()?.into_owned();
+        // Beyond what Linux takes in one call, so unpacking would fail anyway.
+        // Refused before counting, which copies the path of every parent: a
+        // name tens of KiB of `a/` long would otherwise take gigabytes.
+        if path.as_os_str().len() > 4096 {
+            refuse!("主题包里的路径过长");
+        }
+        files += usize::from(kind.is_file());
+        let mut dir = if kind.is_dir() { Some(path.as_path()) } else { path.parent() };
+        // A directory already counted brings its parents with it.
+        while let Some(d) = dir.filter(|d| d.file_name().is_some() && dirs.insert(d.to_path_buf())) {
+            dir = d.parent();
+        }
+        if files + dirs.len() > MAX_ENTRIES {
+            refuse!("主题包里的文件和目录超过 {MAX_ENTRIES} 个");
         }
         // Rejects an entry whose path escapes `into` -- absolute, `..`, or via
         // a symlinked parent -- reporting `false` rather than an error.
@@ -636,11 +659,8 @@ mod tests {
 
     #[test]
     fn theme_files_cannot_escape_their_dist_directory() {
-        let base = std::env::temp_dir().join(format!(
-            "monitor-theme-path-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-        ));
+        let tmp = crate::TempDir::new("theme-path-test");
+        let base = tmp.0.clone();
         let dist = base.join("theme/dist");
         fs::create_dir_all(dist.join("assets")).unwrap();
         fs::write(dist.join("index.html"), "index").unwrap();
@@ -656,16 +676,14 @@ mod tests {
             std::os::unix::fs::symlink(base.join("secret"), dist.join("assets/link")).unwrap();
             assert!(read_inside(&dist, "assets/link").is_none());
         }
-
-        fs::remove_dir_all(base).unwrap();
     }
 
     /// The per-file and total ceilings hold at their exact boundary: a file of
     /// [`MAX_FILE`] and a total of [`MAX_EXPANDED`] install, one byte more does not.
     #[test]
     fn a_package_at_the_size_ceilings_installs_and_one_byte_past_does_not() {
-        let base = std::env::temp_dir().join(format!("monitor-ceilings-{}", std::process::id()));
-        fs::create_dir_all(&base).unwrap();
+        let tmp = crate::TempDir::new("ceilings");
+        let base = tmp.0.clone();
         let manifest = r#"{"name":"x","short":"x","description":"","version":"1","author":"a","url":""}"#;
         let pack = |sizes: &[u64]| {
             let mut tar =
@@ -696,19 +714,14 @@ mod tests {
         let full = [MAX_FILE; 7].into_iter().chain([headroom - 7 * MAX_FILE]).collect::<Vec<_>>();
         assert!(!refused(&full));
         assert!(refused(&[full.as_slice(), &[1]].concat()));
-        fs::remove_dir_all(&base).unwrap();
     }
 
     /// Everything an uploaded archive must satisfy before replacing a theme
     /// currently being served.
     #[test]
     fn an_uploaded_theme_is_checked_before_it_replaces_the_one_in_place() {
-        let base = std::env::temp_dir().join(format!(
-            "monitor-install-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-        ));
-        fs::create_dir_all(&base).unwrap();
+        let tmp = crate::TempDir::new("install-test");
+        let base = tmp.0.clone();
         let archive = base.join("upload.tar.gz");
 
         let manifest: &[u8] =
@@ -722,7 +735,8 @@ mod tests {
             for (name, data) in files {
                 let mut header = tar::Header::new_gnu();
                 header.set_size(data.len() as u64);
-                header.set_mode(0o644);
+                // As packed under umask 000; installed, the files are 0644.
+                header.set_mode(0o666);
                 builder.append_data(&mut header, name, *data).unwrap();
             }
             if let Some((name, target)) = link {
@@ -741,6 +755,9 @@ mod tests {
             .unwrap();
         assert_eq!(theme.short, "aurora");
         assert_eq!(fs::read(base.join("aurora/dist/index.html")).unwrap(), b"v1");
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(base.join("aurora/dist/index.html")).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o644, "the packer's mode is masked");
 
         // The same name again: replaced wholesale, not merged.
         install(
@@ -753,6 +770,9 @@ mod tests {
         assert_eq!(fs::read(base.join("aurora/dist/index.html")).unwrap(), b"v3");
         assert!(!base.join("aurora/dist/old.js").exists(), "the replaced theme must not leave files behind");
 
+        let deep: Vec<(String, &[u8])> =
+            (0..100).map(|i| (format!("d{i}/{}f", "a/".repeat(20)), &b"x"[..])).collect();
+        let deep: Vec<(&str, &[u8])> = deep.iter().map(|(n, d)| (n.as_str(), *d)).collect();
         // A file where a directory must go, a theme the hub cannot serve, a name
         // that cannot be a directory, and a symlink -- the entry type that
         // writes where the path check cannot look.
@@ -762,11 +782,26 @@ mod tests {
             pack(&[("theme.json", r#"{"name":"x","short":"../evil","description":"","version":"1","author":"a","url":""}"#.as_bytes()), ("dist/index.html", b"x")], None),
             pack(&[("theme.json", manifest), ("dist/index.html", b"x")], Some(("dist/link", "/etc/passwd"))),
             pack(&[("dist/index.html", b"x")], None),
+            // 100 files, but 2100 directories implied by their paths.
+            pack(
+                &[&[("theme.json", manifest), ("dist/index.html", &b"x"[..])][..], &deep].concat(),
+                None,
+            ),
         ] {
             // A reason for the panel, never the 500 of a failure on this machine.
             let Err(e) = install(&base, bad, None) else { panic!("a bad package installed") };
             assert!(e.downcast_ref::<crate::Shown>().is_some(), "{e:#}");
         }
+        // Named as such, not left to the filesystem's refusal.
+        let long = format!("dist/{}", "a".repeat(5000));
+        let Err(e) = install(&base, pack(&[("theme.json", manifest), (&long, b"x")], None), None) else {
+            panic!("a path too long installed")
+        };
+        assert_eq!(
+            e.downcast_ref::<crate::Shown>().map(|s| s.0.as_str()),
+            Some("主题包里的路径过长"),
+            "{e:#}"
+        );
         // A download cut short says so, rather than quoting the decoder.
         pack(&[("theme.json", manifest), ("dist/index.html", b"v9")], None);
         let whole = fs::read(&archive).unwrap();
@@ -907,8 +942,6 @@ mod tests {
         assert!(!base.join("aurora").exists());
         assert!(remove(&base, "aurora").is_err(), "already deleted");
         assert!(remove(&base, "../etc").is_err(), "not a name a theme directory can carry");
-
-        fs::remove_dir_all(base).unwrap();
     }
 
     /// The shell changes under a fixed URL -- a new build, or the public page
@@ -1012,5 +1045,22 @@ mod tests {
         let app = App::for_test(crate::db::Db::open(":memory:").unwrap());
         assert!(selectable(&app, "") && selectable(&app, "default"));
         assert!(!selectable(&app, "aurora"), "a theme that is not installed is not selectable");
+    }
+
+    /// A symlink in the themes directory that leads out of it is refused, and
+    /// what it leads to survives.
+    #[test]
+    fn removing_a_theme_stays_inside_the_themes_directory() {
+        let tmp = crate::TempDir::new("remove");
+        let base = tmp.0.clone();
+        let (themes, outside) = (base.join("themes"), base.join("outside"));
+        fs::create_dir_all(themes.join("aurora")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, themes.join("elsewhere")).unwrap();
+
+        assert!(remove(&themes, "elsewhere").is_err());
+        assert!(outside.exists(), "the symlink's target survives");
+        remove(&themes, "aurora").unwrap();
+        assert!(!themes.join("aurora").exists());
     }
 }

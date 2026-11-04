@@ -348,7 +348,9 @@ pub async fn github_callback(
         return sign_in_failed(
             &app,
             &headers,
-            anyhow!("GitHub returned {error}: {reason}").context(Shown(shown.into())),
+            // Quoted: anyone can send this query string, and a newline in it
+            // would print a line of their own into the hub's log.
+            anyhow!("GitHub returned {error:?}: {reason:?}").context(Shown(shown.into())),
         );
     }
     // Reject a callback the browser did not initiate.
@@ -447,8 +449,7 @@ async fn github_login(app: &crate::Shared, code: &str) -> Result<String> {
     let (Some(id), Some(secret)) = (id, secret) else {
         refuse!("没有配置 GitHub 登录");
     };
-    let allowed: Vec<String> =
-        allowed.split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect();
+    let allowed = allowed_logins(&allowed);
     if allowed.is_empty() {
         // Without an allow list, any GitHub account could sign in.
         refuse!("没有设置允许登录的 GitHub 用户");
@@ -480,6 +481,7 @@ async fn github_login(app: &crate::Shared, code: &str) -> Result<String> {
     #[derive(Deserialize)]
     struct GithubUser {
         login: String,
+        id: i64,
     }
     let response = app
         .http
@@ -504,8 +506,50 @@ async fn github_login(app: &crate::Shared, code: &str) -> Result<String> {
         warn!("GitHub user {} is not on the allowed list {allowed:?}", user.login);
         refuse!("GitHub 用户 {} 不在允许登录的名单里", user.login);
     }
+    let id = user.id.to_string();
+    match app.db.bind_github(&user.login.to_lowercase(), &id)? {
+        None => {
+            warn!("GitHub user {} was removed from the allowed list during sign-in", user.login);
+            refuse!("GitHub 用户 {} 不在允许登录的名单里", user.login);
+        }
+        Some(bound) if bound != id => {
+            warn!(
+                "GitHub user {} is account {id}, but the name first signed in as account {bound}",
+                user.login
+            );
+            refuse!(
+                "GitHub 用户 {} 已经不是第一次登录时的那个账号。如果账号确实重建过，先把它从允许名单里删掉并保存，再加回来",
+                user.login
+            );
+        }
+        Some(_) => {}
+    }
     info!("GitHub sign-in accepted for {}", user.login);
     Ok(user.login)
+}
+
+/// The GitHub account each listed login belonged to when it first signed in,
+/// as `login:id` pairs. The list names logins, and a renamed or deleted
+/// account leaves its login free for anyone to register.
+pub const GITHUB_IDS: &str = "github_user_ids";
+
+/// The logins of the allow list, in the case GitHub ignores.
+pub fn allowed_logins(list: &str) -> Vec<String> {
+    list.split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect()
+}
+
+pub fn bound_id<'a>(ids: &'a str, login: &str) -> Option<&'a str> {
+    ids.split(',').filter_map(|pair| pair.split_once(':')).find(|(l, _)| *l == login).map(|(_, id)| id)
+}
+
+/// `ids` without the logins `list` no longer allows, so a login removed and
+/// added back binds afresh on its next sign-in.
+pub fn keep_listed(ids: &str, list: &str) -> String {
+    let allowed = allowed_logins(list);
+    ids.split(',')
+        .filter(|pair| pair.split_once(':').is_some_and(|(l, _)| allowed.iter().any(|a| a == l)))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Peer address, or the last hop in X-Forwarded-For when the request arrived
@@ -772,11 +816,75 @@ mod tests {
         assert_eq!(held(), 0);
     }
 
+    /// Taken by every test that passes through `PASSWORD_GATE`, which is
+    /// process-wide: one holding every permit would refuse a parallel login.
+    static GATE_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn shared() -> crate::Shared {
+        std::sync::Arc::new(crate::App::for_test(crate::db::Db::open(":memory:").unwrap()))
+    }
+
+    fn peer() -> ConnectInfo<std::net::SocketAddr> {
+        ConnectInfo("198.51.100.7:40000".parse().unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_password_signs_in_only_when_it_matches_and_signing_out_ends_the_session() {
+        let _gate = GATE_TESTS.lock().await;
+        let app = shared();
+        app.db.replace_password(&hash_password("the-right-password").unwrap()).unwrap();
+        let attempt = |password: &str| {
+            let body = Json(LoginBody { password: password.into() });
+            login(State(app.clone()), peer(), HeaderMap::new(), body)
+        };
+
+        let wrong = attempt("a-wrong-password").await;
+        assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+        assert!(wrong.headers().get(header::SET_COOKIE).is_none(), "a wrong password earns no session");
+
+        let right = attempt("the-right-password").await;
+        assert_eq!(right.status(), StatusCode::OK);
+        let cookie = right.headers()[header::SET_COOKIE].to_str().unwrap().to_owned();
+        assert!(cookie.contains(&format!("Max-Age={}", SESSION_DAYS * 86_400)), "{cookie}");
+        let token = cookie.split(';').next().unwrap().split_once('=').unwrap().1;
+        assert!(app.db.session_valid(&sha256(token)));
+        let issued = issued_at(app.db.sessions().unwrap()[0].1);
+        assert!((Utc::now().timestamp() - issued).abs() < 60, "valid for {SESSION_DAYS} days from now");
+
+        let mut signed_in = HeaderMap::new();
+        signed_in.insert(header::COOKIE, format!("{COOKIE}={token}").parse().unwrap());
+        logout(State(app.clone()), signed_in).await;
+        assert!(!app.db.session_valid(&sha256(token)), "signing out ends the session server-side");
+    }
+
+    /// The state check precedes any request to GitHub, so a callback the
+    /// browser did not start is turned back with that reason and nothing else.
+    #[tokio::test]
+    async fn a_callback_the_browser_did_not_start_signs_nobody_in() {
+        let app = shared();
+        for (state, cookie) in
+            [(Some("abc"), None), (Some("abc"), Some("xyz")), (None, Some("abc")), (Some(""), Some(""))]
+        {
+            let mut headers = HeaderMap::new();
+            if let Some(cookie) = cookie {
+                headers.insert(header::COOKIE, format!("{STATE_COOKIE}={cookie}").parse().unwrap());
+            }
+            let query =
+                Callback { code: Some("code".into()), state: state.map(Into::into), ..Default::default() };
+            let res = github_callback(State(app.clone()), peer(), headers, Query(query)).await;
+            let to = res.headers()[header::LOCATION].to_str().unwrap();
+            assert!(to.ends_with(&urlencode("登录已过期，请从登录页重新开始")), "{state:?} {cookie:?}: {to}");
+            let sessions = res.headers().get_all(header::SET_COOKIE).iter();
+            assert!(!sessions.into_iter().any(|c| c.to_str().unwrap().starts_with(&format!("{COOKIE}="))));
+        }
+    }
+
     /// The gate must refuse rather than queue: a queue admits the same flood,
     /// and each attempt that lands costs 19 MiB which remains in a thread's
     /// arena for the life of the process.
-    #[test]
-    fn the_password_gate_refuses_a_flood_rather_than_queueing_it() {
+    #[tokio::test]
+    async fn the_password_gate_refuses_a_flood_rather_than_queueing_it() {
+        let _gate = GATE_TESTS.lock().await;
         let held: Vec<_> =
             (0..PASSWORD_CHECKS).map(|_| PASSWORD_GATE.try_acquire().expect("up to the limit")).collect();
         assert!(PASSWORD_GATE.try_acquire().is_err(), "the attempt past the limit must be refused");

@@ -257,6 +257,7 @@ fn a_release_lookup_is_held_for_six_hours_and_a_failed_one_for_ten_minutes() {
     assert!(!fresh_enough(&read(now - 7 * 3600, "1.2.0", "1.1.0"), now));
     assert!(fresh_enough(&read(now - 300, "", ""), now), "a failure is held briefly");
     assert!(!fresh_enough(&read(now - 1200, "1.2.0", ""), now), "half an answer is a failure");
+    assert!(!fresh_enough(&read(now + 3600, "1.2.0", "1.1.0"), now), "read before the clock was set back");
 }
 
 fn app_with_site(site: &str) -> App {
@@ -327,6 +328,8 @@ async fn provisioning_follows_the_browsers_own_origin() {
         "https://198.51.100.1",
         "https://user@monitor.example.com",
         "https://monitor.example.com/path",
+        "https://localhost",
+        "https://hub.localhost",
     ] {
         assert!(https_domain(site).is_none());
         assert_eq!(provisioning_allowed(&app_with_site(site), &good), Err(PROVISIONING_DENIED), "{site}");
@@ -462,7 +465,8 @@ fn only_a_github_repository_url_can_name_a_release_to_download() {
 /// has landed, so a piece continues it, restarts it, or is refused.
 #[tokio::test]
 async fn a_chunk_continues_an_upload_only_where_the_last_one_ended() {
-    let path = std::env::temp_dir().join(format!("monitor-chunk-{}", std::process::id()));
+    let tmp = crate::TempDir::new("chunk");
+    let path = tmp.0.join("upload");
     let path = path.to_str().unwrap();
     let piece = |offset, total| Chunk { upload_id: random_token()[..32].into(), offset, total };
     let body = |bytes: &'static [u8]| axum::body::Body::from(bytes);
@@ -487,7 +491,6 @@ async fn a_chunk_continues_an_upload_only_where_the_last_one_ended() {
     // Starting over truncates whatever an interrupted attempt left behind.
     assert_eq!(receive(path, &piece(0, 2), 1024, body(b"hi")).await.unwrap(), 2);
     assert_eq!(std::fs::read(path).unwrap(), b"hi");
-    std::fs::remove_file(path).unwrap();
 }
 
 /// Both scratch names a restore uses sit beside the live database, and one left
@@ -500,28 +503,38 @@ async fn a_chunk_continues_an_upload_only_where_the_last_one_ended() {
 /// could silently drop.
 #[tokio::test]
 async fn a_finished_restore_leaves_no_scratch_file_behind() {
-    let dir = std::env::temp_dir().join(format!("monitor-restore-{}", &random_token()[..16]));
-    std::fs::create_dir_all(&dir).unwrap();
+    let tmp = crate::TempDir::new("restore");
+    let dir = tmp.0.clone();
     let live = dir.join("live.db").to_string_lossy().into_owned();
     let app = std::sync::Arc::new(App::for_test(Db::open(&live).unwrap()));
     node(&app, "kept", true);
     app.db.set("origin_cdn_only", "on").unwrap();
 
-    // What a restore actually receives: a backup of a hub database.
+    // A backup containing a session, which a restore must invalidate.
+    app.db.create_session(&sha256("backed-up"), Utc::now().timestamp() + 3_600).unwrap();
     let copy = format!("{live}.copy");
     app.db.backup_into(&copy).unwrap();
     let bytes = std::fs::read(&copy).unwrap();
     std::fs::remove_file(&copy).unwrap();
-
-    let done = db_restore(
-        Admin,
-        State(app.clone()),
-        Query(Chunk { upload_id: random_token()[..32].into(), offset: 0, total: bytes.len() as u64 }),
-        [(header::COOKIE, "monitor_session=test-admin".parse().unwrap())].into_iter().collect(),
-        axum::body::Body::from(bytes),
-    )
-    .await;
-    assert_eq!(done.status(), StatusCode::OK);
+    node(&app, "added", true);
+    let upload_id = random_token()[..32].to_owned();
+    let (total, half) = (bytes.len() as u64, bytes.len() / 2);
+    let mut done = None;
+    for (offset, piece) in [(0, &bytes[..half]), (half as u64, &bytes[half..])] {
+        done = Some(
+            db_restore(
+                Admin,
+                State(app.clone()),
+                Query(Chunk { upload_id: upload_id.clone(), offset, total }),
+                [(header::COOKIE, "monitor_session=test-admin".parse().unwrap())].into_iter().collect(),
+                axum::body::Body::from(piece.to_vec()),
+            )
+            .await,
+        );
+        assert_eq!(app.db.nodes().unwrap().len(), if offset == 0 { 2 } else { 1 });
+    }
+    assert_eq!(done.unwrap().status(), StatusCode::OK);
+    assert!(!app.db.session_valid(&sha256("backed-up")));
     assert_eq!(app.db.nodes().unwrap().len(), 1, "the backup went in");
     assert_eq!(
         app.db.get("origin_cdn_only").as_deref(),
@@ -536,7 +549,6 @@ async fn a_finished_restore_leaves_no_scratch_file_behind() {
         .filter(|name| !matches!(name.as_str(), "live.db" | "live.db-wal" | "live.db-shm"))
         .collect();
     assert!(left.is_empty(), "left beside the database: {left:?}");
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 /// A connected agent holding one report. The receiver is returned because
@@ -746,6 +758,25 @@ fn a_thinned_bucket_answers_with_its_mean_and_says_what_it_lost() {
         app.db.insert_pings(even, &[(even_probe, wide_base + i as i64, latency)]).unwrap();
     }
     assert_eq!(app.db.ping_records(even, Span::minutes(wide_base, 180)).unwrap().0[0]["latency"], 25);
+    // An odd count is its middle reading, with the ranks around it far apart.
+    let odd = node(&app, "odd", true);
+    let odd_probe = task(&app, vec![odd]);
+    for (i, latency) in [20, 900, 30].into_iter().enumerate() {
+        app.db.insert_pings(odd, &[(odd_probe, wide_base + i as i64, latency)]).unwrap();
+    }
+    assert_eq!(app.db.ping_records(odd, Span::minutes(wide_base, 180)).unwrap().0[0]["latency"], 30);
+
+    // Several buckets: each row is stamped with its own bucket's start.
+    let grid = node(&app, "grid", true);
+    let grid_probe = task(&app, vec![grid]);
+    // Three whole buckets in the past, whatever second the suite runs at.
+    let since = wide_base - 3 * 180;
+    for i in 0..3 {
+        app.db.insert_pings(grid, &[(grid_probe, since + i * 180 + 7, 20)]).unwrap();
+    }
+    let rows = app.db.ping_records(grid, Span::minutes(since, 180)).unwrap().0;
+    let stamps: Vec<_> = rows.iter().map(|r| r["ts"].clone()).collect();
+    assert_eq!(stamps, [since, since + 180, since + 360].map(|t| json!(t)));
 }
 
 /// What a window lost is the proportion of its samples lost, and only the hub
@@ -1462,30 +1493,21 @@ fn a_node_view_carries_traffic_even_while_offline() {
     assert_eq!(visible_nodes(&app, true).unwrap()[1]["last_seen_ago"], Value::Null, "never seen");
 }
 
-/// A capacity arrives twice -- once in the facts stored at the handshake, and
-/// again in every report -- and the two diverge as soon as a disk is mounted
-/// on a running machine, which the agent detects by re-reading its mount table
-/// every sample. Drawn from the stored copy, the card and the detail page
-/// showed the same host two different sizes until it reconnected.
+/// Stored capacities trail the live reports, so a newly mounted disk must
+/// appear consistently in both the node card and detail page.
 #[test]
-fn a_capacity_that_changed_since_the_handshake_is_the_reported_one() {
+fn a_capacity_that_changed_since_the_last_write_is_the_reported_one() {
     let app = app();
     let id = node(&app, "n", true);
-    // What the handshake stored: 30 GB of disk, 1 GB of swap.
+    // What the last write stored: 30 GB of disk, 1 GB of swap.
     app.db
-        .save_facts(
-            id,
-            &json!({"mem_total": 1_000, "swap_total": 1i64 << 30, "disk_total": 30i64 << 30}),
-            "ip",
-            "",
-        )
+        .touch_seen(id, 1, &json!({"mem_total": 1_000, "swap_total": 1i64 << 30, "disk_total": 30i64 << 30}))
         .unwrap();
 
     let offline = &visible_nodes(&app, true).unwrap()[0];
     assert_eq!(offline["disk_total"], 30i64 << 30, "with nobody connected the stored facts are all there is");
 
-    // A 5 GB volume is mounted and swap is disabled. The same session, with no
-    // second hello, so the stored facts do not change.
+    // A 5 GB volume is mounted and swap is disabled, before the next write.
     let _held = connect(
         &app,
         id,
@@ -2441,4 +2463,27 @@ async fn manual_uuid_updates_exports_and_online_offline_sync() {
             .unwrap();
     assert_eq!(body["error"]["code"], "UUID_CONFLICT");
     assert_eq!(app.db.user(user).unwrap().unwrap().uuid, uuid);
+}
+
+#[tokio::test]
+async fn a_closed_status_page_and_a_sibling_origin_see_no_admin_data() {
+    let app = std::sync::Arc::new(app());
+    app.db.create_session(&sha256("live-token"), Utc::now().timestamp() + 3_600).unwrap();
+    let signed_in = |site: &str| {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, format!("{}=live-token", crate::auth::COOKIE).parse().unwrap());
+        headers.insert("sec-fetch-site", site.parse().unwrap());
+        headers
+    };
+    let operator = Some(Some(sha256("live-token")));
+    assert_eq!(stream_viewer(&app, &signed_in("same-origin")), operator);
+    assert_eq!(stream_viewer(&app, &signed_in("same-site")), Some(None), "a sibling's script is a visitor");
+    assert_eq!(stream_viewer(&app, &HeaderMap::new()), Some(None));
+
+    app.db.set("public_page", "off").unwrap();
+    assert_eq!(stream_viewer(&app, &signed_in("same-origin")), operator);
+    assert_eq!(stream_viewer(&app, &signed_in("same-site")), None);
+    assert_eq!(stream_viewer(&app, &HeaderMap::new()), None);
+    assert_eq!(nodes(State(app.clone()), HeaderMap::new()).await.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(nodes(State(app), signed_in("same-origin")).await.status(), StatusCode::OK);
 }

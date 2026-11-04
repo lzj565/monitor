@@ -76,14 +76,50 @@ impl Db {
     /// As [`Db::get`], with a failed read kept apart from an absent key, for a
     /// caller that would otherwise act on "nothing saved".
     pub fn lookup(&self, key: &str) -> Result<Option<String>> {
-        Ok(self
-            .conn()
-            .query_row("SELECT value FROM setting WHERE key = ?1", [key], |r| r.get(0))
-            .optional()?)
+        setting(&self.conn(), key)
     }
 
     pub fn set(&self, key: &str, value: &str) -> Result<()> {
         put_setting(&self.conn(), key, value)
+    }
+
+    /// Stores the GitHub allow list and drops the bindings of the logins it no
+    /// longer names, both or neither: a removal stored without its prune would
+    /// leave the old account bound when the name is added back.
+    pub fn set_github_allowed(&self, list: &str) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let ids = setting(&tx, crate::auth::GITHUB_IDS)?.unwrap_or_default();
+        put_setting(&tx, "github_allowed_users", list)?;
+        put_setting(&tx, crate::auth::GITHUB_IDS, &crate::auth::keep_listed(&ids, list))?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The GitHub account id `login` is bound to, binding it to `id` when it has
+    /// none; `None` when the allow list no longer names it. The list is read
+    /// again under the writer lock: a save that removed the name during the
+    /// OAuth exchange would otherwise be followed by a binding the removal was
+    /// meant to clear.
+    pub fn bind_github(&self, login: &str, id: &str) -> Result<Option<String>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let list = setting(&tx, "github_allowed_users")?.unwrap_or_default();
+        if !crate::auth::allowed_logins(&list).iter().any(|l| l == login) {
+            return Ok(None);
+        }
+        let ids = setting(&tx, crate::auth::GITHUB_IDS)?.unwrap_or_default();
+        if let Some(bound) = crate::auth::bound_id(&ids, login) {
+            return Ok(Some(bound.to_owned()));
+        }
+        let pair = format!("{login}:{id}");
+        put_setting(
+            &tx,
+            crate::auth::GITHUB_IDS,
+            &if ids.is_empty() { pair } else { format!("{ids},{pair}") },
+        )?;
+        tx.commit()?;
+        Ok(Some(id.to_owned()))
     }
 
     // ---- nodes ----

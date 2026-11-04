@@ -61,7 +61,8 @@ pub async fn versions(_: Admin, State(app): State<Shared>) -> Response {
 pub(super) fn fresh_enough(cached: &crate::Releases, now: i64) -> bool {
     let holds =
         if cached.hub.is_empty() || cached.agent.is_empty() { RELEASES_RETRY } else { RELEASES_FRESH };
-    cached.read_at != 0 && now - cached.read_at < holds
+    // A negative age is a clock set back since the lookup, not a fresh one.
+    cached.read_at != 0 && (0..holds).contains(&(now - cached.read_at))
 }
 
 /// The tag of a repository's latest release, without its leading `v`, or None

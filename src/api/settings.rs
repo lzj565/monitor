@@ -160,7 +160,11 @@ pub async fn save_settings(
                 }
                 continue;
             }
-            if let Err(e) = app.db.set(key, value) {
+            let saved = match key.as_str() {
+                "github_allowed_users" => app.db.set_github_allowed(value),
+                _ => app.db.set(key, value),
+            };
+            if let Err(e) = saved {
                 return fail(e);
             }
         }

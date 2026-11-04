@@ -13,9 +13,7 @@ pub(super) fn restrict(path: &str) {
     }
 }
 
-/// One file, owner-only. Also applied to the backup copy `VACUUM INTO` writes,
-/// which is the entire credential store in one portable file, created under the
-/// umask like any other.
+/// One file, owner-only.
 pub(super) fn own_only(file: &str) {
     #[cfg(unix)]
     {
@@ -578,4 +576,8 @@ impl Tally {
         // The 1-based ranks of the middle answer, or of the middle two.
         Some((at((total + 1) / 2)?.0 + at(total / 2 + 1)?.0) / 2)
     }
+}
+
+pub(super) fn setting(conn: &Connection, key: &str) -> Result<Option<String>> {
+    Ok(conn.query_row("SELECT value FROM setting WHERE key = ?1", [key], |r| r.get(0)).optional()?)
 }

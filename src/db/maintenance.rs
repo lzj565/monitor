@@ -74,15 +74,20 @@ impl Db {
     /// reads the whole file, so the caller runs it off the runtime -- every other
     /// statement here is sub-millisecond, this one is not.
     pub fn backup_into(&self, dest: &str) -> Result<()> {
+        // The copy is the credential store in one portable file: node tokens in
+        // the clear, the GitHub secret, the password hash. SQLite would create
+        // it under the umask, world-readable at the usual 022 for as long as the
+        // copy takes; it writes into an empty file that already exists instead.
+        let mut empty = std::fs::OpenOptions::new();
+        empty.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut empty, 0o600);
+        empty.open(dest)?;
         // A connection of its own. `VACUUM INTO` only reads, and WAL allows it to
         // read a consistent snapshot while the agents continue writing through
         // the first -- exporting is the one heavy operation here that need not
         // block them. Not the charts' reader, which it would hold throughout.
         read_only(&self.file())?.execute("VACUUM INTO ?1", [dest])?;
-        // The copy is the credential store in one portable file: node tokens in
-        // the clear, the GitHub secret, the password hash. SQLite creates it
-        // under the umask, which at the usual 022 is world-readable.
-        own_only(dest);
         Ok(())
     }
 

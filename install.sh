@@ -656,12 +656,13 @@ load_component_profile() {
     SINGBOX_OPTION=--sing-box
 }
 # END component profile helpers
+BINARY=""
 
 while [ $# -gt 0 ]; do
 	# A flag with no argument: under set -u, `$2` aborts with the shell's own
 	# message rather than the usage below, and `shift 2` cannot proceed.
 	case "$1" in
-	--server | --token | --register | --name | --iface | --interval)
+	--server | --token | --register | --name | --iface | --interval | --binary)
 		[ $# -ge 2 ] || { echo "$1 needs a value" >&2; exit 2; } ;;
 	esac
 	case "$1" in
@@ -671,6 +672,7 @@ while [ $# -gt 0 ]; do
 	--name) NAME="$2"; shift 2 ;;
 	--iface) IFACE="$2"; IFACE_SET=1; shift 2 ;;
 	--interval) INTERVAL="$2"; shift 2 ;;
+	--binary) BINARY="$2"; shift 2 ;;
 	--insecure) INSECURE=1; shift ;;
 	--uninstall) UNINSTALL=1; shift ;;
 	--upgrade) UPGRADE=1; shift ;;
@@ -771,12 +773,14 @@ if [ -n "$UPGRADE" ]; then
 fi
 
 [ -n "$SERVER" ] && { [ -n "$TOKEN" ] || [ -n "$REGISTER" ]; } || {
-	echo "usage: install.sh --server URL (--token TOKEN | --register KEY) [--interval SECONDS] [--iface LIST] [--insecure] [--realm | --no-realm] [--mieru | --no-mieru] [--sing-box]" >&2
-	echo "       install.sh --upgrade [--iface LIST] [--interval SECONDS] [--realm | --no-realm] [--mieru | --no-mieru] [--sing-box]" >&2
+	echo "usage: install.sh --server URL (--token TOKEN | --register KEY) [--interval SECONDS] [--iface LIST] [--binary FILE] [--insecure] [--realm | --no-realm] [--mieru | --no-mieru] [--sing-box]" >&2
+	echo "       install.sh --upgrade [--binary FILE] [--iface LIST] [--interval SECONDS] [--realm | --no-realm] [--mieru | --no-mieru] [--sing-box]" >&2
 	echo "       install.sh --uninstall" >&2
 	echo "--name NAME names the node --register creates, which is otherwise named after its id. < > \" ' are dropped from it; the panel renames a node freely" >&2
+	echo "--binary FILE installs an agent already placed on this machine instead of downloading it from the hub" >&2
 	exit 2
 }
+[ -z "$BINARY" ] || [ -f "$BINARY" ] || { echo "--binary: no file at $BINARY" >&2; exit 2; }
 # Names the node a registration creates. A token belongs to a node that already
 # has a name, which the panel changes; silently dropping the flag there would
 # read as a rename that never happened.
@@ -823,7 +827,13 @@ fi
 # defaults a scheme-less URL to http://, fetching over plaintext the binary about
 # to run as root.
 if [ -n "$INSECURE" ]; then SCHEME=http; else SCHEME=https; fi
-case "$SERVER" in *://*) ;; *) SERVER="$SCHEME://$SERVER" ;; esac
+# The scheme in lowercase, as every check below matches it: a hand-typed
+# HTTP:// would otherwise pass the plaintext refusal.
+lower_scheme() { printf '%s://%s' "$(printf '%s' "${1%%://*}" | tr 'A-Z' 'a-z')" "${1#*://}"; }
+case "$SERVER" in
+*://*) SERVER=$(lower_scheme "$SERVER") ;;
+*) SERVER="$SCHEME://$SERVER" ;;
+esac
 # The agent already refuses plaintext ws:// to a remote hub, since the token
 # would travel in the clear. The same address fetches the binary about to run as
 # root here, so the same rule applies: over plain HTTP anyone on the path can
@@ -869,6 +879,7 @@ localhost | ::1) LOCAL=1 ;;
 *) LOCAL="" ;;
 esac
 case "$SERVER" in
+https://*) ;;
 http://*)
 	if [ -z "$LOCAL" ]; then
 		[ -n "$INSECURE" ] || {
@@ -876,9 +887,15 @@ http://*)
 			exit 2
 		}
 		warn "--insecure 将通过未加密的 HTTP 连接远程 Hub"
-		echo "         the token and every report travel in the clear, and the binary" >&2
-		echo "         installed below is fetched over the same unverified channel" >&2
+		echo "         the token and every report travel in the clear" >&2
+		[ -n "$BINARY" ] || echo "         and the binary installed below is fetched over the same unverified channel" >&2
 	fi
+	;;
+# Anything else is refused rather than left to curl: ftp:// or the agent's own
+# ws:// would fetch the binary in the clear while escaping the test above.
+*)
+	echo "server URL must start with https:// or http://, not: $SERVER" >&2
+	exit 2
 	;;
 esac
 case "$(uname -m)" in
@@ -897,27 +914,69 @@ detail "安装位置" "$BIN"
 URL="${SERVER%/}/agent/$ARCH"
 TMP_AGENT=$(mktemp)
 
-info "正在下载 monitor-agent"
-# The hub relays four downloads at once and queues the rest for 30 seconds. A
-# batch run on more machines than drain in that time is turned away with 503,
-# which is retried here rather than failing the machine. Any other refusal is
-# final and shown with the hub's own reason, which --fail would discard.
-TRIES=0
-while :; do
-	CODE=$(curl -sSL --max-time 300 -w '%{http_code}' "$URL" -o "$TMP_AGENT" 2>/dev/null) || { FAIL_REASON="下载 monitor-agent 失败"; exit 1; }
-	[ "$CODE" = 503 ] && [ "$TRIES" -lt 5 ] || break
-	TRIES=$((TRIES + 1))
-	warn "Hub 正在处理中，5 秒后重试"
-	sleep 5
-done
-[ "$CODE" = 200 ] || { FAIL_REASON="monitor-agent 下载失败 (HTTP $CODE)"; exit 1; }
+# A machine whose link to the hub cannot carry the binary in time installs one
+# uploaded beforehand: registration and the service then need only a few small
+# requests. It is copied, so the file given is left as it was and may be $BIN
+# itself.
+if [ -n "$BINARY" ]; then
+	echo "installing $BINARY instead of downloading"
+	cp "$BINARY" "$TMP_AGENT"
+else
+	echo "downloading monitor-agent ($ARCH)"
+	# The hub relays four downloads at once and queues the rest for 30 seconds. A
+	# batch run on more machines than drain in that time is turned away with 503,
+	# which is retried here rather than failing the machine. Any other refusal is
+	# final and shown with the hub's own reason, which --fail would discard.
+	#
+	# A connection cut before any byte arrived is retried too: some networks
+	# reset a share of TLS handshakes to a CDN, which a second attempt usually
+	# gets through, and such a cut costs about a second. Exit codes 16, 18, 35,
+	# 52, 55, 56 and 92 are those cuts, 16 and 92 being their HTTP/2 form. One
+	# that breaks off mid-transfer means a link too slow for the binary, where
+	# each retry would wait minutes for the same end, so it stops at once; it and
+	# cuts that outlast the retries both end with a pointer to --binary. A
+	# refused connection, an unresolved name, a bad certificate or the 300 s
+	# limit before any reply stop at once as well. The download precedes the
+	# registration, so a retry spends nothing.
+	TRIES=0
+	while :; do
+		RC=0 WHY=""
+		OUT=$(curl -sSL --max-time 300 -w '%{http_code} %{size_download}' "$URL" -o "$TMP_AGENT") || RC=$?
+		CODE=${OUT% *} GOT=${OUT#* }
+		case "$RC:$CODE:$GOT" in
+		0:503:*) WHY="the hub is busy relaying to other machines" ;;
+		16:*:0 | 18:*:0 | 35:*:0 | 52:*:0 | 55:*:0 | 56:*:0 | 92:*:0) WHY="the connection to the hub was cut" ;;
+		*) break ;;
+		esac
+		[ "$TRIES" -lt 5 ] || break
+		TRIES=$((TRIES + 1))
+		echo "$WHY; retrying in 5 seconds"
+		sleep 5
+	done
+	if [ "$RC" != 0 ]; then
+		# Cut on every try, or broken off after the body began.
+		case "$RC:$CODE:${WHY:+cut}" in
+		*:cut | 16:200: | 18:200: | 28:200: | 56:200: | 92:200:)
+			echo "the link to the hub did not carry the download; upload monitor-agent-$ARCH-unknown-linux-musl from the agent's latest release to this machine and rerun with --binary FILE" >&2 ;;
+		esac
+		exit 1
+	fi
+	[ "$CODE" = 200 ] ||
+		{ printf 'download failed (HTTP %s): %s\n' "$CODE" "$(head -n 1 "$TMP_AGENT" | cut -c1-500)" >&2; exit 1; }
+fi
 # A relay can answer 200 with something other than the program, such as a
 # mirror's error page. Checked before the running agent is stopped, so a batch
 # run through such a relay leaves each machine on the agent it had, rather than
 # on bytes that cannot start while this script reports success.
-[ "$(head -c 4 "$TMP_AGENT")" = "$(printf '\177ELF')" ] || { FAIL_REASON="下载内容不是 Linux 可执行文件"; fail "$FAIL_REASON"; }
-success "下载完成"
-
+[ "$(head -c 4 "$TMP_AGENT")" = "$(printf '\177ELF')" ] ||
+	{ echo "${BINARY:-the download} is not a Linux executable: $(head -n 1 "$TMP_AGENT" | tr -cd '[:print:]' | cut -c1-200)" >&2; exit 1; }
+# e_machine, as the hub checks what it relays: a file uploaded for the other
+# architecture is refused here, before a key is spent or the old agent stops.
+case "$ARCH:$(od -An -tu2 -j18 -N2 "$TMP_AGENT" | tr -d ' ')" in
+x86_64:62 | aarch64:183) ;;
+*) echo "${BINARY:-the download} is not built for $ARCH; use monitor-agent-$ARCH-unknown-linux-musl" >&2; exit 1 ;;
+esac
+success "安装文件已就绪"
 # Resolve the local API port before registration or replacing the installed
 # Agent. A full range must fail without spending a registration key or leaving
 # a machine half-upgraded.
@@ -944,8 +1003,9 @@ if [ -z "$TOKEN" ]; then
 	#
 	# Only for the same hub: a token issued by hub A means nothing to hub B.
 	HELD=""
+	# An env file written before the scheme was lowercased may hold HTTP://.
 	CACHED=$(sed -n 's/^MONITOR_SERVER=//p' "$ENV_FILE" 2>/dev/null || true)
-	if [ "${CACHED%/}" = "${SERVER%/}" ]; then
+	if [ "$(lower_scheme "${CACHED%/}")" = "${SERVER%/}" ]; then
 		HELD=$(sed -n 's/^[[:space:]]*MONITOR_TOKEN=//p' "$ENV_FILE" 2>/dev/null || true)
 	fi
     PENDING_TOKEN=$(pending_registration_token)
@@ -957,9 +1017,9 @@ if [ -z "$TOKEN" ]; then
 	echo "registering ${NAME:-this machine} with the hub"
 	# curl sends no header at all for an empty $HELD. The status follows the body
 	# on a line of its own, so a refusal shows the hub's own reason: a closed
-	# window, a lockout, an entry that is not an https domain and a database
-	# error share one exit status under --fail. A request that got no response
-	# stops here, with curl's own message. The name travels on stdin: as an
+	# window, a lockout and a database error share one exit status under --fail.
+	# A request that got no response stops here, with curl's own message. The
+	# name travels on stdin: as an
 	# argument, one beginning with @ would be read as a file to send.
     REGISTER_REALM=0 REGISTER_MIERU=0
     [ "$REALM_OPTION" != --realm ] || REGISTER_REALM=1
@@ -1251,7 +1311,10 @@ RestrictSUIDSGID=yes
 PrivateTmp=yes
 PrivateDevices=yes
 # AF_NETLINK is how getifaddrs(3) obtains this host's own addresses from the
-# kernel; without it the agent reports none.
+# kernel; without it the agent reports none. AF_UNIX is what if_nametoindex(3)
+# opens to read a nameserver such as fe80::1%wlan0 in resolv.conf; without it
+# musl skips that nameserver, and when it is the only one every lookup fails
+# with "Try again".
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 MemoryMax=64M
 

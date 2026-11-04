@@ -17,26 +17,13 @@ fn the_tuning_pragmas_reach_the_connection_the_hub_uses() {
     assert_eq!(read("busy_timeout"), 5_000);
 }
 
-/// A real file, since these three tests exist to exercise what happens to
-/// one. Removed by the test that created it.
-struct Scratch(String);
+/// A database isolated in a temporary directory, removed with its companions.
+struct Scratch(String, #[expect(dead_code, reason = "held for its Drop")] crate::TempDir);
 
 impl Scratch {
     fn new() -> Self {
-        Self(
-            std::env::temp_dir()
-                .join(format!("monitor-test-{}.db", rand::random::<u64>()))
-                .to_string_lossy()
-                .into_owned(),
-        )
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm", ".copy"] {
-            let _ = std::fs::remove_file(format!("{}{suffix}", self.0));
-        }
+        let dir = crate::TempDir::new("test");
+        Self(dir.0.join("monitor.db").to_string_lossy().into_owned(), dir)
     }
 }
 
@@ -51,6 +38,12 @@ fn a_backup_restores_the_database_it_was_taken_from() {
     let kept =
         db.create_node(&Node { name: "backed-up".into(), ..Default::default() }, "token-kept").unwrap();
     db.backup_into(&copy).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    for file in [scratch.0.clone(), format!("{}-wal", scratch.0), format!("{}-shm", scratch.0), copy.clone()]
+    {
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "{file} holds the node tokens");
+    }
 
     // Everything after the copy must disappear on restore.
     db.delete_node(kept).unwrap();
@@ -136,6 +129,13 @@ fn restore_refuses_anything_that_is_not_a_backup_of_this_hub() {
     refused("from a newer hub");
 
     newer.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}")).unwrap();
+    // Every table right, and SQL of the file's own that every later write
+    // would run.
+    newer
+        .execute_batch("CREATE TRIGGER t AFTER INSERT ON session BEGIN UPDATE node SET remark = 'x'; END")
+        .unwrap();
+    refused("a trigger beside the right tables");
+    newer.execute_batch("DROP TRIGGER t").unwrap();
     db.check_backup(&bad).unwrap();
 }
 
@@ -1570,12 +1570,17 @@ fn prune_drops_history_but_never_traffic_totals() {
     let old = Utc::now().timestamp() - 40 * 86_400;
     db.insert_metric(id, old, &serde_json::json!({"cpu": 1.0})).unwrap();
     db.insert_metric(id, Utc::now().timestamp(), &serde_json::json!({"cpu": 2.0})).unwrap();
+    let detailed = Utc::now().timestamp() / 60 * 60 - 6 * 86_400;
+    db.insert_metric(id, detailed, &serde_json::json!({"cpu": 3.0})).unwrap();
 
     db.prune(30).unwrap();
-    assert_eq!(db.metrics(id, Span::minutes(0, 60)).unwrap().len(), 2, "unfolded minutes are kept");
+    assert_eq!(db.metrics(id, Span::minutes(0, 60)).unwrap().len(), 3, "unfolded minutes are kept");
     db.roll_up(Utc::now().timestamp(), 30).unwrap();
     db.prune(30).unwrap();
-    assert_eq!(db.metrics(id, Span::minutes(0, 60)).unwrap().len(), 1);
+    assert_eq!(db.metrics(id, Span::minutes(0, 60)).unwrap().len(), 2);
+    let kept: i64 =
+        db.conn().query_row("SELECT count(*) FROM metric WHERE ts = ?1", [detailed], |r| r.get(0)).unwrap();
+    assert_eq!(kept, 1, "a folded minute within the week of detail stays");
     assert_eq!(db.all_traffic()[&id].total_rx, 800);
 }
 
@@ -1743,9 +1748,8 @@ fn a_failed_upgrade_leaves_the_file_as_it_was() {
 /// from being written.
 #[test]
 fn dropping_load1_keeps_the_history_and_lets_new_rows_in() {
-    let file = std::env::temp_dir().join(format!("monitor-load1-{}.db", std::process::id()));
-    let _ = std::fs::remove_file(&file);
-    let path = file.to_str().unwrap();
+    let scratch = Scratch::new();
+    let path = &scratch.0;
 
     // A database as a hub predating this build left it: one metric row
     // carrying a load average, stamped with the schema version of the time.
@@ -1777,7 +1781,6 @@ fn dropping_load1_keeps_the_history_and_lets_new_rows_in() {
     // Opening again must not attempt to drop a column already removed.
     drop(db);
     assert!(Db::open(path).is_ok());
-    let _ = std::fs::remove_file(&file);
 }
 
 /// Removing a node from a probe must remove the probe from that node's chart.
@@ -2178,9 +2181,8 @@ fn a_reboot_after_the_node_was_last_seen_books_the_counters_since_boot() {
 /// deleted before anything is created keep their ids out of circulation.
 #[test]
 fn an_upgraded_database_does_not_reissue_the_newest_ids() {
-    let file = std::env::temp_dir().join(format!("monitor-marks-{}.db", std::process::id()));
-    let _ = std::fs::remove_file(&file);
-    let path = file.to_str().unwrap();
+    let scratch = Scratch::new();
+    let path = &scratch.0;
     let db = Db::open(path).unwrap();
     let (_, newest) = (node(&db, 1), node(&db, 1));
     let probe = |name: &str| PingTask {
@@ -2203,8 +2205,6 @@ fn an_upgraded_database_does_not_reissue_the_newest_ids() {
     let other = node(&db, 1);
     let fresh = db.save_ping_task(&PingTask { nodes: vec![other], ..probe("osaka") }).unwrap();
     assert!(fresh > task, "the newest probe's id is issued again");
-    drop(db);
-    std::fs::remove_file(&file).unwrap();
 }
 
 /// An earlier build deleting a node or a probe runs only its own statements,
@@ -2510,4 +2510,35 @@ fn manual_user_uuid_is_canonical_unique_and_atomic() {
     }
     assert_eq!(db.update_user(alice, &draft).unwrap(), Ok(()));
     assert_eq!(db.user(alice).unwrap().unwrap().uuid, uuid);
+}
+
+#[test]
+fn an_allowed_login_stays_bound_to_the_account_it_first_signed_in_as() {
+    let db = db();
+    db.set_github_allowed(" Alice, ,bob,").unwrap();
+    assert_eq!(db.bind_github("alice", "1").unwrap().as_deref(), Some("1"), "first sign-in binds");
+    assert_eq!(db.bind_github("alice", "2").unwrap().as_deref(), Some("1"), "another account under the name");
+    assert_eq!(db.bind_github("bob", "3").unwrap().as_deref(), Some("3"));
+    assert_eq!(db.bind_github("carol", "4").unwrap(), None, "a login the list does not name");
+    db.set_github_allowed("ALICE ").unwrap();
+    assert_eq!(db.get(crate::auth::GITHUB_IDS).as_deref(), Some("alice:1"), "case and spaces keep it");
+    db.set_github_allowed("bob").unwrap();
+    db.set_github_allowed("alice,bob").unwrap();
+    assert_eq!(
+        db.bind_github("alice", "2").unwrap().as_deref(),
+        Some("2"),
+        "removed and re-added binds afresh"
+    );
+}
+
+#[test]
+fn temporary_files_go_beside_the_database() {
+    let database = std::env::temp_dir().join("monitor.db");
+    temp_files_beside(&database.to_string_lossy()).unwrap();
+    let set: String = Connection::open_in_memory()
+        .unwrap()
+        .query_row("PRAGMA temp_store_directory", [], |r| r.get(0))
+        .unwrap();
+    // The parent, not `temp_dir()` itself, which keeps a trailing slash from TMPDIR.
+    assert_eq!(set, database.parent().unwrap().to_string_lossy());
 }

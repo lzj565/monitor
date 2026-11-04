@@ -37,6 +37,14 @@ const REPORT_SPACING: Duration = Duration::from_millis(500);
 const PROXY_TRAFFIC_SPACING: Duration = Duration::from_secs(4);
 const EXPIRED_USER_SYNC_RETRY: Duration = Duration::from_secs(30);
 
+/// Facts are written at most this often. The agent sends a hello as it
+/// connects and another when its facts change, which it checks once a minute.
+/// One arriving sooner is held until the first heartbeat past the spacing
+/// rather than dropped: the agent does not repeat a hello, and a stalled link
+/// can deliver two of them together. The heartbeat rather than the next
+/// report, which `--interval` can put an hour away.
+const HELLO_SPACING: Duration = Duration::from_secs(30);
+
 /// Probe results admitted per window: twice what the busiest honest node sends
 /// in one -- every probe it may run, each at the shortest interval -- since a
 /// window can straddle two rounds.
@@ -224,6 +232,16 @@ impl Minute {
     }
 }
 
+/// Whether a frame at `tick` keeps `spacing` from the last admitted, which it
+/// then becomes.
+fn spaced(last: &mut Option<Instant>, tick: Instant, spacing: Duration) -> bool {
+    if last.is_some_and(|last| tick.saturating_duration_since(last) < spacing) {
+        return false;
+    }
+    *last = Some(tick);
+    true
+}
+
 /// What one connection may cost the hub, and the probe results it has yet to
 /// file. Local to the connection, unlike [`Agent`], which others read.
 ///
@@ -231,8 +249,9 @@ impl Minute {
 /// most are written: unbounded, 34,209 reports over one connection in ten
 /// seconds would have the hub write 93 MB (measured). The agent's own pace is
 /// known, so what exceeds it is dropped: reports faster than its one-second
-/// floor, a second hello, and results beyond [`Db::MAX_PROBES_PER_NODE`]
-/// probes each run every [`Db::MIN_PROBE_INTERVAL`] seconds.
+/// floor, hellos beyond one per [`HELLO_SPACING`] save the latest, and results
+/// beyond [`Db::MAX_PROBES_PER_NODE`] probes each run every
+/// [`Db::MIN_PROBE_INTERVAL`] seconds.
 ///
 /// ponytail: the caps start afresh with each connection, so a token reconnecting
 /// in a loop costs two commits per handshake -- the hello, and the first
@@ -245,6 +264,10 @@ struct Session {
     /// connection. `Session::default()` keeps zero for non-socket unit tests.
     tag: u64,
     greeted: bool,
+    last_hello: Option<Instant>,
+    /// The latest hello that arrived within [`HELLO_SPACING`] of the last one
+    /// written; see there.
+    held_hello: Option<serde_json::Value>,
     last_report: Option<Instant>,
     last_proxy_traffic: Option<Instant>,
     last_mieru_traffic: Option<Instant>,
@@ -268,11 +291,20 @@ struct Session {
 
 impl Session {
     fn admit_report(&mut self, tick: Instant) -> bool {
-        if self.last_report.is_some_and(|last| tick.saturating_duration_since(last) < REPORT_SPACING) {
-            return false;
+        spaced(&mut self.last_report, tick, REPORT_SPACING)
+    }
+
+    fn admit_hello(&mut self, tick: Instant) -> bool {
+        spaced(&mut self.last_hello, tick, HELLO_SPACING)
+    }
+
+    /// The held hello, once the spacing allows it to be written.
+    fn held_hello_due(&mut self, tick: Instant) -> Option<serde_json::Value> {
+        if self.held_hello.is_some() && self.admit_hello(tick) {
+            self.held_hello.take()
+        } else {
+            None
         }
-        self.last_report = Some(tick);
-        true
     }
 
     fn admit_proxy_traffic(&mut self, tick: Instant) -> bool {
@@ -330,9 +362,21 @@ impl Session {
     /// Files the probe results gathered so far. Taken rather than kept on a
     /// failure, so a database that refuses them cannot grow the buffer.
     fn file_results(&mut self, app: &App, node_id: i64) -> Result<()> {
-        let results = std::mem::take(&mut self.results);
+        let mut results = std::mem::take(&mut self.results);
         if results.is_empty() {
             return Ok(());
+        }
+        // Results held back by a stalled link arrive in one read and share its
+        // second; on the `(node, ts, task)` key all but the last would replace
+        // one another, and the probes lost during the stall would go uncounted.
+        // Each therefore lands at least a second before the next result of the
+        // same probe.
+        let mut next = HashMap::new();
+        for (task, ts, _) in results.iter_mut().rev() {
+            if let Some(&later) = next.get(task) {
+                *ts = (*ts).min(later - 1);
+            }
+            next.insert(*task, *ts);
         }
         app.db.insert_pings(node_id, &results)
     }
@@ -481,6 +525,13 @@ where
                 let quiet = last_frame.elapsed();
                 if quiet > SILENCE {
                     break Err(anyhow::anyhow!("silent for {}s", quiet.as_secs()));
+                }
+                if let Some(facts) = session.held_hello_due(Instant::now()) {
+                    match crate::blocking::in_place(|| save_facts(&app, node_id, &ip, &facts)) {
+                        Ok(Some(source)) => owed = Some(source),
+                        Ok(None) => {}
+                        Err(e) => session.complain(node_id, format_args!("storing held facts failed: {e:#}")),
+                    }
                 }
                 if let Some(source) = &owed {
                     match crate::blocking::in_place(|| app.db.country_owed(node_id, source)) {
@@ -637,11 +688,11 @@ fn dispatch(
         }
     }
     match rpc.method.as_str() {
+        "hello" if !session.admit_hello(arrival.tick) => {
+            debug!("node {node_id}: a hello within {HELLO_SPACING:?} of the last was held");
+            session.held_hello = Some(rpc.params);
+        }
         "hello" => {
-            if std::mem::replace(&mut session.greeted, true) {
-                session.complain(node_id, "a second hello on one connection was ignored");
-                return Ok(None);
-            }
             if let Some(agent) = app.agents.write().unwrap_or_else(|e| e.into_inner()).get_mut(&node_id) {
                 if agent.session == session.tag {
                     agent.realm_traffic_capable = rpc.params["capabilities"]
@@ -661,11 +712,9 @@ fn dispatch(
                         .is_some_and(|caps| caps.iter().any(|v| v.as_str() == Some("realm.v1")));
                 }
             }
-            let field = |k: &str| rpc.params.get(k).and_then(|v| v.as_str()).unwrap_or("");
-            let source =
-                country_source(ip, field("ipv4"), field("ipv6")).map_or_else(String::new, |a| a.to_string());
-            let owed = app.db.save_facts(node_id, &rpc.params, ip, &source)?;
-            return Ok(owed.then_some(source));
+            session.greeted = true;
+            session.held_hello = None;
+            return save_facts(app, node_id, ip, &rpc.params);
         }
         // Dropped quietly: two reports the network bunched are how an honest
         // agent trips this.
@@ -818,6 +867,14 @@ fn settle_expiry_sync(app: &App, node_id: i64, session: &mut Session, now: Insta
             warn!("node {node_id}: expired-user config sync failed; retrying after cooldown");
         }
     }
+}
+
+/// Stores a hello's facts and returns the address a country lookup is now owed
+/// for, if any.
+fn save_facts(app: &App, node_id: i64, ip: &str, facts: &serde_json::Value) -> Result<Option<String>> {
+    let field = |k: &str| facts.get(k).and_then(|v| v.as_str()).unwrap_or("");
+    let source = country_source(ip, field("ipv4"), field("ipv6")).map_or_else(String::new, |a| a.to_string());
+    Ok(app.db.save_facts(node_id, facts, ip, &source)?.then_some(source))
 }
 
 /// Globally routable. Excluded on the v4 side: RFC 1918, CGNAT (100.64/10),
@@ -1962,10 +2019,7 @@ mod tests {
         let hello = |name: &str| {
             json!({"jsonrpc": "2.0", "method": "hello", "params": {"hostname": name}}).to_string()
         };
-        send(&app, id, &mut session, 0, &hello("first")).unwrap();
-        send(&app, id, &mut session, 1, &hello("second")).unwrap();
-        assert_eq!(app.db.node(id).unwrap().unwrap().hostname, "first", "one hello per connection");
-
+        let hostname = || app.db.node(id).unwrap().unwrap().hostname;
         let cpu =
             |value: f64| json!({"jsonrpc": "2.0", "method": "report", "params": {"cpu": value}}).to_string();
         let live_cpu = || app.agents.read().unwrap()[&id].metrics["cpu"].clone();
@@ -1982,6 +2036,26 @@ mod tests {
         assert_eq!(session.results.len(), RESULTS_PER_WINDOW as usize, "the excess of one window is dropped");
         send(&app, id, &mut session, 25, &result_json(task, 1)).unwrap();
         assert_eq!(session.results.len(), RESULTS_PER_WINDOW as usize + 1, "the next window admits again");
+
+        let due = |session: &mut Session, secs| {
+            session.held_hello_due(at(secs).tick).map(|f| f["hostname"].clone())
+        };
+        send(&app, id, &mut session, 100, &hello("first")).unwrap();
+        send(&app, id, &mut session, 101, &hello("second")).unwrap();
+        send(&app, id, &mut session, 102, &hello("third")).unwrap();
+        assert_eq!(hostname(), "first", "facts are written at most once per spacing");
+        assert_eq!(due(&mut session, 129), None);
+        assert_eq!(
+            due(&mut session, 130),
+            Some(json!("third")),
+            "the latest held hello is due once the spacing passes"
+        );
+        assert_eq!(due(&mut session, 131), None, "and only once");
+        send(&app, id, &mut session, 150, &hello("renamed")).unwrap();
+        assert_eq!(due(&mut session, 159), None, "the spacing runs from the held hello's write");
+        send(&app, id, &mut session, 160, &hello("again")).unwrap();
+        assert_eq!(hostname(), "again", "a hello written directly supersedes the held one");
+        assert_eq!(due(&mut session, 300), None);
     }
 
     #[test]
@@ -1998,6 +2072,7 @@ mod tests {
         assert_eq!(n.hostname, "vps-1");
         assert_eq!(n.cpu_cores, 4);
         assert_eq!(n.ip, "198.51.100.4");
+        assert_eq!(n.mem_total, 0, "capacities are the reports' to store, not an older agent's hello");
     }
 
     /// The country follows the machine rather than whatever stands in front of
@@ -2095,6 +2170,43 @@ mod tests {
             vec![(one, 42), (two, 15)],
             "each real task keeps its own result, and only those"
         );
+    }
+
+    /// A panel edit reaches the agents it concerns, carrying their own list.
+    #[test]
+    fn a_probe_edit_is_pushed_to_the_nodes_it_names() {
+        let app = app();
+        let (a, b) = (node(&app), node(&app));
+        let task = probe(&app, a, "p");
+        let (ta, mut to_a) = mpsc::channel(4);
+        let (tb, mut to_b) = mpsc::channel(4);
+        app.agents.write().unwrap().insert(a, Agent::new(1, ta));
+        app.agents.write().unwrap().insert(b, Agent::new(2, tb));
+
+        push_ping_tasks(&app, Some(a));
+        let sent: serde_json::Value = serde_json::from_str(&to_a.try_recv().unwrap()).unwrap();
+        assert_eq!(sent["method"], "ping.tasks");
+        assert_eq!(sent["params"][0]["id"], task);
+        assert!(to_b.try_recv().is_err(), "an edit of one node is pushed to that node alone");
+
+        push_ping_tasks(&app, None);
+        assert!(to_a.try_recv().is_ok());
+        let sent: serde_json::Value = serde_json::from_str(&to_b.try_recv().unwrap()).unwrap();
+        assert_eq!(sent["params"], json!([]), "a node without probes is told so");
+    }
+
+    #[test]
+    fn results_bunched_into_one_second_keep_a_row_each() {
+        let app = app();
+        let id = node(&app);
+        let mut session = Session::default();
+        let one = probe(&app, id, "one");
+        for latency in [-1, -1, 30] {
+            send(&app, id, &mut session, 0, &result_json(one, latency)).unwrap();
+        }
+        send(&app, id, &mut session, 60, r#"{"method":"whatever"}"#).unwrap();
+        let loss = app.db.ping_records(id, Span::minutes(0, 60)).unwrap().1;
+        assert_eq!(loss[one.to_string()], 200.0 / 3.0, "the two timeouts before the reply count");
     }
 
     #[test]

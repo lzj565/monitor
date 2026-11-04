@@ -80,17 +80,16 @@ pub(super) fn node_view(
     full: bool,
     now: DateTime<Local>,
 ) -> Value {
-    // The three capacities arrive twice: once in `Facts`, sent at the handshake,
-    // and again in every `Metrics`. The stored figure follows the reports a
-    // minute at a time and as the session ends, so it lags a disk mounted while
-    // the agent runs -- the agent re-reads its mount table every sample so that
-    // it appears -- by up to a minute. Using the report while a node is connected
-    // keeps every consumer of this view on one number: the card reads the live
-    // metrics and the detail page reads these, which would otherwise show the
-    // same machine two different capacities. Offline, the stored figure is the
-    // last one reported. No floor is applied: a host whose swap has just been
-    // disabled reports zero and means it. A node connected but not yet reporting
-    // holds `Null`, where `get` returns nothing and the stored figure stands.
+    // The three capacities arrive in every `Metrics`. The stored figure follows the
+    // reports a minute at a time and as the session ends, so it lags a disk mounted
+    // while the agent runs -- the agent re-reads its mount table every sample so
+    // that it appears -- by up to a minute. Using the report while a node is
+    // connected keeps every consumer of this view on one number: the card reads the
+    // live metrics and the detail page reads these, which would otherwise show the
+    // same machine two different capacities. Offline, the stored figure is the last
+    // one reported. No floor is applied: a host whose swap has just been disabled
+    // reports zero and means it. A node connected but not yet reporting holds
+    // `Null`, where `get` returns nothing and the stored figure stands.
     let live = |key: &str, stored: i64| {
         current.and_then(|a| a.metrics.get(key).and_then(serde_json::Value::as_i64)).unwrap_or(stored)
     };
@@ -450,17 +449,9 @@ pub async fn live_ws(
     upgrade: WebSocketUpgrade,
 ) -> Response {
     crate::blocking::response(move || {
-        // The digest rather than the result: signing out must reach a stream already
-        // running, and only the row it names can report whether it has.
-        // A sibling subdomain's script opens this with the cookie too, and a
-        // WebSocket is not held back by CORS: it would read the admin frame. Such a
-        // handshake is answered as an anonymous one.
-        let session = current_session(&headers)
-            .filter(|_| !from_other_origin(&headers))
-            .filter(|hash| app.db.admin_session_valid(hash));
-        if session.is_none() && !app.public_page() {
+        let Some(session) = stream_viewer(&app, &headers) else {
             return answer(StatusCode::UNAUTHORIZED, "需要登录后查看");
-        }
+        };
         let Ok(slot) = stream_slot(session.as_deref()) else {
             return answer(StatusCode::SERVICE_UNAVAILABLE, "同时在线的访客太多，请稍后再试");
         };
@@ -666,4 +657,11 @@ pub(super) fn stream_slot(
         return Ok(None);
     }
     PUBLIC_STREAM_GATE.try_acquire().map(Some).map_err(|_| ())
+}
+
+pub(super) fn stream_viewer(app: &App, headers: &HeaderMap) -> Option<Option<String>> {
+    let session = current_session(headers)
+        .filter(|_| !from_other_origin(headers))
+        .filter(|hash| app.db.admin_session_valid(hash));
+    (session.is_some() || app.public_page()).then_some(session)
 }

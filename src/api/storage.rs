@@ -114,7 +114,7 @@ pub(super) async fn receive(
 
 /// A scratch file beside the database, so the copy lands on the same filesystem
 /// the database has room on. The random component keeps two concurrent calls
-/// apart, since `VACUUM INTO` refuses an existing file.
+/// apart, since `VACUUM INTO` refuses a file that is not empty.
 pub(super) fn scratch_path(app: &App, kind: &str) -> String {
     format!("{}.{kind}-{}.tmp", app.db.file(), &random_token()[..16])
 }
