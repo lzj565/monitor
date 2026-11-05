@@ -2575,3 +2575,100 @@ fn entry_preferences_are_private_and_do_not_remove_portal_entries() {
     assert!(db.save_entry_preferences(other, 999999, Some(true), None).is_err());
     assert!(db.save_entry_preferences(uid, a, None, Some("bad\nname".into())).is_err());
 }
+
+#[test]
+fn external_import_authorization_preferences_and_backup_are_atomic_and_independent() {
+    let scratch = Scratch::new();
+    let db = Db::open(&scratch.0).unwrap();
+    let uid = db.create_user(&user_draft("external-alice")).unwrap().unwrap();
+    let other = db.create_user(&user_draft("external-bob")).unwrap().unwrap();
+    let config = serde_json::json!({"name":"外部","type":"trojan","server":"example.com","port":443,"password":"original-password","sni":"edge.example.com"});
+    let id = db.import_external_proxies(std::slice::from_ref(&config)).unwrap()[0];
+    let key = format!("external:{id}");
+    let now = Utc::now().timestamp();
+    assert!(db.active_external_configs(uid, now).unwrap().is_empty());
+    db.replace_external_authorizations(uid, &[id]).unwrap();
+    assert_eq!(db.active_external_configs(uid, now).unwrap()[0].1, config);
+    assert!(db.active_external_configs(other, now).unwrap().is_empty());
+    assert!(db.save_user_entry_preference(other, &key, Some(true), None).is_err());
+    db.save_user_entry_preference(uid, &key, Some(true), Some("私人名称".into())).unwrap();
+    db.reorder_user_entries(uid, std::slice::from_ref(&key), now).unwrap();
+    assert!(db.all_entry_preferences(uid).unwrap()[&key].1);
+    assert!(db.reorder_user_entries(uid, &[key.clone(), key.clone()], now).is_err());
+    assert!(db.replace_external_authorizations(uid, &[id, 999999]).is_err());
+    assert_eq!(db.external_authorizations(uid).unwrap(), vec![id]);
+    let mut second = config.clone();
+    second["name"] = serde_json::json!("second");
+    assert!(db.import_external_proxies(&[second, config.clone()]).is_err());
+    assert_eq!(db.external_proxies().unwrap().len(), 1, "batch rolled back");
+    db.update_external_proxy(id, None, Some(false)).unwrap();
+    assert!(db.active_external_configs(uid, now).unwrap().is_empty());
+    db.update_external_proxy(id, None, Some(true)).unwrap();
+    let copy = format!("{}.copy", scratch.0);
+    db.backup_into(&copy).unwrap();
+    db.delete_external_proxy(id).unwrap();
+    assert!(db.external_authorizations(uid).unwrap().is_empty());
+    assert!(!db.all_entry_preferences(uid).unwrap().contains_key(&key));
+    db.restore_from(&copy).unwrap();
+    assert_eq!(db.active_external_configs(uid, now).unwrap()[0].1, config);
+    assert_eq!(db.all_entry_preferences(uid).unwrap()[&key].2, "私人名称");
+    assert!(db.all_proxies().unwrap().is_empty());
+    assert!(db.all_traffic().is_empty());
+    db.replace_external_authorizations(uid, &[]).unwrap();
+    assert!(db.active_external_configs(uid, now).unwrap().is_empty());
+    db.replace_external_authorizations(uid, &[id]).unwrap();
+    let mut disabled = user_draft("external-alice");
+    disabled.enabled = false;
+    db.update_user(uid, &disabled).unwrap().unwrap();
+    assert!(db.active_external_configs(uid, now).unwrap().is_empty());
+    disabled.enabled = true;
+    disabled.expires_at = Some(now - 1);
+    db.update_user(uid, &disabled).unwrap().unwrap();
+    assert!(db.active_external_configs(uid, now).unwrap().is_empty());
+    disabled.expires_at = None;
+    db.update_user(uid, &disabled).unwrap().unwrap();
+    let mut edited = config.clone();
+    edited["password"] = serde_json::json!("replacement-fixture");
+    db.update_external_proxy(id, Some(&edited), None).unwrap();
+    assert_eq!(db.active_external_configs(uid, now).unwrap()[0].1, edited);
+    assert_eq!(db.all_entry_preferences(uid).unwrap()[&key].2, "私人名称");
+    db.delete_user(uid).unwrap();
+    assert!(db.all_entry_preferences(uid).unwrap().is_empty());
+    assert!(
+        db.conn()
+            .query_row(
+                "SELECT count(*) FROM user_external_proxy_authorizations WHERE user_id=?1",
+                [uid],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap()
+            == 0
+    );
+    assert!(db.external_proxy_config(id).unwrap().is_some(), "deleting a user keeps external configuration");
+}
+
+#[test]
+fn numeric_preferences_migrate_from_28_and_unreleased_29_without_data_loss() {
+    for version in [28, 29] {
+        let scratch = Scratch::new();
+        let db = Db::open(&scratch.0).unwrap();
+        let uid = db.create_user(&user_draft("legacy-entry")).unwrap().unwrap();
+        db.conn().execute_batch(&format!("DROP TABLE user_entry_preferences;
+            CREATE TABLE user_entry_preferences(user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,entry_id INTEGER NOT NULL,position INTEGER,hidden INTEGER NOT NULL DEFAULT 0,custom_name TEXT NOT NULL DEFAULT '',PRIMARY KEY(user_id,entry_id));
+            INSERT INTO user_entry_preferences VALUES({uid},7,0,1,'direct-name'),({uid},-8,1,0,'realm-name'); PRAGMA user_version={version};")).unwrap();
+        if version == 28 {
+            db.conn()
+                .execute_batch("DROP TABLE user_external_proxy_authorizations; DROP TABLE external_proxies;")
+                .unwrap();
+        }
+        drop(db);
+        let fresh = Db::open(&scratch.0).unwrap();
+        let prefs = fresh.all_entry_preferences(uid).unwrap();
+        assert_eq!(prefs["proxy:7"].2, "direct-name");
+        assert!(prefs["proxy:7"].1);
+        assert_eq!(prefs["realm:8"].0, Some(1));
+        let copy = format!("{}.copy", scratch.0);
+        fresh.backup_into(&copy).unwrap();
+        fresh.check_backup(&copy).unwrap();
+    }
+}

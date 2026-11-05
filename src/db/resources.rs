@@ -140,8 +140,15 @@ impl Db {
     }
 
     pub fn delete_proxy(&self, id: i64) -> Result<bool> {
-        self.conn().execute("DELETE FROM user_entry_preferences WHERE entry_id=?1", [id])?;
-        Ok(self.conn().execute("DELETE FROM proxies WHERE id=?1", [id])? > 0)
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM user_entry_preferences WHERE entry_key=?1",
+            [super::external::internal_entry_key(id)],
+        )?;
+        let deleted = tx.execute("DELETE FROM proxies WHERE id=?1", [id])? > 0;
+        tx.commit()?;
+        Ok(deleted)
     }
 
     pub fn users(&self, enabled: Option<bool>, query: Option<&str>) -> Result<Vec<User>> {
@@ -595,7 +602,7 @@ impl Db {
             refuse!("节点列表已变更或排序无效，请刷新后重试");
         }
         for (sort, id) in ids.iter().enumerate() {
-            tx.execute("INSERT INTO user_entry_preferences(user_id,entry_id,position) VALUES(?1,?2,?3) ON CONFLICT(user_id,entry_id) DO UPDATE SET position=excluded.position", params![user_id,id,sort as i64])?;
+            tx.execute("INSERT INTO user_entry_preferences(user_id,entry_key,position) VALUES(?1,?2,?3) ON CONFLICT(user_id,entry_key) DO UPDATE SET position=excluded.position", params![user_id,super::external::internal_entry_key(*id),sort as i64])?;
         }
         tx.commit()?;
         Ok(())
@@ -1317,12 +1324,13 @@ impl Db {
 
     /// False when no node has this id.
     pub fn delete_node(&self, id: i64) -> Result<bool> {
-        let conn = self.conn();
-        // `ping_record` carries no foreign key -- it is WITHOUT ROWID and keyed
-        // for the chart query -- so it is cleared explicitly; the other history
-        // tables cascade.
-        conn.execute("DELETE FROM ping_record WHERE node_id = ?1", [id])?;
-        Ok(conn.execute("DELETE FROM node WHERE id = ?1", [id])? > 0)
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM user_entry_preferences WHERE entry_key IN (SELECT 'proxy:'||id FROM proxies WHERE node_id=?1)",[id])?;
+        tx.execute("DELETE FROM ping_record WHERE node_id=?1", [id])?;
+        let deleted = tx.execute("DELETE FROM node WHERE id=?1", [id])? > 0;
+        tx.commit()?;
+        Ok(deleted)
     }
 
     /// Replaces a node's token, which immediately locks out the old one. False
@@ -1427,15 +1435,13 @@ impl Db {
 
 impl Db {
     pub fn entry_preferences(&self, user: i64) -> Result<EntryPreferences> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT entry_id,position,hidden,custom_name FROM user_entry_preferences WHERE user_id=?1",
-        )?;
-        let rows = stmt
-            .query_map([user], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?, r.get(3)?))))?
-            .collect::<rusqlite::Result<_>>()?;
-        Ok(rows)
+        Ok(self
+            .all_entry_preferences(user)?
+            .into_iter()
+            .filter_map(|(key, pref)| super::external::internal_entry_id(&key).map(|id| (id, pref)))
+            .collect())
     }
+
     pub fn save_entry_preferences(
         &self,
         user: i64,
@@ -1446,11 +1452,6 @@ impl Db {
         if !self.active_user_portal_proxies(user, Utc::now().timestamp())?.iter().any(|p| p.id == id) {
             refuse!("入口不存在或未授权");
         }
-        let name = name.map(|n| n.trim().to_owned());
-        if name.as_ref().is_some_and(|n| n.chars().count() > 100 || n.chars().any(char::is_control)) {
-            refuse!("名称最多100字且不能包含控制字符");
-        }
-        self.conn().execute("INSERT INTO user_entry_preferences(user_id,entry_id,hidden,custom_name) VALUES(?1,?2,COALESCE(?3,0),COALESCE(?4,'')) ON CONFLICT(user_id,entry_id) DO UPDATE SET hidden=COALESCE(?3,hidden),custom_name=COALESCE(?4,custom_name)",params![user,id,hidden,name])?;
-        Ok(())
+        self.write_entry_preference(user, &super::external::internal_entry_key(id), hidden, name)
     }
 }

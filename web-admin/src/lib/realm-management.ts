@@ -7,11 +7,11 @@ export type RealmRule = { traffic_key: string; id: number; node_id: number; targ
 export type RealmRuleDraft = Pick<RealmRule, "node_id" | "target_proxy_id" | "name" | "address_type" | "address" | "listen_port" | "enabled">
 export type RealmHostDraft = { node_id: number; enabled: boolean }
 export type ProxyListItem = { kind: "proxy"; key: string; proxy: Proxy } | { kind: "realm"; key: string; rule: RealmRule }
-export type ProxyTypeFilter = "all" | "vless" | "mieru" | "realm"
+export type ProxyTypeFilter = "all" | "vless" | "mieru" | "realm" | "external"
 
 export function proxyTypeFilter(search: string): ProxyTypeFilter {
   const type = new URLSearchParams(search).get("type")
-  return type === "realm" || type === "vless" || type === "mieru" ? type : "all"
+  return type === "external" || type === "realm" || type === "vless" || type === "mieru" ? type : "all"
 }
 export function realmHostStatus(host?: RealmHost): string {
   if (!host) return "等待入口配置"

@@ -205,3 +205,7 @@ impl Db {
         reader
     }
 }
+
+mod external;
+pub use external::internal_entry_key;
+use external::EXTERNAL_SCHEMA;

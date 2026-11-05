@@ -4,6 +4,8 @@ import { toast } from "sonner"
 
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog"
+import { Input } from "@/components/ui/input"
 import { Badge } from "@/components/ui/badge"
 import { Skeleton } from "@/components/ui/skeleton"
 import { ProxyAddressTypeBadge, ProxyProtocolBadge, TooltipText } from "@/components/ProxyBadges"
@@ -24,7 +26,10 @@ type UserProfile = {
 type PortalProxy = {
   hidden: boolean
   custom_name: string
-  id: number
+  id: string
+  entry_key: string
+  source: "proxy" | "realm" | "external"
+  default_name: string
   node_id: number
   node_name: string
   node_group: string
@@ -39,7 +44,7 @@ type PortalProxy = {
   vless_url: string
   mieru_url?: string
   mihomo_yaml: string
-  online: boolean
+  online: boolean | null
 }
 
 type SubscriptionLinks = { clash: string; sing_box: string }
@@ -66,10 +71,13 @@ export function UserCenter({ siteName, dark, toggleTheme, signOut, returnToAdmin
   const [links, setLinks] = useState<SubscriptionLinks | null>(null)
   const [error, setError] = useState("")
   const [rotating, setRotating] = useState(false)
+  const [editingName, setEditingName] = useState<{ proxy: PortalProxy; value: string } | null>(null)
+  const [savingEntry, setSavingEntry] = useState<string | null>(null)
+  const [preferenceError, setPreferenceError] = useState("")
   const [loadAttempt, setLoadAttempt] = useState(0)
 
   const reloadProxies = useCallback(() => {
-    void api<{ items: PortalProxy[] }>("/user/me/proxies").then((result) => setProxies(result.items)).catch((e: Error) => toast.error(e.message))
+    return api<{ items: PortalProxy[] }>("/user/me/proxies").then((result) => setProxies(result.items.map(p => ({ ...p, id: p.entry_key })))).catch((e: Error) => toast.error(e.message))
   }, [])
   const drag = useDragOrder((proxies ?? []), "user/me/proxies", reloadProxies)
   const used = profile ? profile.traffic.uplink_bytes + profile.traffic.downlink_bytes : 0
@@ -90,7 +98,7 @@ export function UserCenter({ siteName, dark, toggleTheme, signOut, returnToAdmin
         if (!active) return
         setError("")
         setProfile(nextProfile)
-        setProxies(nextProxies.items)
+        setProxies(nextProxies.items.map(p => ({ ...p, id: p.entry_key })))
         setLinks(nextLinks)
       } catch (e) {
         if (active) setError((e as Error).message)
@@ -107,6 +115,17 @@ export function UserCenter({ siteName, dark, toggleTheme, signOut, returnToAdmin
     } catch {
       toast.error("复制失败，请检查浏览器剪贴板权限")
     }
+  }
+
+  async function savePreference(proxy: PortalProxy, patch: { hidden?: boolean; custom_name?: string }) {
+    setSavingEntry(proxy.id); setPreferenceError("")
+    try {
+      await api(`/user/me/proxies/${encodeURIComponent(proxy.entry_key)}/preferences`, { method: "PATCH", body: JSON.stringify(patch) })
+      await reloadProxies()
+      if (patch.custom_name !== undefined) setEditingName(null)
+      toast.success("节点偏好已保存")
+    } catch (e) { const message = (e as Error).message; setPreferenceError(message); toast.error(message) }
+    finally { setSavingEntry(null) }
   }
 
   async function rotateLinks() {
@@ -200,8 +219,8 @@ export function UserCenter({ siteName, dark, toggleTheme, signOut, returnToAdmin
           </div>
           <div className="grid gap-3 sm:grid-cols-2">
             {([
-              { key: "clash", title: "Clash / Mihomo", description: "VLESS / mieru 配置，适用于 Mihomo 客户端" },
-              { key: "sing_box", title: "Sing-box", description: "VLESS 配置，适用于 Sing-box 客户端" },
+              { key: "clash", title: "Clash / Mihomo", description: "包含获授权的外部代理，适用于 Mihomo 客户端" },
+              { key: "sing_box", title: "Sing-box", description: "VLESS 配置，不含外部导入代理" },
             ] as const).map(({ key, title, description }) => {
               const path = links?.[key]
               const url = path ? absoluteLink(path) : ""
@@ -222,17 +241,17 @@ export function UserCenter({ siteName, dark, toggleTheme, signOut, returnToAdmin
         <Card className="gap-4 p-5 shadow-sm md:p-6">
           <div>
             <h2 className="flex items-center gap-2 font-semibold">我的节点{proxies && <Badge variant="secondary" className="tabular-nums">{proxies.length}</Badge>}</h2>
-            <p className="mt-1 text-sm text-muted-foreground">拖动左侧手柄调整顺序，自动保存并同步到订阅。</p>
+            <p className="mt-1 text-sm text-muted-foreground">拖动左侧手柄调整顺序，自动保存并同步到订阅。</p><p className="mt-1 text-xs text-muted-foreground sm:hidden">左右滑动节点表可查看全部操作。</p>
           </div>
           {!proxies ? (
             error ? <p className="text-sm text-muted-foreground">节点暂时无法加载，请重试。</p> : <Skeleton className="h-24" />
           ) : proxies.length === 0 ? (
             <p className="rounded-md border border-dashed p-6 text-center text-sm text-muted-foreground">当前没有已启用的节点授权</p>
           ) : (
-            <div className="overflow-hidden rounded-md border">
-              <table className="w-full table-fixed text-left text-sm">
+            <div className="overflow-x-auto rounded-md border">
+              <table className="w-full min-w-[560px] table-fixed text-left text-sm">
                 <thead className="bg-muted/50 text-xs text-muted-foreground">
-                  <tr><th className="w-10 px-1 py-3 sm:px-2"><span className="sr-only">排序</span></th><th className="w-[30%] px-2 py-3 sm:w-[20%] sm:px-3">节点</th><th className="hidden w-[14%] px-2 py-3 sm:table-cell sm:px-3">名称</th><th className="hidden w-[13%] px-3 py-3 xl:table-cell">协议</th><th className="w-[35%] px-2 py-3 sm:w-[22%] sm:px-3">地址</th><th className="hidden w-[7%] px-3 py-3 xl:table-cell">端口</th><th className="hidden w-[12%] px-3 py-3 xl:table-cell">SNI</th><th className="hidden w-[10%] px-3 py-3 xl:table-cell">状态</th><th className="w-20 px-1 py-3 sm:w-24 sm:px-3"><span className="sr-only">复制</span></th></tr>
+                  <tr><th className="w-10 px-1 py-3 sm:px-2"><span className="sr-only">排序</span></th><th className="w-[30%] px-2 py-3 sm:w-[20%] sm:px-3">节点</th><th className="hidden w-[14%] px-2 py-3 sm:table-cell sm:px-3">名称</th><th className="hidden w-[13%] px-3 py-3 xl:table-cell">协议</th><th className="w-[35%] px-2 py-3 sm:w-[22%] sm:px-3">地址</th><th className="hidden w-[7%] px-3 py-3 xl:table-cell">端口</th><th className="hidden w-[12%] px-3 py-3 xl:table-cell">SNI</th><th className="hidden w-[10%] px-3 py-3 xl:table-cell">状态</th><th className="w-36 px-1 py-3 sm:px-3"><span className="sr-only">复制</span></th></tr>
                 </thead>
                 <tbody>
                   {drag.order.map((proxy) => (
@@ -241,7 +260,7 @@ export function UserCenter({ siteName, dark, toggleTheme, signOut, returnToAdmin
                       <td className="whitespace-normal px-2 py-3 sm:px-3">
                         <div className="min-w-0">
                           <div className="font-medium text-balance break-keep">
-                            {proxy.custom_name || proxy.node_name}{proxy.hidden && <Badge>已从订阅隐藏</Badge>}{proxy.node_country && "\u2007"}{proxy.node_country && <Badge variant="outline" className="align-middle font-normal text-muted-foreground">{proxy.node_country}</Badge>}
+                            {proxy.name}{proxy.hidden && <Badge>已从订阅隐藏</Badge>}{proxy.node_country && "\u2007"}{proxy.node_country && <Badge variant="outline" className="align-middle font-normal text-muted-foreground">{proxy.node_country}</Badge>}
                           </div>
                           {proxy.node_group && <div className="text-xs text-balance text-muted-foreground">{proxy.node_group}</div>}
                         </div>
@@ -251,8 +270,13 @@ export function UserCenter({ siteName, dark, toggleTheme, signOut, returnToAdmin
                       <td className="px-2 py-3 sm:px-3"><div className="flex min-w-0 items-center gap-1 sm:gap-2"><span className="hidden shrink-0 sm:inline-flex"><ProxyAddressTypeBadge addressType={proxy.address_type} /></span><span className="min-w-0 truncate font-mono text-xs" title={proxy.address}>{proxy.address}</span></div></td>
                       <td className="hidden px-3 py-3 font-mono xl:table-cell">{proxy.port}</td>
                       <td className="hidden px-3 py-3 xl:table-cell"><TooltipText text={proxy.server_name || "—"} className="font-mono text-xs" /></td>
-                      <td className="hidden px-3 py-3 xl:table-cell"><Badge variant="outline" className={`font-normal ${proxy.online ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300" : "text-muted-foreground"}`}><span className={`size-1.5 rounded-full ${proxy.online ? "bg-emerald-500" : "bg-muted-foreground/50"}`} />{proxy.online ? "在线" : "离线"}</Badge></td>
-                      <td className="px-1 py-3 sm:px-3"><div className="flex flex-wrap items-center justify-center gap-0 sm:gap-1"><Button variant="ghost" size="sm" onClick={async()=>{const name=window.prompt("自定义名称（留空恢复默认）",proxy.custom_name);if(name===null)return;try{await api(`/user/me/proxies/${proxy.id}/preferences`,{method:"PATCH",body:JSON.stringify({custom_name:name})});reloadProxies()}catch(e){toast.error((e as Error).message)}}}>改名</Button><Button variant="ghost" size="sm" onClick={async()=>{try{await api(`/user/me/proxies/${proxy.id}/preferences`,{method:"PATCH",body:JSON.stringify({hidden:!proxy.hidden})});reloadProxies()}catch(e){toast.error((e as Error).message)}}}>{proxy.hidden?"恢复订阅":"隐藏"}</Button><Button type="button" variant="ghost" size="icon" className="size-8 shrink-0" title={proxy.mieru_url ? "复制 mieru 分享链接" : "复制 VLESS URL"} aria-label={`复制 ${proxy.name} 的${proxy.mieru_url ? " mieru 分享链接" : " VLESS URL"}`} onClick={() => void copy(proxy.mieru_url ?? proxy.vless_url, proxy.mieru_url ? "mieru 分享链接" : "VLESS URL")}><Link /></Button><Button type="button" variant="ghost" size="icon" className="size-8 shrink-0" title="复制 Mihomo 配置" aria-label={`复制 ${proxy.name} 的 Mihomo 配置`} onClick={() => void copy(proxy.mihomo_yaml, "Mihomo 配置")}><FileCode /></Button></div></td>
+                      <td className="hidden px-3 py-3 xl:table-cell"><Badge variant="outline" className={`font-normal ${proxy.online ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300" : "text-muted-foreground"}`}><span className={`size-1.5 rounded-full ${proxy.online ? "bg-emerald-500" : "bg-muted-foreground/50"}`} />{proxy.online === null ? "不监测" : proxy.online ? "在线" : "离线"}</Badge></td>
+                      <td className="px-1 py-3 sm:px-3"><div className="flex flex-wrap items-center justify-center gap-0 sm:gap-1">
+                        <Button variant="ghost" size="sm" disabled={savingEntry !== null} onClick={() => { setPreferenceError(""); setEditingName({ proxy, value: proxy.custom_name }) }}>改名</Button>
+                        <Button variant="ghost" size="sm" disabled={savingEntry !== null} onClick={() => void savePreference(proxy, { hidden: !proxy.hidden })}>{proxy.hidden ? "恢复订阅" : "隐藏"}</Button>
+                        {proxy.source !== "external" && <Button type="button" variant="ghost" size="icon" className="size-8 shrink-0" title={proxy.mieru_url ? "复制 mieru 分享链接" : "复制 VLESS URL"} aria-label={`复制 ${proxy.name} 的${proxy.mieru_url ? " mieru 分享链接" : " VLESS URL"}`} onClick={() => void copy(proxy.mieru_url ?? proxy.vless_url, proxy.mieru_url ? "mieru 分享链接" : "VLESS URL")}><Link /></Button>}
+                        <Button type="button" variant="ghost" size="icon" className="size-8 shrink-0" title="复制 Mihomo 配置" aria-label={`复制 ${proxy.name} 的 Mihomo 配置`} onClick={() => void copy(proxy.mihomo_yaml, "Mihomo 配置")}><FileCode /></Button>
+                      </div></td>
                     </tr>
                   ))}
                 </tbody>
@@ -261,6 +285,13 @@ export function UserCenter({ siteName, dark, toggleTheme, signOut, returnToAdmin
           )}
         </Card>
       </main>
+      {editingName && <Dialog open onOpenChange={open => !open && savingEntry === null && setEditingName(null)}><DialogContent className="sm:max-w-md">
+        <DialogHeader><DialogTitle>自定义节点名称</DialogTitle><DialogDescription>仅影响你的页面和订阅。清空后恢复默认名称：{editingName.proxy.default_name}</DialogDescription></DialogHeader>
+        <Input aria-label="个人节点名称" maxLength={100} value={editingName.value} disabled={savingEntry !== null} placeholder={editingName.proxy.default_name} onChange={e => setEditingName({ ...editingName, value: e.target.value })} />
+        {preferenceError && <p role="alert" className="text-sm text-destructive">{preferenceError}</p>}
+        <DialogFooter className="flex-wrap"><Button variant="ghost" disabled={savingEntry !== null} onClick={() => setEditingName(null)}>取消</Button><Button variant="outline" disabled={savingEntry !== null} onClick={() => setEditingName({ ...editingName, value: "" })}>恢复默认名称</Button><Button disabled={savingEntry !== null} onClick={() => void savePreference(editingName.proxy, { custom_name: editingName.value })}>{savingEntry ? "保存中…" : "保存名称"}</Button></DialogFooter>
+      </DialogContent></Dialog>}
+
     </div>
   )
 }

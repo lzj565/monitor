@@ -31,6 +31,7 @@ mod blocking;
 mod command;
 mod components;
 mod db;
+mod external_proxy;
 mod frontend;
 mod mieru;
 mod notify;
@@ -803,9 +804,9 @@ async fn main() -> Result<()> {
                 .route("/api/user/me/proxies", get(api::user_proxies))
                 .route(
                     "/api/user/me/proxies/{id}/preferences",
-                    axum::routing::patch(api::save_user_entry_preferences),
+                    axum::routing::patch(api::save_user_entry_preference),
                 )
-                .route("/api/user/me/proxies/order", put(api::reorder_user_proxies))
+                .route("/api/user/me/proxies/order", put(api::reorder_user_entries))
                 .route("/api/user/me/subscription", get(api::user_subscription_links))
                 .route("/api/user/me/subscription-token", post(api::rotate_user_subscription_token))
                 .route("/api/subscriptions/{token}/{format}", get(api::subscription))
@@ -823,10 +824,29 @@ async fn main() -> Result<()> {
                 .layer(tower_http::limit::RequestBodyLimitLayer::new(8 * 1024 * 1024))
                 .with_state(app.clone()),
         )
+        .merge(
+            Router::new()
+                .route("/api/external-proxies", get(api::list_external))
+                .route("/api/external-proxies/preview", post(api::preview_external))
+                .route("/api/external-proxies/import", post(api::import_external))
+                .route(
+                    "/api/external-proxies/{id}",
+                    get(api::get_external).put(api::update_external).delete(api::delete_external),
+                )
+                .layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024))
+                .layer(tower_http::limit::RequestBodyLimitLayer::new(8 * 1024 * 1024))
+                .layer(axum::middleware::map_response(api::external_no_store))
+                .layer(axum::middleware::map_response(api::api_json_errors))
+                .with_state(app.clone()),
+        )
         // Resource V1 APIs have a JSON error contract. Keep their body limit
         // and response mapper scoped so legacy endpoints retain text errors.
         .merge(
             Router::new()
+                .route(
+                    "/api/users/{id}/external-proxies",
+                    get(api::get_external_access).put(api::save_external_access),
+                )
                 .route("/api/proxies", get(api::list_all_proxies))
                 .route("/api/proxies/order", put(api::reorder_proxies))
                 .route("/api/proxy-list/order", get(api::proxy_list_order).put(api::save_proxy_list_order))

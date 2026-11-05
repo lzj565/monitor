@@ -1,3 +1,4 @@
+import { ExternalAuthorization, ExternalAuthorizedSummary, ExternalImportDialog, ExternalProxyRow, useExternalProxies } from "./admin/ExternalProxies"
 import { normalizeUserUuid } from "@/lib/user-uuid"
 import { MieruForm, MieruCredential } from "./admin/Mieru"
 import { useAdminResources, useSharedProxies, useSharedUsers } from "@/components/AdminResources"
@@ -415,6 +416,8 @@ function ProxyPage({ nodes, site, refusal, search, go }: { nodes: Node[]; site: 
   const notifySync = useNotifySync()
   const { items, error, loading, reload } = useAllProxies()
   const realm = useRealmProxies()
+  const external = useExternalProxies()
+  const [importingExternal, setImportingExternal] = useState(false)
   const typeFilter = proxyTypeFilter(search)
   const [creationType, setCreationType] = useState<"vless" | "mieru" | "realm" | null>(null)
   const [editingRealmId, setEditingRealmId] = useState<number | null>(null)
@@ -453,6 +456,7 @@ function ProxyPage({ nodes, site, refusal, search, go }: { nodes: Node[]; site: 
   const nodeById = new Map(nodes.map((node) => [node.id, node]))
   const visibleKeys = new Set(proxyListItems(items ?? [], realm.rules, nodes, { query, node: nodeFilter, status: statusFilter, type: typeFilter }).map((item) => item.key))
   const visible = drag.order.filter((item) => visibleKeys.has(item.key))
+  const visibleExternal = external.items.filter(p => (typeFilter === "all" || typeFilter === "external") && nodeFilter === "all" && (statusFilter === "all" || (statusFilter === "enabled") === p.enabled) && `${p.name} ${p.protocol} ${p.address}`.toLowerCase().includes(query.trim().toLowerCase()))
   const searching = query.trim() !== "" || nodeFilter !== "all" || statusFilter !== "all" || typeFilter !== "all"
   const orderReady = savedOrder !== null && !orderError && !loading && !error && realm.loaded && !realm.error && [...savedOrder].sort().join(",") === liveKeys
   const dragDisabled = searching || !orderReady
@@ -460,6 +464,7 @@ function ProxyPage({ nodes, site, refusal, search, go }: { nodes: Node[]; site: 
   const changeTypeFilter = (type: string) => {
     const params = new URLSearchParams(search)
     if (type === "all") params.delete("type"); else params.set("type", type)
+    if (type === "external") setNodeFilter("all")
     go(`/admin/proxies${params.size ? `?${params}` : ""}`)
   }
   const realmAction = async (work: () => Promise<unknown>, message: string) => {
@@ -502,9 +507,9 @@ function ProxyPage({ nodes, site, refusal, search, go }: { nodes: Node[]; site: 
   return (
     <div className="space-y-4">
       <div className="flex min-w-0 flex-wrap items-center gap-2 xl:flex-nowrap" aria-label="代理筛选与操作">
-        <Select value={typeFilter} onValueChange={changeTypeFilter}><SelectTrigger className="w-28 shrink-0" aria-label="按代理类型筛选"><SelectValue /></SelectTrigger><SelectContent position="popper"><SelectItem value="all">全部类型</SelectItem><SelectItem value="mieru">mieru</SelectItem><SelectItem value="vless">VLESS Reality</SelectItem><SelectItem value="realm">Realm 转发</SelectItem></SelectContent></Select>
+        <Select value={typeFilter} onValueChange={changeTypeFilter}><SelectTrigger className="w-28 shrink-0" aria-label="按代理类型筛选"><SelectValue /></SelectTrigger><SelectContent position="popper"><SelectItem value="all">全部类型</SelectItem><SelectItem value="mieru">mieru</SelectItem><SelectItem value="vless">VLESS Reality</SelectItem><SelectItem value="realm">Realm 转发</SelectItem><SelectItem value="external">外部导入</SelectItem></SelectContent></Select>
         <AdminSearchInput className="min-w-40 flex-1 basis-40" value={query} onChange={setQuery} placeholder="搜索代理名称、地址或节点" />
-        <Select value={nodeFilter} onValueChange={setNodeFilter}>
+        <Select value={nodeFilter} disabled={typeFilter === "external"} onValueChange={setNodeFilter}>
           <SelectTrigger className="w-28 shrink-0" aria-label="按节点筛选"><SelectValue /></SelectTrigger>
           <SelectContent position="popper">
             <SelectItem value="all">全部节点</SelectItem>
@@ -514,6 +519,7 @@ function ProxyPage({ nodes, site, refusal, search, go }: { nodes: Node[]; site: 
         <StatusFilter value={statusFilter} onChange={setStatusFilter} labels={[["all", "全部状态"], ["enabled", "已启用"], ["disabled", "已停用"]]} />
         <div className="ml-auto flex shrink-0 items-center gap-2">
           {(typeFilter === "all" || typeFilter === "mieru") && <Button variant="outline" onClick={() => setShowMieruPassword(true)}>mieru 连接密码</Button>}
+          <Button variant="outline" onClick={() => setImportingExternal(true)}>导入外部代理</Button>
           <Button disabled={!nodes.length} onClick={() => { setCreationType(null); setCreating(true) }}><Plus /> 新增代理</Button>
         </div>
       </div>
@@ -588,11 +594,14 @@ function ProxyPage({ nodes, site, refusal, search, go }: { nodes: Node[]; site: 
                 </TableRow>
               )
             })}
-            {!tableLoading && !error && !realm.error && !visible.length && (
+            {!tableLoading && !error && !realm.error && !external.loading && !external.error && !visibleExternal.length && !visible.length && (
               <TableRow><TableCell colSpan={9} className="py-10 text-center text-sm text-muted-foreground">
-                {!items?.length && !realm.rules.length ? (nodes.length ? "还没有代理，右上角新增" : "先添加节点，再创建代理") : "没有匹配的代理"}
+                {!items?.length && !realm.rules.length ? (nodes.length ? "还没有代理，右上角新增" : "可直接导入外部代理，或添加节点后创建托管代理") : "没有匹配的代理"}
               </TableCell></TableRow>
             )}
+            {visibleExternal.map(proxy => <ExternalProxyRow key={`external:${proxy.id}`} proxy={proxy} />)}
+            {external.error && <TableRow><TableCell colSpan={9}><div role="alert" className="p-4 text-destructive">加载外部代理失败：{external.error}<Button variant="link" onClick={() => void external.reload()}>重试</Button></div></TableCell></TableRow>}
+            {external.loading && <TableRow><TableCell colSpan={9}>正在读取外部代理…</TableCell></TableRow>}
             {tableLoading && <TableRow><TableCell colSpan={9} className="p-4"><Skeleton className="h-10 w-full" /></TableCell></TableRow>}
             {error && <TableRow><TableCell colSpan={9} className="py-8 text-center text-sm text-destructive">
               <div role="alert">加载代理失败：{error}</div>
@@ -602,6 +611,7 @@ function ProxyPage({ nodes, site, refusal, search, go }: { nodes: Node[]; site: 
         </Table>
       </Card>
 
+      {importingExternal && <ExternalImportDialog onClose={() => setImportingExternal(false)} />}
       {showMieruPassword && <MieruCredential onClose={() => setShowMieruPassword(false)} />}
       {creating && <ProxyDialog compact={creationType === null} busy={creationBusy} onClose={() => setCreating(false)}>
         {creationType === null ? <><DialogHeader className="px-5 pt-5 pb-3 text-left"><DialogTitle>选择代理类型</DialogTitle><DialogDescription>选择要创建的代理服务</DialogDescription></DialogHeader><div className="flex flex-col gap-2 px-5 pb-5">{([
@@ -1111,7 +1121,7 @@ function SubscriptionForm({ user, proxies, nodes, accesses, ready, onClose, onSa
               <Button type="button" variant="outline" size="sm" disabled={!ready || saving} onClick={() => setSelectedIds(new Set())}>清空选择</Button>
             </div>
             <label className="flex items-center justify-between gap-3">
-              <span className="space-y-1"><span className="block text-sm font-medium">自动授权新增代理</span><span className="block text-xs text-muted-foreground">保存后新建的代理会自动加入此用户订阅，已有代理仍按勾选结果授权。</span></span>
+              <span className="space-y-1"><span className="block text-sm font-medium">自动授权新增代理</span><span className="block text-xs text-muted-foreground">保存后新建的托管代理会自动加入此用户订阅（不含外部导入），已有代理仍按勾选结果授权。</span></span>
               <Switch checked={autoAuthorizeNewProxies} disabled={!ready || saving} onCheckedChange={setAutoAuthorizeNewProxies} />
             </label>
             <AdminSearchInput value={proxyQuery} onChange={setProxyQuery} placeholder="搜索节点名称或所属服务器..." className="w-full" />
@@ -1175,11 +1185,12 @@ function SubscriptionForm({ user, proxies, nodes, accesses, ready, onClose, onSa
                 {!!groups.length && query && !groups.some((group) => group.proxies.some((proxy) => [proxy.name, displayProxyName(proxy, group.node), group.node?.name, proxy.address].some((value) => value?.toLocaleLowerCase().includes(query)))) && <p className="p-4 text-center text-sm text-muted-foreground">没有匹配的代理节点</p>}
               </div>
 
+            <ExternalAuthorization key={user.id} userId={user.id} />
           </div>
           <DialogFooter className="shrink-0 items-center border-t px-6 py-4">
             <span className="mr-auto text-sm text-muted-foreground">已选择 {selectedProxies.length} 个节点</span>
             <Button type="button" variant="ghost" disabled={saving} onClick={onClose}>取消</Button>
-            <Button type="submit" disabled={saving || !ready}>{saving ? "保存中..." : "保存修改"}</Button>
+            <Button type="submit" disabled={saving || !ready}>{saving ? "保存中..." : "保存托管授权"}</Button>
           </DialogFooter>
         </form>
       </DialogContent>
@@ -1224,7 +1235,7 @@ function SubscriptionProxyRows({ accesses, proxies, nodes }: { accesses: UserPro
             <TableCell className="w-28 max-w-28 px-3"><TooltipText text={reality?.server_name ?? "—"} className="w-24 max-w-24 text-sm" /></TableCell>
           </TableRow>
         })}
-        {!ordered.length && <TableRow><TableCell colSpan={6} className="py-5 text-center text-sm text-muted-foreground">该用户还没有代理节点授权</TableCell></TableRow>}
+        {!ordered.length && <TableRow><TableCell colSpan={6} className="py-5 text-center text-sm text-muted-foreground">该用户还没有托管入口授权</TableCell></TableRow>}
       </TableBody>
     </Table>
   )
@@ -1404,13 +1415,14 @@ function SubscriptionsPage({ nodes, search }: { nodes: Node[]; search: string })
                         </Button>
                       </div>
                     </TableCell>
-                    <TableCell className="px-3 text-sm"><Button type="button" variant="link" className="h-auto p-0" disabled={accessLoading.has(user.id) || proxiesLoading || !!proxyError} aria-label={`编辑 ${user.username} 的授权节点`} onClick={() => void openEdit(user)}>{accessLoading.has(user.id) ? "加载中..." : `${user.proxy_count} 个节点`}</Button></TableCell>
+                    <TableCell className="px-3 text-sm"><Button type="button" variant="link" className="h-auto p-0" disabled={accessLoading.has(user.id) || proxiesLoading || !!proxyError} aria-label={`编辑 ${user.username} 的授权节点`} onClick={() => void openEdit(user)}>{accessLoading.has(user.id) ? "加载中..." : `${user.proxy_count} 个托管入口 · 编辑授权`}</Button></TableCell>
                     <TableCell className="px-3 text-center"><Switch checked={user.enabled} disabled={updatingUserId !== null} onCheckedChange={(enabled) => void setUserEnabled(user, enabled)} aria-label={`${user.enabled ? "停用" : "启用"}${user.username}的订阅授权`} /></TableCell>
                   </TableRow>
                   {isExpanded && <TableRow className="bg-muted/20 hover:bg-muted/20"><TableCell colSpan={3} className="p-0">
                     {rowError ? <div className="p-4 text-sm text-destructive" role="alert">加载授权节点失败：{rowError}<Button variant="link" className="h-auto p-0 pl-2" onClick={() => void loadAccesses(user.id).catch(() => {})}>重试</Button></div>
                       : accessLoading.has(user.id) || proxiesLoading ? <div className="p-4"><Skeleton className="h-9 w-full" /></div>
                       : accesses ? <SubscriptionProxyRows accesses={accesses} proxies={proxies ?? []} nodes={nodes} /> : null}
+                    <ExternalAuthorizedSummary userId={user.id} />
                   </TableCell></TableRow>}
                 </Fragment>
               })}

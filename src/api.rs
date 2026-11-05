@@ -348,3 +348,6 @@ pub async fn same_origin_writes(request: Request, next: Next) -> Response {
 
 mod realm;
 pub(super) use realm::*;
+
+mod external;
+pub(super) use external::*;

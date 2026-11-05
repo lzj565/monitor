@@ -49,61 +49,86 @@ pub async fn user_me(UserAuth(user_id): UserAuth, State(app): State<Shared>) -> 
     .await
 }
 
-pub async fn user_proxies(UserAuth(user_id): UserAuth, State(app): State<Shared>) -> Response {
-    crate::blocking::response(move || {
-        let now = Utc::now().timestamp();
-        let prefs = match app.db.entry_preferences(user_id) {Ok(p)=>p,Err(e)=>return api_internal(e)};
-        match app.db.active_user_portal_proxies(user_id, now) {
-            Ok(mut proxies) => {
-                let agents = app.agents.read().unwrap_or_else(|e| e.into_inner());
-                for proxy in &mut proxies {
-                    proxy.online = agents.contains_key(&proxy.node_id) && proxy.realm_target_node_id.is_none_or(|id|agents.contains_key(&id));
-                }
-                let items = proxies.into_iter().map(|proxy| {
-                    let label = crate::db::displayed_proxy_name(
-                        &proxy.name,
-                        proxy.include_node_name,
-                        &proxy.node_country,
-                    );
-                    if proxy.protocol == "mieru" {
-                        let password=proxy.mieru_password.as_deref().unwrap_or("");
-                        let username=format!("user-{user_id}");
-                        let mihomo_yaml = mihomo_proxy(user_id, &proxy);
-                        let host=if proxy.address.contains(':'){format!("[{}]",proxy.address)}else{proxy.address.clone()};
-                        let link=format!("mierus://{}:{}@{}?profile={}&port={}&protocol=TCP",uri_component(&username),uri_component(password),host,uri_component(&label),proxy.port);
-                        let mut item=serde_json::to_value(&proxy).expect("portal proxy serializes");
-                        item.as_object_mut().unwrap().remove("mieru_password");
-                        item["hidden"]=json!(prefs.get(&proxy.id).is_some_and(|v|v.1));
-                        item["custom_name"]=json!(prefs.get(&proxy.id).map(|v|v.2.as_str()).unwrap_or(""));
-                        item["mieru_url"]=json!(link);item["mihomo_yaml"]=json!(mihomo_yaml);
-                        return item;
-                    }
-                    let flow = if proxy.flow.is_empty() { proxy::DEFAULT_FLOW } else { &proxy.flow };
-                    let host = if proxy.address.parse::<std::net::Ipv6Addr>().is_ok() {
-                        format!("[{}]", proxy.address)
-                    } else {
-                        proxy.address.clone()
-                    };
-                    let vless_url = format!(
-                        "vless://{}@{}:{}?encryption=none&security=reality&sni={}&fp=chrome&pbk={}&sid={}&type=tcp&flow={}#{}",
-                        proxy.uuid, host, proxy.port,
-                        uri_component(&proxy.server_name), proxy.public_key, proxy.short_id,
-                        uri_component(flow), uri_component(&label),
-                    );
-                    let mihomo_yaml = mihomo_proxy(user_id, &proxy);
-                    let hidden=prefs.get(&proxy.id).is_some_and(|v|v.1);
-                    let custom_name=prefs.get(&proxy.id).map(|v|v.2.clone()).unwrap_or_default();
-                    let mut item = serde_json::to_value(proxy).expect("portal proxy serializes");
-                    item["hidden"]=json!(hidden); item["custom_name"]=json!(custom_name);
-                    item["vless_url"] = json!(vless_url);
-                    item["mihomo_yaml"] = json!(mihomo_yaml);
-                    item
-                }).collect::<Vec<_>>();
-                ([(header::CACHE_CONTROL,"no-store")],Json(json!({"items": items}))).into_response()
+pub async fn user_proxies(UserAuth(user): UserAuth, State(app): State<Shared>) -> Response {
+    crate::blocking::response(move || match user_portal_items(&app, user) {
+        Ok(items) => ([(header::CACHE_CONTROL, "no-store")], Json(json!({"items":items}))).into_response(),
+        Err(e) => api_internal(e),
+    })
+    .await
+}
+
+/// One ordered collection drives the page, individual copies and Mihomo export.
+pub(super) fn user_portal_items(app: &App, user: i64) -> anyhow::Result<Vec<Value>> {
+    let now = Utc::now().timestamp();
+    let prefs = app.db.all_entry_preferences(user)?;
+    let mut entries: Vec<(String, Value, Option<crate::db::UserPortalProxy>)> = Vec::new();
+    let defaults = app.db.internal_default_names()?;
+    for mut proxy in app.db.active_user_portal_proxies(user, now)? {
+        let key = db::internal_entry_key(proxy.id);
+        let default = defaults.get(&proxy.id).cloned().unwrap_or_else(|| proxy.name.clone());
+        proxy.name = default.clone();
+        proxy.include_node_name = false;
+        let online = {
+            let agents = app.agents.read().unwrap_or_else(|e| e.into_inner());
+            agents.contains_key(&proxy.node_id)
+                && proxy.realm_target_node_id.is_none_or(|id| agents.contains_key(&id))
+        };
+        let mut item = serde_json::to_value(&proxy)?;
+        item.as_object_mut().unwrap().remove("mieru_password");
+        item["default_name"] = json!(default);
+        item["online"] = json!(online);
+        item["source"] = json!(if proxy.id > 0 { "proxy" } else { "realm" });
+        entries.push((key, item, Some(proxy)));
+    }
+    for (id, config) in app.db.active_external_configs(user, now)? {
+        let item = json!({"source":"external","default_name":config["name"],"name":config["name"],"protocol":config["type"],"address":config["server"],"address_type":"domain","port":config["port"],"node_name":"外部导入","node_group":"仅用于 Mihomo · 不采集统计","node_country":"","server_name":config.get("sni").or_else(||config.get("servername")).cloned().unwrap_or(json!("")),"online":null,"external_config":config});
+        entries.push((format!("external:{id}"), item, None));
+    }
+    entries.sort_by_key(|(key, _, _)| prefs.get(key).and_then(|p| p.0).unwrap_or(i64::MAX));
+    let mut names: std::collections::HashSet<String> =
+        ["Proxy", "DIRECT", "direct"].into_iter().map(str::to_owned).collect();
+    entries.into_iter().map(|(key,mut item,proxy)|{
+        let pref=prefs.get(&key);
+        let custom=pref.map(|p|p.2.as_str()).unwrap_or("");
+        let default=item["default_name"].as_str().unwrap_or("代理");
+        let mut name=if custom.is_empty(){default}else{custom}.to_owned();
+        while !names.insert(name.clone()){name=format!("{name} [{key}]");}
+        item["entry_key"]=json!(key);item["hidden"]=json!(pref.is_some_and(|p|p.1));
+        item["custom_name"]=json!(custom);item["name"]=json!(name);
+        if let Some(mut proxy)=proxy {
+            proxy.name=name.clone();proxy.include_node_name=false;
+            item["mihomo_yaml"]=json!(mihomo_proxy(user,&proxy));
+            let host=if proxy.address.contains(':'){format!("[{}]",proxy.address)}else{proxy.address.clone()};
+            if proxy.protocol=="mieru" {
+                item["mieru_url"]=json!(format!("mierus://{}:{}@{}?profile={}&port={}&protocol=TCP",uri_component(&format!("user-{user}")),uri_component(proxy.mieru_password.as_deref().unwrap_or("")),host,uri_component(&name),proxy.port));
+            } else {
+                let flow=if proxy.flow.is_empty(){proxy::DEFAULT_FLOW}else{&proxy.flow};
+                item["vless_url"]=json!(format!("vless://{}@{}:{}?encryption=none&security=reality&sni={}&fp=chrome&pbk={}&sid={}&type=tcp&flow={}#{}",proxy.uuid,host,proxy.port,uri_component(&proxy.server_name),proxy.public_key,proxy.short_id,uri_component(flow),uri_component(&name)));
             }
-            Err(error) => api_internal(error),
+        } else {
+            let mut config=item.as_object_mut().unwrap().remove("external_config").unwrap();config["name"]=json!(name);
+            item["mihomo_yaml"]=json!(serde_yaml_ng::to_string(&vec![config])?.trim_end());
         }
-    }).await
+        Ok(item)
+    }).collect()
+}
+
+pub(super) fn combined_clash_subscription(items: &[Value]) -> String {
+    let visible: Vec<_> = items.iter().filter(|p| p["hidden"] != true).collect();
+    let mut out = if visible.is_empty() { "proxies: []\n".to_owned() } else { "proxies:\n".to_owned() };
+    for item in &visible {
+        for line in item["mihomo_yaml"].as_str().unwrap_or("").lines() {
+            out.push_str("  ");
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out.push_str("proxy-groups:\n  - name: Proxy\n    type: select\n    proxies:\n");
+    for item in visible {
+        out.push_str(&format!("      - {}\n", yaml_string(item["name"].as_str().unwrap_or(""))));
+    }
+    out.push_str("      - DIRECT\nrules:\n  - MATCH,Proxy\n");
+    out
 }
 
 pub(super) fn uri_component(value: &str) -> String {
@@ -235,6 +260,7 @@ pub(super) fn mihomo_proxy(user_id: i64, proxy: &crate::db::UserPortalProxy) -> 
     )
 }
 
+#[cfg(test)]
 pub(super) fn clash_subscription(user_id: i64, proxies: &[crate::db::UserPortalProxy]) -> String {
     let mut out = String::from(if proxies.is_empty() { "proxies: []\n" } else { "proxies:\n" });
     let labels: Vec<_> = proxies
@@ -310,29 +336,34 @@ pub async fn subscription(
         };
         let (content_type, body) = match format.as_str() {
             "clash" => {
-                let proxies = match app.db.active_user_portal_proxies(user_id, Utc::now().timestamp()) {
-                    Ok(proxies) => {
-                        let prefs = match app.db.entry_preferences(user_id) {
-                            Ok(p) => p,
-                            Err(e) => return api_internal(e),
-                        };
-                        proxies
-                            .into_iter()
-                            .filter(|p| !prefs.get(&p.id).is_some_and(|v| v.1))
-                            .collect::<Vec<_>>()
-                    }
-                    Err(error) => return api_internal(error),
+                let items = match user_portal_items(&app, user_id) {
+                    Ok(items) => items,
+                    Err(e) => return api_internal(e),
                 };
-                ("application/yaml; charset=utf-8", clash_subscription(user_id, &proxies))
+                ("application/yaml; charset=utf-8", combined_clash_subscription(&items))
             }
+
             "sing-box" => {
-                let (uuid, proxies) = match app.db.active_user_subscription(user_id, Utc::now().timestamp()) {
-                    Ok(Some(data)) => data,
-                    Ok(None) => {
-                        return api_error(StatusCode::FORBIDDEN, "ACCOUNT_INACTIVE", "账号当前不可用")
-                    }
-                    Err(error) => return api_internal(error),
+                let (uuid, mut proxies) =
+                    match app.db.active_user_subscription(user_id, Utc::now().timestamp()) {
+                        Ok(Some(data)) => data,
+                        Ok(None) => {
+                            return api_error(StatusCode::FORBIDDEN, "ACCOUNT_INACTIVE", "账号当前不可用")
+                        }
+                        Err(error) => return api_internal(error),
+                    };
+                let names = match user_portal_items(&app, user_id) {
+                    Ok(items) => items,
+                    Err(e) => return api_internal(e),
                 };
+                for proxy in &mut proxies {
+                    if let Some(item) =
+                        names.iter().find(|item| item["entry_key"] == db::internal_entry_key(proxy.id))
+                    {
+                        proxy.name = item["name"].as_str().unwrap_or(&proxy.name).to_owned();
+                        proxy.include_node_name = false;
+                    }
+                }
                 ("application/json; charset=utf-8", sing_box_subscription(&uuid, &proxies).to_string())
             }
             _ => return api_error(StatusCode::NOT_FOUND, "SUBSCRIPTION_FORMAT_NOT_FOUND", "订阅格式不存在"),
@@ -346,8 +377,8 @@ pub async fn subscription(
 
 #[derive(Deserialize)]
 pub struct EntryPreference {
-    hidden: Option<bool>,
-    custom_name: Option<String>,
+    pub(super) hidden: Option<bool>,
+    pub(super) custom_name: Option<String>,
 }
 pub async fn save_user_entry_preferences(
     UserAuth(user): UserAuth,

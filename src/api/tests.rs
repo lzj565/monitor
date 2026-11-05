@@ -2487,3 +2487,151 @@ async fn a_closed_status_page_and_a_sibling_origin_see_no_admin_data() {
     assert_eq!(nodes(State(app.clone()), HeaderMap::new()).await.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(nodes(State(app), signed_in("same-origin")).await.status(), StatusCode::OK);
 }
+
+#[tokio::test]
+async fn mixed_external_portal_and_subscriptions_preserve_credentials_and_isolate_users() {
+    let app = std::sync::Arc::new(app());
+    let now = Utc::now().timestamp();
+    let user = app.db.user_login_record("admin").unwrap().unwrap().id;
+    let other = app
+        .db
+        .create_user(&crate::db::UserDraft {
+            username: "external-other".into(),
+            password_hash: Some("hash".into()),
+            enabled: true,
+            expires_at: None,
+            traffic_limit: None,
+            device_limit: None,
+            traffic_reset_day: None,
+        })
+        .unwrap()
+        .unwrap();
+    let target = node(&app, "target", true);
+    let relay = node(&app, "relay", true);
+    let direct=app.db.create_proxy(target,&crate::db::ProxyDraft{name:"same".into(),include_node_name:false,protocol:"vless".into(),address_type:"domain".into(),address:"internal.example.com".into(),port:24060,enabled:true,flow:None,config:json!({"reality":{"server_name":"edge.example.com","public_key":"public-key","short_id":"abcd"}})}).unwrap().unwrap();
+    app.db
+        .put_authorization(user, direct, &crate::db::AuthorizationDraft { enabled: true, auth: None })
+        .unwrap()
+        .unwrap();
+    app.db.realm_save_host(&crate::db::RealmHostInput { node_id: relay, enabled: true }).unwrap();
+    let realm = app
+        .db
+        .realm_save_rule(
+            None,
+            &crate::db::RealmRuleInput {
+                node_id: relay,
+                target_proxy_id: direct,
+                name: "same".into(),
+                address_type: "domain".into(),
+                address: "relay.example.com".into(),
+                listen_port: 24062,
+                enabled: true,
+            },
+        )
+        .unwrap();
+    let desired = app.db.realm_desired(relay).unwrap();
+    app.db.realm_applied(&desired).unwrap();
+    let config = json!({"name":"same","type":"vless","server":"external.example.com","port":443,"uuid":"imported-original-uuid","tls":true,"ws-opts":{"path":"/original"}});
+    let external = app.db.import_external_proxies(std::slice::from_ref(&config)).unwrap()[0];
+    app.db.replace_external_authorizations(user, &[external]).unwrap();
+    let keys = vec![format!("external:{external}"), format!("realm:{realm}"), format!("proxy:{direct}")];
+    app.db.reorder_user_entries(user, &keys, now).unwrap();
+    let rows = user_portal_items(&app, user).unwrap();
+    assert_eq!(rows.iter().map(|r| r["entry_key"].as_str().unwrap().to_owned()).collect::<Vec<_>>(), keys);
+    assert!(rows[0]["online"].is_null());
+    assert!(rows[0].get("vless_url").is_none());
+    assert!(!user_portal_items(&app, other).unwrap().iter().any(|r| r["source"] == "external"));
+    let yaml = combined_clash_subscription(&rows);
+    let exported: Value = serde_yaml_ng::from_str(&yaml).unwrap();
+    let proxies = exported["proxies"].as_array().unwrap();
+    assert_eq!(proxies.len(), 3);
+    assert_eq!(proxies[0]["uuid"], "imported-original-uuid");
+    assert_eq!(proxies[0]["ws-opts"], config["ws-opts"]);
+    let names: std::collections::HashSet<_> = proxies.iter().map(|p| p["name"].as_str().unwrap()).collect();
+    assert_eq!(names.len(), 3);
+    let selected = exported["proxy-groups"][0]["proxies"].as_array().unwrap();
+    for (p, s) in proxies.iter().zip(selected) {
+        assert_eq!(p["name"], *s);
+    }
+    app.db.save_user_entry_preference(user, &keys[0], Some(true), Some("私人名字".into())).unwrap();
+    let rows = user_portal_items(&app, user).unwrap();
+    assert_eq!(rows[0]["name"], "私人名字");
+    assert!(rows[0]["mihomo_yaml"].as_str().unwrap().contains("私人名字"));
+    let filtered: Value = serde_yaml_ng::from_str(&combined_clash_subscription(&rows)).unwrap();
+    assert_eq!(filtered["proxies"].as_array().unwrap().len(), 2);
+    let token = app.db.user_subscription_token(user).unwrap().unwrap();
+    let response = subscription(State(app.clone()), Path((token.clone(), "sing-box".into()))).await;
+    let native = portal_json(response).await;
+    assert!(!native.to_string().contains("external.example.com"));
+    for key in &keys {
+        app.db.save_user_entry_preference(user, key, Some(true), None).unwrap();
+    }
+    let empty: Value =
+        serde_yaml_ng::from_str(&combined_clash_subscription(&user_portal_items(&app, user).unwrap()))
+            .unwrap();
+    assert_eq!(empty["proxies"], json!([]));
+    app.db.replace_external_authorizations(user, &[]).unwrap();
+    assert!(!user_portal_items(&app, user).unwrap().iter().any(|r| r["source"] == "external"));
+    assert!(app.db.all_traffic().values().all(|t| t.total_rx == 0 && t.total_tx == 0));
+}
+
+#[tokio::test]
+async fn external_preview_import_and_edit_enforce_validation_without_returning_secrets_in_errors() {
+    let app = std::sync::Arc::new(app());
+    let request=serde_json::from_value(json!({"yaml":"proxies:\n - {name: remote, type: trojan, server: example.com, port: 443, password: original}\nrules: [MATCH,DIRECT]"})).unwrap();
+    let preview = portal_json(preview_external(ApiAdmin, State(app.clone()), Json(request)).await).await;
+    assert_eq!(preview["ignored_sections"], true);
+    assert!(preview["items"][0]["error"].is_null());
+    let config = preview["items"][0]["config"].clone();
+    let response = import_external(
+        ApiAdmin,
+        State(app.clone()),
+        Json(serde_json::from_value(json!({"items":[config.clone()]})).unwrap()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let id = app.db.external_proxies().unwrap()[0].id;
+    let list = portal_json(list_external(ApiAdmin, State(app.clone())).await).await;
+    assert!(list["items"][0].get("config").is_none());
+    assert!(!list.to_string().contains("original"));
+    let preview = portal_json(
+        preview_external(
+            ApiAdmin,
+            State(app.clone()),
+            Json(
+                serde_json::from_value(
+                    json!({"yaml":serde_json::to_string(&vec![config.clone()]).unwrap(),"exclude_id":id}),
+                )
+                .unwrap(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert!(preview["items"][0]["error"].is_null());
+    let duplicate = import_external(
+        ApiAdmin,
+        State(app.clone()),
+        Json(serde_json::from_value(json!({"items":[config.clone()]})).unwrap()),
+    )
+    .await;
+    assert_eq!(duplicate.status(), StatusCode::BAD_REQUEST);
+    let text = axum::body::to_bytes(duplicate.into_body(), usize::MAX).await.unwrap();
+    assert!(!String::from_utf8_lossy(&text).contains("original"));
+    let mut changed = config;
+    changed["password"] = json!("new-credential");
+    let response = update_external(
+        ApiAdmin,
+        State(app.clone()),
+        Path(id),
+        Json(serde_json::from_value(json!({"config":changed,"enabled":false})).unwrap()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(!app.db.external_proxies().unwrap()[0].enabled);
+    assert_eq!(app.db.external_proxy_config(id).unwrap().unwrap()["password"], "new-credential");
+    assert_eq!(
+        delete_external(ApiAdmin, State(app.clone()), Path(id)).await.status(),
+        StatusCode::NO_CONTENT
+    );
+}

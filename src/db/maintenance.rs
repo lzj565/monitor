@@ -164,7 +164,8 @@ impl Db {
             &TABLES
         };
         for table in required_tables.iter().filter(|t| {
-            !(version < 28 && **t == "user_entry_preferences")
+            !(version < 29 && ["external_proxies", "user_external_proxy_authorizations"].contains(t))
+                && !(version < 28 && **t == "user_entry_preferences")
                 && !(version < 27 && **t == "proxy_list_order")
                 && !(version < 26 && **t == "node_components")
                 && !(version < 25
@@ -194,7 +195,13 @@ impl Db {
         // could not use while reporting a failure to the panel -- the one
         // arrangement in which the restore has failed and the original data is
         // also gone.
-        if let Err(e) = if version < SCHEMA_VERSION { migrate(&candidate, version) } else { Ok(()) } {
+        if let Err(e) = if version < SCHEMA_VERSION
+            || columns_of(&candidate, "user_entry_preferences")?.contains("entry_id")
+        {
+            migrate(&candidate, version)
+        } else {
+            Ok(())
+        } {
             refuse!("{NOT_A_BACKUP}：数据库结构无法升级：{e}");
         }
         // The migration lands in a -wal beside a backup taken from a running hub.
