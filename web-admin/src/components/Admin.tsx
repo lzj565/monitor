@@ -1,4 +1,4 @@
-import { Activity, ArrowUpCircle, Bell, Database, KeyRound, Network, Palette, Radio, Server, Settings, Shield, Users } from "lucide-react"
+import { Activity, ArrowUpCircle, Bell, Database, KeyRound, Import, Network, Palette, Radio, Server, Settings, Shield, Users } from "lucide-react"
 import { behind, outdatedAgents, type Node } from "@/lib/api"
 import { useVersions } from "./admin/hooks"
 import { lazy, Suspense } from "react"
@@ -11,6 +11,7 @@ const Notify = lazy(() => import("./admin/Settings").then((m) => ({ default: m.N
 const Security = lazy(() => import("./admin/Security").then((m) => ({ default: m.Security })))
 const Data = lazy(() => import("./admin/Data").then((m) => ({ default: m.Data })))
 const Update = lazy(() => import("./admin/Update").then((m) => ({ default: m.Update })))
+const ExternalProxiesPage = lazy(() => import("./admin/ExternalProxies").then(m => ({ default: m.ExternalProxiesPage })))
 const ProxiesPage = lazy(() => import("@/components/Resources").then((m) => ({ default: m.ProxiesPage })))
 const SubscriptionsResourcePage = lazy(() => import("@/components/Resources").then((m) => ({ default: m.SubscriptionsResourcePage })))
 const UsersResourcePage = lazy(() => import("@/components/Resources").then((m) => ({ default: m.UsersResourcePage })))
@@ -21,6 +22,7 @@ const ProxyTrafficPage = lazy(() => import("@/components/ProxyTrafficPage").then
 export const ADMIN_SECTIONS = [
   { path: "/admin/nodes", label: "节点", icon: Server },
   { path: "/admin/proxies", label: "代理", icon: Network },
+  { path: "/admin/external-proxies", label: "外部代理", icon: Import },
   { path: "/admin/users", label: "用户", icon: Users },
   { path: "/admin/subscriptions", label: "订阅", icon: KeyRound },
   { path: "/admin/traffic", label: "流量", icon: Activity },
@@ -88,6 +90,8 @@ export function Admin({
           <ProxyTrafficPage nodes={nodes} />
         ) : path === "/admin/proxies" ? (
           <ProxiesPage nodes={nodes} site={site} refusal={refusal} search={search} go={go} />
+        ) : path === "/admin/external-proxies" ? (
+          <ExternalProxiesPage />
         ) : path === "/admin/users" ? (
           <UsersResourcePage />
         ) : path === "/admin/subscriptions" ? (

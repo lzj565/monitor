@@ -260,7 +260,7 @@ export function UserCenter({ siteName, dark, toggleTheme, signOut, returnToAdmin
                       <td className="whitespace-normal px-2 py-3 sm:px-3">
                         <div className="min-w-0">
                           <div className="font-medium text-balance break-keep">
-                            {proxy.name}{proxy.hidden && <Badge>已从订阅隐藏</Badge>}{proxy.node_country && "\u2007"}{proxy.node_country && <Badge variant="outline" className="align-middle font-normal text-muted-foreground">{proxy.node_country}</Badge>}
+                            {proxy.name}<Badge variant="outline" className="ml-1 font-normal">{proxy.source === "external" ? "外部代理" : proxy.source === "realm" ? "Realm" : "直连"}</Badge>{proxy.hidden && <Badge>已从订阅隐藏</Badge>}{proxy.node_country && "\u2007"}{proxy.node_country && <Badge variant="outline" className="align-middle font-normal text-muted-foreground">{proxy.node_country}</Badge>}
                           </div>
                           {proxy.node_group && <div className="text-xs text-balance text-muted-foreground">{proxy.node_group}</div>}
                         </div>

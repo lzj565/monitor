@@ -1,4 +1,4 @@
-import { ExternalAuthorization, ExternalAuthorizedSummary, ExternalImportDialog, ExternalProxyRow, useExternalProxies } from "./admin/ExternalProxies"
+import { ExternalAuthorization, ExternalAuthorizedSummary } from "./admin/ExternalProxies"
 import { normalizeUserUuid } from "@/lib/user-uuid"
 import { MieruForm, MieruCredential } from "./admin/Mieru"
 import { useAdminResources, useSharedProxies, useSharedUsers } from "@/components/AdminResources"
@@ -416,8 +416,6 @@ function ProxyPage({ nodes, site, refusal, search, go }: { nodes: Node[]; site: 
   const notifySync = useNotifySync()
   const { items, error, loading, reload } = useAllProxies()
   const realm = useRealmProxies()
-  const external = useExternalProxies()
-  const [importingExternal, setImportingExternal] = useState(false)
   const typeFilter = proxyTypeFilter(search)
   const [creationType, setCreationType] = useState<"vless" | "mieru" | "realm" | null>(null)
   const [editingRealmId, setEditingRealmId] = useState<number | null>(null)
@@ -456,7 +454,6 @@ function ProxyPage({ nodes, site, refusal, search, go }: { nodes: Node[]; site: 
   const nodeById = new Map(nodes.map((node) => [node.id, node]))
   const visibleKeys = new Set(proxyListItems(items ?? [], realm.rules, nodes, { query, node: nodeFilter, status: statusFilter, type: typeFilter }).map((item) => item.key))
   const visible = drag.order.filter((item) => visibleKeys.has(item.key))
-  const visibleExternal = external.items.filter(p => (typeFilter === "all" || typeFilter === "external") && nodeFilter === "all" && (statusFilter === "all" || (statusFilter === "enabled") === p.enabled) && `${p.name} ${p.protocol} ${p.address}`.toLowerCase().includes(query.trim().toLowerCase()))
   const searching = query.trim() !== "" || nodeFilter !== "all" || statusFilter !== "all" || typeFilter !== "all"
   const orderReady = savedOrder !== null && !orderError && !loading && !error && realm.loaded && !realm.error && [...savedOrder].sort().join(",") === liveKeys
   const dragDisabled = searching || !orderReady
@@ -464,7 +461,6 @@ function ProxyPage({ nodes, site, refusal, search, go }: { nodes: Node[]; site: 
   const changeTypeFilter = (type: string) => {
     const params = new URLSearchParams(search)
     if (type === "all") params.delete("type"); else params.set("type", type)
-    if (type === "external") setNodeFilter("all")
     go(`/admin/proxies${params.size ? `?${params}` : ""}`)
   }
   const realmAction = async (work: () => Promise<unknown>, message: string) => {
@@ -507,9 +503,9 @@ function ProxyPage({ nodes, site, refusal, search, go }: { nodes: Node[]; site: 
   return (
     <div className="space-y-4">
       <div className="flex min-w-0 flex-wrap items-center gap-2 xl:flex-nowrap" aria-label="代理筛选与操作">
-        <Select value={typeFilter} onValueChange={changeTypeFilter}><SelectTrigger className="w-28 shrink-0" aria-label="按代理类型筛选"><SelectValue /></SelectTrigger><SelectContent position="popper"><SelectItem value="all">全部类型</SelectItem><SelectItem value="mieru">mieru</SelectItem><SelectItem value="vless">VLESS Reality</SelectItem><SelectItem value="realm">Realm 转发</SelectItem><SelectItem value="external">外部导入</SelectItem></SelectContent></Select>
+        <Select value={typeFilter} onValueChange={changeTypeFilter}><SelectTrigger className="w-28 shrink-0" aria-label="按代理类型筛选"><SelectValue /></SelectTrigger><SelectContent position="popper"><SelectItem value="all">全部类型</SelectItem><SelectItem value="mieru">mieru</SelectItem><SelectItem value="vless">VLESS Reality</SelectItem><SelectItem value="realm">Realm 转发</SelectItem></SelectContent></Select>
         <AdminSearchInput className="min-w-40 flex-1 basis-40" value={query} onChange={setQuery} placeholder="搜索代理名称、地址或节点" />
-        <Select value={nodeFilter} disabled={typeFilter === "external"} onValueChange={setNodeFilter}>
+        <Select value={nodeFilter} onValueChange={setNodeFilter}>
           <SelectTrigger className="w-28 shrink-0" aria-label="按节点筛选"><SelectValue /></SelectTrigger>
           <SelectContent position="popper">
             <SelectItem value="all">全部节点</SelectItem>
@@ -519,7 +515,6 @@ function ProxyPage({ nodes, site, refusal, search, go }: { nodes: Node[]; site: 
         <StatusFilter value={statusFilter} onChange={setStatusFilter} labels={[["all", "全部状态"], ["enabled", "已启用"], ["disabled", "已停用"]]} />
         <div className="ml-auto flex shrink-0 items-center gap-2">
           {(typeFilter === "all" || typeFilter === "mieru") && <Button variant="outline" onClick={() => setShowMieruPassword(true)}>mieru 连接密码</Button>}
-          <Button variant="outline" onClick={() => setImportingExternal(true)}>导入外部代理</Button>
           <Button disabled={!nodes.length} onClick={() => { setCreationType(null); setCreating(true) }}><Plus /> 新增代理</Button>
         </div>
       </div>
@@ -594,14 +589,11 @@ function ProxyPage({ nodes, site, refusal, search, go }: { nodes: Node[]; site: 
                 </TableRow>
               )
             })}
-            {!tableLoading && !error && !realm.error && !external.loading && !external.error && !visibleExternal.length && !visible.length && (
+            {!tableLoading && !error && !realm.error && !visible.length && (
               <TableRow><TableCell colSpan={9} className="py-10 text-center text-sm text-muted-foreground">
-                {!items?.length && !realm.rules.length ? (nodes.length ? "还没有代理，右上角新增" : "可直接导入外部代理，或添加节点后创建托管代理") : "没有匹配的代理"}
+                {!items?.length && !realm.rules.length ? (nodes.length ? "还没有代理，右上角新增" : "先添加节点，再创建托管代理") : "没有匹配的代理"}
               </TableCell></TableRow>
             )}
-            {visibleExternal.map(proxy => <ExternalProxyRow key={`external:${proxy.id}`} proxy={proxy} />)}
-            {external.error && <TableRow><TableCell colSpan={9}><div role="alert" className="p-4 text-destructive">加载外部代理失败：{external.error}<Button variant="link" onClick={() => void external.reload()}>重试</Button></div></TableCell></TableRow>}
-            {external.loading && <TableRow><TableCell colSpan={9}>正在读取外部代理…</TableCell></TableRow>}
             {tableLoading && <TableRow><TableCell colSpan={9} className="p-4"><Skeleton className="h-10 w-full" /></TableCell></TableRow>}
             {error && <TableRow><TableCell colSpan={9} className="py-8 text-center text-sm text-destructive">
               <div role="alert">加载代理失败：{error}</div>
@@ -611,7 +603,6 @@ function ProxyPage({ nodes, site, refusal, search, go }: { nodes: Node[]; site: 
         </Table>
       </Card>
 
-      {importingExternal && <ExternalImportDialog onClose={() => setImportingExternal(false)} />}
       {showMieruPassword && <MieruCredential onClose={() => setShowMieruPassword(false)} />}
       {creating && <ProxyDialog compact={creationType === null} busy={creationBusy} onClose={() => setCreating(false)}>
         {creationType === null ? <><DialogHeader className="px-5 pt-5 pb-3 text-left"><DialogTitle>选择代理类型</DialogTitle><DialogDescription>选择要创建的代理服务</DialogDescription></DialogHeader><div className="flex flex-col gap-2 px-5 pb-5">{([

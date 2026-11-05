@@ -49,3 +49,7 @@ console.log("Realm per-rule addresses, filters, default families and single-requ
 const mieru = { ...proxy, id: 3, protocol: "mieru", config: { transport: "tcp" } } as Proxy
 assert.equal(proxyTypeFilter("?type=mieru"), "mieru")
 assert.deepEqual(proxyListItems([proxy, mieru], [rule], nodes, { query: "", node: "all", status: "all", type: "mieru" }).map((i) => i.kind === "proxy" && i.proxy.id), [3])
+
+assert.deepEqual(normaliseRoute("/admin/proxies/", "?type=external&q=hello"), { path: "/admin/external-proxies", search: "?q=hello" })
+assert.deepEqual(normaliseRoute("/admin/proxies", "?type=external"), { path: "/admin/external-proxies", search: "" })
+assert.deepEqual(normaliseRoute("/admin/external-proxies/", "?q=hello"), { path: "/admin/external-proxies", search: "?q=hello" })
