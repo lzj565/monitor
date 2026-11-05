@@ -164,7 +164,8 @@ impl Db {
             &TABLES
         };
         for table in required_tables.iter().filter(|t| {
-            !(version < 27 && **t == "proxy_list_order")
+            !(version < 28 && **t == "user_entry_preferences")
+                && !(version < 27 && **t == "proxy_list_order")
                 && !(version < 26 && **t == "node_components")
                 && !(version < 25
                     && ["user_proxy_credentials", "mieru_hosts", "mieru_traffic_sources"].contains(t))

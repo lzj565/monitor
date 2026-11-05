@@ -298,6 +298,7 @@ impl Db {
         if let Some(name) = realm_display_names(&tx)?.get(&id) {
             tx.execute("UPDATE realm_traffic_rules SET name=?2 WHERE rule_id=?1", params![id, name])?;
         }
+        tx.execute("DELETE FROM user_entry_preferences WHERE entry_id=?1", [-id])?;
         let deleted = tx.execute("DELETE FROM realm_rules WHERE id=?1", [id])? > 0;
         tx.commit()?;
         Ok(deleted)

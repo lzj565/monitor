@@ -801,6 +801,10 @@ async fn main() -> Result<()> {
             Router::new()
                 .route("/api/user/me", get(api::user_me))
                 .route("/api/user/me/proxies", get(api::user_proxies))
+                .route(
+                    "/api/user/me/proxies/{id}/preferences",
+                    axum::routing::patch(api::save_user_entry_preferences),
+                )
                 .route("/api/user/me/proxies/order", put(api::reorder_user_proxies))
                 .route("/api/user/me/subscription", get(api::user_subscription_links))
                 .route("/api/user/me/subscription-token", post(api::rotate_user_subscription_token))

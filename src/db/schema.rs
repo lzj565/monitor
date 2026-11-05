@@ -230,6 +230,7 @@ CREATE TABLE IF NOT EXISTS user_proxy_authorizations (
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS user_entry_preferences(user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, entry_id INTEGER NOT NULL, position INTEGER, hidden INTEGER NOT NULL DEFAULT 0, custom_name TEXT NOT NULL DEFAULT '', PRIMARY KEY(user_id,entry_id));
 CREATE TABLE IF NOT EXISTS user_proxy_order (
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   proxy_id INTEGER NOT NULL REFERENCES proxies(id) ON DELETE CASCADE,
@@ -285,7 +286,7 @@ CREATE TABLE IF NOT EXISTS proxy_node_traffic (
 /// cannot: `open` runs `SCHEMA` before migrating, and on an older file the
 /// column is not there yet. `an_upgraded_release_matches_a_fresh_database`
 /// holds every migration to these rules, starting from v1.0.0's schema.
-pub(super) const SCHEMA_VERSION: i64 = 27;
+pub(super) const SCHEMA_VERSION: i64 = 28;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -620,6 +621,10 @@ pub(super) fn migrate(conn: &Connection, from: i64) -> Result<()> {
         PRIMARY KEY(user_id,proxy_id)
     )",
     )?;
+    tx.execute_batch("CREATE TABLE IF NOT EXISTS user_entry_preferences(user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, entry_id INTEGER NOT NULL, position INTEGER, hidden INTEGER NOT NULL DEFAULT 0, custom_name TEXT NOT NULL DEFAULT '', PRIMARY KEY(user_id,entry_id));")?;
+    if from < 28 {
+        tx.execute("INSERT OR IGNORE INTO user_entry_preferences(user_id,entry_id,position) SELECT user_id,proxy_id,sort FROM user_proxy_order", [])?;
+    }
     tx.execute_batch(PROXY_LIST_ORDER_SCHEMA)?;
     tx.execute_batch(COMPONENT_SCHEMA)?;
     tx.execute_batch("INSERT OR IGNORE INTO node_components(node_id,component,desired_installed) SELECT id,'singbox',1 FROM node UNION ALL SELECT id,'realm',0 FROM node UNION ALL SELECT id,'mieru',0 FROM node")?;
@@ -672,7 +677,7 @@ pub(super) fn seed_default_admin(conn: &Connection) -> Result<()> {
 }
 
 /// Every table a backup must carry before this build will restore it.
-pub(super) const TABLES: [&str; 26] = [
+pub(super) const TABLES: [&str; 27] = [
     "setting",
     "node",
     "proxies",
@@ -687,6 +692,7 @@ pub(super) const TABLES: [&str; 26] = [
     "proxy_user_traffic",
     "proxy_node_traffic",
     "user_proxy_order",
+    "user_entry_preferences",
     "metric_hour",
     "ping_hour",
     "realm_hosts",

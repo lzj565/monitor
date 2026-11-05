@@ -22,6 +22,8 @@ type UserProfile = {
 }
 
 type PortalProxy = {
+  hidden: boolean
+  custom_name: string
   id: number
   node_id: number
   node_name: string
@@ -69,7 +71,7 @@ export function UserCenter({ siteName, dark, toggleTheme, signOut, returnToAdmin
   const reloadProxies = useCallback(() => {
     void api<{ items: PortalProxy[] }>("/user/me/proxies").then((result) => setProxies(result.items)).catch((e: Error) => toast.error(e.message))
   }, [])
-  const drag = useDragOrder((proxies ?? []).filter((p) => p.id > 0), "user/me/proxies", reloadProxies)
+  const drag = useDragOrder((proxies ?? []), "user/me/proxies", reloadProxies)
   const used = profile ? profile.traffic.uplink_bytes + profile.traffic.downlink_bytes : 0
   const limit = profile?.traffic_limit ?? 0
   const percentage = limit > 0 ? used / limit * 100 : 0
@@ -233,13 +235,13 @@ export function UserCenter({ siteName, dark, toggleTheme, signOut, returnToAdmin
                   <tr><th className="w-10 px-1 py-3 sm:px-2"><span className="sr-only">排序</span></th><th className="w-[30%] px-2 py-3 sm:w-[20%] sm:px-3">节点</th><th className="hidden w-[14%] px-2 py-3 sm:table-cell sm:px-3">名称</th><th className="hidden w-[13%] px-3 py-3 xl:table-cell">协议</th><th className="w-[35%] px-2 py-3 sm:w-[22%] sm:px-3">地址</th><th className="hidden w-[7%] px-3 py-3 xl:table-cell">端口</th><th className="hidden w-[12%] px-3 py-3 xl:table-cell">SNI</th><th className="hidden w-[10%] px-3 py-3 xl:table-cell">状态</th><th className="w-20 px-1 py-3 sm:w-24 sm:px-3"><span className="sr-only">复制</span></th></tr>
                 </thead>
                 <tbody>
-                  {[...drag.order, ...(proxies ?? []).filter((p) => p.id < 0)].map((proxy) => (
+                  {drag.order.map((proxy) => (
                     <tr key={proxy.id} {...drag.row(proxy.id)} className="border-t transition-colors hover:bg-muted/30 data-[dragging]:opacity-40">
-                      <td className="px-1 py-3 sm:px-2"><DragHandle disabled={proxy.id < 0} name={proxy.name} {...drag.handle(proxy.id)} /></td>
+                      <td className="px-1 py-3 sm:px-2"><DragHandle disabled={false} name={proxy.name} {...drag.handle(proxy.id)} /></td>
                       <td className="whitespace-normal px-2 py-3 sm:px-3">
                         <div className="min-w-0">
                           <div className="font-medium text-balance break-keep">
-                            {proxy.node_name}{proxy.node_country && "\u2007"}{proxy.node_country && <Badge variant="outline" className="align-middle font-normal text-muted-foreground">{proxy.node_country}</Badge>}
+                            {proxy.custom_name || proxy.node_name}{proxy.hidden && <Badge>已从订阅隐藏</Badge>}{proxy.node_country && "\u2007"}{proxy.node_country && <Badge variant="outline" className="align-middle font-normal text-muted-foreground">{proxy.node_country}</Badge>}
                           </div>
                           {proxy.node_group && <div className="text-xs text-balance text-muted-foreground">{proxy.node_group}</div>}
                         </div>
@@ -250,7 +252,7 @@ export function UserCenter({ siteName, dark, toggleTheme, signOut, returnToAdmin
                       <td className="hidden px-3 py-3 font-mono xl:table-cell">{proxy.port}</td>
                       <td className="hidden px-3 py-3 xl:table-cell"><TooltipText text={proxy.server_name || "—"} className="font-mono text-xs" /></td>
                       <td className="hidden px-3 py-3 xl:table-cell"><Badge variant="outline" className={`font-normal ${proxy.online ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300" : "text-muted-foreground"}`}><span className={`size-1.5 rounded-full ${proxy.online ? "bg-emerald-500" : "bg-muted-foreground/50"}`} />{proxy.online ? "在线" : "离线"}</Badge></td>
-                      <td className="px-1 py-3 sm:px-3"><div className="flex items-center justify-center gap-0 sm:gap-1"><Button type="button" variant="ghost" size="icon" className="size-8 shrink-0" title={proxy.mieru_url ? "复制 mieru 分享链接" : "复制 VLESS URL"} aria-label={`复制 ${proxy.name} 的${proxy.mieru_url ? " mieru 分享链接" : " VLESS URL"}`} onClick={() => void copy(proxy.mieru_url ?? proxy.vless_url, proxy.mieru_url ? "mieru 分享链接" : "VLESS URL")}><Link /></Button><Button type="button" variant="ghost" size="icon" className="size-8 shrink-0" title="复制 Mihomo 配置" aria-label={`复制 ${proxy.name} 的 Mihomo 配置`} onClick={() => void copy(proxy.mihomo_yaml, "Mihomo 配置")}><FileCode /></Button></div></td>
+                      <td className="px-1 py-3 sm:px-3"><div className="flex flex-wrap items-center justify-center gap-0 sm:gap-1"><Button variant="ghost" size="sm" onClick={async()=>{const name=window.prompt("自定义名称（留空恢复默认）",proxy.custom_name);if(name===null)return;try{await api(`/user/me/proxies/${proxy.id}/preferences`,{method:"PATCH",body:JSON.stringify({custom_name:name})});reloadProxies()}catch(e){toast.error((e as Error).message)}}}>改名</Button><Button variant="ghost" size="sm" onClick={async()=>{try{await api(`/user/me/proxies/${proxy.id}/preferences`,{method:"PATCH",body:JSON.stringify({hidden:!proxy.hidden})});reloadProxies()}catch(e){toast.error((e as Error).message)}}}>{proxy.hidden?"恢复订阅":"隐藏"}</Button><Button type="button" variant="ghost" size="icon" className="size-8 shrink-0" title={proxy.mieru_url ? "复制 mieru 分享链接" : "复制 VLESS URL"} aria-label={`复制 ${proxy.name} 的${proxy.mieru_url ? " mieru 分享链接" : " VLESS URL"}`} onClick={() => void copy(proxy.mieru_url ?? proxy.vless_url, proxy.mieru_url ? "mieru 分享链接" : "VLESS URL")}><Link /></Button><Button type="button" variant="ghost" size="icon" className="size-8 shrink-0" title="复制 Mihomo 配置" aria-label={`复制 ${proxy.name} 的 Mihomo 配置`} onClick={() => void copy(proxy.mihomo_yaml, "Mihomo 配置")}><FileCode /></Button></div></td>
                     </tr>
                   ))}
                 </tbody>

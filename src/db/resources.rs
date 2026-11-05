@@ -1,4 +1,5 @@
 use super::*;
+type EntryPreferences = std::collections::HashMap<i64, (Option<i64>, bool, String)>;
 
 impl Db {
     // ---- desired proxy and user state ----
@@ -139,6 +140,7 @@ impl Db {
     }
 
     pub fn delete_proxy(&self, id: i64) -> Result<bool> {
+        self.conn().execute("DELETE FROM user_entry_preferences WHERE entry_id=?1", [id])?;
         Ok(self.conn().execute("DELETE FROM proxies WHERE id=?1", [id])? > 0)
     }
 
@@ -584,29 +586,16 @@ impl Db {
     }
 
     pub fn reorder_user_proxies(&self, user_id: i64, ids: &[i64], now: i64) -> Result<()> {
+        let visible: HashSet<i64> =
+            self.active_user_portal_proxies(user_id, now)?.iter().map(|p| p.id).collect();
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        let visible = {
-            let mut stmt = tx.prepare(
-                "SELECT p.id FROM user_proxy_authorizations a
-                JOIN users u ON u.id=a.user_id JOIN proxies p ON p.id=a.proxy_id
-                WHERE a.user_id=?1 AND a.enabled=1 AND p.enabled=1 AND u.enabled=1
-                AND (u.expires_at IS NULL OR u.expires_at>?2)",
-            )?;
-            let rows = stmt.query_map(params![user_id, now], |r| r.get::<_, i64>(0))?;
-            rows.collect::<rusqlite::Result<HashSet<_>>>()?
-        };
         let requested: HashSet<_> = ids.iter().copied().collect();
         if ids.len() != requested.len() || requested != visible {
             refuse!("节点列表已变更或排序无效，请刷新后重试");
         }
-        // Replace only this user's preference; authorization changes never mutate it.
-        tx.execute("DELETE FROM user_proxy_order WHERE user_id=?1", [user_id])?;
         for (sort, id) in ids.iter().enumerate() {
-            tx.execute(
-                "INSERT INTO user_proxy_order(user_id,proxy_id,sort) VALUES(?1,?2,?3)",
-                params![user_id, id, sort as i64],
-            )?;
+            tx.execute("INSERT INTO user_entry_preferences(user_id,entry_id,position) VALUES(?1,?2,?3) ON CONFLICT(user_id,entry_id) DO UPDATE SET position=excluded.position", params![user_id,id,sort as i64])?;
         }
         tx.commit()?;
         Ok(())
@@ -707,6 +696,29 @@ impl Db {
                 proxies.push(item);
             }
         }
+        let prefs = self.entry_preferences(id)?;
+        for p in &mut proxies {
+            if let Some((_, _, name)) = prefs.get(&p.id) {
+                if !name.is_empty() {
+                    p.name = name.clone();
+                    p.include_node_name = false;
+                }
+            }
+        }
+        let mut used: HashSet<String> =
+            ["Proxy".to_owned(), "direct".to_owned(), "DIRECT".to_owned()].into_iter().collect();
+        for p in &mut proxies {
+            let label = displayed_proxy_name(&p.name, p.include_node_name, &p.node_country);
+            let mut final_name = label.clone();
+            while !used.insert(final_name.clone()) {
+                final_name = format!("{} [{}]", final_name, p.id);
+            }
+            if final_name != label {
+                p.name = final_name;
+                p.include_node_name = false;
+            }
+        }
+        proxies.sort_by_key(|p| prefs.get(&p.id).and_then(|v| v.0).unwrap_or(i64::MAX));
         Ok(proxies)
     }
 
@@ -772,6 +784,30 @@ impl Db {
                 proxies.push(item);
             }
         }
+        let prefs = self.entry_preferences(id)?;
+        proxies.retain(|p| !prefs.get(&p.id).is_some_and(|v| v.1));
+        for p in &mut proxies {
+            if let Some((_, _, name)) = prefs.get(&p.id) {
+                if !name.is_empty() {
+                    p.name = name.clone();
+                    p.include_node_name = false;
+                }
+            }
+        }
+        let mut used: HashSet<String> =
+            ["Proxy".to_owned(), "direct".to_owned(), "DIRECT".to_owned()].into_iter().collect();
+        for p in &mut proxies {
+            let label = displayed_proxy_name(&p.name, p.include_node_name, &p.node_country);
+            let mut final_name = label.clone();
+            while !used.insert(final_name.clone()) {
+                final_name = format!("{} [{}]", final_name, p.id);
+            }
+            if final_name != label {
+                p.name = final_name;
+                p.include_node_name = false;
+            }
+        }
+        proxies.sort_by_key(|p| prefs.get(&p.id).and_then(|v| v.0).unwrap_or(i64::MAX));
         Ok(Some((uuid, proxies)))
     }
 
@@ -1385,6 +1421,36 @@ impl Db {
         // Unchanged is not written: a reconnecting agent, or a token holder
         // repeating the request, would otherwise cost a write transaction each.
         self.conn().execute("UPDATE node SET ip_other=?2 WHERE id=?1 AND ip_other<>?2", params![id, ip])?;
+        Ok(())
+    }
+}
+
+impl Db {
+    pub fn entry_preferences(&self, user: i64) -> Result<EntryPreferences> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT entry_id,position,hidden,custom_name FROM user_entry_preferences WHERE user_id=?1",
+        )?;
+        let rows = stmt
+            .query_map([user], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?, r.get(3)?))))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+    pub fn save_entry_preferences(
+        &self,
+        user: i64,
+        id: i64,
+        hidden: Option<bool>,
+        name: Option<String>,
+    ) -> Result<()> {
+        if !self.active_user_portal_proxies(user, Utc::now().timestamp())?.iter().any(|p| p.id == id) {
+            refuse!("入口不存在或未授权");
+        }
+        let name = name.map(|n| n.trim().to_owned());
+        if name.as_ref().is_some_and(|n| n.chars().count() > 100 || n.chars().any(char::is_control)) {
+            refuse!("名称最多100字且不能包含控制字符");
+        }
+        self.conn().execute("INSERT INTO user_entry_preferences(user_id,entry_id,hidden,custom_name) VALUES(?1,?2,COALESCE(?3,0),COALESCE(?4,'')) ON CONFLICT(user_id,entry_id) DO UPDATE SET hidden=COALESCE(?3,hidden),custom_name=COALESCE(?4,custom_name)",params![user,id,hidden,name])?;
         Ok(())
     }
 }

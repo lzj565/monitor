@@ -2542,3 +2542,36 @@ fn temporary_files_go_beside_the_database() {
     // The parent, not `temp_dir()` itself, which keeps a trailing slash from TMPDIR.
     assert_eq!(set, database.parent().unwrap().to_string_lossy());
 }
+
+#[test]
+fn entry_preferences_are_private_and_do_not_remove_portal_entries() {
+    let scratch = Scratch::new();
+    let db = Db::open(&scratch.0).unwrap();
+    let uid = db.create_user(&user_draft("portal-order")).unwrap().unwrap();
+    let other = db.create_user(&user_draft("portal-other")).unwrap().unwrap();
+    let nid = node(&db, 1);
+    db.conn().execute("UPDATE node SET country='HK' WHERE id=?1", [nid]).unwrap();
+    let mut draft = proxy_draft("one", true);
+    draft.enabled = true;
+    let a = db.create_proxy(nid, &draft).unwrap().unwrap();
+    draft.name = "two".into();
+    draft.port += 1;
+    let b = db.create_proxy(nid, &draft).unwrap().unwrap();
+    for uid in [uid, other] {
+        for id in [a, b] {
+            db.put_authorization(uid, id, &access_draft("")).unwrap().unwrap();
+        }
+    }
+    let now = Utc::now().timestamp();
+    db.save_entry_preferences(uid, a, Some(true), Some("我的节点".into())).unwrap();
+    assert_eq!(db.active_user_portal_proxies(uid, now).unwrap().len(), 2);
+    assert_eq!(db.active_user_portal_proxies(uid, now).unwrap()[0].name, "我的节点");
+    assert_eq!(db.active_user_subscription(uid, now).unwrap().unwrap().1.len(), 1);
+    assert_eq!(db.active_user_subscription(other, now).unwrap().unwrap().1.len(), 2);
+    db.reorder_user_proxies(uid, &[b, a], now).unwrap();
+    assert!(db.entry_preferences(uid).unwrap()[&a].1);
+    db.save_entry_preferences(uid, a, Some(false), Some(String::new())).unwrap();
+    assert_eq!(db.active_user_subscription(uid, now).unwrap().unwrap().1.len(), 2);
+    assert!(db.save_entry_preferences(other, 999999, Some(true), None).is_err());
+    assert!(db.save_entry_preferences(uid, a, None, Some("bad\nname".into())).is_err());
+}

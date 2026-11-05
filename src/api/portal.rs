@@ -52,6 +52,7 @@ pub async fn user_me(UserAuth(user_id): UserAuth, State(app): State<Shared>) -> 
 pub async fn user_proxies(UserAuth(user_id): UserAuth, State(app): State<Shared>) -> Response {
     crate::blocking::response(move || {
         let now = Utc::now().timestamp();
+        let prefs = match app.db.entry_preferences(user_id) {Ok(p)=>p,Err(e)=>return api_internal(e)};
         match app.db.active_user_portal_proxies(user_id, now) {
             Ok(mut proxies) => {
                 let agents = app.agents.read().unwrap_or_else(|e| e.into_inner());
@@ -72,6 +73,8 @@ pub async fn user_proxies(UserAuth(user_id): UserAuth, State(app): State<Shared>
                         let link=format!("mierus://{}:{}@{}?profile={}&port={}&protocol=TCP",uri_component(&username),uri_component(password),host,uri_component(&label),proxy.port);
                         let mut item=serde_json::to_value(&proxy).expect("portal proxy serializes");
                         item.as_object_mut().unwrap().remove("mieru_password");
+                        item["hidden"]=json!(prefs.get(&proxy.id).is_some_and(|v|v.1));
+                        item["custom_name"]=json!(prefs.get(&proxy.id).map(|v|v.2.as_str()).unwrap_or(""));
                         item["mieru_url"]=json!(link);item["mihomo_yaml"]=json!(mihomo_yaml);
                         return item;
                     }
@@ -88,7 +91,10 @@ pub async fn user_proxies(UserAuth(user_id): UserAuth, State(app): State<Shared>
                         uri_component(flow), uri_component(&label),
                     );
                     let mihomo_yaml = mihomo_proxy(user_id, &proxy);
+                    let hidden=prefs.get(&proxy.id).is_some_and(|v|v.1);
+                    let custom_name=prefs.get(&proxy.id).map(|v|v.2.clone()).unwrap_or_default();
                     let mut item = serde_json::to_value(proxy).expect("portal proxy serializes");
+                    item["hidden"]=json!(hidden); item["custom_name"]=json!(custom_name);
                     item["vless_url"] = json!(vless_url);
                     item["mihomo_yaml"] = json!(mihomo_yaml);
                     item
@@ -305,7 +311,16 @@ pub async fn subscription(
         let (content_type, body) = match format.as_str() {
             "clash" => {
                 let proxies = match app.db.active_user_portal_proxies(user_id, Utc::now().timestamp()) {
-                    Ok(proxies) => proxies,
+                    Ok(proxies) => {
+                        let prefs = match app.db.entry_preferences(user_id) {
+                            Ok(p) => p,
+                            Err(e) => return api_internal(e),
+                        };
+                        proxies
+                            .into_iter()
+                            .filter(|p| !prefs.get(&p.id).is_some_and(|v| v.1))
+                            .collect::<Vec<_>>()
+                    }
                     Err(error) => return api_internal(error),
                 };
                 ("application/yaml; charset=utf-8", clash_subscription(user_id, &proxies))
@@ -325,6 +340,26 @@ pub async fn subscription(
         let mut response = ([(header::CONTENT_TYPE, content_type)], body).into_response();
         response.headers_mut().insert(header::CACHE_CONTROL, "no-store".parse().expect("static header"));
         response
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+pub struct EntryPreference {
+    hidden: Option<bool>,
+    custom_name: Option<String>,
+}
+pub async fn save_user_entry_preferences(
+    UserAuth(user): UserAuth,
+    State(app): State<Shared>,
+    Path(id): Path<i64>,
+    Json(pref): Json<EntryPreference>,
+) -> Response {
+    crate::blocking::response(move || {
+        match app.db.save_entry_preferences(user, id, pref.hidden, pref.custom_name) {
+            Ok(()) => Json(json!({"ok":true})).into_response(),
+            Err(e) => fail(e),
+        }
     })
     .await
 }
