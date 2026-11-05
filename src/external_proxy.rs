@@ -127,6 +127,9 @@ pub fn parse_yaml(input: &str) -> Result<(Vec<Value>, bool)> {
     let (items, ignored) = match value {
         Value::Array(items) => (items, false),
         Value::Object(mut map) => {
+            if map.contains_key("type") {
+                return Ok((vec![Value::Object(map)], false));
+            }
             let items = map
                 .remove("proxies")
                 .and_then(|v| v.as_array().cloned())
@@ -151,14 +154,14 @@ pub fn validate(entry: &Value) -> Result<Value> {
         bail!("名称最多100字且不能包含控制字符");
     }
     text("type").context("缺少代理类型type")?;
-    text("server").context("缺少服务器地址server")?;
-    entry
-        .get("port")
-        .and_then(Value::as_i64)
-        .filter(|p| (1..=65535).contains(p))
-        .context("端口须为1至65535的整数")?;
-    if entry.get("dialer-proxy").is_some() {
-        bail!("不支持依赖其他代理的dialer-proxy");
+    if entry.get("server").is_some_and(|v| !v.is_null() && v.as_str().is_none_or(|s| s.trim().is_empty())) {
+        bail!("服务器地址须为非空字符串");
+    }
+    if let Some(port) = entry.get("port").filter(|v| !v.is_null()) {
+        port.as_i64().filter(|p| (1..=65535).contains(p)).context("端口须为1至65535的整数")?;
+    }
+    if entry.get("dialer-proxy").is_some_and(|v| v.as_str().is_none_or(|s| s.trim().is_empty())) {
+        bail!("dialer-proxy须为非空字符串");
     }
     let mut value = entry.clone();
     value["name"] = Value::String(name.into());
@@ -171,6 +174,20 @@ pub fn validate(entry: &Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn all_protocols_and_single_objects_round_trip() {
+        for yaml in [
+            "-   name: 🇸🇬SG\n    type: vless\n    server: net.cctester100.xyz\n    port: 443\n    uuid: bfec97d1-9b7c-481a-b8ee-2fa2bfc36bd8\n    network: ws",
+            "name: vpn\ntype: openvpn\nserver: 54.254.93.236\nport: 1194\nproto: udp\ndata-ciphers: [AES-128-GCM]\nping: 10\nping-restart: 60",
+            "name: direct\ntype: direct\nunknown-option: {nested: [true, 42]}",
+            "name: chain\ntype: future-protocol\ndialer-proxy: parent",
+        ] {
+            let (items, _) = parse_yaml(yaml).unwrap();
+            let config = validate(&items[0]).unwrap();
+            assert_eq!(config, items[0]);
+            assert_eq!(parse_yaml(&serde_json::to_string(&config).unwrap()).unwrap().0[0], config);
+        }
+    }
     #[test]
     fn yaml_preserves_protocol_parameters_and_ignores_top_level_sections() {
         let text="proxies:\n  - name: 香港 # comment\n    type: trojan\n    server: example.com\n    port: 443\n    password: 'false:#secret'\n    ws-opts: {path: /ws, headers: {Host: edge.example.com}}\nrules: [MATCH,DIRECT]\n";
@@ -217,8 +234,8 @@ mod tests {
             ("port", 0.into()),
             ("port", 65536.into()),
             ("port", "443".into()),
-            ("server", Value::Null),
-            ("dialer-proxy", "parent".into()),
+            ("server", 123.into()),
+            ("dialer-proxy", 123.into()),
         ] {
             let mut bad = valid.clone();
             bad[field] = value;

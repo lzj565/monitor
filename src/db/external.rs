@@ -5,8 +5,8 @@ CREATE TABLE IF NOT EXISTS external_proxies (
  id INTEGER PRIMARY KEY AUTOINCREMENT,
  name TEXT NOT NULL UNIQUE,
  protocol TEXT NOT NULL,
- address TEXT NOT NULL,
- port INTEGER NOT NULL CHECK(port BETWEEN 1 AND 65535),
+ address TEXT,
+ port INTEGER CHECK(port BETWEEN 1 AND 65535),
  config TEXT NOT NULL,
  enabled INTEGER NOT NULL DEFAULT 1,
  created_at INTEGER NOT NULL,
@@ -45,8 +45,8 @@ pub struct ExternalProxy {
     pub id: i64,
     pub name: String,
     pub protocol: String,
-    pub address: String,
-    pub port: i64,
+    pub address: Option<String>,
+    pub port: Option<i64>,
     pub enabled: bool,
 }
 
@@ -236,6 +236,28 @@ impl Db {
         }
         if let Some(config) = config {
             let config = crate::external_proxy::validate(config)?;
+            let old_name: String =
+                tx.query_row("SELECT name FROM external_proxies WHERE id=?1", [id], |r| r.get(0))?;
+            if config["name"].as_str() != Some(old_name.as_str()) {
+                let references = {
+                    let mut stmt = tx.prepare("SELECT id,config FROM external_proxies WHERE id<>?1")?;
+                    let rows = stmt
+                        .query_map([id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    rows
+                };
+                for (other, text) in references {
+                    let mut value: serde_json::Value = serde_json::from_str(&text)?;
+                    if value["dialer-proxy"].as_str() == Some(old_name.as_str()) {
+                        value["dialer-proxy"] = config["name"].clone();
+                        tx.execute(
+                            "UPDATE external_proxies SET config=?2,updated_at=?3 WHERE id=?1",
+                            params![other, value.to_string(), Utc::now().timestamp()],
+                        )?;
+                    }
+                }
+            }
+
             tx.execute("UPDATE external_proxies SET name=?2,protocol=?3,address=?4,port=?5,config=?6,updated_at=?7 WHERE id=?1",params![id,config["name"].as_str(),config["type"].as_str(),config["server"].as_str(),config["port"].as_i64(),config.to_string(),Utc::now().timestamp()])?;
         }
         if let Some(enabled) = enabled {

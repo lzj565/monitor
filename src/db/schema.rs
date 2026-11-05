@@ -286,7 +286,7 @@ CREATE TABLE IF NOT EXISTS proxy_node_traffic (
 /// cannot: `open` runs `SCHEMA` before migrating, and on an older file the
 /// column is not there yet. `an_upgraded_release_matches_a_fresh_database`
 /// holds every migration to these rules, starting from v1.0.0's schema.
-pub(super) const SCHEMA_VERSION: i64 = 29;
+pub(super) const SCHEMA_VERSION: i64 = 30;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -632,6 +632,23 @@ pub(super) fn migrate(conn: &Connection, from: i64) -> Result<()> {
         tx.execute("INSERT OR IGNORE INTO user_entry_preferences(user_id,entry_key,position) SELECT user_id,'proxy:'||proxy_id,sort FROM user_proxy_order", [])?;
     }
     tx.execute_batch(EXTERNAL_SCHEMA)?;
+    if from < 30 {
+        tx.execute_batch(
+            "CREATE TABLE external_proxies_v30 (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE,
+          protocol TEXT NOT NULL, address TEXT, port INTEGER CHECK(port BETWEEN 1 AND 65535),
+          config TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
+          created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+          INSERT INTO external_proxies_v30 SELECT * FROM external_proxies;
+          CREATE TEMP TABLE saved_external_access AS SELECT * FROM user_external_proxy_authorizations;
+          DELETE FROM user_external_proxy_authorizations;
+          DROP TABLE external_proxies;
+          ALTER TABLE external_proxies_v30 RENAME TO external_proxies;
+          INSERT INTO user_external_proxy_authorizations SELECT * FROM saved_external_access;
+          DROP TABLE saved_external_access;",
+        )?;
+    }
+
     tx.execute_batch(PROXY_LIST_ORDER_SCHEMA)?;
     tx.execute_batch(COMPONENT_SCHEMA)?;
     tx.execute_batch("INSERT OR IGNORE INTO node_components(node_id,component,desired_installed) SELECT id,'singbox',1 FROM node UNION ALL SELECT id,'realm',0 FROM node UNION ALL SELECT id,'mieru',0 FROM node")?;

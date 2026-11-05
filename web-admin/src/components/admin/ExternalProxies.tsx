@@ -8,9 +8,9 @@ import { Switch } from "@/components/ui/switch"
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { Table, TableBody, TableHead, TableHeader, TableCell, TableRow } from "@/components/ui/table"
 
-export type ExternalProxy = { id: number; name: string; protocol: string; address: string; port: number; enabled: boolean }
+export type ExternalProxy = { id: number; name: string; protocol: string; address: string | null; port: number | null; enabled: boolean }
 type Config = Record<string, unknown>
-type Preview = { index: number; config: Config; error: string | null }
+type Preview = { index: number; config: Config; error: string | null; warning?: string | null }
 const changed = () => window.dispatchEvent(new Event("external-proxies-changed"))
 
 export function useExternalProxies() {
@@ -57,12 +57,12 @@ export function ExternalImportDialog({ editing, onClose }: { editing?: ExternalP
     finally { setBusy(false) }
   }
   return <Dialog open onOpenChange={open => !open && !busy && onClose()}><DialogContent className="flex max-h-[90dvh] flex-col sm:max-w-3xl">
-    <DialogHeader><DialogTitle>{editing ? `编辑外部代理：${editing.name}` : "导入外部代理"}</DialogTitle><DialogDescription>粘贴完整 Mihomo 配置或静态代理列表。仅导入代理，不导入分组、规则或远程 providers。保留原凭据，仅用于 Mihomo，不采集统计。校验不代表连接实测。</DialogDescription></DialogHeader>
+    <DialogHeader><DialogTitle>{editing ? `编辑外部代理：${editing.name}` : "导入外部代理"}</DialogTitle><DialogDescription>粘贴单个代理、完整 Mihomo 配置或静态代理列表。仅导入代理，不导入分组、规则或远程 providers。保留原凭据，仅用于 Mihomo，不采集统计。校验不代表连接实测。</DialogDescription></DialogHeader>
     <div className="min-h-0 space-y-3 overflow-y-auto">
       {error && <div role="alert" className="text-sm text-destructive">{error}{editing && !yaml && <Button variant="link" onClick={load}>重试读取</Button>}</div>}
       <label className="block space-y-2"><span className="text-sm font-medium">YAML 配置（最多 1 MiB / 500 条）</span><textarea aria-label="YAML 配置" className="min-h-52 w-full rounded-md border bg-background p-3 font-mono text-xs" value={yaml} disabled={busy || loading} onChange={e => { setYaml(e.target.value); setRows(null); setDirty(false); setIgnored(false); setError("") }} placeholder={'proxies:\n  - name: 示例\n    type: trojan\n    server: example.com\n    port: 443\n    password: your-password'} /></label>
       {ignored && <p className="text-sm text-muted-foreground">仅导入 proxies，其他配置未导入。</p>}
-      {rows && <div className="space-y-2">{rows.map((r, i) => <div key={r.index} className="space-y-2 rounded-md border p-3"><label className="flex items-center gap-2 text-sm"><span className="shrink-0">第 {i + 1} 条</span><Input aria-label={`第 ${i + 1} 条名称`} disabled={busy} value={typeof r.config?.name === "string" ? r.config.name : ""} onChange={e => { setRows(rows.map((row, j) => j === i ? { ...row, config: { ...row.config, name: e.target.value } } : row)); setDirty(true) }} /></label><p className="break-all text-xs text-muted-foreground">{String(r.config?.type ?? "未知协议")} · {String(r.config?.server ?? "缺少地址")}:{String(r.config?.port ?? "—")}</p>{r.error && <p role="alert" className="text-sm text-destructive">{r.error}</p>}</div>)}</div>}
+      {rows && <div className="space-y-2">{rows.map((r, i) => <div key={r.index} className="space-y-2 rounded-md border p-3"><label className="flex items-center gap-2 text-sm"><span className="shrink-0">第 {i + 1} 条</span><Input aria-label={`第 ${i + 1} 条名称`} disabled={busy} value={typeof r.config?.name === "string" ? r.config.name : ""} onChange={e => { setRows(rows.map((row, j) => j === i ? { ...row, config: { ...row.config, name: e.target.value } } : row)); setDirty(true) }} /></label><p className="break-all text-xs text-muted-foreground">{String(r.config?.type ?? "未知协议")} · {String(r.config?.server ?? "缺少地址")}:{String(r.config?.port ?? "—")}</p>{r.warning && <p className="text-sm text-muted-foreground">{r.warning}</p>}{r.error && <p role="alert" className="text-sm text-destructive">{r.error}</p>}</div>)}</div>}
     </div>
     <DialogFooter className="flex-wrap"><Button variant="ghost" disabled={busy} onClick={onClose}>取消</Button><Button variant="outline" disabled={busy || loading || !yaml.trim()} onClick={() => void preview()}>{busy ? "处理中…" : rows ? "重新校验" : "解析预览"}</Button><Button disabled={busy || loading || !rows || dirty || !!error || rows.some(r => r.error !== null)} onClick={() => void save()}>{editing ? "保存配置" : "确认导入"}</Button></DialogFooter>
   </DialogContent></Dialog>
@@ -78,7 +78,7 @@ export function ExternalProxyRow({ proxy }: { proxy: ExternalProxy }) {
     catch (e) { toast.error((e as Error).message) }
     finally { setBusy(false) }
   }
-  return <TableRow><TableCell className="max-w-64 break-all font-medium">{proxy.name}</TableCell><TableCell><Badge variant="outline">外部导入 · {proxy.protocol}</Badge></TableCell><TableCell className="font-mono text-xs">{proxy.address}</TableCell><TableCell>{proxy.port}</TableCell><TableCell><Switch checked={proxy.enabled} disabled={busy} aria-label={`${proxy.enabled ? "停用" : "启用"}外部代理${proxy.name}`} onCheckedChange={v => void mutate(false, v)} /></TableCell><TableCell><div className="flex justify-end gap-2"><Button size="sm" variant="outline" disabled={busy} onClick={() => setEditing(true)}>编辑配置</Button><Button size="sm" variant="ghost" disabled={busy} onClick={() => void mutate(true)}>删除</Button></div>{editing && <ExternalImportDialog editing={proxy} onClose={() => setEditing(false)} />}</TableCell></TableRow>
+  return <TableRow><TableCell className="max-w-64 break-all font-medium">{proxy.name}</TableCell><TableCell><Badge variant="outline">外部导入 · {proxy.protocol}</Badge></TableCell><TableCell className="font-mono text-xs">{proxy.address ?? "—"}</TableCell><TableCell>{proxy.port ?? "—"}</TableCell><TableCell><Switch checked={proxy.enabled} disabled={busy} aria-label={`${proxy.enabled ? "停用" : "启用"}外部代理${proxy.name}`} onCheckedChange={v => void mutate(false, v)} /></TableCell><TableCell><div className="flex justify-end gap-2"><Button size="sm" variant="outline" disabled={busy} onClick={() => setEditing(true)}>编辑配置</Button><Button size="sm" variant="ghost" disabled={busy} onClick={() => void mutate(true)}>删除</Button></div>{editing && <ExternalImportDialog editing={proxy} onClose={() => setEditing(false)} />}</TableCell></TableRow>
 }
 
 export function ExternalAuthorization({ userId }: { userId: number }) {

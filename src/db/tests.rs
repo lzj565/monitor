@@ -2672,3 +2672,19 @@ fn numeric_preferences_migrate_from_28_and_unreleased_29_without_data_loss() {
         fresh.check_backup(&copy).unwrap();
     }
 }
+
+#[test]
+fn external_metadata_is_optional_and_admin_rename_preserves_chain() {
+    let db = Db::open(":memory:").unwrap();
+    let parent = serde_json::json!({"name":"parent","type":"direct","future":{"nested":[true,42]}});
+    let child =
+        serde_json::json!({"name":"child","type":"vless","server":"host","port":443,"dialer-proxy":"parent"});
+    let ids = db.import_external_proxies(&[parent.clone(), child]).unwrap();
+    assert!(db.external_proxies().unwrap()[0].address.is_none());
+    assert!(db.external_proxies().unwrap()[0].port.is_none());
+    let mut renamed = parent;
+    renamed["name"] = serde_json::json!("renamed");
+    db.update_external_proxy(ids[0], Some(&renamed), None).unwrap();
+    assert_eq!(db.external_proxy_config(ids[1]).unwrap().unwrap()["dialer-proxy"], "renamed");
+    assert_eq!(db.external_proxy_config(ids[0]).unwrap().unwrap(), renamed);
+}

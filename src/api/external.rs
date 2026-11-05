@@ -34,6 +34,12 @@ pub async fn preview_external(
             Ok(p) => p,
             Err(e) => return api_internal(e),
         };
+        let dependencies: std::collections::HashMap<String, Option<String>> = items
+            .iter()
+            .filter_map(|v| {
+                Some((v["name"].as_str()?.to_owned(), v["dialer-proxy"].as_str().map(str::to_owned)))
+            })
+            .collect();
         let mut names = std::collections::HashSet::new();
         let rows: Vec<_> = items
             .into_iter()
@@ -53,7 +59,24 @@ pub async fn preview_external(
                         }
                     }
                 };
-                json!({"index":index,"config":checked.unwrap_or(item),"error":error})
+                let mut cursor = item["name"].as_str().unwrap_or("").to_owned();
+                let mut visited = std::collections::HashSet::new();
+                let mut warning: Option<&str> = None;
+                while let Some(Some(dep)) = dependencies.get(&cursor) {
+                    if !visited.insert(cursor.clone()) {
+                        warning = Some("代理链存在循环，订阅将排除受影响节点");
+                        break;
+                    }
+                    if !dependencies.contains_key(dep)
+                        && !existing.iter().any(|p| p.enabled && p.name == *dep)
+                        && !matches!(dep.as_str(), "DIRECT" | "REJECT" | "PASS" | "COMPATIBLE")
+                    {
+                        warning = Some("依赖未导入或已停用；用户还须获得依赖节点授权，否则订阅将排除此节点");
+                        break;
+                    }
+                    cursor = dep.clone();
+                }
+                json!({"index":index,"config":checked.unwrap_or(item),"error":error,"warning":warning})
             })
             .collect();
         Json(json!({"items":rows,"ignored_sections":ignored})).into_response()
@@ -76,7 +99,21 @@ pub async fn import_external(
         }
         match app.db.import_external_proxies(&body.items) {
             Ok(ids) => (StatusCode::CREATED, Json(json!({"ids":ids}))).into_response(),
-            Err(_) => rejected(),
+            Err(e) => {
+                let message = e.to_string();
+                let safe = if message.contains("UNIQUE constraint") {
+                    "名称重复，请修改后重试"
+                } else if message.contains("端口") {
+                    "端口须为1至65535的整数"
+                } else if message.contains("name") {
+                    "缺少代理名称name"
+                } else if message.contains("type") {
+                    "缺少代理类型type"
+                } else {
+                    "配置保存失败，请重新解析预览并检查名称及字段"
+                };
+                api_error(StatusCode::BAD_REQUEST, "INVALID_EXTERNAL_PROXY", safe)
+            }
         }
     })
     .await
@@ -105,7 +142,21 @@ pub async fn update_external(
         match app.db.update_external_proxy(id, body.config.as_ref(), body.enabled) {
             Ok(true) => Json(json!({"ok":true})).into_response(),
             Ok(false) => api_error(StatusCode::NOT_FOUND, "EXTERNAL_PROXY_NOT_FOUND", "外部代理不存在"),
-            Err(_) => rejected(),
+            Err(e) => {
+                let message = e.to_string();
+                let safe = if message.contains("UNIQUE constraint") {
+                    "名称重复，请修改后重试"
+                } else if message.contains("端口") {
+                    "端口须为1至65535的整数"
+                } else if message.contains("name") {
+                    "缺少代理名称name"
+                } else if message.contains("type") {
+                    "缺少代理类型type"
+                } else {
+                    "配置保存失败，请重新解析预览并检查名称及字段"
+                };
+                api_error(StatusCode::BAD_REQUEST, "INVALID_EXTERNAL_PROXY", safe)
+            }
         }
     })
     .await

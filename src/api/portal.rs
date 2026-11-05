@@ -87,7 +87,7 @@ pub(super) fn user_portal_items(app: &App, user: i64) -> anyhow::Result<Vec<Valu
     entries.sort_by_key(|(key, _, _)| prefs.get(key).and_then(|p| p.0).unwrap_or(i64::MAX));
     let mut names: std::collections::HashSet<String> =
         ["Proxy", "DIRECT", "direct"].into_iter().map(str::to_owned).collect();
-    entries.into_iter().map(|(key,mut item,proxy)|{
+    let mut result: Vec<Value> = entries.into_iter().map(|(key,mut item,proxy)|{
         let pref=prefs.get(&key);
         let custom=pref.map(|p|p.2.as_str()).unwrap_or("");
         let default=item["default_name"].as_str().unwrap_or("代理");
@@ -110,14 +110,93 @@ pub(super) fn user_portal_items(app: &App, user: i64) -> anyhow::Result<Vec<Valu
             item["mihomo_yaml"]=json!(serde_yaml_ng::to_string(&vec![config])?.trim_end());
         }
         Ok(item)
-    }).collect()
+    }).collect::<anyhow::Result<_>>()?;
+    let snapshot = result.clone();
+    for item in &mut result {
+        let mut scope = snapshot.clone();
+        for candidate in &mut scope {
+            candidate["hidden"] = json!(candidate["entry_key"] != item["entry_key"]);
+        }
+        let yaml = combined_clash_subscription(&scope);
+        let document: Value = serde_yaml_ng::from_str(&yaml)?;
+        let proxies = document["proxies"].as_array().cloned().unwrap_or_default();
+        let available = proxies.iter().any(|p| p["name"] == item["name"]);
+        item["subscription_error"] = if available {
+            Value::Null
+        } else {
+            json!("代理链依赖缺失、未授权、停用或存在循环，已从订阅排除")
+        };
+        if available && proxies.len() > 1 {
+            item["mihomo_yaml"] = json!(serde_yaml_ng::to_string(&proxies)?.trim_end());
+        }
+    }
+    Ok(result)
 }
 
 pub(super) fn combined_clash_subscription(items: &[Value]) -> String {
-    let visible: Vec<_> = items.iter().filter(|p| p["hidden"] != true).collect();
+    let mut configs = std::collections::HashMap::new();
+    let original: std::collections::HashMap<_, _> = items
+        .iter()
+        .map(|p| (p["default_name"].as_str().unwrap_or(""), p["name"].as_str().unwrap_or("")))
+        .collect();
+    for item in items {
+        if let Ok(mut entries) =
+            serde_yaml_ng::from_str::<Vec<Value>>(item["mihomo_yaml"].as_str().unwrap_or(""))
+        {
+            for mut config in entries.drain(..) {
+                if let Some(dep) = config["dialer-proxy"].as_str().map(str::to_owned) {
+                    if let Some(name) = original.get(dep.as_str()) {
+                        config["dialer-proxy"] = json!(name);
+                    }
+                }
+                configs.insert(config["name"].as_str().unwrap_or("").to_owned(), config);
+            }
+        }
+    }
+    fn resolve(
+        name: &str,
+        configs: &std::collections::HashMap<String, Value>,
+        path: &mut Vec<String>,
+        result: &mut std::collections::HashSet<String>,
+    ) -> bool {
+        if path.iter().any(|p| p == name) {
+            return false;
+        }
+        let Some(config) = configs.get(name) else {
+            return matches!(name, "DIRECT" | "REJECT" | "PASS" | "COMPATIBLE");
+        };
+        path.push(name.to_owned());
+        let valid = config["dialer-proxy"].as_str().is_none_or(|dep| resolve(dep, configs, path, result));
+        path.pop();
+        if valid {
+            result.insert(name.to_owned());
+        }
+        valid
+    }
+    let mut included = std::collections::HashSet::new();
+    let visible: Vec<_> = items
+        .iter()
+        .filter(|p| p["hidden"] != true)
+        .filter(|p| {
+            let mut closure = std::collections::HashSet::new();
+            if resolve(p["name"].as_str().unwrap_or(""), &configs, &mut Vec::new(), &mut closure) {
+                included.extend(closure);
+                true
+            } else {
+                false
+            }
+        })
+        .collect();
+    let emitted: Vec<_> =
+        items.iter().filter(|p| included.contains(p["name"].as_str().unwrap_or(""))).collect();
     let mut out = if visible.is_empty() { "proxies: []\n".to_owned() } else { "proxies:\n".to_owned() };
-    for item in &visible {
-        for line in item["mihomo_yaml"].as_str().unwrap_or("").lines() {
+    for item in &emitted {
+        let yaml = if item["source"] != "external" {
+            item["mihomo_yaml"].as_str().unwrap_or("").to_owned()
+        } else {
+            serde_yaml_ng::to_string(&vec![&configs[item["name"].as_str().unwrap_or("")]]).unwrap_or_default()
+        };
+        for line in yaml.lines() {
             out.push_str("  ");
             out.push_str(line);
             out.push('\n');

@@ -2635,3 +2635,20 @@ async fn external_preview_import_and_edit_enforce_validation_without_returning_s
         StatusCode::NO_CONTENT
     );
 }
+
+#[test]
+fn external_chains_follow_renames_and_exclude_missing_or_cyclic_dependencies() {
+    let items = vec![
+        json!({"entry_key":"external:1","source":"external","default_name":"parent","name":"custom parent","hidden":true,"mihomo_yaml":"- {name: custom parent, type: socks5, server: host, port: 1080}"}),
+        json!({"entry_key":"external:2","source":"external","default_name":"child","name":"child","hidden":false,"mihomo_yaml":"- {name: child, type: vless, server: host, port: 443, dialer-proxy: parent}"}),
+        json!({"source":"external","default_name":"broken","name":"broken","mihomo_yaml":"- {name: broken, type: vless, dialer-proxy: absent}"}),
+        json!({"source":"external","default_name":"loop","name":"loop","mihomo_yaml":"- {name: loop, type: vless, dialer-proxy: loop}"}),
+    ];
+    let body = combined_clash_subscription(&items);
+    let config: Value = serde_yaml_ng::from_str(&body).unwrap();
+    let proxies = config["proxies"].as_array().unwrap();
+    assert_eq!(proxies.len(), 2);
+    assert_eq!(proxies[1]["dialer-proxy"], "custom parent");
+    let selected = config["proxy-groups"][0]["proxies"].as_array().unwrap();
+    assert_eq!(selected, &vec![json!("child"), json!("DIRECT")]);
+}
