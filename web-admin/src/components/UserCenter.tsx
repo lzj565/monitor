@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useState } from "react"
-import { ArrowDown, ArrowUp, CalendarDays, Copy, FileCode, Gauge, Link, LogOut, Moon, RefreshCw, Shield, Sun } from "lucide-react"
+import { ArrowDown, ArrowUp, CalendarDays, Copy, Eye, EyeOff, Pencil, FileCode, Gauge, Link, LogOut, Moon, RefreshCw, Shield, Sun } from "lucide-react"
 import { toast } from "sonner"
 
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog"
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
+import { cn } from "@/lib/utils"
 import { Input } from "@/components/ui/input"
 import { Badge } from "@/components/ui/badge"
 import { Skeleton } from "@/components/ui/skeleton"
@@ -251,11 +253,11 @@ export function UserCenter({ siteName, dark, toggleTheme, signOut, returnToAdmin
             <div className="overflow-x-auto rounded-md border">
               <table className="w-full min-w-[560px] table-fixed text-left text-sm">
                 <thead className="bg-muted/50 text-xs text-muted-foreground">
-                  <tr><th className="w-10 px-1 py-3 sm:px-2"><span className="sr-only">排序</span></th><th className="w-[30%] px-2 py-3 sm:w-[20%] sm:px-3">节点</th><th className="hidden w-[14%] px-2 py-3 sm:table-cell sm:px-3">名称</th><th className="hidden w-[13%] px-3 py-3 xl:table-cell">协议</th><th className="w-[35%] px-2 py-3 sm:w-[22%] sm:px-3">地址</th><th className="hidden w-[7%] px-3 py-3 xl:table-cell">端口</th><th className="hidden w-[12%] px-3 py-3 xl:table-cell">SNI</th><th className="hidden w-[10%] px-3 py-3 xl:table-cell">状态</th><th className="w-36 px-1 py-3 sm:px-3"><span className="sr-only">复制</span></th></tr>
+                  <tr><th className="w-10 px-1 py-3 sm:px-2"><span className="sr-only">排序</span></th><th className="w-[30%] px-2 py-3 sm:w-[20%] sm:px-3">节点</th><th className="hidden w-[14%] px-2 py-3 sm:table-cell sm:px-3">名称</th><th className="hidden w-[13%] px-3 py-3 xl:table-cell">协议</th><th className="w-[35%] px-2 py-3 sm:w-[22%] sm:px-3">地址</th><th className="hidden w-[7%] px-3 py-3 xl:table-cell">端口</th><th className="hidden w-[12%] px-3 py-3 xl:table-cell">SNI</th><th className="hidden w-[10%] px-3 py-3 xl:table-cell">状态</th><th className="w-36 px-1 py-3 sm:px-3"><span className="sr-only">操作</span></th></tr>
                 </thead>
                 <tbody>
                   {drag.order.map((proxy) => (
-                    <tr key={proxy.id} {...drag.row(proxy.id)} className="border-t transition-colors hover:bg-muted/30 data-[dragging]:opacity-40">
+                    <tr key={proxy.id} {...drag.row(proxy.id)} className={cn(drag.row(proxy.id).className, "border-t transition-colors", proxy.hidden ? "bg-muted hover:bg-muted dark:bg-muted/70 dark:hover:bg-muted/70" : "bg-card hover:bg-muted/30")}>
                       <td className="px-1 py-3 sm:px-2"><DragHandle disabled={false} name={proxy.name} {...drag.handle(proxy.id)} /></td>
                       <td className="whitespace-normal px-2 py-3 sm:px-3">
                         <div className="min-w-0">
@@ -271,12 +273,12 @@ export function UserCenter({ siteName, dark, toggleTheme, signOut, returnToAdmin
                       <td className="hidden px-3 py-3 font-mono xl:table-cell">{proxy.port}</td>
                       <td className="hidden px-3 py-3 xl:table-cell"><TooltipText text={proxy.server_name || "—"} className="font-mono text-xs" /></td>
                       <td className="hidden px-3 py-3 xl:table-cell"><Badge variant="outline" className={`font-normal ${proxy.online ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300" : "text-muted-foreground"}`}><span className={`size-1.5 rounded-full ${proxy.online ? "bg-emerald-500" : "bg-muted-foreground/50"}`} />{proxy.online === null ? "不监测" : proxy.online ? "在线" : "离线"}</Badge></td>
-                      <td className="px-1 py-3 sm:px-3"><div className="flex flex-wrap items-center justify-center gap-0 sm:gap-1">
-                        <Button variant="ghost" size="sm" disabled={savingEntry !== null} onClick={() => { setPreferenceError(""); setEditingName({ proxy, value: proxy.custom_name }) }}>改名</Button>
-                        <Button variant="ghost" size="sm" disabled={savingEntry !== null} onClick={() => void savePreference(proxy, { hidden: !proxy.hidden })}>{proxy.hidden ? "恢复订阅" : "隐藏"}</Button>
-                        {proxy.source !== "external" && <Button type="button" variant="ghost" size="icon" className="size-8 shrink-0" title={proxy.mieru_url ? "复制 mieru 分享链接" : "复制 VLESS URL"} aria-label={`复制 ${proxy.name} 的${proxy.mieru_url ? " mieru 分享链接" : " VLESS URL"}`} onClick={() => void copy(proxy.mieru_url ?? proxy.vless_url, proxy.mieru_url ? "mieru 分享链接" : "VLESS URL")}><Link /></Button>}
-                        <Button type="button" variant="ghost" size="icon" className="size-8 shrink-0" title="复制 Mihomo 配置" aria-label={`复制 ${proxy.name} 的 Mihomo 配置`} onClick={() => void copy(proxy.mihomo_yaml, "Mihomo 配置")}><FileCode /></Button>
-                      </div></td>
+                      <td className="px-1 py-3 sm:px-3"><div className="flex flex-wrap items-center justify-center gap-0 sm:gap-1"><TooltipProvider>
+                        <Tooltip><TooltipTrigger asChild><Button variant="ghost" size="icon" className="size-8 shrink-0" aria-label={`修改 ${proxy.name} 的名称`} disabled={savingEntry !== null} onClick={() => { setPreferenceError(""); setEditingName({ proxy, value: proxy.custom_name }) }}><Pencil /></Button></TooltipTrigger><TooltipContent>改名</TooltipContent></Tooltip>
+                        <Tooltip><TooltipTrigger asChild><Button variant="ghost" size="icon" className="size-8 shrink-0" aria-label={`${proxy.hidden ? "恢复" : "隐藏"} ${proxy.name} 的订阅条目`} disabled={savingEntry !== null} onClick={() => void savePreference(proxy, { hidden: !proxy.hidden })}>{proxy.hidden ? <Eye /> : <EyeOff />}</Button></TooltipTrigger><TooltipContent>{proxy.hidden ? "恢复订阅" : "从订阅隐藏"}</TooltipContent></Tooltip>
+                        {proxy.source !== "external" && <Tooltip><TooltipTrigger asChild><Button type="button" variant="ghost" size="icon" className="size-8 shrink-0" title={proxy.mieru_url ? "复制 mieru 分享链接" : "复制 VLESS URL"} aria-label={`复制 ${proxy.name} 的${proxy.mieru_url ? " mieru 分享链接" : " VLESS URL"}`} onClick={() => void copy(proxy.mieru_url ?? proxy.vless_url, proxy.mieru_url ? "mieru 分享链接" : "VLESS URL")}><Link /></Button></TooltipTrigger><TooltipContent>{proxy.mieru_url ? "复制 mieru 分享链接" : "复制 VLESS URL"}</TooltipContent></Tooltip>}
+                        <Tooltip><TooltipTrigger asChild><Button type="button" variant="ghost" size="icon" className="size-8 shrink-0" title="复制 Mihomo 配置" aria-label={`复制 ${proxy.name} 的 Mihomo 配置`} onClick={() => void copy(proxy.mihomo_yaml, "Mihomo 配置")}><FileCode /></Button></TooltipTrigger><TooltipContent>复制 Mihomo 配置</TooltipContent></Tooltip>
+                      </TooltipProvider></div></td>
                     </tr>
                   ))}
                 </tbody>
