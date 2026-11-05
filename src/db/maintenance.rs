@@ -164,7 +164,8 @@ impl Db {
             &TABLES
         };
         for table in required_tables.iter().filter(|t| {
-            !(version < 29 && ["external_proxies", "user_external_proxy_authorizations"].contains(t))
+            !(version < 31 && **t == "user_realm_authorizations")
+                && !(version < 29 && ["external_proxies", "user_external_proxy_authorizations"].contains(t))
                 && !(version < 28 && **t == "user_entry_preferences")
                 && !(version < 27 && **t == "proxy_list_order")
                 && !(version < 26 && **t == "node_components")

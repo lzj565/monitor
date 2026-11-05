@@ -241,9 +241,9 @@ export function deleteUserProxy(userId: number, proxyId: number) {
   return api<{ sync: SyncReport }>(`/users/${userId}/proxies/${proxyId}`, { method: "DELETE" })
 }
 
-export function replaceUserAuthorizations(userId: number, items: Array<{ proxy_id: number; enabled: boolean }>, autoAuthorizeNewProxies?: boolean) {
+export function replaceUserAuthorizations(userId: number, items: Array<{ proxy_id: number; enabled: boolean }>, autoAuthorizeNewProxies?: boolean, realmRuleIds?: number[]) {
   return api<{ sync: SyncReport }>(`/users/${userId}/proxies`, {
     method: "PUT",
-    body: JSON.stringify({ items, auto_authorize_new_proxies: autoAuthorizeNewProxies }),
+    body: JSON.stringify({ items, auto_authorize_new_proxies: autoAuthorizeNewProxies, realm_rule_ids: realmRuleIds }),
   })
 }

@@ -1051,6 +1051,10 @@ function SubscriptionForm({ user, proxies, nodes, accesses, ready, onClose, onSa
   onClose: () => void
   onSaved: () => void
 }) {
+  const realm = useRealmProxies()
+  const [realmIds,setRealmIds]=useState<number[]>([])
+  const [realmReady,setRealmReady]=useState(false)
+  useEffect(()=>{ void api<{realm_items:number[]}>(`/users/${user.id}/proxies`).then(r=>{setRealmIds(r.realm_items);setRealmReady(true)}).catch(e=>toast.error(e.message)) },[user.id])
   const notifySync = useNotifySync()
   const [autoAuthorizeNewProxies, setAutoAuthorizeNewProxies] = useState(user.auto_authorize_new_proxies)
   const [proxyQuery, setProxyQuery] = useState("")
@@ -1078,7 +1082,7 @@ function SubscriptionForm({ user, proxies, nodes, accesses, ready, onClose, onSa
 
   async function save(event: React.FormEvent) {
     event.preventDefault()
-    if (!ready || savingRef.current) return
+    if (!ready || !realmReady || savingRef.current) return
     savingRef.current = true
     setSaving(true)
     try {
@@ -1086,6 +1090,7 @@ function SubscriptionForm({ user, proxies, nodes, accesses, ready, onClose, onSa
         user.id,
         selectedProxies.map((proxy) => ({ proxy_id: proxy.id, enabled: true })),
         autoAuthorizeNewProxies,
+        realmIds,
       )
       notifySync("订阅已更新", result.sync)
       onClose()
@@ -1176,10 +1181,11 @@ function SubscriptionForm({ user, proxies, nodes, accesses, ready, onClose, onSa
                 {!!groups.length && query && !groups.some((group) => group.proxies.some((proxy) => [proxy.name, displayProxyName(proxy, group.node), group.node?.name, proxy.address].some((value) => value?.toLocaleLowerCase().includes(query)))) && <p className="p-4 text-center text-sm text-muted-foreground">没有匹配的代理节点</p>}
               </div>
 
+            <section className="space-y-2"><h3>Realm 入口授权</h3>{realm.error && <p role="alert">{realm.error}</p>}{realm.rules.filter(r=>!query || `${r.name} ${r.address} ${r.target_name}`.toLocaleLowerCase().includes(query)).map(r=><label key={r.id} className="flex gap-2"><input type="checkbox" disabled={!realmReady || saving} checked={realmIds.includes(r.id)} onChange={e=>setRealmIds(ids=>e.target.checked?[...ids,r.id]:ids.filter(id=>id!==r.id))}/>{r.name} · {r.address}:{r.listen_port} → {r.target_name}</label>)}</section>
             <ExternalAuthorization key={user.id} userId={user.id} />
           </div>
           <DialogFooter className="shrink-0 items-center border-t px-6 py-4">
-            <span className="mr-auto text-sm text-muted-foreground">已选择 {selectedProxies.length} 个节点</span>
+            <span className="mr-auto text-sm text-muted-foreground">已选择 {selectedProxies.length + realmIds.length} 个节点</span>
             <Button type="button" variant="ghost" disabled={saving} onClick={onClose}>取消</Button>
             <Button type="submit" disabled={saving || !ready}>{saving ? "保存中..." : "保存托管授权"}</Button>
           </DialogFooter>

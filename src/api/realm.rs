@@ -16,7 +16,11 @@ pub async fn realm_hosts(_: Admin, State(app): State<Shared>) -> Response {
                 host["online"] = json!(agent.is_some());
                 host["capable"] = json!(agent.is_some_and(|a| a.realm_capable));
             }
-            Json(json!({"items":hosts})).into_response()
+            let candidates = app.db.realm_entry_candidates();
+            match candidates {
+                Ok(ids) => Json(json!({"items":hosts,"entry_candidates":ids})).into_response(),
+                Err(e) => fail(e),
+            }
         }
         Err(e) => fail(e),
     })
@@ -37,7 +41,17 @@ pub async fn realm_save_host(
 }
 pub async fn realm_delete_host(_: Admin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
     crate::blocking::response(move || match app.db.realm_delete_host(id) {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => {
+            let nodes = app
+                .db
+                .all_proxies()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|p| p.node_id)
+                .collect::<std::collections::BTreeSet<_>>();
+            sync_generated_nodes(&app, nodes.into_iter().collect());
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => rejected(e),
     })
@@ -67,12 +81,35 @@ pub async fn realm_update_rule(
 }
 async fn save_rule(app: Shared, id: Option<i64>, body: crate::db::RealmRuleInput) -> Response {
     crate::blocking::response(move || {
+        let unchanged = id.is_some_and(|id| {
+            app.db
+                .realm_rules()
+                .is_ok_and(|rules| rules.iter().any(|r| r["id"] == id && r["node_id"] == body.node_id))
+        });
+        if !unchanged && !app.db.realm_entry_candidates().is_ok_and(|ids| ids.contains(&body.node_id)) {
+            return api_error(
+                StatusCode::CONFLICT,
+                "REALM_NOT_INSTALLED",
+                "入口节点尚未确认安装 Realm，请安装后刷新状态",
+            );
+        }
+
         match app
             .db
             .realm_save_rule(id, &body)
             .and_then(|id| app.db.realm_desired(body.node_id).map(|desired| (id, desired)))
         {
-            Ok((id, desired)) => Json(json!({"id":id,"desired":desired})).into_response(),
+            Ok((id, desired)) => {
+                let nodes = app
+                    .db
+                    .all_proxies()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|p| p.node_id)
+                    .collect::<std::collections::BTreeSet<_>>();
+                let sync = sync_generated_nodes(&app, nodes.into_iter().collect());
+                Json(json!({"id":id,"desired":desired,"sync":sync})).into_response()
+            }
             Err(e) => rejected(e),
         }
     })
@@ -80,7 +117,17 @@ async fn save_rule(app: Shared, id: Option<i64>, body: crate::db::RealmRuleInput
 }
 pub async fn realm_delete_rule(_: Admin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
     crate::blocking::response(move || match app.db.realm_delete_rule(id) {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => {
+            let nodes = app
+                .db
+                .all_proxies()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|p| p.node_id)
+                .collect::<std::collections::BTreeSet<_>>();
+            sync_generated_nodes(&app, nodes.into_iter().collect());
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => rejected(e),
     })

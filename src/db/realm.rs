@@ -166,7 +166,18 @@ fn endpoint(host: &str, port: i64) -> String {
         format!("{host}:{port}")
     }
 }
+pub(super) fn refresh_realm_credentials(conn: &Connection) -> Result<()> {
+    conn.execute("DELETE FROM user_proxy_authorizations WHERE direct_visible=0", [])?;
+    conn.execute("INSERT OR IGNORE INTO user_proxy_authorizations(user_id,proxy_id,enabled,auth,created_at,updated_at,direct_visible) SELECT a.user_id,r.target_proxy_id,1,'{}',?1,?1,0 FROM user_realm_authorizations a JOIN realm_rules r ON r.id=a.rule_id WHERE r.enabled=1",[Utc::now().timestamp()])?;
+    Ok(())
+}
 impl Db {
+    pub fn realm_entry_candidates(&self) -> Result<Vec<i64>> {
+        let conn = self.conn();
+        let mut stmt=conn.prepare("SELECT node_id FROM node_components WHERE component='realm' AND installed=1 AND checked_at IS NOT NULL ORDER BY node_id")?;
+        let rows = stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
     pub fn realm_hosts(&self) -> Result<Vec<Value>> {
         let conn = self.conn();
         let mut stmt=conn.prepare("SELECT h.node_id,n.name,h.enabled,h.desired_revision,h.applied_revision,h.desired_digest,h.applied_digest,h.status,h.last_error FROM realm_hosts h JOIN node n ON n.id=h.node_id ORDER BY h.node_id")?;
@@ -289,6 +300,7 @@ impl Db {
         if let Some(name) = realm_display_names(&tx)?.get(&saved) {
             tx.execute("UPDATE realm_traffic_rules SET name=?2 WHERE rule_id=?1", params![saved, name])?;
         }
+        refresh_realm_credentials(&tx)?;
         tx.commit()?;
         Ok(saved)
     }
@@ -300,6 +312,7 @@ impl Db {
         }
         tx.execute("DELETE FROM user_entry_preferences WHERE entry_key=?1", [format!("realm:{id}")])?;
         let deleted = tx.execute("DELETE FROM realm_rules WHERE id=?1", [id])? > 0;
+        refresh_realm_credentials(&tx)?;
         tx.commit()?;
         Ok(deleted)
     }
@@ -504,6 +517,7 @@ mod tests {
         let id = db.realm_save_rule(None, &input).unwrap();
         let desired = db.realm_desired(source).unwrap();
         db.realm_applied(&desired).unwrap();
+        db.conn().execute("INSERT OR IGNORE INTO user_realm_authorizations SELECT a.user_id,r.id FROM user_proxy_authorizations a JOIN realm_rules r ON r.target_proxy_id=a.proxy_id WHERE a.enabled=1",[]).unwrap();
         let check = |expected: &str| {
             let rules = db.realm_rules().unwrap();
             let row = rules.iter().find(|r| r["id"] == id).unwrap();
@@ -538,6 +552,37 @@ mod tests {
     }
 
     #[test]
+    fn realm_only_authorization_hides_direct_and_revokes_last_dependency() {
+        let (db, source, _, proxy, user) = fixture();
+        let id = db.realm_save_rule(None, &rule(source, proxy)).unwrap();
+        db.realm_applied(&db.realm_desired(source).unwrap()).unwrap();
+        db.replace_entry_authorizations(user, &[], None, Some(&[id])).unwrap().unwrap();
+        assert!(db.authorizations_for_user(user).unwrap().unwrap().is_empty());
+        let entries = db.active_user_subscription(user, 0).unwrap().unwrap().1;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, -id);
+        assert_eq!(
+            db.conn()
+                .query_row("SELECT count(*) FROM user_proxy_authorizations WHERE user_id=?1", [user], |r| r
+                    .get::<_, i64>(
+                    0
+                ))
+                .unwrap(),
+            1
+        );
+        db.replace_entry_authorizations(user, &[], None, Some(&[])).unwrap().unwrap();
+        assert!(db.active_user_subscription(user, 0).unwrap().unwrap().1.is_empty());
+        assert_eq!(
+            db.conn()
+                .query_row("SELECT count(*) FROM user_proxy_authorizations WHERE user_id=?1", [user], |r| r
+                    .get::<_, i64>(
+                    0
+                ))
+                .unwrap(),
+            0
+        );
+    }
+    #[test]
     fn publication_requires_matching_ack_and_live_authorization() {
         let (db, source, _, proxy, user) = fixture();
         let id = db.realm_save_rule(None, &rule(source, proxy)).unwrap();
@@ -545,6 +590,12 @@ mod tests {
         assert_eq!(first.config["endpoints"][0]["listen"], "[::]:20443");
         assert!(first.run);
         assert_eq!(db.active_user_subscription(user, 0).unwrap().unwrap().1.len(), 1);
+        db.conn()
+            .execute(
+                "INSERT INTO user_realm_authorizations(user_id,rule_id) VALUES(?1,?2)",
+                params![user, id],
+            )
+            .unwrap();
         assert!(db.realm_applied(&first).unwrap());
         let (uuid, entries) = db.active_user_subscription(user, 0).unwrap().unwrap();
         assert_eq!(entries.len(), 2);
@@ -579,6 +630,7 @@ mod tests {
             "restored snapshots cannot publish until confirmed again"
         );
         db.realm_applied(&second).unwrap();
+        db.conn().execute("INSERT OR IGNORE INTO user_realm_authorizations SELECT a.user_id,r.id FROM user_proxy_authorizations a JOIN realm_rules r ON r.target_proxy_id=a.proxy_id WHERE a.enabled=1",[]).unwrap();
         db.put_authorization(user, proxy, &AuthorizationDraft { enabled: false, auth: None })
             .unwrap()
             .unwrap();
@@ -590,6 +642,7 @@ mod tests {
         let id = db.realm_save_rule(None, &rule(source, proxy)).unwrap();
         let desired = db.realm_desired(source).unwrap();
         db.realm_applied(&desired).unwrap();
+        db.conn().execute("INSERT OR IGNORE INTO user_realm_authorizations SELECT a.user_id,r.id FROM user_proxy_authorizations a JOIN realm_rules r ON r.target_proxy_id=a.proxy_id WHERE a.enabled=1",[]).unwrap();
         assert!(db.realm_save_rule(None, &rule(source, proxy)).is_err());
         assert!(!db.realm_refs(Some(target), None).unwrap().is_empty());
         assert!(db.delete_proxy(proxy).is_err());
@@ -603,6 +656,7 @@ mod tests {
         assert!(next.revision > desired.revision);
         assert_eq!(next.config["endpoints"][0]["remote"], "new.example.com:443");
         db.realm_applied(&next).unwrap();
+        db.conn().execute("INSERT OR IGNORE INTO user_realm_authorizations SELECT a.user_id,r.id FROM user_proxy_authorizations a JOIN realm_rules r ON r.target_proxy_id=a.proxy_id WHERE a.enabled=1",[]).unwrap();
         assert_eq!(db.active_user_subscription(user, 0).unwrap().unwrap().1.len(), 2);
         let mut disabled = rule(source, proxy);
         disabled.enabled = false;
@@ -675,12 +729,14 @@ mod tests {
         assert_eq!(desired.entries[0].address, first.address);
         assert_eq!(desired.entries[1].address, second.address);
         db.realm_applied(&desired).unwrap();
+        db.conn().execute("INSERT OR IGNORE INTO user_realm_authorizations SELECT a.user_id,r.id FROM user_proxy_authorizations a JOIN realm_rules r ON r.target_proxy_id=a.proxy_id WHERE a.enabled=1",[]).unwrap();
         assert_eq!(db.active_user_subscription(user, 0).unwrap().unwrap().1.len(), 3);
         let key = db.realm_rules().unwrap()[0]["traffic_key"].clone();
         first.address = "192.0.2.11".into();
         db.realm_save_rule(Some(one), &first).unwrap();
         let want = db.realm_desired(source).unwrap();
         db.realm_applied(&want).unwrap();
+        db.conn().execute("INSERT OR IGNORE INTO user_realm_authorizations SELECT a.user_id,r.id FROM user_proxy_authorizations a JOIN realm_rules r ON r.target_proxy_id=a.proxy_id WHERE a.enabled=1",[]).unwrap();
         let rows = db.realm_rules().unwrap();
         assert_eq!(rows[0]["traffic_key"], key);
         assert_eq!(rows.iter().find(|r| r["id"] == two).unwrap()["address"], "2001:db8::10");

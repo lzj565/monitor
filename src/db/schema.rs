@@ -286,7 +286,7 @@ CREATE TABLE IF NOT EXISTS proxy_node_traffic (
 /// cannot: `open` runs `SCHEMA` before migrating, and on an older file the
 /// column is not there yet. `an_upgraded_release_matches_a_fresh_database`
 /// holds every migration to these rules, starting from v1.0.0's schema.
-pub(super) const SCHEMA_VERSION: i64 = 30;
+pub(super) const SCHEMA_VERSION: i64 = 31;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -654,6 +654,12 @@ pub(super) fn migrate(conn: &Connection, from: i64) -> Result<()> {
     tx.execute_batch("INSERT OR IGNORE INTO node_components(node_id,component,desired_installed) SELECT id,'singbox',1 FROM node UNION ALL SELECT id,'realm',0 FROM node UNION ALL SELECT id,'mieru',0 FROM node")?;
     prepare_realm_schema(&tx)?;
     tx.execute_batch(REALM_SCHEMA)?;
+    add_column(&tx, "user_proxy_authorizations", "direct_visible INTEGER NOT NULL DEFAULT 1")?;
+    tx.execute_batch("CREATE TABLE IF NOT EXISTS user_realm_authorizations(user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, rule_id INTEGER NOT NULL REFERENCES realm_rules(id) ON DELETE CASCADE, PRIMARY KEY(user_id,rule_id));")?;
+    if from < 31 {
+        tx.execute_batch("INSERT OR IGNORE INTO user_realm_authorizations SELECT a.user_id,r.id FROM user_proxy_authorizations a JOIN realm_rules r ON r.target_proxy_id=a.proxy_id WHERE a.enabled=1;")?;
+    }
+
     tx.execute_batch(MIERU_SCHEMA)?;
     add_column(&tx, "mieru_hosts", "traffic_error TEXT NOT NULL DEFAULT ''")?;
     add_column(&tx, "mieru_hosts", "traffic_received INTEGER NOT NULL DEFAULT 0")?;
@@ -701,7 +707,7 @@ pub(super) fn seed_default_admin(conn: &Connection) -> Result<()> {
 }
 
 /// Every table a backup must carry before this build will restore it.
-pub(super) const TABLES: [&str; 29] = [
+pub(super) const TABLES: [&str; 30] = [
     "setting",
     "node",
     "proxies",
@@ -731,6 +737,7 @@ pub(super) const TABLES: [&str; 29] = [
     "proxy_list_order",
     "external_proxies",
     "user_external_proxy_authorizations",
+    "user_realm_authorizations",
 ];
 pub(super) const PRE_RESOURCE_TABLES: [&str; 8] =
     ["setting", "node", "traffic", "metric", "ping_task", "ping_node", "ping_record", "session"];

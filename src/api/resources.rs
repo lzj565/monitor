@@ -603,7 +603,10 @@ pub async fn get_user_authorizations(
     Path(user_id): Path<i64>,
 ) -> Response {
     crate::blocking::response(move || match app.db.authorizations_for_user(user_id) {
-        Ok(Some(items)) => Json(json!({"items":items})).into_response(),
+        Ok(Some(items)) => match app.db.realm_authorization_ids(user_id) {
+            Ok(ids) => Json(json!({"items":items,"realm_items":ids})).into_response(),
+            Err(e) => api_internal(e),
+        },
         Ok(None) => api_error(StatusCode::NOT_FOUND, "USER_NOT_FOUND", "user does not exist"),
         Err(error) => api_internal(error),
     })
@@ -613,6 +616,7 @@ pub async fn get_user_authorizations(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReplaceAuthorizationsRequest {
+    pub realm_rule_ids: Option<Vec<i64>>,
     pub items: Vec<ReplaceAuthorizationItem>,
     pub auto_authorize_new_proxies: Option<bool>,
 }
@@ -657,10 +661,11 @@ pub async fn replace_user_authorizations(
                 );
             }
         }
-        match app.db.replace_authorizations_with_policy(
+        match app.db.replace_entry_authorizations(
             user_id,
             &request.items.iter().map(|item| (item.proxy_id, item.enabled)).collect::<Vec<_>>(),
             request.auto_authorize_new_proxies,
+            request.realm_rule_ids.as_deref(),
         ) {
             Ok(Ok(node_ids)) => {
                 let sync = sync_generated_nodes(&app, node_ids);

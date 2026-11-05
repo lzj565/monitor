@@ -92,9 +92,12 @@ export function RealmProxyForm({ rule, nodes, proxies, hosts, rules, ready, site
   rule: RealmRule | null; nodes: Node[]; proxies: Proxy[]; hosts: RealmHost[]; rules: RealmRule[]; ready: boolean; site: string; refusal: string;
   onClose: () => void; onSaved: () => void; onRefresh: () => Promise<void>; onBack?: () => void; embedded?: boolean; onBusyChange?: (busy: boolean) => void;
 }) {
-  const initialNodeId = rule?.node_id ?? nodes[0]?.id ?? 0
+  const [candidates,setCandidates]=useState<number[]>([])
+  const eligibleNodes=nodes.filter(n=>candidates.includes(n.id)||n.id===rule?.node_id)
+  const initialNodeId = rule?.node_id ?? 0
   const initialNode=nodes.find((n)=>n.id===initialNodeId)
   const [draft, setDraft] = useState<RealmRuleDraft>(() => rule ? { node_id: rule.node_id, target_proxy_id: rule.target_proxy_id, name: rule.custom_name, address_type: rule.address_type, address: rule.address, listen_port: rule.listen_port, enabled: rule.enabled } : { node_id: initialNodeId, target_proxy_id: 0, name: "", address_type: defaultProxyAddressType(initialNode), address: "", listen_port: 0, enabled: true })
+  useEffect(()=>{void api<{entry_candidates:number[]}>("/realm/hosts").then(r=>{setCandidates(r.entry_candidates);if(!rule && r.entry_candidates.length)setDraft(d=>d.node_id?d:{...d,node_id:r.entry_candidates[0],address_type:defaultProxyAddressType(nodes.find(n=>n.id===r.entry_candidates[0]))})}).catch(()=>setCandidates([]))},[nodes,rule])
   const [customAddress, setCustomAddress] = useState(rule?.address_type === "domain" ? rule.address : "")
   const [targetNodeId, setTargetNodeId] = useState(rule?.target_node_id ?? 0)
   const [saving, setSaving] = useState(false)
@@ -131,7 +134,7 @@ export function RealmProxyForm({ rule, nodes, proxies, hosts, rules, ready, site
       <DialogHeader className="shrink-0 px-6 pt-6 pb-4"><DialogTitle>{rule ? `编辑 Realm 代理：${rule.name}` : "新增 Realm 代理"}</DialogTitle><DialogDescription>客户端 → 入口节点的监听端口 → 已有代理。客户端协议和授权沿用目标代理。</DialogDescription></DialogHeader>
       <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-6 pb-4">
         <Field title="代理名称"><Input aria-label="代理名称" autoFocus required maxLength={128} value={draft.name} onChange={(e) => setDraft({ ...draft, name: e.target.value })} /></Field>
-        <Field title="入口节点"><select aria-label="入口节点" className={selectClass} required value={draft.node_id || ""} disabled={saving} onChange={(e) => changeNode(Number(e.target.value))}><option value="">选择已有节点</option>{nodes.map((n) => <option key={n.id} value={n.id}>{n.name}{n.online ? "" : "（离线）"}</option>)}</select></Field>
+        {!eligibleNodes.length && <p role="status">没有已确认安装 Realm 的机器，请先安装并刷新状态。</p>}<Field title="入口节点"><select aria-label="入口节点" className={selectClass} required value={draft.node_id || ""} disabled={saving} onChange={(e) => changeNode(Number(e.target.value))}><option value="">选择已有节点</option>{eligibleNodes.map((n) => <option key={n.id} value={n.id}>{n.name}{n.online ? "" : "（离线）"}</option>)}</select></Field>
         <EntryWarning host={host} />
         <section className="space-y-2">
           <span className="text-sm font-medium">对外地址</span>

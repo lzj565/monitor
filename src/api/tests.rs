@@ -2218,6 +2218,23 @@ async fn mieru_exports_in_clash_and_native_subscription_is_removed() {
         .unwrap();
     let desired = app.db.realm_desired(relay).unwrap();
     app.db.realm_applied(&desired).unwrap();
+    app.db
+        .replace_entry_authorizations(
+            user,
+            &app.db
+                .authorizations_for_user(user)
+                .unwrap()
+                .unwrap()
+                .iter()
+                .map(|a| (a.proxy.id, a.access.enabled))
+                .collect::<Vec<_>>(),
+            None,
+            Some(
+                &app.db.realm_rules().unwrap().iter().map(|r| r["id"].as_i64().unwrap()).collect::<Vec<_>>(),
+            ),
+        )
+        .unwrap()
+        .unwrap();
     let mut proxies = app.db.active_user_portal_proxies(user, Utc::now().timestamp()).unwrap();
     assert_eq!(proxies.len(), 2);
     let relayed = mihomo_proxy(user, &proxies[1]);
@@ -2531,6 +2548,23 @@ async fn mixed_external_portal_and_subscriptions_preserve_credentials_and_isolat
         .unwrap();
     let desired = app.db.realm_desired(relay).unwrap();
     app.db.realm_applied(&desired).unwrap();
+    app.db
+        .replace_entry_authorizations(
+            user,
+            &app.db
+                .authorizations_for_user(user)
+                .unwrap()
+                .unwrap()
+                .iter()
+                .map(|a| (a.proxy.id, a.access.enabled))
+                .collect::<Vec<_>>(),
+            None,
+            Some(
+                &app.db.realm_rules().unwrap().iter().map(|r| r["id"].as_i64().unwrap()).collect::<Vec<_>>(),
+            ),
+        )
+        .unwrap()
+        .unwrap();
     let config = json!({"name":"same","type":"vless","server":"external.example.com","port":443,"uuid":"imported-original-uuid","tls":true,"ws-opts":{"path":"/original"}});
     let external = app.db.import_external_proxies(std::slice::from_ref(&config)).unwrap()[0];
     app.db.replace_external_authorizations(user, &[external]).unwrap();
