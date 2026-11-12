@@ -81,7 +81,8 @@ export function ExternalProxyRow({ proxy }: { proxy: ExternalProxy }) {
   return <TableRow><TableCell className="max-w-64 break-all font-medium">{proxy.name}</TableCell><TableCell><Badge variant="outline">外部导入 · {proxy.protocol}</Badge></TableCell><TableCell className="font-mono text-xs">{proxy.address ?? "—"}</TableCell><TableCell>{proxy.port ?? "—"}</TableCell><TableCell><Switch checked={proxy.enabled} disabled={busy} aria-label={`${proxy.enabled ? "停用" : "启用"}外部代理${proxy.name}`} onCheckedChange={v => void mutate(false, v)} /></TableCell><TableCell><div className="flex justify-end gap-2"><Button size="sm" variant="outline" disabled={busy} onClick={() => setEditing(true)}>编辑配置</Button><Button size="sm" variant="ghost" disabled={busy} onClick={() => void mutate(true)}>删除</Button></div>{editing && <ExternalImportDialog editing={proxy} onClose={() => setEditing(false)} />}</TableCell></TableRow>
 }
 
-export function ExternalAuthorization({ userId }: { userId: number }) {
+export function ExternalAuthorization({ userId, onState }: { userId: number; onState?: (state: { dirty: boolean; saving: boolean; count: number }) => void }) {
+  const [baseline, setBaseline] = useState("[]")
   const { items, loading, error, reload } = useExternalProxies()
   const [selected, setSelected] = useState<Set<number>>(new Set())
   const [loaded, setLoaded] = useState(false)
@@ -89,18 +90,20 @@ export function ExternalAuthorization({ userId }: { userId: number }) {
   const [saving, setSaving] = useState(false)
   const [query, setQuery] = useState("")
   const loadAccess = useCallback(() => {
-    void api<{ ids: number[] }>(`/users/${userId}/external-proxies`).then(r => { setSelected(new Set(r.ids)); setLoaded(true); setAccessError("") }).catch((e: Error) => setAccessError(e.message))
+    void api<{ ids: number[] }>(`/users/${userId}/external-proxies`).then(r => { setSelected(new Set(r.ids)); setBaseline(JSON.stringify([...r.ids].sort((a,b) => a-b))); setLoaded(true); setAccessError("") }).catch((e: Error) => setAccessError(e.message))
   }, [userId])
   useEffect(loadAccess, [loadAccess])
+  useEffect(() => { onState?.({ dirty: JSON.stringify([...selected].sort((a,b) => a-b)) !== baseline, saving, count: selected.size }) }, [selected, baseline, saving, onState])
   async function save() {
     setSaving(true)
-    try { await api(`/users/${userId}/external-proxies`, { method: "PUT", body: JSON.stringify({ ids: [...selected] }) }); window.dispatchEvent(new Event("external-authorizations-changed")); toast.success("外部代理授权已保存") }
+    try { await api(`/users/${userId}/external-proxies`, { method: "PUT", body: JSON.stringify({ ids: [...selected] }) }); setBaseline(JSON.stringify([...selected].sort((a,b) => a-b))); window.dispatchEvent(new Event("external-authorizations-changed")); toast.success("外部代理授权已保存") }
     catch (e) { toast.error((e as Error).message) }
     finally { setSaving(false) }
   }
   return <section className="mt-4 space-y-3 rounded-md border p-4" aria-label="外部代理授权"><h3 className="text-sm font-semibold">外部代理授权 · 独立保存</h3><p className="text-xs text-muted-foreground">仅进入 Mihomo 订阅，共用导入凭据，不采集统计。撤销授权不会让已复制的凭据失效。自动授权新增代理不包含外部导入。</p>
     {(error || accessError) && <p role="alert" className="text-sm text-destructive">{error || accessError}<Button type="button" variant="link" onClick={() => { void reload(); loadAccess() }}>重试</Button></p>}
     <Input aria-label="搜索外部代理授权" placeholder="搜索外部代理名称或地址" value={query} onChange={e => setQuery(e.target.value)} />
+    <div className="flex gap-2"><Button type="button" variant="outline" disabled={!loaded || saving || loading} onClick={() => setSelected(new Set(items.map(p => p.id)))}>全选入口</Button><Button type="button" variant="outline" disabled={!loaded || saving || loading} onClick={() => setSelected(new Set())}>清空选择</Button></div>
     <div className="space-y-2">{items.filter(p => `${p.name} ${p.address}`.toLowerCase().includes(query.trim().toLowerCase())).map(p => <label key={p.id} className="flex items-center gap-3 text-sm"><input type="checkbox" checked={selected.has(p.id)} disabled={!loaded || saving || loading} onChange={e => setSelected(current => { const next = new Set(current); if (e.target.checked) next.add(p.id); else next.delete(p.id); return next })} /><span className="min-w-0 break-all">{p.name} · {p.protocol} · {p.address}:{p.port}{!p.enabled && "（已停用）"}</span></label>)}</div>
     {!loading && !items.length && !error && <p className="text-sm text-muted-foreground">尚无外部代理，请先在“代理”页面导入。</p>}
     <Button type="button" variant="ghost" disabled={saving || loading} onClick={loadAccess}>重新读取授权</Button>

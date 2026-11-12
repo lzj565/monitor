@@ -616,6 +616,7 @@ pub async fn get_user_authorizations(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReplaceAuthorizationsRequest {
+    pub scope: Option<String>,
     pub realm_rule_ids: Option<Vec<i64>>,
     pub items: Vec<ReplaceAuthorizationItem>,
     pub auto_authorize_new_proxies: Option<bool>,
@@ -644,6 +645,20 @@ pub async fn replace_user_authorizations(
         if let Err(response) = api_user(&app, user_id) {
             return response;
         }
+        let realm_only = request.scope.as_deref() == Some("realm");
+        if !matches!(request.scope.as_deref(), None | Some("proxy") | Some("realm"))
+            || (realm_only
+                && (request.realm_rule_ids.is_none()
+                    || !request.items.is_empty()
+                    || request.auto_authorize_new_proxies.is_some()))
+            || (request.scope.as_deref() == Some("proxy") && request.realm_rule_ids.is_some())
+        {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "INVALID_SCOPE",
+                "authorization fields do not match scope",
+            );
+        }
         let mut seen = std::collections::HashSet::new();
         for item in &request.items {
             if !seen.insert(item.proxy_id) {
@@ -661,11 +676,12 @@ pub async fn replace_user_authorizations(
                 );
             }
         }
-        match app.db.replace_entry_authorizations(
+        match app.db.replace_scoped_entry_authorizations(
             user_id,
             &request.items.iter().map(|item| (item.proxy_id, item.enabled)).collect::<Vec<_>>(),
             request.auto_authorize_new_proxies,
             request.realm_rule_ids.as_deref(),
+            realm_only,
         ) {
             Ok(Ok(node_ids)) => {
                 let sync = sync_generated_nodes(&app, node_ids);

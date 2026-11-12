@@ -1228,15 +1228,21 @@ fi
 # keeps it private, since $ROOT itself is readable and holds the binaries. Set in
 # a subshell, because the unit file written below is read by anyone debugging
 # with `systemctl cat` and need not be 0600.
+# BEGIN agent environment
 (
 	umask 077
 	cat >"$ENV_FILE" <<ENV
 MONITOR_SERVER=$SERVER
 MONITOR_TOKEN=$TOKEN
-SINGBOX_API_PORT=$SINGBOX_API_PORT
 ENV
+	# An absent port uses the Agent default; an empty value is a startup error.
+	if [ "$SINGBOX_OPTION" = --sing-box ]; then
+		valid_api_port "$SINGBOX_API_PORT" || fail "invalid SINGBOX_API_PORT"
+		printf 'SINGBOX_API_PORT=%s\n' "$SINGBOX_API_PORT" >>"$ENV_FILE"
+	fi
 	[ -z "$IFACE" ] || printf 'MONITOR_IFACE=%s\n' "$IFACE" >>"$ENV_FILE"
 )
+# END agent environment
 chmod 0600 "$ENV_FILE"
 [ "$(pending_registration_token)" != "$TOKEN" ] || rm -f "$REGISTRATION_FILE"
 

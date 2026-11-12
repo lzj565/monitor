@@ -1092,6 +1092,23 @@ impl Db {
         auto_authorize_new_proxies: Option<bool>,
         realm_ids: Option<&[i64]>,
     ) -> Result<std::result::Result<Vec<i64>, AuthorizationWriteIssue>> {
+        self.replace_scoped_entry_authorizations(
+            user_id,
+            items,
+            auto_authorize_new_proxies,
+            realm_ids,
+            false,
+        )
+    }
+
+    pub fn replace_scoped_entry_authorizations(
+        &self,
+        user_id: i64,
+        items: &[(i64, bool)],
+        auto_authorize_new_proxies: Option<bool>,
+        realm_ids: Option<&[i64]>,
+        realm_only: bool,
+    ) -> Result<std::result::Result<Vec<i64>, AuthorizationWriteIssue>> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let user_exists: bool =
@@ -1119,14 +1136,16 @@ impl Db {
             node_ids.insert(node_id);
         }
 
-        tx.execute("DELETE FROM user_proxy_authorizations WHERE user_id=?1", [user_id])?;
         let now = Utc::now().timestamp();
-        for (proxy_id, enabled) in items {
-            tx.execute(
-                "INSERT INTO user_proxy_authorizations(user_id,proxy_id,enabled,auth,created_at,updated_at)
-                 VALUES(?1,?2,?3,'{}',?4,?4)",
-                params![user_id, proxy_id, enabled, now],
-            )?;
+        if !realm_only {
+            tx.execute("DELETE FROM user_proxy_authorizations WHERE user_id=?1", [user_id])?;
+            for (proxy_id, enabled) in items {
+                tx.execute(
+                    "INSERT INTO user_proxy_authorizations(user_id,proxy_id,enabled,auth,created_at,updated_at)
+                     VALUES(?1,?2,?3,'{}',?4,?4)",
+                    params![user_id, proxy_id, enabled, now],
+                )?;
+            }
         }
         if let Some(ids) = realm_ids {
             let mut seen = std::collections::HashSet::new();

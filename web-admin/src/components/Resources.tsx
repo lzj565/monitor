@@ -40,7 +40,6 @@ import {
   getProxyUserTraffic,
   listProxyUserTraffic,
   listUserAuthorizations,
-  replaceUserAuthorizations,
   resolveSync,
   resetUserUuid,
   resetProxyUserTraffic,
@@ -1051,10 +1050,15 @@ function SubscriptionForm({ user, proxies, nodes, accesses, ready, onClose, onSa
   onClose: () => void
   onSaved: () => void
 }) {
+  const [tab, setTab] = useState<"proxy" | "realm" | "external">("proxy")
+  const [externalState, setExternalState] = useState({ dirty: false, saving: false, count: 0 })
+  const [confirmClose, setConfirmClose] = useState(false)
+  const [proxyBaseline, setProxyBaseline] = useState(JSON.stringify({ ids: accesses.filter(item => item.access.enabled).map(item => item.proxy.id).sort((a,b) => a-b), auto: user.auto_authorize_new_proxies }))
+  const [realmBaseline, setRealmBaseline] = useState("[]")
   const realm = useRealmProxies()
   const [realmIds,setRealmIds]=useState<number[]>([])
   const [realmReady,setRealmReady]=useState(false)
-  useEffect(()=>{ void api<{realm_items:number[]}>(`/users/${user.id}/proxies`).then(r=>{setRealmIds(r.realm_items);setRealmReady(true)}).catch(e=>toast.error(e.message)) },[user.id])
+  useEffect(()=>{ void api<{realm_items:number[]}>(`/users/${user.id}/proxies`).then(r=>{setRealmIds(r.realm_items);setRealmBaseline(JSON.stringify([...r.realm_items].sort((a,b) => a-b)));setRealmReady(true)}).catch(e=>toast.error(e.message)) },[user.id])
   const notifySync = useNotifySync()
   const [autoAuthorizeNewProxies, setAutoAuthorizeNewProxies] = useState(user.auto_authorize_new_proxies)
   const [proxyQuery, setProxyQuery] = useState("")
@@ -1080,20 +1084,27 @@ function SubscriptionForm({ user, proxies, nodes, accesses, ready, onClose, onSa
     })
   }
 
+  const proxySignature = JSON.stringify({ ids: [...selectedIds].sort((a,b) => a-b), auto: autoAuthorizeNewProxies })
+  const realmSignature = JSON.stringify([...realmIds].sort((a,b) => a-b))
+  function close() {
+    if (saving || externalState.saving) return
+    if (proxySignature !== proxyBaseline || realmSignature !== realmBaseline || externalState.dirty) setConfirmClose(true)
+    else onClose()
+  }
+
   async function save(event: React.FormEvent) {
     event.preventDefault()
-    if (!ready || !realmReady || savingRef.current) return
+    if (!ready || (tab === "realm" && !realmReady) || savingRef.current || tab === "external") return
     savingRef.current = true
     setSaving(true)
     try {
-      const result = await replaceUserAuthorizations(
-        user.id,
-        selectedProxies.map((proxy) => ({ proxy_id: proxy.id, enabled: true })),
-        autoAuthorizeNewProxies,
-        realmIds,
-      )
+      const result = await api<{ sync: SyncReport }>(`/users/${user.id}/proxies`, { method: "PUT", body: JSON.stringify({
+        scope: tab, items: tab === "proxy" ? selectedProxies.map(proxy => ({ proxy_id: proxy.id, enabled: true })) : [],
+        ...(tab === "proxy" ? { auto_authorize_new_proxies: autoAuthorizeNewProxies } : { realm_rule_ids: realmIds }),
+      }) })
       notifySync("订阅已更新", result.sync)
-      onClose()
+      if (tab === "proxy") setProxyBaseline(proxySignature)
+      else setRealmBaseline(realmSignature)
       onSaved()
     } catch (error) {
       toast.error(`订阅授权未能保存：${(error as Error).message}`)
@@ -1104,43 +1115,50 @@ function SubscriptionForm({ user, proxies, nodes, accesses, ready, onClose, onSa
   }
 
   return (
-    <Dialog open onOpenChange={(open) => !open && !savingRef.current && onClose()}>
+    <>
+    <Dialog open onOpenChange={(open) => !open && close()}>
       <DialogContent onOpenAutoFocus={(event) => event.preventDefault()} className="flex h-[min(42rem,85dvh)] w-full max-w-[calc(100%-2rem)] flex-col gap-0 overflow-hidden p-0 sm:max-w-3xl">
         <form className="flex min-h-0 flex-1 flex-col" onSubmit={save}>
           <DialogHeader className="shrink-0 px-6 pt-6 pb-4">
-            <DialogTitle className="pr-6 [overflow-wrap:anywhere]">{`托管授权：${user.username}`}</DialogTitle>
+            <DialogTitle className="pr-6 [overflow-wrap:anywhere]">{`订阅入口：${user.username}`}</DialogTitle>
             <DialogDescription>勾选需要授权的节点；取消全部勾选并保存可清空授权。</DialogDescription>
           </DialogHeader>
-          <div className="shrink-0 space-y-3 px-6 pb-4">
+          <div role="tablist" aria-label="订阅入口类型" className="flex gap-2 px-6 pb-4">
+            {([ ["proxy", "节点"], ["realm", "Realm"], ["external", "外部节点"] ] as const).map(([value, label]) => <Button key={value} type="button" role="tab" aria-selected={tab === value} disabled={saving || externalState.saving} variant={tab === value ? "default" : "outline"} onKeyDown={event => { if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) { event.preventDefault(); const buttons = Array.from(event.currentTarget.parentElement!.querySelectorAll<HTMLButtonElement>("[role=tab]")); const index = buttons.indexOf(event.currentTarget); buttons[event.key === "Home" ? 0 : event.key === "End" ? 2 : (index + (event.key === "ArrowRight" ? 1 : 2)) % 3]?.click(); buttons[event.key === "Home" ? 0 : event.key === "End" ? 2 : (index + (event.key === "ArrowRight" ? 1 : 2)) % 3]?.focus() } }} onClick={() => setTab(value)}>{label}（{value === "proxy" ? selectedIds.size : value === "realm" ? realmIds.length : externalState.count}）</Button>)}
+          </div>
+          <div hidden={tab !== "external"} className="min-h-0 overflow-y-auto px-6"><ExternalAuthorization userId={user.id} onState={setExternalState} /></div>
+          <div hidden={tab === "external"} className="shrink-0 space-y-3 px-6 pb-4">
             <div className="flex flex-wrap items-center gap-2">
-              <Button type="button" variant="outline" size="sm" disabled={!ready || saving} onClick={() => { setSelectedIds(new Set(proxies.map((proxy) => proxy.id))); setRealmIds(realm.rules.map(r => r.id)) }}>全选入口</Button>
-              <Button type="button" variant="outline" size="sm" disabled={!ready || saving} onClick={() => { setSelectedIds(new Set()); setRealmIds([]) }}>清空选择</Button>
+              <Button type="button" variant="outline" size="sm" disabled={!ready || saving} onClick={() => { if (tab === "proxy") setSelectedIds(new Set(proxies.map((proxy) => proxy.id))); else setRealmIds(realm.rules.map(r => r.id)) }}>全选入口</Button>
+              <Button type="button" variant="outline" size="sm" disabled={!ready || saving} onClick={() => { if (tab === "proxy") setSelectedIds(new Set()); else setRealmIds([]) }}>清空选择</Button>
             </div>
-            <label className="flex items-center justify-between gap-3">
+            <label hidden={tab !== "proxy"} className="items-center justify-between gap-3">
               <span className="space-y-1"><span className="block text-sm font-medium">自动授权新增代理</span><span className="block text-xs text-muted-foreground">保存后新建的托管代理会自动加入此用户订阅（不含外部导入），已有代理仍按勾选结果授权。</span></span>
               <Switch checked={autoAuthorizeNewProxies} disabled={!ready || saving} onCheckedChange={setAutoAuthorizeNewProxies} />
             </label>
             <AdminSearchInput value={proxyQuery} onChange={setProxyQuery} placeholder="搜索节点名称或所属服务器..." className="w-full" />
           </div>
-          <div className="min-h-0 flex-1 overflow-y-auto px-6 pb-4">
+          <div hidden={tab === "external"} className="min-h-0 flex-1 overflow-y-auto px-6 pb-4">
             <div className="rounded-md border">
-              {entries.filter(entry => !query || `${entry.name} ${entry.node} ${entry.address}`.toLocaleLowerCase().includes(query)).map(entry => <label key={entry.key} className="flex cursor-pointer items-start gap-3 border-b px-4 py-3 last:border-0 hover:bg-muted/30">
-                <input type="checkbox" className="mt-1 size-4 shrink-0 accent-primary" disabled={!ready || !realmReady || saving} checked={entry.realm ? realmIds.includes(entry.id) : selectedIds.has(entry.id)} onChange={e => entry.realm ? setRealmIds(ids => e.target.checked ? [...ids, entry.id] : ids.filter(id => id !== entry.id)) : setProxySelected(entry.id, e.target.checked)} />
+              {entries.filter(entry => entry.realm === (tab === "realm")).filter(entry => !query || `${entry.name} ${entry.node} ${entry.address}`.toLocaleLowerCase().includes(query)).map(entry => <label key={entry.key} className="flex cursor-pointer items-start gap-3 border-b px-4 py-3 last:border-0 hover:bg-muted/30">
+                <input type="checkbox" className="mt-1 size-4 shrink-0 accent-primary" disabled={!ready || (tab === "realm" && !realmReady) || saving} checked={entry.realm ? realmIds.includes(entry.id) : selectedIds.has(entry.id)} onChange={e => entry.realm ? setRealmIds(ids => e.target.checked ? [...ids, entry.id] : ids.filter(id => id !== entry.id)) : setProxySelected(entry.id, e.target.checked)} />
                 <span className="min-w-0 space-y-1"><span className="flex flex-wrap items-center gap-2"><span className="break-all text-sm font-medium">{entry.name}</span><Badge variant="outline">{entry.protocol}</Badge></span><span className="block break-all text-xs text-muted-foreground">{entry.node} · {entry.address}:{entry.port}</span></span>
               </label>)}
-              {!entries.length && <p className="p-4 text-sm text-muted-foreground">目前没有可授权的入口</p>}
+              {!entries.filter(e => e.realm === (tab === "realm")).length && <p className="p-4 text-sm text-muted-foreground">目前没有可授权的入口</p>}
               {query && entries.length > 0 && !entries.some(e => `${e.name} ${e.node} ${e.address}`.toLocaleLowerCase().includes(query)) && <p className="p-4 text-sm text-muted-foreground">没有匹配的入口</p>}
               {realm.error && <p role="alert">{realm.error}</p>}
             </div>
           </div>
           <DialogFooter className="shrink-0 items-center border-t px-6 py-4">
-            <span className="mr-auto text-sm text-muted-foreground">已选择 {selectedProxies.length + realmIds.length} 个节点</span>
-            <Button type="button" variant="ghost" disabled={saving} onClick={onClose}>取消</Button>
-            <Button type="submit" disabled={saving || !ready}>{saving ? "保存中..." : "保存托管授权"}</Button>
+            <span className="mr-auto text-sm text-muted-foreground">{tab === "proxy" ? `已选择 ${selectedProxies.length} 个节点` : tab === "realm" ? `已选择 ${realmIds.length} 个 Realm` : "外部节点独立保存"}</span>
+            <Button type="button" variant="ghost" disabled={saving || externalState.saving} onClick={close}>关闭</Button>
+            {tab !== "external" && <Button type="submit" disabled={saving || !ready || (tab === "realm" && !realmReady)}>{saving ? "保存中..." : tab === "proxy" ? "保存节点授权" : "保存 Realm 授权"}</Button>}
           </DialogFooter>
         </form>
       </DialogContent>
     </Dialog>
+    {confirmClose && <ConfirmDialog title="放弃未保存的授权修改？" description="已保存的授权不受影响。" confirmLabel="放弃修改" busy={false} onClose={() => setConfirmClose(false)} onConfirm={onClose} />}
+    </>
   )
 }
 
@@ -1205,7 +1223,6 @@ function SubscriptionsPage({ nodes, search }: { nodes: Node[]; search: string })
   const [accessLoading, setAccessLoading] = useState<Set<number>>(() => new Set())
   const [accessErrors, setAccessErrors] = useState<Record<number, string>>({})
   const [expandedUsers, setExpandedUsers] = useState<Set<number>>(() => requestedUserId === null ? new Set() : new Set([requestedUserId]))
-  const [externalUser, setExternalUser] = useState<User | null>(null)
   const [editing, setEditing] = useState<User | null>(null)
   const [updatingUserId, setUpdatingUserId] = useState<number | null>(null)
   const needle = userQuery.trim().toLocaleLowerCase()
@@ -1362,7 +1379,7 @@ function SubscriptionsPage({ nodes, search }: { nodes: Node[]; search: string })
                         </Button>
                       </div>
                     </TableCell>
-                    <TableCell className="px-3 text-sm"><Button type="button" variant="link" className="h-auto p-0" disabled={accessLoading.has(user.id) || proxiesLoading || !!proxyError} aria-label={`编辑 ${user.username} 的授权节点`} onClick={() => void openEdit(user)}>{accessLoading.has(user.id) ? "加载中..." : `${user.proxy_count} 个托管入口 · 托管授权`}</Button><Button type="button" variant="link" className="ml-3 h-auto p-0" onClick={() => setExternalUser(user)}>外部代理授权</Button></TableCell>
+                    <TableCell className="px-3 text-sm"><Button type="button" variant="link" className="h-auto p-0" disabled={accessLoading.has(user.id) || proxiesLoading || !!proxyError} aria-label={`编辑 ${user.username} 的授权节点`} onClick={() => void openEdit(user)}>{accessLoading.has(user.id) ? "加载中..." : `${user.proxy_count} 个托管入口 · 订阅入口`}</Button></TableCell>
                     <TableCell className="px-3 text-center"><Switch checked={user.enabled} disabled={updatingUserId !== null} onCheckedChange={(enabled) => void setUserEnabled(user, enabled)} aria-label={`${user.enabled ? "停用" : "启用"}${user.username}的订阅授权`} /></TableCell>
                   </TableRow>
                   {isExpanded && <TableRow className="bg-muted/20 hover:bg-muted/20"><TableCell colSpan={3} className="p-0">
@@ -1381,7 +1398,6 @@ function SubscriptionsPage({ nodes, search }: { nodes: Node[]; search: string })
           </Table>
         </Card>
 
-        {externalUser && <Dialog open onOpenChange={open => !open && setExternalUser(null)}><DialogContent className="flex max-h-[85dvh] flex-col sm:max-w-3xl"><DialogHeader><DialogTitle>外部代理授权：{externalUser.username}</DialogTitle><DialogDescription>独立保存，不修改托管代理和 Realm 授权。</DialogDescription></DialogHeader><div className="min-h-0 overflow-y-auto"><ExternalAuthorization key={externalUser.id} userId={externalUser.id} /></div><DialogFooter><Button variant="ghost" onClick={() => setExternalUser(null)}>取消</Button></DialogFooter></DialogContent></Dialog>}
         {editing && <SubscriptionForm key={`edit-${editing.id}`} user={editing} proxies={proxies ?? []} nodes={nodes} accesses={accessCache.get(editing.id) ?? []} ready={!proxiesLoading && !proxyError && proxies !== null} onClose={() => setEditing(null)} onSaved={reloadAll} />}
       </div>
     </TooltipProvider>

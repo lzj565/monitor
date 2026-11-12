@@ -120,4 +120,30 @@ grep -F 'internal set-api-port-in-config "$SING_BOX_CONFIG" "$SINGBOX_API_PORT"'
 	exit 1
 }
 
+# Exercise the production env writer, including repairs of existing files.
+write_agent_environment() {
+	eval "$(sed -n '/# BEGIN agent environment/,/# END agent environment/p' "$INSTALLER" | sed '1d;$d')"
+}
+fail() { echo "$*" >&2; exit 1; }
+SERVER=https://example.invalid TOKEN=test-token IFACE=eth0
+for old_port in absent '' 9123; do
+	reset_case
+	[ "$old_port" = absent ] || printf 'SINGBOX_API_PORT=%s\n' "$old_port" >"$ENV_FILE"
+	SINGBOX_OPTION=--no-sing-box
+	SINGBOX_API_PORT=''
+	write_agent_environment
+	if grep -q '^SINGBOX_API_PORT=' "$ENV_FILE"; then
+		echo "disabled sing-box must omit the API port" >&2
+		exit 1
+	fi
+	grep -Fx 'MONITOR_TOKEN=test-token' "$ENV_FILE" >/dev/null
+	grep -Fx 'MONITOR_IFACE=eth0' "$ENV_FILE" >/dev/null
+done
+for selected_port in 9001 9123; do
+	SINGBOX_OPTION=--sing-box
+	SINGBOX_API_PORT=$selected_port
+	write_agent_environment
+	grep -Fx "SINGBOX_API_PORT=$selected_port" "$ENV_FILE" >/dev/null
+done
+
 echo "installer sing-box API port selection: ok"

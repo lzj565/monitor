@@ -552,6 +552,20 @@ mod tests {
     }
 
     #[test]
+    fn scoped_authorizations_preserve_other_entry_types() {
+        let (db, source, _, proxy, user) = fixture();
+        let id = db.realm_save_rule(None, &rule(source, proxy)).unwrap();
+        db.replace_entry_authorizations(user, &[(proxy, true)], None, Some(&[id])).unwrap().unwrap();
+        db.replace_scoped_entry_authorizations(user, &[], None, Some(&[]), true).unwrap().unwrap();
+        assert!(db.realm_authorization_ids(user).unwrap().is_empty());
+        assert_eq!(db.authorizations_for_user(user).unwrap().unwrap().len(), 1);
+        db.replace_scoped_entry_authorizations(user, &[], None, Some(&[id]), true).unwrap().unwrap();
+        db.replace_scoped_entry_authorizations(user, &[], None, None, false).unwrap().unwrap();
+        assert_eq!(db.realm_authorization_ids(user).unwrap(), vec![id]);
+        assert!(db.authorizations_for_user(user).unwrap().unwrap().is_empty());
+    }
+
+    #[test]
     fn realm_only_authorization_hides_direct_and_revokes_last_dependency() {
         let (db, source, _, proxy, user) = fixture();
         let id = db.realm_save_rule(None, &rule(source, proxy)).unwrap();
