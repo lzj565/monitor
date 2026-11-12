@@ -650,6 +650,12 @@ pub(super) fn migrate(conn: &Connection, from: i64) -> Result<()> {
     }
 
     tx.execute_batch(PROXY_LIST_ORDER_SCHEMA)?;
+    let component_sql: Option<String> = tx.query_row("SELECT sql FROM sqlite_master WHERE type='table' AND name='node_components'", [], |r| r.get(0)).optional()?;
+    if component_sql.as_deref().is_some_and(|sql| sql.contains("component<>'singbox'")) {
+        tx.execute_batch("ALTER TABLE node_components RENAME TO node_components_required;")?;
+        tx.execute_batch(COMPONENT_SCHEMA)?;
+        tx.execute_batch("INSERT INTO node_components SELECT * FROM node_components_required; DROP TABLE node_components_required;")?;
+    }
     tx.execute_batch(COMPONENT_SCHEMA)?;
     tx.execute_batch("INSERT OR IGNORE INTO node_components(node_id,component,desired_installed) SELECT id,'singbox',1 FROM node UNION ALL SELECT id,'realm',0 FROM node UNION ALL SELECT id,'mieru',0 FROM node")?;
     prepare_realm_schema(&tx)?;

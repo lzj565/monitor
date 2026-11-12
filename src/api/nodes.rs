@@ -152,6 +152,7 @@ pub async fn agent_register(
             _ => Err("invalid component registration option"),
         }
     };
+    let singbox = match flag("x-install-singbox") { Ok(v) => v, Err(r) => return bad(r) };
     let realm = match flag("x-install-realm") {
         Ok(v) => v,
         Err(r) => return bad(r),
@@ -164,7 +165,7 @@ pub async fn agent_register(
     match app.db.create_node_with_components(
         &node,
         &token,
-        &crate::db::InstallChoices { singbox: true, realm, mieru },
+        &crate::db::InstallChoices { singbox, realm, mieru },
     ) {
         Ok(_) => {
             app.registrations.clear(ip);

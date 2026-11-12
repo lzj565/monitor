@@ -482,8 +482,8 @@ export function ifaceArg(iface: string | undefined) {
 // within the window it opened, and each machine exchanges it for a token of its
 // own, so unlike an install command this text is no one's credential and can be
 // sent to every machine as it is.
-export function registerCommand(site: string, key: string, seconds: number | undefined, iface: string | undefined, realm?: boolean, mieru?: boolean) {
-  return scriptCommand(site, (s) => [`--server ${s}`, `--register ${key}`, ...intervalArg(seconds), ...ifaceArg(iface), ...realmArg(realm ?? false), mieru ? "--mieru" : "--no-mieru"])
+export function registerCommand(site: string, key: string, seconds: number | undefined, iface: string | undefined, realm?: boolean, mieru?: boolean, singbox = false) {
+  return scriptCommand(site, (s) => [`--server ${s}`, `--register ${key}`, ...intervalArg(seconds), ...ifaceArg(iface), singbox ? "--sing-box" : "--no-sing-box", ...realmArg(realm ?? false), mieru ? "--mieru" : "--no-mieru"])
 }
 
 // Carries no token, so it is the same for every node and remains valid after the
@@ -563,9 +563,10 @@ export function RegisterDialog({ site, reg, onClose }: {
 }) {
   const iface = useIfaceOption(undefined)
   const interval = useIntervalOption()
+  const [singbox, setSingbox] = useState(false)
   const [realm, setRealm] = useState(false)
   const [mieru, setMieru] = useState(false)
-  const command = reg.left > 0 && iface.valid ? registerCommand(site, reg.key, interval.flag, iface.flag, realm, mieru) : ""
+  const command = reg.left > 0 && iface.valid ? registerCommand(site, reg.key, interval.flag, iface.flag, realm, mieru, singbox) : ""
   const clock = `${Math.floor(reg.left / 60)}:${String(reg.left % 60).padStart(2, "0")}`
 
   return (
@@ -586,7 +587,7 @@ export function RegisterDialog({ site, reg, onClose }: {
             <IfaceOption option={iface} batch />
             <RealmOption on={realm} setOn={setRealm} />
             <OptionRow title="安装 mieru" hint="关闭后卸载托管组件，配置保留。"><Switch checked={mieru} onCheckedChange={setMieru} aria-label="安装 mieru" /></OptionRow>
-            <OptionRow title="sing-box" hint="每次安装和升级均安装"><Badge variant="secondary">必装</Badge></OptionRow>
+            <OptionRow title="安装 sing-box" hint="默认不安装"><Switch checked={singbox} onCheckedChange={setSingbox} aria-label="安装 sing-box" /></OptionRow>
           </section>
           {reg.left > 0 ? (
             <section className="space-y-2 border-t pt-5">

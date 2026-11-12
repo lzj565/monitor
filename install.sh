@@ -642,7 +642,8 @@ load_component_profile() {
     PROFILE_REALM='' PROFILE_MIERU=''
     while IFS= read -r PROFILE_LINE || [ -n "$PROFILE_LINE" ]; do
         case "$PROFILE_LINE" in
-            singbox=1) PROFILE_SINGBOX_COUNT=$((PROFILE_SINGBOX_COUNT + 1)) ;;
+            singbox=0) PROFILE_SINGBOX_COUNT=$((PROFILE_SINGBOX_COUNT + 1)); PROFILE_SINGBOX=--no-sing-box ;;
+            singbox=1) PROFILE_SINGBOX=--sing-box; PROFILE_SINGBOX_COUNT=$((PROFILE_SINGBOX_COUNT + 1)) ;;
             realm=0) PROFILE_REALM_COUNT=$((PROFILE_REALM_COUNT + 1)); PROFILE_REALM=--no-realm ;;
             realm=1) PROFILE_REALM_COUNT=$((PROFILE_REALM_COUNT + 1)); PROFILE_REALM=--realm ;;
             mieru=0) PROFILE_MIERU_COUNT=$((PROFILE_MIERU_COUNT + 1)); PROFILE_MIERU=--no-mieru ;;
@@ -653,7 +654,7 @@ load_component_profile() {
     [ "$PROFILE_SINGBOX_COUNT:$PROFILE_REALM_COUNT:$PROFILE_MIERU_COUNT" = 1:1:1 ] || fail "incomplete saved component choices"
     [ -n "$REALM_OPTION" ] || REALM_OPTION=$PROFILE_REALM
     [ -n "$MIERU_OPTION" ] || MIERU_OPTION=$PROFILE_MIERU
-    SINGBOX_OPTION=--sing-box
+    SINGBOX_OPTION=$PROFILE_SINGBOX
 }
 # END component profile helpers
 BINARY=""
@@ -679,8 +680,8 @@ while [ $# -gt 0 ]; do
     --mieru | --no-mieru)
         [ -z "$MIERU_OPTION" ] || [ "$MIERU_OPTION" = "$1" ] || { echo "conflicting mieru flags" >&2; exit 2; }
         MIERU_OPTION=$1; shift ;;
-    --skip-sing-box) echo "sing-box is required; --skip-sing-box is no longer supported" >&2; exit 2 ;;
-    --sing-box)
+    --skip-sing-box) SINGBOX_OPTION=--no-sing-box; shift ;;
+    --sing-box | --no-sing-box)
         [ -z "$SINGBOX_OPTION" ] || [ "$SINGBOX_OPTION" = "$1" ] || { echo "conflicting sing-box flags" >&2; exit 2; }
         SINGBOX_OPTION=$1; shift ;;
 	--realm | --no-realm)
@@ -690,7 +691,6 @@ while [ $# -gt 0 ]; do
 	esac
 done
 
-SINGBOX_OPTION=--sing-box
 
 step 0 "检查系统环境"
 [ "$(id -u)" = 0 ] || { CURRENT_STEP="检查系统环境"; FAIL_REASON="请使用 root 用户运行安装程序"; fail "$FAIL_REASON"; }
@@ -773,8 +773,8 @@ if [ -n "$UPGRADE" ]; then
 fi
 
 [ -n "$SERVER" ] && { [ -n "$TOKEN" ] || [ -n "$REGISTER" ]; } || {
-	echo "usage: install.sh --server URL (--token TOKEN | --register KEY) [--interval SECONDS] [--iface LIST] [--binary FILE] [--insecure] [--realm | --no-realm] [--mieru | --no-mieru] [--sing-box]" >&2
-	echo "       install.sh --upgrade [--binary FILE] [--iface LIST] [--interval SECONDS] [--realm | --no-realm] [--mieru | --no-mieru] [--sing-box]" >&2
+	echo "usage: install.sh --server URL (--token TOKEN | --register KEY) [--interval SECONDS] [--iface LIST] [--binary FILE] [--insecure] [--realm | --no-realm] [--mieru | --no-mieru] [--sing-box | --no-sing-box]" >&2
+	echo "       install.sh --upgrade [--binary FILE] [--iface LIST] [--interval SECONDS] [--realm | --no-realm] [--mieru | --no-mieru] [--sing-box | --no-sing-box]" >&2
 	echo "       install.sh --uninstall" >&2
 	echo "--name NAME names the node --register creates, which is otherwise named after its id. < > \" ' are dropped from it; the panel renames a node freely" >&2
 	echo "--binary FILE installs an agent already placed on this machine instead of downloading it from the hub" >&2
@@ -982,7 +982,7 @@ success "安装文件已就绪"
 # a machine half-upgraded.
 API_PORT_HELPER=$TMP_AGENT
 info "checking sing-box V2Ray API port..."
-select_singbox_api_port || fail "$FAIL_REASON"
+: # API port is selected after loading saved choices
 
 # Downloaded before the registration below, because that step spends a node: the
 # key returns a token and the panel gains a row, while the env file recording it
@@ -1021,11 +1021,12 @@ if [ -z "$TOKEN" ]; then
 	# A request that got no response stops here, with curl's own message. The
 	# name travels on stdin: as an
 	# argument, one beginning with @ would be read as a file to send.
-    REGISTER_REALM=0 REGISTER_MIERU=0
+    REGISTER_SINGBOX=0 REGISTER_REALM=0 REGISTER_MIERU=0
+    [ "$SINGBOX_OPTION" != --sing-box ] || REGISTER_SINGBOX=1
     [ "$REALM_OPTION" != --realm ] || REGISTER_REALM=1
     [ "$MIERU_OPTION" != --mieru ] || REGISTER_MIERU=1
 	REPLY=$(printf '%s' "$NAME" | curl -sS --max-time 30 -w '\n%{http_code}' -H "Authorization: Bearer $REGISTER" \
-		-H "X-Node-Token: $HELD" -H "X-Install-Realm: $REGISTER_REALM" -H "X-Install-Mieru: $REGISTER_MIERU" --data-binary @- "${SERVER%/}/api/agent/register" 2>/dev/null) || { FAIL_REASON="向 Hub 注册 monitor-agent 失败"; exit 1; }
+		-H "X-Node-Token: $HELD" -H "X-Install-Singbox: $REGISTER_SINGBOX" -H "X-Install-Realm: $REGISTER_REALM" -H "X-Install-Mieru: $REGISTER_MIERU" --data-binary @- "${SERVER%/}/api/agent/register" 2>/dev/null) || { FAIL_REASON="向 Hub 注册 monitor-agent 失败"; exit 1; }
 	CODE=$(printf '%s\n' "$REPLY" | tail -n 1)
 	TOKEN=$(printf '%s\n' "$REPLY" | sed '$d')
 	if [ "$CODE" != 200 ]; then
@@ -1063,6 +1064,8 @@ success "monitor-agent binary 安装完成"
 SING_BOX_SOURCE=installer
 SING_BOX_STATUS=unknown
 SING_BOX_VER=""
+if [ "$SINGBOX_OPTION" = --sing-box ]; then
+select_singbox_api_port || fail "$FAIL_REASON"
 step 2 "检查 sing-box"
 set_singbox_memory_limit
 SING_BOX_SOURCE="installer"
@@ -1151,10 +1154,25 @@ detail "Agent 路径" "$SING_BOX"
 detail "版本" "$SING_BOX_VER"
 success "自构建 sing-box 安装及配置校验完成"
 
+else
+    SING_BOX_SOURCE=skipped
+    if [ -f "$SING_BOX_UNIT" ] && grep -F "ExecStart=$SING_BOX run" "$SING_BOX_UNIT" >/dev/null; then
+        systemctl disable --now sing-box.service || fail "cannot stop sing-box"
+        rm -f "$SING_BOX_UNIT" "$SING_BOX"
+        [ ! -f "$SING_BOX_UNIT_BACKUP" ] || mv "$SING_BOX_UNIT_BACKUP" "$SING_BOX_UNIT"
+        systemctl daemon-reload
+    elif [ -f "$SING_BOX_RC" ] && grep -F "command=\"$SING_BOX\"" "$SING_BOX_RC" >/dev/null; then
+        rc-service sing-box stop || fail "cannot stop sing-box"
+        rc-update del sing-box default || true
+        rm -f "$SING_BOX_RC" "$SING_BOX"
+        [ ! -f "$SING_BOX_RC_BACKUP" ] || mv "$SING_BOX_RC_BACKUP" "$SING_BOX_RC"
+    fi
+fi
 manage_realm
 manage_mieru
 
 step 3 "初始化系统服务"
+if [ "$SINGBOX_OPTION" = --sing-box ]; then
 if [ "$INIT" = systemd ]; then
 	if { [ -e "$SING_BOX_UNIT" ] || [ -L "$SING_BOX_UNIT" ]; } &&
 		! grep -F "$SING_BOX" "$SING_BOX_UNIT" >/dev/null 2>&1 &&
@@ -1203,6 +1221,7 @@ RC
 fi
 
 rm -f "$ROOT/.skip-sing-box"
+fi
 
 # The token lives in a root-only environment file rather than the unit, keeping
 # it out of `systemctl cat` and the world-readable journal. 0600 root is what

@@ -59,7 +59,7 @@ pub async fn installer(State(app): State<Shared>, headers: HeaderMap) -> Respons
         match app.db.component_choices(id) {
             Ok(Some(c)) => (
                 [(header::CACHE_CONTROL, "no-store")],
-                format!("singbox=1\nrealm={}\nmieru={}\n", u8::from(c.realm), u8::from(c.mieru)),
+                format!("singbox={}\nrealm={}\nmieru={}\n", u8::from(c.singbox), u8::from(c.realm), u8::from(c.mieru)),
             )
                 .into_response(),
             Ok(None) => api::answer(StatusCode::NOT_FOUND, "component profile not found"),

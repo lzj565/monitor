@@ -104,7 +104,7 @@ export function ExternalAuthorization({ userId }: { userId: number }) {
     <div className="space-y-2">{items.filter(p => `${p.name} ${p.address}`.toLowerCase().includes(query.trim().toLowerCase())).map(p => <label key={p.id} className="flex items-center gap-3 text-sm"><input type="checkbox" checked={selected.has(p.id)} disabled={!loaded || saving || loading} onChange={e => setSelected(current => { const next = new Set(current); if (e.target.checked) next.add(p.id); else next.delete(p.id); return next })} /><span className="min-w-0 break-all">{p.name} · {p.protocol} · {p.address}:{p.port}{!p.enabled && "（已停用）"}</span></label>)}</div>
     {!loading && !items.length && !error && <p className="text-sm text-muted-foreground">尚无外部代理，请先在“代理”页面导入。</p>}
     <Button type="button" variant="ghost" disabled={saving || loading} onClick={loadAccess}>重新读取授权</Button>
-    <Button type="button" variant="outline" disabled={saving || !loaded || loading || !!error} onClick={() => void save()}>{saving ? "保存中…" : `保存外部授权（${selected.size}）`}</Button>
+    <Button type="button" variant="outline" disabled={saving || !loaded || loading || !!error || !!accessError} onClick={() => void save()}>{saving ? "保存中…" : `保存外部授权（${selected.size}）`}</Button>
   </section>
 }
 

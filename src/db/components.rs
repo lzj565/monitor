@@ -10,7 +10,7 @@ CREATE TABLE IF NOT EXISTS node_components(
  managed INTEGER NOT NULL DEFAULT 0 CHECK(managed IN (0,1)),
  running INTEGER NOT NULL DEFAULT 0 CHECK(running IN (0,1)),
  version TEXT NOT NULL DEFAULT '',checked_at INTEGER,last_error TEXT NOT NULL DEFAULT '',
- PRIMARY KEY(node_id,component),CHECK(component<>'singbox' OR desired_installed=1)
+ PRIMARY KEY(node_id,component)
 );
 "#;
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -22,24 +22,21 @@ pub struct InstallChoices {
     pub mieru: bool,
 }
 fn required_singbox() -> bool {
-    true
+    false
 }
 impl Default for InstallChoices {
     fn default() -> Self {
-        Self { singbox: true, realm: false, mieru: false }
+        Self { singbox: false, realm: false, mieru: false }
     }
 }
 impl InstallChoices {
     pub fn validate(&self) -> Result<()> {
-        if !self.singbox {
-            refuse!("sing-box 必须安装，不能关闭")
-        }
         Ok(())
     }
 }
 pub(super) fn seed_components(conn: &Connection, id: i64, choices: &InstallChoices) -> Result<()> {
     choices.validate()?;
-    for (component, desired) in [("singbox", true), ("realm", choices.realm), ("mieru", choices.mieru)] {
+    for (component, desired) in [("singbox", choices.singbox), ("realm", choices.realm), ("mieru", choices.mieru)] {
         conn.execute(
             "INSERT INTO node_components(node_id,component,desired_installed) VALUES(?1,?2,?3)",
             params![id, component, desired],
@@ -96,7 +93,7 @@ impl Db {
         if !exists {
             return Ok(false);
         }
-        for (component, desired) in [("singbox", true), ("realm", choices.realm), ("mieru", choices.mieru)] {
+        for (component, desired) in [("singbox", choices.singbox), ("realm", choices.realm), ("mieru", choices.mieru)] {
             tx.execute(
                 "UPDATE node_components SET desired_installed=?3 WHERE node_id=?1 AND component=?2",
                 params![id, component, desired],
@@ -166,17 +163,9 @@ mod tests {
         assert_eq!(p["components"][0]["installed"], true);
         assert_eq!(p["components"][0]["last_error"], "timed out");
         assert_eq!(p["components"][0]["checked_at"], 20);
-        assert!(db
-            .save_component_choices(id, &InstallChoices { singbox: false, realm: false, mieru: false })
-            .is_err());
-        assert_eq!(db.component_choices(id).unwrap(), Some(wanted));
-        assert!(db
-            .conn()
-            .execute(
-                "UPDATE node_components SET desired_installed=0 WHERE node_id=?1 AND component='singbox'",
-                [id]
-            )
-            .is_err());
+        let disabled = InstallChoices { singbox: false, realm: false, mieru: false };
+        assert!(db.save_component_choices(id, &disabled).unwrap());
+        assert_eq!(db.component_choices(id).unwrap(), Some(disabled));
     }
     #[test]
     fn malformed_inventory_is_atomic_and_cannot_change_intent() {
@@ -215,13 +204,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(db.component_choices(id).unwrap(), Some(choices));
-        assert!(db
-            .create_node_with_components(
-                &Node::default(),
-                "invalid-token",
-                &InstallChoices { singbox: false, realm: false, mieru: false }
-            )
-            .is_err());
-        assert_eq!(db.node_by_token("invalid-token").unwrap(), None);
+        let optional = db.create_node_with_components(&Node::default(), "optional-token", &InstallChoices::default()).unwrap();
+        assert_eq!(db.component_choices(optional).unwrap(), Some(InstallChoices::default()));
     }
 }

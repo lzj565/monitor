@@ -16,7 +16,7 @@ fn region(code: &str) -> String {
 }
 
 fn route_name(source: &str, target: &str, custom: &str) -> String {
-    realm_name(&format!("{}-{}-{}", region(source), region(target), custom.trim().trim_end_matches("-realm")))
+    format!("{}{}", country_flag(target), realm_name(&format!("{}-{}-{}", region(source), region(target), custom.trim().trim_end_matches("-realm"))))
 }
 
 fn unique_realm_names(rows: Vec<(i64, String)>) -> HashMap<i64, String> {
@@ -496,18 +496,18 @@ mod tests {
     }
     #[test]
     fn route_names_use_regions_custom_names_and_global_collision_resolution() {
-        assert_eq!(route_name("hk", "my", " NTT "), "HK-MY-NTT-realm");
-        assert_eq!(route_name("HK", "HK", "NTT-realm-realm"), "HK-HK-NTT-realm");
+        assert_eq!(route_name("hk", "my", " NTT "), "🇲🇾HK-MY-NTT-realm");
+        assert_eq!(route_name("HK", "HK", "NTT-realm-realm"), "🇭🇰HK-HK-NTT-realm");
         assert_eq!(route_name("", "invalid", "HK-NTT"), "XX-XX-HK-NTT-realm");
         let rows = vec![
-            (1, "HK-MY-NTT-realm".into()),
-            (2, "HK-MY-NTT-realm".into()),
-            (3, "HK-MY-NTT-2-realm".into()),
+            (1, "🇲🇾HK-MY-NTT-realm".into()),
+            (2, "🇲🇾HK-MY-NTT-realm".into()),
+            (3, "🇲🇾HK-MY-NTT-2-realm".into()),
         ];
         let names = unique_realm_names(rows);
-        assert_eq!(names[&1], "HK-MY-NTT-realm");
-        assert_eq!(names[&2], "HK-MY-NTT-3-realm");
-        assert_eq!(names[&3], "HK-MY-NTT-2-realm");
+        assert_eq!(names[&1], "🇲🇾HK-MY-NTT-realm");
+        assert_eq!(names[&2], "🇲🇾HK-MY-NTT-3-realm");
+        assert_eq!(names[&3], "🇲🇾HK-MY-NTT-2-realm");
 
         let (db, source, target, proxy, user) = fixture();
         db.conn().execute("UPDATE node SET country='HK' WHERE id=?1", [source]).unwrap();
@@ -527,10 +527,10 @@ mod tests {
             assert_eq!(db.active_user_subscription(user, 0).unwrap().unwrap().1[1].name, expected);
             assert_eq!(db.realm_traffic().unwrap()["rules"][0]["name"], expected);
         };
-        check("HK-MY-NTT-realm");
+        check("🇲🇾HK-MY-NTT-realm");
         // Current node metadata changes names even if Agent still holds the old applied snapshot.
         db.conn().execute("UPDATE node SET country_pin='SG' WHERE id=?1", [source]).unwrap();
-        check("SG-MY-NTT-realm");
+        check("🇲🇾SG-MY-NTT-realm");
         db.conn().execute("UPDATE node SET country='',country_pin='' WHERE id=?1", [target]).unwrap();
         check("SG-XX-NTT-realm");
         // Rename without publishing a new Agent snapshot: displayed names follow the live rule.
