@@ -69,7 +69,7 @@ impl Db {
             }
             t.id
         } else {
-            // At the end, as in `create_node`.
+            // At the end.
             let id = next_id(&tx, "ping_task")?;
             tx.execute(
                 "INSERT INTO ping_task (id, name, target, interval, auto_join, sort)

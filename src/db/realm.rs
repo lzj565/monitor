@@ -16,7 +16,16 @@ fn region(code: &str) -> String {
 }
 
 fn route_name(source: &str, target: &str, custom: &str) -> String {
-    format!("{}{}", country_flag(target), realm_name(&format!("{}-{}-{}", region(source), region(target), custom.trim().trim_end_matches("-realm"))))
+    format!(
+        "{}{}",
+        country_flag(target),
+        realm_name(&format!(
+            "{}-{}-{}",
+            region(source),
+            region(target),
+            custom.trim().trim_end_matches("-realm")
+        ))
+    )
 }
 
 fn unique_realm_names(rows: Vec<(i64, String)>) -> HashMap<i64, String> {

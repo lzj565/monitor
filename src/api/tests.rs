@@ -813,8 +813,8 @@ fn a_probe_reports_the_share_of_the_window_it_lost_not_the_mean_of_its_buckets()
 #[test]
 fn the_public_view_hides_private_nodes_and_sensitive_fields() {
     let app = app();
-    let open = node(&app, "open", true);
     node(&app, "hidden", false);
+    let open = node(&app, "open", true);
     app.db.save_facts(open, &json!({"hostname": "vps-1"}), "198.51.100.9", "").unwrap();
 
     // A live report, so the public view has metrics to strip. `hostname` is
@@ -1274,8 +1274,8 @@ fn a_stream_re_reads_both_answers_its_handshake_tested() {
 #[test]
 fn the_shared_snapshot_keeps_the_two_audiences_apart() {
     let app = app();
-    let open = node(&app, "open", true);
     node(&app, "hidden", false);
+    let open = node(&app, "open", true);
     app.db.save_facts(open, &json!({"hostname": "vps-1"}), "198.51.100.9", "").unwrap();
 
     let public = live_snapshot(&app, false).unwrap();
@@ -1490,7 +1490,7 @@ fn a_node_view_carries_traffic_even_while_offline() {
     assert!((Utc::now().timestamp() - 1_700_000_000 - ago).abs() <= 1, "counted on the hub's clock");
 
     node(&app, "never", true);
-    assert_eq!(visible_nodes(&app, true).unwrap()[1]["last_seen_ago"], Value::Null, "never seen");
+    assert_eq!(visible_nodes(&app, true).unwrap()[0]["last_seen_ago"], Value::Null, "never seen");
 }
 
 /// Stored capacities trail the live reports, so a newly mounted disk must

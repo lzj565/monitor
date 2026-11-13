@@ -179,18 +179,20 @@ export function Command({ className = "", children }: { className?: string; chil
   )
 }
 
-export function Field({ label, hint, help, helpWidth, className = "", children }: {
+export function Field({ label, hint, help, helpWidth, action, className = "", children }: {
   label: string
   hint?: string
   help?: React.ReactNode
   helpWidth?: string
+  action?: React.ReactNode
   className?: string
   children: React.ReactNode
 }) {
   const title = <Label className="text-sm font-medium">{label}</Label>
+  const head = help ? <div className="flex items-center gap-1.5">{title}<Help width={helpWidth}>{help}</Help></div> : title
   return (
     <div className={`space-y-2 ${className}`}>
-      {help ? <div className="flex items-center gap-1.5">{title}<Help width={helpWidth}>{help}</Help></div> : title}
+      {action ? <div className="flex items-center justify-between">{head}{action}</div> : head}
       {children}
       {/* Kept whole between punctuation, as in Help below. */}
       {hint && <p className="text-xs leading-relaxed text-muted-foreground break-keep wrap-anywhere">{hint}</p>}
@@ -541,4 +543,27 @@ export function nameText(name: string) {
       if (ems(word) > 8) return <span key={i} className="wrap-anywhere [word-break:normal]">{parts}</span>
       return word.includes("-") ? <span key={i} className="whitespace-nowrap">{word}</span> : parts
     })
+}
+
+export function Segments<K extends string>({ label, options, value, onPick }: {
+  label: string
+  options: { key: K; label: React.ReactNode }[]
+  value: K
+  onPick: (key: K) => void
+}) {
+  return (
+    <div role="group" aria-label={label} className="flex w-fit max-w-full flex-wrap gap-0.5 rounded-lg bg-muted p-0.5">
+      {options.map((o) => (
+        <button
+          key={o.key}
+          type="button"
+          aria-pressed={value === o.key}
+          onClick={() => onPick(o.key)}
+          className={`rounded-md px-3 py-1 text-sm transition-colors ${value === o.key ? "bg-background font-medium shadow-sm" : "text-muted-foreground hover:text-foreground"}`}
+        >
+          {o.label}
+        </button>
+      ))}
+    </div>
+  )
 }

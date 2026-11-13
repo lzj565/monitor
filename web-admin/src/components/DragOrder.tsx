@@ -50,8 +50,32 @@ export function useDragOrder<T extends { id: OrderId }>(items: T[], path: string
 
   // Once the hub lists this order, its list is followed again, so a reorder made
   // in another tab appears here instead of being overwritten by the next drag.
-  if (dragging === null && manualOrder.length && manualOrder.join() === items.map((item) => item.id).join()) {
+  if (dragging === null && manualOrder.length && manualOrder.filter((id) => byId.has(id)).join() === items.filter((item) => orderedIds.has(item.id)).map((item) => item.id).join()) {
     setManualOrder([])
+  }
+
+  // The whole order at once, as sorting it or undoing a sort sets it.
+  function arrange(next: OrderId[], rows: HTMLTableSectionElement | null) {
+    slide(rows, () => setManualOrder(next))
+    return commit(next)
+  }
+
+  function commit(next: OrderId[]) {
+    orderBeforeDrag.current = next
+    const put = () => api(`/${path}/order`, { method: "PUT", body: JSON.stringify({ ids: next }) })
+    // A refusal falls back to whatever the hub holds, which a save queued
+    // behind it may still change.
+    const saved = saving.current.then(put).then(() => {
+      reload()
+      return true
+    }, (e: Error) => {
+      setManualOrder([])
+      reload()
+      toast.error(e.message)
+      return false
+    })
+    saving.current = saved
+    return saved
   }
 
   // Handled on the document by layout position, not by the row under the
@@ -154,19 +178,12 @@ export function useDragOrder<T extends { id: OrderId }>(items: T[], path: string
     setDragging(null)
     const before = orderBeforeDrag.current
     if (!before.length || next.join() === before.join()) return
-    orderBeforeDrag.current = next
-    const put = () => api(`/${path}/order`, { method: "PUT", body: JSON.stringify({ ids: next }) })
-    // A refusal falls back to whatever the hub holds, which a save queued
-    // behind it may still change.
-    saving.current = saving.current.then(put).then(reload, (e: Error) => {
-      setManualOrder([])
-      reload()
-      toast.error(e.message)
-    })
+    commit(next)
   }
 
   return {
     order,
+    arrange,
     row: (id: OrderId) => ({
       "data-id": id,
       "data-dragging": dragging === id || undefined,
@@ -205,8 +222,9 @@ export function DragHandle({ name, disabled, title = "拖动排序", ...events }
     <button
       type="button"
       disabled={disabled}
+      aria-disabled={disabled}
       // A larger target for a finger, and no text selection from a press.
-      className="cursor-grab touch-none rounded p-1 text-muted-foreground select-none hover:bg-muted hover:text-foreground active:cursor-grabbing disabled:cursor-default disabled:opacity-40 disabled:hover:bg-transparent pointer-coarse:p-2"
+      className="cursor-grab touch-none rounded p-1 text-muted-foreground select-none hover:bg-muted hover:text-foreground active:cursor-grabbing aria-disabled:cursor-default aria-disabled:opacity-40 aria-disabled:hover:bg-transparent pointer-coarse:p-2"
       title={title}
       aria-label={`拖动 ${name} 排序`}
       {...events}

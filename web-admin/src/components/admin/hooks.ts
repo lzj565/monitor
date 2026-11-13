@@ -5,9 +5,9 @@ import { api } from "@/lib/api"
 export type Settings = Record<string, string | boolean | number>
 
 // Two pages write settings, and each loads only what it displays.
-export function useSettings() {
+export function useSettings(quiet = false) {
   const [s, setS] = useState<Settings | null>(null)
-  useEffect(() => { api<Settings>("/settings").then(setS).catch(() => {}) }, [])
+  useEffect(() => { api<Settings>("/settings").then(setS).catch((e: Error) => quiet || toast.error(e.message)) }, [quiet])
   return {
     s,
     set: (k: string, v: string) => setS((old) => ({ ...(old ?? {}), [k]: v })),

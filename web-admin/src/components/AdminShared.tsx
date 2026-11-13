@@ -19,17 +19,18 @@ export function AdminSearchInput({ value, onChange, placeholder, ariaLabel, clas
   )
 }
 
-export function AdminConfirmDialog({ title, description, confirmLabel, busy = false, onClose, onConfirm, children }: {
+export function AdminConfirmDialog({ title, description, confirmLabel, busy = false, locked = false, onClose, onConfirm, children }: {
   title: string
   description: string
   confirmLabel: string
+  locked?: boolean
   busy?: boolean
   onClose: () => void
   onConfirm: () => void
   children?: React.ReactNode
 }) {
   return (
-    <Dialog open onOpenChange={(open) => !open && onClose()}>
+    <Dialog open onOpenChange={(open) => !open && !locked && onClose()}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle>{title}</DialogTitle>
@@ -37,7 +38,7 @@ export function AdminConfirmDialog({ title, description, confirmLabel, busy = fa
         </DialogHeader>
         {children}
         <DialogFooter className="border-t pt-4">
-          <Button variant="ghost" onClick={onClose}>取消</Button>
+          <Button variant="ghost" onClick={onClose} disabled={locked}>取消</Button>
           <Button variant="destructive" onClick={onConfirm} disabled={busy}>{confirmLabel}</Button>
         </DialogFooter>
       </DialogContent>

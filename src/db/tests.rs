@@ -1525,10 +1525,65 @@ fn nodes_can_be_reordered_atomically() {
     assert!(db.reorder_nodes(&[a, b]).is_err(), "a node left out");
     assert!(db.reorder_nodes(&[a, b, 9999]).is_err(), "an id that is not a node");
     assert_eq!(order(), vec![c, a, b]);
-    // A node added afterwards goes to the end rather than wherever sort 0
+    // A node added afterwards goes first rather than wherever sort 0
     // places it.
     let d = node(&db, 1);
-    assert_eq!(db.nodes().unwrap().iter().map(|n| n.id).collect::<Vec<_>>(), vec![c, a, b, d]);
+    assert_eq!(order(), vec![d, c, a, b]);
+}
+
+#[test]
+fn a_node_entering_a_group_joins_its_block_and_leaves_the_group_order_alone() {
+    let db = db();
+    let ids: Vec<i64> = (0..6).map(|_| node(&db, 1)).collect();
+    let [hk1, hk2, jp, us, x, y] = ids[..] else { unreachable!() };
+    db.reorder_nodes(&ids).unwrap();
+    let group = |ids: &[i64], name: &str| {
+        let patch = NodePatch { group: Some(name.into()), ..Default::default() };
+        assert!(db.update_nodes(ids, &patch).unwrap());
+    };
+    let order = || db.nodes().unwrap().iter().map(|n| n.id).collect::<Vec<_>>();
+    group(&[hk1, hk2], "港");
+    group(&[jp], "日");
+    group(&[us], "美");
+    assert_eq!(order(), vec![x, y, hk1, hk2, jp, us], "a new group starts at the end, so its tab comes last");
+    db.reorder_nodes(&ids).unwrap();
+
+    // A new node from the top of the list, and two at once in list order.
+    let n = node(&db, 1);
+    assert_eq!(order()[0], n);
+    group(&[n], "港");
+    assert_eq!(order(), vec![hk1, hk2, n, jp, us, x, y]);
+    group(&[y, x], "日");
+    assert_eq!(order(), vec![hk1, hk2, n, jp, x, y, us]);
+
+    // Already in it, or a patch not touching the group: nothing moves.
+    db.reorder_nodes(&[n, hk1, hk2, jp, x, y, us]).unwrap();
+    group(&[n], "港");
+    let name = NodePatch { name: Some("m".into()), ..Default::default() };
+    assert!(db.update_node(n, &name).unwrap());
+    assert_eq!(order()[0], n);
+
+    // A whole group renamed keeps its place; part of one starts a new group
+    // at the end, so its tab comes last.
+    group(&[jp, x, y], "东京");
+    assert_eq!(order(), vec![n, hk1, hk2, jp, x, y, us]);
+    group(&[hk1], "澳");
+    assert_eq!(order(), vec![n, hk2, jp, x, y, us, hk1]);
+
+    // Leaving every group moves nothing.
+    group(&[jp], "");
+    assert_eq!(order(), vec![n, hk2, jp, x, y, us, hk1]);
+
+    // An unknown id still rolls the whole patch back, the move included.
+    let patch = NodePatch { group: Some("港".into()), ..Default::default() };
+    assert!(!db.update_nodes(&[us, 9999], &patch).unwrap());
+    assert_eq!(order(), vec![n, hk2, jp, x, y, us, hk1]);
+
+    // Created in a group, as the API allows: into its rows, not first.
+    let made = Node { name: "z".into(), group: "港".into(), ..Default::default() };
+    let z = db.create_node(&made, "token-z").unwrap();
+    assert_eq!(order(), vec![n, hk2, z, jp, x, y, us, hk1]);
+    assert_eq!(db.node(z).unwrap().unwrap().group, "港");
 }
 
 /// Themes draw probes in the order they first appear in the rows, so the rows

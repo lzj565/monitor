@@ -1092,13 +1092,7 @@ impl Db {
         auto_authorize_new_proxies: Option<bool>,
         realm_ids: Option<&[i64]>,
     ) -> Result<std::result::Result<Vec<i64>, AuthorizationWriteIssue>> {
-        self.replace_scoped_entry_authorizations(
-            user_id,
-            items,
-            auto_authorize_new_proxies,
-            realm_ids,
-            false,
-        )
+        self.replace_scoped_entry_authorizations(user_id, items, auto_authorize_new_proxies, realm_ids, false)
     }
 
     pub fn replace_scoped_entry_authorizations(
@@ -1247,12 +1241,13 @@ impl Db {
         let tx = conn.transaction()?;
         let id = next_id(&tx, "node")?;
         tx.execute(
-            // A new node belongs at the end. The caller sends sort 0, which would
-            // tie with whatever the last reorder placed first.
+            // A new node goes first, where the one who just added it looks. The
+            // caller sends sort 0, which would tie with whatever the last reorder
+            // placed first.
             "INSERT INTO node (id, name, token, sort, public, price, currency, billing_cycle,
                                expires_at, remark, traffic_limit, traffic_mode, traffic_reset_day, created_at,
                                group_name)
-             VALUES (?14,?1,?2,(SELECT COALESCE(MAX(sort),-1)+1 FROM node),?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+             VALUES (?14,?1,?2,(SELECT COALESCE(MIN(sort),1)-1 FROM node),?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             params![
                 n.name,
                 token,
@@ -1266,10 +1261,16 @@ impl Db {
                 n.traffic_mode,
                 n.traffic_reset_day,
                 Utc::now().timestamp(),
-                n.group,
+                "",
                 id
             ],
         )?;
+        // Created in a group, it joins that group's rows as a node moved into it
+        // later would, rather than drag the group's tab to the front.
+        if !n.group.is_empty() {
+            Self::gather_into_group(&tx, &[id], &n.group)?;
+            tx.execute("UPDATE node SET group_name=?1 WHERE id=?2", params![n.group, id])?;
+        }
         // Only a registration without `--name` arrives unnamed; the panel
         // requires a name.
         if n.name.is_empty() {
@@ -1318,6 +1319,9 @@ impl Db {
     pub fn update_nodes(&self, ids: &[i64], n: &NodePatch) -> Result<bool> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
+        if let Some(group) = n.group.as_deref().filter(|g| !g.is_empty()) {
+            Self::gather_into_group(&tx, ids, group)?;
+        }
         {
             let mut update = tx.prepare(
                 "UPDATE node SET name=COALESCE(?2,name), public=COALESCE(?3,public),
@@ -1363,6 +1367,33 @@ impl Db {
         }
         tx.commit()?;
         Ok(true)
+    }
+
+    /// Moves nodes about to enter `group` behind its last member, or to the end of
+    /// the list when it has none. Themes order groups by first appearance, so a
+    /// node entering from elsewhere in the list would otherwise drag its group's
+    /// tab along. A whole group taking a new name stays where it is.
+    fn gather_into_group(tx: &rusqlite::Transaction, ids: &[i64], group: &str) -> Result<()> {
+        let list = tx
+            .prepare("SELECT id, group_name FROM node ORDER BY sort, id")?
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let (entering, mut rest): (Vec<_>, Vec<_>) =
+            list.into_iter().partition(|(id, from)| ids.contains(id) && from != group);
+        let Some((_, first)) = entering.first() else { return Ok(()) };
+        let renamed = !first.is_empty()
+            && entering.iter().all(|(_, from)| from == first)
+            && !rest.iter().any(|(_, g)| g == first || g == group);
+        if renamed {
+            return Ok(());
+        }
+        let at = rest.iter().rposition(|(_, g)| g == group).map_or(rest.len(), |last| last + 1);
+        rest.splice(at..at, entering);
+        let mut update = tx.prepare("UPDATE node SET sort=?2 WHERE id=?1")?;
+        for (sort, (id, _)) in rest.iter().enumerate() {
+            update.execute(params![id, sort as i64])?;
+        }
+        Ok(())
     }
 
     pub fn set_expiry(&self, id: i64, date: &str) -> Result<()> {

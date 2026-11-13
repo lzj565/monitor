@@ -143,20 +143,19 @@ pub async fn db_stats(_: Admin, State(app): State<Shared>) -> Response {
 pub async fn db_backup(_: Admin, State(app): State<Shared>) -> Response {
     let path = scratch_path(&app, "backup");
     // Off the runtime: this reads the entire database, through a connection of
-    // its own, so the agents' writes continue meanwhile.
-    let copied = {
-        let (app, path) = (app.clone(), path.clone());
-        crate::blocking::run(move || app.db.backup_into(&path)).await
-    };
-    if let Err(e) = copied.map_err(|e| anyhow::anyhow!(e)).and_then(|r| r) {
+    // its own, so the agents' writes continue meanwhile. Opened and unlinked on
+    // the same thread: a client that disconnects during the copy drops this
+    // handler, and the blocking task still removes the file.
+    let copied = crate::blocking::run(move || {
+        let opened = app.db.backup_into(&path).and_then(|()| Ok(std::fs::File::open(&path)?));
         let _ = std::fs::remove_file(&path);
-        return fail(e);
-    }
-    let opened = tokio::fs::File::open(&path).await;
-    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-    let _ = std::fs::remove_file(&path);
-    match opened {
-        Ok(file) => (
+        let file = opened?;
+        let size = file.metadata()?.len();
+        Ok::<_, anyhow::Error>((file, size))
+    })
+    .await;
+    match copied.map_err(anyhow::Error::from).and_then(|r| r) {
+        Ok((file, size)) => (
             [
                 (header::CONTENT_TYPE, "application/octet-stream".to_owned()),
                 (header::CONTENT_LENGTH, size.to_string()),
@@ -167,7 +166,7 @@ pub async fn db_backup(_: Admin, State(app): State<Shared>) -> Response {
                     format!("attachment; filename=\"monitor-{}.db\"", Local::now().format("%Y%m%d-%H%M%S")),
                 ),
             ],
-            axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(file)),
+            axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(tokio::fs::File::from_std(file))),
         )
             .into_response(),
         Err(e) => fail(e),
@@ -224,6 +223,7 @@ pub async fn db_restore(
         let outcome = (|| {
             app.db.check_backup(&path)?;
             app.db.restore_from(&path)?;
+            info!("database restored from an uploaded backup");
             app.db.realm_reset_applied()?;
             // Trust in the local network must be confirmed again after restore.
             app.db.set("origin_cdn_only", "off")?;

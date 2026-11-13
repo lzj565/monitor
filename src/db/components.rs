@@ -36,7 +36,9 @@ impl InstallChoices {
 }
 pub(super) fn seed_components(conn: &Connection, id: i64, choices: &InstallChoices) -> Result<()> {
     choices.validate()?;
-    for (component, desired) in [("singbox", choices.singbox), ("realm", choices.realm), ("mieru", choices.mieru)] {
+    for (component, desired) in
+        [("singbox", choices.singbox), ("realm", choices.realm), ("mieru", choices.mieru)]
+    {
         conn.execute(
             "INSERT INTO node_components(node_id,component,desired_installed) VALUES(?1,?2,?3)",
             params![id, component, desired],
@@ -93,7 +95,9 @@ impl Db {
         if !exists {
             return Ok(false);
         }
-        for (component, desired) in [("singbox", choices.singbox), ("realm", choices.realm), ("mieru", choices.mieru)] {
+        for (component, desired) in
+            [("singbox", choices.singbox), ("realm", choices.realm), ("mieru", choices.mieru)]
+        {
             tx.execute(
                 "UPDATE node_components SET desired_installed=?3 WHERE node_id=?1 AND component=?2",
                 params![id, component, desired],
@@ -204,7 +208,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(db.component_choices(id).unwrap(), Some(choices));
-        let optional = db.create_node_with_components(&Node::default(), "optional-token", &InstallChoices::default()).unwrap();
+        let optional = db
+            .create_node_with_components(&Node::default(), "optional-token", &InstallChoices::default())
+            .unwrap();
         assert_eq!(db.component_choices(optional).unwrap(), Some(InstallChoices::default()));
     }
 }

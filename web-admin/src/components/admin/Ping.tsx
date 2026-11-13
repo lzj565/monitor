@@ -1,3 +1,4 @@
+import { Segments } from "./Shared"
 import { useEffect, useRef, useState } from "react"
 import { Pencil, Plus, Trash2 } from "lucide-react"
 import { toast } from "sonner"
@@ -155,18 +156,12 @@ export function Ping({ nodes }: { nodes: Node[] }) {
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between gap-2">
-        <div role="group" aria-label="视图" className="inline-flex rounded-lg bg-muted p-0.5">
-          {(["task", "node"] as const).map((v) => (
-            <button
-              key={v}
-              aria-pressed={view === v}
-              onClick={() => setView(v)}
-              className={`rounded-md px-3 py-1 text-sm transition-colors ${view === v ? "bg-background font-medium shadow-sm" : "text-muted-foreground hover:text-foreground"}`}
-            >
-              {v === "task" ? "按监控" : "按节点"}
-            </button>
-          ))}
-        </div>
+        <Segments
+          label="视图"
+          value={view}
+          onPick={setView}
+          options={[{ key: "task", label: "按监控" }, { key: "node", label: "按节点" }]}
+        />
         <Button onClick={() => setEditing({ name: "", target: "", interval: 60, nodes: nodes.map((n) => n.id), auto_join: true })}>
           <Plus /> 添加监控
         </Button>
@@ -318,7 +313,8 @@ function PingByNode({ nodes, tasks, reload }: { nodes: Node[]; tasks: PingTask[]
             <TableRow>
               <TableHead className="w-[30%]">节点</TableHead>
               <TableHead>监控</TableHead>
-              <TableHead className="w-0 text-right">操作</TableHead>
+              {/* Sized for its one button, which an empty list would not hold. */}
+              <TableHead className="w-13 text-right">操作</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>

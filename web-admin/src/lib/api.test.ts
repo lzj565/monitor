@@ -1,7 +1,15 @@
 /// <reference types="node" />
 import assert from "node:assert/strict"
-import { badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, loopbackOrigin, outdatedAgents, provisioningSite, provisionRefusal, shortAddress, trafficCorrection } from "./api.ts"
+import { badIfaceName, behind, byName, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, loopbackOrigin, outdatedAgents, provisioningSite, provisionRefusal, shortAddress, trafficCorrection, upload, CHUNK } from "./api.ts"
+import { addMonths } from "./format.ts"
 
+// The same results as the hub's roll-over, which uses chrono's checked_add_months.
+assert.equal(addMonths("2026-11-20", 1), "2026-12-20")
+assert.equal(addMonths("2026-12-31", 2), "2027-02-28")
+assert.equal(addMonths("2028-01-31", 1), "2028-02-29")
+assert.equal(addMonths("2026-03-10", 60), "2031-03-10")
+assert.equal(addMonths("2026-12-15", 12), "2027-12-15")
+assert.equal(addMonths("0026-11-20", 1), "0026-12-20")
 assert.deepEqual(changes({ public: true, price: 5 }, { price: 20 }), { price: 20 })
 assert.deepEqual(changes({ total_rx: "100", month_tx: "2" }, { total_rx: "100", month_tx: "3" }), { month_tx: "3" })
 assert.deepEqual(changes({ expires_at: "2030-01-01" as string | null }, { expires_at: null }), { expires_at: null })
@@ -130,3 +138,49 @@ assert.deepEqual(
   [["通用", ["a"]], ["外观", ["b"]]],
 )
 
+// The same list from any starting order: 日本 (ri) before 香港 (xiang) by
+// pinyin, Latin before Chinese.
+const named = [
+  { id: 1, name: "HK-10", group: "香港" },
+  { id: 2, name: "solo", group: "" },
+  { id: 3, name: "JP-1", group: "日本" },
+  { id: 4, name: "香港 · 甲", group: "香港" },
+  { id: 5, name: "备用机" },
+  { id: 6, name: "HK-2", group: "香港" },
+  { id: 7, name: "alpha" },
+]
+for (const start of [named, [...named].reverse()]) {
+  assert.deepEqual(byName(start).map((n) => n.name), ["JP-1", "HK-2", "HK-10", "香港 · 甲", "alpha", "solo", "备用机"])
+}
+
+// Groups the numeric collation calls equal stay apart.
+const close = [{ id: 1, name: "b", group: "G1" }, { id: 2, name: "a", group: "G01" }, { id: 3, name: "c", group: "G01" }]
+for (const start of [close, [...close].reverse()]) {
+  assert.deepEqual(byName(start).map((n) => n.name), ["a", "c", "b"])
+}
+
+// The same name twice: by id, so the order it started in leaves no trace.
+const twins = [{ id: 2, name: "备用机" }, { id: 1, name: "备用机" }]
+for (const start of [twins, [...twins].reverse()]) {
+  assert.deepEqual(byName(start).map((n) => n.id), [1, 2])
+}
+
+// Every chunk but the last can be aborted. Once the last lands the hub applies
+// it whether or not anyone waits, so an abort there would report a database
+// that was replaced as one that was not.
+{
+  const signals: (AbortSignal | null | undefined)[] = []
+  globalThis.fetch = async (_: RequestInfo | URL, init?: RequestInit) => {
+    signals.push(init?.signal)
+    return new Response("{}", { headers: { "content-type": "application/json" } })
+  }
+  const abort = new AbortController()
+  await upload("/db/restore", new File([new Uint8Array(2 * CHUNK + 1)], "b.db"), undefined, abort.signal)
+  abort.abort()
+  assert.deepEqual(signals.map((s) => s?.aborted), [true, true, false])
+  signals.length = 0
+  const single = new AbortController()
+  await upload("/db/restore", new File([new Uint8Array(CHUNK)], "b.db"), undefined, single.signal)
+  single.abort()
+  assert.deepEqual(signals.map((s) => s?.aborted), [false])
+}

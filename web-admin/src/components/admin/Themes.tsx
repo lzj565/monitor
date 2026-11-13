@@ -207,8 +207,15 @@ export function Themes() {
   const [repo, setRepo] = useState("")
   const picker = useRef<HTMLInputElement>(null)
 
+  // A failed reload keeps the list on screen; only a failed first load draws it
+  // empty, keeping the install card in reach.
   const load = () =>
-    api<{ themes: Theme[] }>("/themes").then((data) => setThemes(data.themes)).catch(() => setThemes([]))
+    api<{ themes: Theme[] }>("/themes")
+      .then((data) => setThemes(data.themes))
+      .catch((e: Error) => {
+        toast.error(e.message)
+        setThemes((themes) => themes ?? [])
+      })
   useEffect(() => { load() }, [])
 
   async function select(short: string) {

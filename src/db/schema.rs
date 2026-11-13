@@ -650,7 +650,11 @@ pub(super) fn migrate(conn: &Connection, from: i64) -> Result<()> {
     }
 
     tx.execute_batch(PROXY_LIST_ORDER_SCHEMA)?;
-    let component_sql: Option<String> = tx.query_row("SELECT sql FROM sqlite_master WHERE type='table' AND name='node_components'", [], |r| r.get(0)).optional()?;
+    let component_sql: Option<String> = tx
+        .query_row("SELECT sql FROM sqlite_master WHERE type='table' AND name='node_components'", [], |r| {
+            r.get(0)
+        })
+        .optional()?;
     if component_sql.as_deref().is_some_and(|sql| sql.contains("component<>'singbox'")) {
         tx.execute_batch("ALTER TABLE node_components RENAME TO node_components_required;")?;
         tx.execute_batch(COMPONENT_SCHEMA)?;

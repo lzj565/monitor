@@ -4,7 +4,7 @@ import { toast } from "sonner"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { AdminConfirmDialog as ConfirmDialog } from "@/components/AdminShared"
-import { api, upload } from "@/lib/api"
+import { api, CHUNK, upload } from "@/lib/api"
 import { bytes } from "@/lib/format"
 
 export type DbInfo = {
@@ -39,9 +39,9 @@ export function Data() {
   const [confirm, setConfirm] = useState<"vacuum" | null>(null)
   const [pending, setPending] = useState<File | null>(null)
   const [sent, setSent] = useState(0)
-  // Closing the dialog must stop the upload rather than merely hide it: restore
-  // is the one irreversible action here, and it takes minutes on a large
-  // backup.
+  // Closing the dialog stops the upload rather than merely hiding it: restore is
+  // the one irreversible action here. Once the last chunk is on its way it can
+  // no longer be stopped, and the dialog stays open until the hub answers.
   const abort = useRef<AbortController | null>(null)
   const picker = useRef<HTMLInputElement>(null)
 
@@ -73,8 +73,8 @@ export function Data() {
       // replaced.
       setTimeout(() => location.reload(), 800)
     } catch (e) {
-      // Aborting partway is not a failure: the hub replaces nothing until the
-      // last chunk, so the original database remains.
+      // Aborting before the last chunk is not a failure: the hub replaces
+      // nothing until then, so the original database remains.
       const aborted = (e as Error).name === "AbortError"
       if (aborted) toast.info("已取消，数据库没有改动")
       else toast.error((e as Error).message)
@@ -83,6 +83,8 @@ export function Data() {
     setPending(null)
   }
 
+  // `sent` counts acknowledged chunks, so the last one is in flight from here on.
+  const applying = busy === "restore" && !!pending && sent + CHUNK >= pending.size
   if (!info) return null
   const stat = (label: string, value: string, className = "") => (
     <div key={label} className={className}>
@@ -174,8 +176,9 @@ export function Data() {
         <ConfirmDialog
           title="用备份覆盖当前数据？"
           description={`将用 ${pending.name}（${bytes(pending.size)}）整体替换当前数据库。当前的节点、设置和历史全部丢失，且无法撤销。`}
-          confirmLabel={busy === "restore" ? `已上传 ${bytes(sent)} / ${bytes(pending.size)}` : "确认恢复"}
+          confirmLabel={busy !== "restore" ? "确认恢复" : applying ? "正在校验并恢复…" : `已上传 ${bytes(sent)} / ${bytes(pending.size)}`}
           busy={!!busy}
+          locked={applying}
           onClose={() => { abort.current?.abort(); setPending(null) }}
           onConfirm={() => restore(pending)}
         />

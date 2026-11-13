@@ -152,7 +152,10 @@ pub async fn agent_register(
             _ => Err("invalid component registration option"),
         }
     };
-    let singbox = match flag("x-install-singbox") { Ok(v) => v, Err(r) => return bad(r) };
+    let singbox = match flag("x-install-singbox") {
+        Ok(v) => v,
+        Err(r) => return bad(r),
+    };
     let realm = match flag("x-install-realm") {
         Ok(v) => v,
         Err(r) => return bad(r),

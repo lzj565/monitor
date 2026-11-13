@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react"
-import { CalendarClock, Copy, Download, Layers, Pencil, Plus, Server, Trash2 } from "lucide-react"
+import { ArrowDownAZ, CalendarClock, Copy, Download, Layers, Pencil, Plus, Server, Trash2 } from "lucide-react"
 import { toast } from "sonner"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -12,14 +12,14 @@ import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { AdminConfirmDialog as ConfirmDialog, AdminSearchInput } from "@/components/AdminShared"
 import { DragHandle, useDragOrder } from "@/components/DragOrder"
-import { api, badIfaceName, changes, currentIface, GIB, ifaceChoice, ifaceSpec, inGroup, provisioningSite, trafficCorrection, type IfaceChoice, type Node } from "@/lib/api"
+import { api, byName, groupsOf, badIfaceName, changes, currentIface, GIB, ifaceChoice, ifaceSpec, inGroup, provisioningSite, trafficCorrection, type IfaceChoice, type Node } from "@/lib/api"
 import { NodeComponents } from "./NodeComponents"
 import { realmArg } from "@/lib/realm"
-import { bytes, cycleMonths, FOREVER, money, uptime } from "@/lib/format"
-import { TRAFFIC_FIELDS, TRAFFIC_MODES, nameText, copy, Addresses, searchNodes, useGroupFilter, GroupFilter, NodePicker, Command, Field, OptionRow, GroupInput } from "./Shared"
+import { addMonths, bytes, cycleMonths, FOREVER, money, uptime } from "@/lib/format"
+import { Segments, TRAFFIC_FIELDS, TRAFFIC_MODES, nameText, copy, Addresses, searchNodes, useGroupFilter, GroupFilter, NodePicker, Command, Field, OptionRow, GroupInput } from "./Shared"
 import { type Settings, useSettings } from "./hooks"
 
-export function GroupDialog({ nodes, onClose, onSaved }: { nodes: Node[]; onClose: () => void; onSaved: () => void }) {
+export function GroupDialog({ nodes, onClose, onSaved }: { nodes: Node[]; onClose: () => void; onSaved: (id: number, group: string) => void }) {
   const [name, setName] = useState("")
   const [chosen, setChosen] = useState<Set<number>>(new Set())
   const [saving, setSaving] = useState(false)
@@ -42,7 +42,8 @@ export function GroupDialog({ nodes, onClose, onSaved }: { nodes: Node[]; onClos
       await api("/nodes/batch", { method: "PUT", body: JSON.stringify({ ids, patch: { group } }) })
       toast.success(group ? `已把 ${ids.length} 台设为「${group}」` : `已把 ${ids.length} 台移出分组`)
       onClose()
-      onSaved()
+      // The first that moved: one already in the group stays where it was.
+      onSaved(nodes.find((n) => chosen.has(n.id) && n.group !== group)?.id ?? ids[0], group)
     } catch (e) {
       toast.error((e as Error).message)
     } finally {
@@ -129,7 +130,7 @@ export function NodeForm({ node, nodes, onClose, onSaved }: {
   node: Node
   nodes: Node[]
   onClose: () => void
-  onSaved: () => void
+  onSaved: (group?: string) => void
 }) {
   const [form, setForm] = useState(node)
   const [limitGib, setLimitGib] = useState(String(node.traffic_limit / GIB || ""))
@@ -184,7 +185,7 @@ export function NodeForm({ node, nodes, onClose, onSaved }: {
       }
       toast.success("节点设置已保存")
       onClose()
-      onSaved()
+      onSaved(patch.group)
     } catch (e) {
       toast.error((e as Error).message)
     } finally {
@@ -334,12 +335,15 @@ export function BillingForm({ node, onClose, onSaved }: {
   const [unit, setUnit] = useState(months === 0 ? "once" : months % 12 ? "months" : "years")
   const [count, setCount] = useState(String(months % 12 ? months : months / 12 || 1))
   const [saving, setSaving] = useState(false)
+  const [renewals, setRenewals] = useState(0)
   const set = <K extends keyof Node>(k: K, v: Node[K]) => setForm((f) => ({ ...f, [k]: v }))
+  const length = Number(count) * (unit === "years" ? 12 : 1)
+  const renewable = unit !== "once" && Number.isInteger(length) && length > 0 && !!form.expires_at
 
   async function save() {
     // The hub refuses a length out of range and stores a named one by name, so
     // an unchanged length is compared in months, not in spelling.
-    const cycle = unit === "once" ? "once" : `${Number(count) * (unit === "years" ? 12 : 1)}m`
+    const cycle = unit === "once" ? "once" : `${length}m`
     setSaving(true)
     try {
       await api(`/nodes/${node.id}`, {
@@ -409,16 +413,17 @@ export function BillingForm({ node, onClose, onSaved }: {
                 />
               </Field>
             </div>
-            <div className="grid grid-cols-2 gap-4">
+            <div className="grid gap-x-4 gap-y-5 sm:grid-cols-2">
               <Field label="付款周期">
-                <div className="flex gap-2">
+                {/* On a phone the two controls sit under the price and currency columns. */}
+                <div className="flex gap-4 sm:gap-2">
                   {unit !== "once" && (
                     <Input
                       type="number"
                       min="1"
                       step="1"
                       aria-label="周期长度"
-                      className="w-16"
+                      className="w-0 flex-1 sm:w-16 sm:flex-none"
                       value={count}
                       onChange={(e) => setCount(e.target.value)}
                     />
@@ -433,8 +438,37 @@ export function BillingForm({ node, onClose, onSaved }: {
                   </Select>
                 </div>
               </Field>
-              <Field label="到期时间">
-                <Input type="date" value={form.expires_at ?? ""} onChange={(e) => set("expires_at", e.target.value)} />
+              <Field
+                label="到期时间"
+                action={renewable && (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="xs"
+                    className="-my-1"
+                    title="提前续费后点这里，到期时间往后加一个付款周期，保存后生效"
+                    onClick={() => {
+                      set("expires_at", addMonths(form.expires_at!, length))
+                      setRenewals((n) => n + 1)
+                    }}
+                  >
+                    续期
+                  </Button>
+                )}
+              >
+                <div className="relative">
+                  <Input type="date" value={form.expires_at ?? ""} onChange={(e) => set("expires_at", e.target.value)} />
+                  {/* Keyed by the count so that every click replays the animation. */}
+                  {renewals > 0 && (
+                    <span
+                      key={renewals}
+                      aria-hidden
+                      className="pointer-events-none absolute -top-4 left-1/2 -translate-x-1/2 text-sm font-semibold text-primary animate-[renewed_900ms_ease-out_forwards] motion-reduce:hidden"
+                    >
+                      +1
+                    </span>
+                  )}
+                </div>
               </Field>
             </div>
           </div>
@@ -633,7 +667,7 @@ export function useIntervalOption(current?: number | null) {
   const [typed, setTyped] = useState<string>()
   const text = typed ?? String(current ?? 1)
   const seconds = Math.min(3600, Math.max(1, Math.round(Number(text) || 1)))
-  return { typed: text, setTyped, current, flag: typed === undefined ? undefined : seconds }
+  return { typed: text, setTyped, current, flag: typed === undefined || text.trim() === "" ? undefined : seconds }
 }
 
 export function IntervalOption({ option, batch = false }: { option: ReturnType<typeof useIntervalOption>; batch?: boolean }) {
@@ -828,8 +862,17 @@ export function trafficTone(n: Node, warnAt: number) {
   return n.month_used * 100 >= n.traffic_limit * warnAt ? "text-near" : ""
 }
 
+const ATTENTION: [key: string, label: string, test: (n: Node, warnAt: number, expiryDays: number) => boolean][] = [
+  ["offline", "离线", (n) => !n.online],
+  ["traffic", "流量预警", (n, warnAt) => trafficTone(n, warnAt) !== ""],
+  ["expiring", "即将到期", (n, _, days) => n.expires_in !== null && n.expires_in <= days],
+  ["private", "不公开", (n) => !n.public],
+]
+
 export function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () => void; site: string; refusal: string }) {
-  const warnAt = Number(useSettings().s?.notify_traffic) || 80
+  const settings = useSettings(true).s
+  const warnAt = Number(settings?.notify_traffic) || 80
+  const expiryDays = Number(settings?.notify_expiry) || 7
   const [creating, setCreating] = useState(false)
   const [editing, setEditing] = useState<Node | null>(null)
   const [billing, setBilling] = useState<Node | null>(null)
@@ -840,20 +883,107 @@ export function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refres
   const [removing, setRemoving] = useState(false)
   const [query, setQuery] = useState("")
   const [group, setGroup] = useGroupFilter(nodes)
+  const [status, setStatus] = useState("all")
   const [grouping, setGrouping] = useState(false)
-  // A new node lands last, a hundred rows down on a large fleet, so it is
-  // brought into view once the list carries it. A filter hiding it cancels the
-  // scroll rather than leaving one to fire when the filter is cleared.
-  const added = useRef<number | null>(null)
+  const [sorting, setSorting] = useState(false)
+  // A row to bring into view once the list shows it: a new node, which lands
+  // first while the list may be scrolled far down; or one that joined a group,
+  // which the hub moved to the group's rows, once the list carries the move. A
+  // filter hiding it cancels the scroll rather than leaving one to fire when it
+  // is cleared.
+  const reveal = useRef<{ id: number; group?: string } | null>(null)
   const drag = useDragOrder(nodes, "nodes", refresh)
-  const visible = inGroup(searchNodes(drag.order, query), group)
+  // For an undo pressed long after the render that offered it.
+  const latest = useRef(drag.order)
+  useEffect(() => { latest.current = drag.order })
+  // Counted within the search and the group, so each count is what its filter
+  // would then show.
+  const found = inGroup(searchNodes(drag.order, query), group)
+  const attention = ATTENTION.map(([key, label, test]) => ({ key, label, rows: found.filter((n) => test(n, warnAt, expiryDays)) }))
+  const picked = attention.find((a) => a.key === status)
+  const showChips = status !== "all" || ATTENTION.some(([, , test]) => nodes.some((n) => test(n, warnAt, expiryDays)))
+  const chips = attention
+    .filter((a) => a.key === status || a.rows.length)
+    .map((a) => ({ key: a.key, label: <>{a.label} <span className="tnum ml-0.5 text-xs font-normal text-muted-foreground">{a.rows.length}</span></> }))
+  const visible = picked?.rows ?? found
   useEffect(() => {
-    if (added.current === null || !nodes.some((n) => n.id === added.current)) return
-    document.querySelector(`tbody tr[data-id="${added.current}"]`)?.scrollIntoView({ block: "center", behavior: "smooth" })
-    added.current = null
+    if (!reveal.current) return
+    const { id, group: joined } = reveal.current
+    const node = nodes.find((n) => n.id === id)
+    if (!node || (joined !== undefined && node.group !== joined)) return
+    document.querySelector(`tbody tr[data-id="${id}"]`)?.scrollIntoView({ block: "center", behavior: "smooth" })
+    reveal.current = null
   })
-  const searching = query.trim() !== "" || group !== "all"
+  const searching = query.trim() !== "" || group !== "all" || status !== "all"
+
+  // The columns as the whole list lays them out, taken as a search or a filter
+  // begins, while that list is still on screen. The narrowed table is laid out
+  // by these shares, so the columns stay where they were rather than refit the
+  // rows left. Shares rather than pixels, so it still follows the window.
+  const head = useRef<HTMLTableRowElement>(null)
+  const [layout, setLayout] = useState<{ width: number; shares: number[] } | null>(null)
+  function narrow<T>(set: (v: T) => void) {
+    return (v: T) => {
+      const row = head.current
+      if (!searching && row) {
+        const width = row.getBoundingClientRect().width
+        setLayout({ width, shares: [...row.cells].map((c) => c.getBoundingClientRect().width / width) })
+      }
+      set(v)
+    }
+  }
+  const frozen = searching ? layout : null
+  // A new width lays the page out afresh: the shares were taken at another, and
+  // the narrowed rows are left to size the columns. A phone's address bar
+  // collapsing resizes only the height.
+  useEffect(() => {
+    if (!frozen) return
+    const width = innerWidth
+    const thaw = () => innerWidth !== width && setLayout(null)
+    addEventListener("resize", thaw)
+    return () => removeEventListener("resize", thaw)
+  }, [frozen])
+  const col = (i: number) => frozen?.shares[i] ? { width: `${frozen.shares[i] * 100}%` } : undefined
   const uninstall = refusal ? "" : uninstallCommand(site)
+
+  // Under a filter the rows on screen are not the order, so a handle cannot
+  // move one. A press says why and offers the way out, which a disabled
+  // button would not: it takes no press, and a touch screen shows no title.
+  const locked = {
+    onPointerDown: (e: React.PointerEvent) => e.button === 0 && hintLocked(),
+    onKeyDown: (e: React.KeyboardEvent) => {
+      if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return
+      e.preventDefault()
+      hintLocked()
+    },
+  }
+  function hintLocked() {
+    toast("筛选时不能拖动排序", {
+      id: "drag-locked",
+      action: { label: "清除筛选", onClick: () => { scrollTo(0, 0); setQuery(""); setGroup("all"); setStatus("all") } },
+    })
+  }
+
+  function followGroup(id: number, group?: string) {
+    if (group) reveal.current = { id, group }
+    refresh()
+  }
+
+  // Confirmed first, since it replaces an order that may have taken many
+  // drags; the toast then keeps an undo long enough to think it over.
+  async function sortByName() {
+    setSorting(false)
+    const rows = head.current!.closest("table")!.tBodies[0]
+    const before = drag.order.map((n) => n.id)
+    if (!await drag.arrange(byName(drag.order).map((n) => n.id), rows)) return
+    // Against the list as it is by then, which the hub requires in full: a node
+    // added since goes first, where the hub placed it.
+    const undo = () => {
+      const now = latest.current.map((n) => n.id)
+      drag.arrange([...now.filter((id) => !before.includes(id)), ...before.filter((id) => now.includes(id))], rows)
+    }
+    toast.success("已按名称排序", { duration: 15_000, action: { label: "撤销", onClick: undo } })
+  }
 
   async function remove() {
     if (!deleting) return
@@ -875,9 +1005,12 @@ export function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refres
       {refusal && <p className="text-sm text-muted-foreground">{refusal}</p>}
       <div className="flex flex-wrap items-center justify-end gap-2">
         <div className="mr-auto flex w-full gap-2 sm:w-auto">
-          <AdminSearchInput className="min-w-0 flex-1 sm:w-64 sm:flex-none" ariaLabel="搜索节点" placeholder="名称/地址/地区/分组" value={query} onChange={setQuery} />
-          <GroupFilter nodes={nodes} value={group} onChange={setGroup} className="w-32" />
+          <AdminSearchInput className="min-w-0 flex-1 sm:w-64 sm:flex-none" ariaLabel="搜索节点" placeholder="名称/地址/地区/分组" value={query} onChange={narrow(setQuery)} />
+          <GroupFilter nodes={nodes} value={group} onChange={narrow(setGroup)} className="w-32" />
         </div>
+        {showChips && <div className="order-last min-h-8 w-full xl:order-none xl:mr-auto xl:w-auto">
+          {chips.length > 0 && <Segments label="按状态筛选" value={status} onPick={(key) => narrow(setStatus)(status === key ? "all" : key)} options={chips} />}
+        </div>}
         <Button variant="outline" disabled={!nodes.length} onClick={() => setGrouping(true)}>
           <Layers /> 分组
         </Button>
@@ -892,20 +1025,37 @@ export function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refres
       </div>
 
       <Card className="overflow-x-auto p-0">
-        <Table>
+        <Table className={frozen ? "table-fixed" : ""} style={frozen ? { minWidth: frozen.width } : undefined}>
           <TableHeader>
             {/* Percentages, or the address column swallows every spare pixel
                 and pushes status across the table. */}
-            <TableRow>
-              <TableHead className="w-[26%]">名称</TableHead>
-              <TableHead className="w-[18%]">IP</TableHead>
-              <TableHead className="w-[12%]">状态</TableHead>
-              <TableHead className="w-[16%]">流量</TableHead>
+            <TableRow ref={head}>
+              <TableHead className="w-[26%]" style={col(0)}>
+                {nodes.length > 1 ? (
+                  <button
+                    type="button"
+                    className="-mx-1 inline-flex items-center gap-1 rounded px-1 hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+                    title={groupsOf(nodes).length ? "按分组名、再按名称排序" : "按名称排序"}
+                    onClick={() => {
+                      const ids = drag.order.map((n) => n.id).join()
+                      if (byName(drag.order).map((n) => n.id).join() === ids) toast("已经是按名称排的顺序")
+                      else setSorting(true)
+                    }}
+                  >
+                    名称 <ArrowDownAZ className="size-3.5" />
+                  </button>
+                ) : (
+                  "名称"
+                )}
+              </TableHead>
+              <TableHead className="w-[18%]" style={col(1)}>IP</TableHead>
+              <TableHead className="w-[12%]" style={col(2)}>状态</TableHead>
+              <TableHead className="w-[16%]" style={col(3)}>流量</TableHead>
               {/* Below xl the expiry date moves under the price: seven
                   columns leave a 1024px window no room for names. */}
-              <TableHead className="w-[10%]">价格<span className="xl:hidden"> / 到期</span></TableHead>
-              <TableHead className="hidden w-[12%] xl:table-cell">到期</TableHead>
-              <TableHead className="text-right">操作</TableHead>
+              <TableHead className="w-[10%]" style={col(4)}>价格<span className="xl:hidden"> / 到期</span></TableHead>
+              <TableHead className="hidden w-[12%] xl:table-cell" style={col(5)}>到期</TableHead>
+              <TableHead className="text-right" style={col(6)}>操作</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -916,10 +1066,10 @@ export function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refres
                 <TableCell className="whitespace-normal">
                   <div className="flex items-center gap-2">
                     <DragHandle
-                      {...drag.handle(n.id)}
+                      {...(searching ? locked : drag.handle(n.id))}
                       name={n.name}
-                      disabled={searching}
-                      title={searching ? "清空搜索和分组筛选后可拖动排序" : undefined}
+                      aria-disabled={searching}
+                      title={searching ? "清空搜索和筛选后可拖动排序" : undefined}
                     />
                     <div className="min-w-24">
                       {/* Lines are balanced, so none ends on a character or two. */}
@@ -1005,28 +1155,21 @@ export function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refres
                 </TableCell>
               </TableRow>
             ))}
-            {nodes.length === 0 && (
-              <TableRow>
-                <TableCell colSpan={7} className="py-10 text-center text-sm text-muted-foreground">
-                  还没有节点，右上角添加
-                </TableCell>
-              </TableRow>
-            )}
-            {searching && nodes.length > 0 && !visible.length && (
-              <TableRow>
-                <TableCell colSpan={7} className="py-10 text-center text-sm text-muted-foreground">
-                  没有匹配的节点
-                </TableCell>
-              </TableRow>
-            )}
           </TableBody>
         </Table>
+        {/* Below the table rather than a row spanning it: below xl the span
+            would count the hidden expiry column and add a column of its own. */}
+        {!visible.length && (
+          <p className="py-10 text-center text-sm text-muted-foreground">
+            {!nodes.length ? "还没有节点，右上角添加" : picked && found.length ? `当前没有${picked.label}的节点` : "没有匹配的节点"}
+          </p>
+        )}
       </Card>
 
       {creating && (
         <CreateNode
           onClose={() => setCreating(false)}
-          onSaved={(id) => { added.current = id; refresh() }}
+          onSaved={(id) => { reveal.current = { id }; refresh() }}
         />
       )}
       {editing && (
@@ -1034,10 +1177,19 @@ export function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refres
           node={editing}
           nodes={nodes}
           onClose={() => setEditing(null)}
-          onSaved={refresh}
+          onSaved={(group) => followGroup(editing.id, group)}
         />
       )}
-      {grouping && <GroupDialog nodes={drag.order} onClose={() => setGrouping(false)} onSaved={refresh} />}
+      {sorting && (
+        <ConfirmDialog
+          title="按名称重新排序？"
+          description={`全部 ${nodes.length} 台节点将${groupsOf(nodes).length ? "先按分组名、组内再按名称" : "按名称"}重排${groupsOf(nodes).length ? "，未分组的排在最后" : ""}。当前的顺序会被替换，公开页同步变化；排序后 15 秒内可在提示里撤销。`}
+          confirmLabel="排序"
+          onClose={() => setSorting(false)}
+          onConfirm={sortByName}
+        />
+      )}
+      {grouping && <GroupDialog nodes={drag.order} onClose={() => setGrouping(false)} onSaved={followGroup} />}
       {billing && (
         <BillingForm node={billing} onClose={() => setBilling(null)} onSaved={refresh} />
       )}
