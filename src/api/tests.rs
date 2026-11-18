@@ -199,6 +199,7 @@ fn client_subscriptions_default_empty_flow_to_vision() {
     let uuid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
     let portal_proxy = |p: crate::db::UserSubscriptionProxy| crate::db::UserPortalProxy {
         hysteria2: None,
+        snell_psk: None,
         id: p.id,
         node_id: 1,
         node_name: p.node_name,
@@ -2753,4 +2754,52 @@ fn hy2_persists_certificate_and_exports_uuid_without_private_key() {
         .as_array()
         .unwrap()
         .is_empty());
+}
+
+#[test]
+fn snell_shared_psk_survives_edit_and_is_exported_only_when_authorized() {
+    let app = app();
+    let node =
+        app.db.create_node(&Node { name: "Snell".into(), ..Default::default() }, "snell-node").unwrap();
+    let user = app
+        .db
+        .create_user(&crate::db::UserDraft {
+            username: "snell-user".into(),
+            password_hash: Some("hash".into()),
+            enabled: true,
+            expires_at: None,
+            traffic_limit: None,
+            device_limit: None,
+            traffic_reset_day: None,
+        })
+        .unwrap()
+        .unwrap();
+    let draft = serde_json::from_value::<crate::proxy::ProxyRequest>(json!({
+        "name":"Snell", "protocol":"snell", "address":"::1", "address_type":"ipv6",
+        "port":24444, "enabled":true, "config":{}
+    }))
+    .unwrap()
+    .into_draft()
+    .unwrap();
+    let id = app.db.create_proxy(node, &draft).unwrap().unwrap();
+    let first = app.db.proxy(id).unwrap().unwrap();
+    let psk = first.config["snell"]["psk"].as_str().unwrap();
+    assert_eq!(psk.len(), 32);
+    app.db.update_proxy(id, None, &draft).unwrap().unwrap();
+    assert_eq!(first.config, app.db.proxy(id).unwrap().unwrap().config);
+    let generated = crate::proxy::generate_config(&app.db, node, Utc::now().timestamp()).unwrap();
+    assert_eq!(generated["inbounds"][0]["psk"], psk);
+    assert_eq!(generated["inbounds"][0]["version"], 6);
+    assert!(generated["inbounds"][0].get("users").is_none());
+    assert!(user_portal_items(&app, user).unwrap().is_empty());
+    app.db
+        .put_authorization(user, id, &crate::db::AuthorizationDraft { enabled: true, auth: None })
+        .unwrap()
+        .unwrap();
+    let entries = user_portal_items(&app, user).unwrap();
+    let yaml: Vec<Value> = serde_yaml_ng::from_str(entries[0]["mihomo_yaml"].as_str().unwrap()).unwrap();
+    assert_eq!(yaml[0]["psk"], psk);
+    assert_eq!(yaml[0]["reuse"], true);
+    assert_eq!(yaml[0]["udp"], true);
+    assert!(yaml[0].get("userkey").is_none());
 }

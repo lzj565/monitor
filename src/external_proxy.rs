@@ -243,3 +243,27 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[test]
+fn snell_v6_mihomo_fields_round_trip() {
+    let yaml = r#"proxies:
+  - name: Snell IPv6
+    type: snell
+    server: "::1"
+    port: 60005
+    psk: "fixture-only-psk"
+    version: 6
+    reuse: true
+    mode: default
+    udp: true
+"#;
+    let (items, _) = parse_yaml(yaml).unwrap();
+    assert_eq!(
+        validate(&items[0]).unwrap(),
+        serde_json::json!({
+            "name": "Snell IPv6", "type": "snell", "server": "::1", "port": 60005,
+            "psk": "fixture-only-psk", "version": 6, "reuse": true, "mode": "default", "udp": true
+        })
+    );
+}

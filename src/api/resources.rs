@@ -353,7 +353,7 @@ pub async fn create_proxy(
             Ok(draft) => draft,
             Err(error) => return api_input_error(error),
         };
-        if draft.protocol == "hysteria2"
+        if matches!(draft.protocol.as_str(), "hysteria2" | "snell")
             && !app.db.component_choices(node_id).ok().flatten().is_some_and(|c| c.singbox)
         {
             return api_error(
@@ -407,7 +407,7 @@ pub async fn update_proxy(
             Ok(proxy) => proxy.map(|proxy| proxy.node_id),
             Err(error) => return api_internal(error),
         };
-        if draft.protocol == "hysteria2"
+        if matches!(draft.protocol.as_str(), "hysteria2" | "snell")
             && !node_id
                 .or(previous_node_id)
                 .and_then(|node| app.db.component_choices(node).ok().flatten())
@@ -832,7 +832,7 @@ pub(super) fn sync_generated_nodes(app: &Shared, node_ids: Vec<i64>) -> SyncRepo
         let has_singbox_proxy = app
             .db
             .proxies_for_node(node_id)
-            .is_ok_and(|p| p.iter().any(|p| matches!(p.protocol.as_str(), "vless" | "hysteria2")));
+            .is_ok_and(|p| p.iter().any(|p| matches!(p.protocol.as_str(), "vless" | "hysteria2" | "snell")));
         if has_singbox_proxy {
             if let Err(e) = app.db.set(&format!("singbox_managed_node_{node_id}"), "1") {
                 tracing::warn!("cannot record sing-box ownership: {e:#}");

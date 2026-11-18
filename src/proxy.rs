@@ -69,6 +69,23 @@ impl ProxyRequest {
         if name.is_empty() || name.chars().count() > 128 {
             return Err(InputError::new("INVALID_PROXY_CONFIG", "name must contain 1 to 128 characters"));
         }
+        if self.protocol == "snell" {
+            validate_address(&self.address_type, &self.address)?;
+            if self.port == 0 || self.flow.as_deref().is_some_and(|f| !f.is_empty()) {
+                return Err(InputError::new("INVALID_PROXY_CONFIG", "Snell requires a port and empty flow"));
+            }
+            return Ok(ProxyDraft {
+                name: name.into(),
+                include_node_name: self.include_node_name,
+                protocol: self.protocol,
+                address_type: self.address_type,
+                address: self.address,
+                port: self.port.into(),
+                enabled: self.enabled,
+                flow: Some(String::new()),
+                config: json!({}),
+            });
+        }
         if self.protocol == "hysteria2" {
             validate_address(&self.address_type, &self.address)?;
             let config: crate::hysteria2::Settings = serde_json::from_value(self.config["hysteria2"].clone())
@@ -316,8 +333,18 @@ pub fn generate_config(db: &Db, node_id: i64, now: i64) -> anyhow::Result<Value>
     for proxy in db
         .proxies_for_node(node_id)?
         .into_iter()
-        .filter(|p| p.enabled && matches!(p.protocol.as_str(), "vless" | "hysteria2"))
+        .filter(|p| p.enabled && matches!(p.protocol.as_str(), "vless" | "hysteria2" | "snell"))
     {
+        if proxy.protocol == "snell" {
+            let psk = proxy.config["snell"]["psk"].as_str().context("missing Snell PSK")?;
+            let tag = format!("proxy-{}", proxy.id);
+            inbounds.push(json!({
+                "type": "snell", "tag": tag, "listen": listen, "listen_port": proxy.port,
+                "version": 6, "mode": "default", "psk": psk
+            }));
+            stats_inbounds.push(tag);
+            continue;
+        }
         if proxy.protocol == "hysteria2" {
             let settings = crate::hysteria2::settings(&proxy.config)?;
             let users = db
@@ -419,7 +446,7 @@ struct VlessUser {
 }
 
 pub fn supported_protocol(proxy: &db::Proxy) -> bool {
-    matches!(proxy.protocol.as_str(), "vless" | "mieru" | "hysteria2")
+    matches!(proxy.protocol.as_str(), "vless" | "mieru" | "hysteria2" | "snell")
 }
 
 #[cfg(test)]

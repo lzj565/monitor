@@ -110,7 +110,7 @@ pub(super) fn user_portal_items(app: &App, user: i64) -> anyhow::Result<Vec<Valu
                 item["hysteria2_url"]=json!(link);
             } else if proxy.protocol=="mieru" {
                 item["mieru_url"]=json!(format!("mierus://{}:{}@{}?profile={}&port={}&protocol=TCP",uri_component(&format!("user-{user}")),uri_component(proxy.mieru_password.as_deref().unwrap_or("")),host,uri_component(&name),proxy.port));
-            } else {
+            } else if proxy.protocol == "vless" {
                 let flow=if proxy.flow.is_empty(){proxy::DEFAULT_FLOW}else{&proxy.flow};
                 item["vless_url"]=json!(format!("vless://{}@{}:{}?encryption=none&security=reality&sni={}&fp=chrome&pbk={}&sid={}&type=tcp&flow={}#{}",proxy.uuid,host,proxy.port,uri_component(&proxy.server_name),proxy.public_key,proxy.short_id,uri_component(flow),uri_component(&name)));
             }
@@ -333,6 +333,13 @@ pub(super) fn yaml_ip_or_string(value: &str) -> String {
 
 pub(super) fn mihomo_proxy(user_id: i64, proxy: &crate::db::UserPortalProxy) -> String {
     let name = crate::db::displayed_proxy_name(&proxy.name, proxy.include_node_name, &proxy.node_country);
+    if proxy.protocol == "snell" {
+        return format!(
+            "- name: {}\n  type: snell\n  server: {}\n  port: {}\n  psk: {}\n  version: 6\n  reuse: true\n  mode: default\n  udp: true",
+            yaml_string(&name), yaml_string(&proxy.address), proxy.port,
+            yaml_string(proxy.snell_psk.as_deref().expect("authorized Snell proxy has a PSK")),
+        );
+    }
     if proxy.protocol == "hysteria2" {
         let settings = proxy.hysteria2.as_ref().expect("HY2 settings");
         let mut text = format!("- name: {}\n  type: hysteria2\n  server: {}\n  port: {}\n  password: {}\n  sni: {}\n  skip-cert-verify: true\n  alpn: [h3]\n  up: {}\n  down: {}",yaml_string(&name),yaml_string(&proxy.address),proxy.port,yaml_string(&proxy.uuid),yaml_string(&proxy.server_name),settings["up_mbps"],settings["down_mbps"]);

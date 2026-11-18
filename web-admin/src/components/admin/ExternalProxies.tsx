@@ -57,7 +57,7 @@ export function ExternalImportDialog({ editing, onClose }: { editing?: ExternalP
     finally { setBusy(false) }
   }
   return <Dialog open onOpenChange={open => !open && !busy && onClose()}><DialogContent className="flex max-h-[90dvh] flex-col sm:max-w-3xl">
-    <DialogHeader><DialogTitle>{editing ? `编辑外部代理：${editing.name}` : "导入外部代理"}</DialogTitle><DialogDescription>粘贴单个代理、完整 Mihomo 配置或静态代理列表。仅导入代理，不导入分组、规则或远程 providers。保留原凭据，仅用于 Mihomo，不采集统计。校验不代表连接实测。</DialogDescription></DialogHeader>
+    <DialogHeader><DialogTitle>{editing ? `编辑外部代理：${editing.name}` : "导入外部代理"}</DialogTitle><DialogDescription>粘贴单个代理、完整 Mihomo 配置或静态代理列表，支持 Snell v6。仅导入代理，不导入分组、规则或远程 providers。保留原凭据，仅用于 Mihomo，不采集统计。校验不代表连接实测。</DialogDescription></DialogHeader>
     <div className="min-h-0 space-y-3 overflow-y-auto">
       {error && <div role="alert" className="text-sm text-destructive">{error}{editing && !yaml && <Button variant="link" onClick={load}>重试读取</Button>}</div>}
       <label className="block space-y-2"><span className="text-sm font-medium">YAML 配置（最多 1 MiB / 500 条）</span><textarea aria-label="YAML 配置" className="min-h-52 w-full rounded-md border bg-background p-3 font-mono text-xs" value={yaml} disabled={busy || loading} onChange={e => { setYaml(e.target.value); setRows(null); setDirty(false); setIgnored(false); setError("") }} placeholder={'proxies:\n  - name: 示例\n    type: trojan\n    server: example.com\n    port: 443\n    password: your-password'} /></label>

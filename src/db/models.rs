@@ -171,6 +171,8 @@ pub struct UserLoginRecord {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct UserPortalProxy {
+    #[serde(skip_serializing)]
+    pub snell_psk: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hysteria2: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -20,13 +20,13 @@ export type Proxy = {
   sort: number
   name: string
   include_node_name: boolean
-  protocol: "vless" | "mieru" | "hysteria2"
+  protocol: "vless" | "mieru" | "hysteria2" | "snell"
   address_type: AddressType
   address: string
   port: number
   enabled: boolean
   flow: Flow
-  config: ({ hysteria2: { server_name: string; obfs_password: string; up_mbps: number; down_mbps: number }; reality?: never; transport?: never } | { reality: RealityConfig; transport?: never } | { transport: "tcp"; reality?: never }) & { hysteria2?: { server_name: string; obfs_password: string; up_mbps: number; down_mbps: number } }
+  config: ({ snell?: { psk: string }; reality?: never; transport?: never } | { hysteria2: { server_name: string; obfs_password: string; up_mbps: number; down_mbps: number }; reality?: never; transport?: never } | { reality: RealityConfig; transport?: never } | { transport: "tcp"; reality?: never }) & { hysteria2?: { server_name: string; obfs_password: string; up_mbps: number; down_mbps: number } }
   created_at: number
   updated_at: number
   sync?: SyncReport

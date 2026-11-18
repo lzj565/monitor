@@ -1,3 +1,4 @@
+import { SnellForm } from "./admin/Snell"
 import { ProxyAddressField, defaultAddressType, nodeAddress } from "./ProxyAddressField"
 import { Hysteria2Form } from "./admin/Hysteria2"
 import { ExternalAuthorization, ExternalAuthorizedSummary } from "./admin/ExternalProxies"
@@ -386,7 +387,7 @@ function ProxyPage({ nodes, site, refusal, search, go }: { nodes: Node[]; site: 
   const { items, error, loading, reload } = useAllProxies()
   const realm = useRealmProxies()
   const typeFilter = proxyTypeFilter(search)
-  const [creationType, setCreationType] = useState<"vless" | "mieru" | "hysteria2" | "realm" | null>(null)
+  const [creationType, setCreationType] = useState<"vless" | "mieru" | "hysteria2" | "snell" | "realm" | null>(null)
   const [editingRealmId, setEditingRealmId] = useState<number | null>(null)
   const [deletingRealm, setDeletingRealm] = useState<RealmRule | null>(null)
   const [detail, setDetail] = useState<{ nodeId: number; ruleId?: number } | null>(null)
@@ -472,7 +473,7 @@ function ProxyPage({ nodes, site, refusal, search, go }: { nodes: Node[]; site: 
   return (
     <div className="space-y-4">
       <div className="flex min-w-0 flex-wrap items-center gap-2 xl:flex-nowrap" aria-label="代理筛选与操作">
-        <Select value={typeFilter} onValueChange={changeTypeFilter}><SelectTrigger className="w-28 shrink-0" aria-label="按代理类型筛选"><SelectValue /></SelectTrigger><SelectContent position="popper"><SelectItem value="all">全部类型</SelectItem><SelectItem value="hysteria2">HY2</SelectItem><SelectItem value="mieru">mieru</SelectItem><SelectItem value="vless">VLESS Reality</SelectItem><SelectItem value="realm">Realm 转发</SelectItem></SelectContent></Select>
+        <Select value={typeFilter} onValueChange={changeTypeFilter}><SelectTrigger className="w-28 shrink-0" aria-label="按代理类型筛选"><SelectValue /></SelectTrigger><SelectContent position="popper"><SelectItem value="all">全部类型</SelectItem><SelectItem value="snell">Snell v6</SelectItem><SelectItem value="hysteria2">HY2</SelectItem><SelectItem value="mieru">mieru</SelectItem><SelectItem value="vless">VLESS Reality</SelectItem><SelectItem value="realm">Realm 转发</SelectItem></SelectContent></Select>
         <AdminSearchInput className="min-w-40 flex-1 basis-40" value={query} onChange={setQuery} placeholder="搜索代理名称、地址或节点" />
         <Select value={nodeFilter} onValueChange={setNodeFilter}>
           <SelectTrigger className="w-28 shrink-0" aria-label="按节点筛选"><SelectValue /></SelectTrigger>
@@ -576,11 +577,13 @@ function ProxyPage({ nodes, site, refusal, search, go }: { nodes: Node[]; site: 
       {creating && <ProxyDialog compact={creationType === null} busy={creationBusy} onClose={() => setCreating(false)}>
         {creationType === null ? <><DialogHeader className="px-5 pt-5 pb-3 text-left"><DialogTitle>选择代理类型</DialogTitle><DialogDescription>选择要创建的代理服务</DialogDescription></DialogHeader><div className="flex flex-col gap-2 px-5 pb-5">{([
           ["vless", "VLESS Reality", "配置节点上的代理服务"],
+          ["snell", "Snell v6", "单端口 TCP 代理"],
           ["hysteria2", "HY2", "单端口 UDP 代理"],
           ["mieru", "mieru", "单端口 TCP 代理"],
           ["realm", "Realm 转发", "监听端口转发到已有代理"],
         ] as const).map(([type, title, description]) => <Button key={type} className="group h-auto w-full justify-between gap-3 rounded-lg px-4 py-3 text-left" variant="outline" onClick={() => setCreationType(type)}><span className="flex min-w-0 flex-col gap-1"><strong className="whitespace-nowrap text-sm font-medium">{title}</strong><span className="whitespace-nowrap text-xs font-normal text-muted-foreground">{description}</span></span><ArrowRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground transition-transform group-hover:translate-x-0.5" /></Button>)}</div></>
         : creationType === "vless" ? <ProxyForm embedded nodes={nodes} proxy={null} onClose={() => setCreating(false)} onSaved={reload} onBack={() => setCreationType(null)} onBusyChange={setCreationBusy} />
+        : creationType === "snell" ? <SnellForm embedded proxy={null} nodes={nodes} onClose={() => setCreating(false)} onSaved={reload} onBack={() => setCreationType(null)} onBusyChange={setCreationBusy} />
         : creationType === "hysteria2" ? <Hysteria2Form embedded proxy={null} nodes={nodes} onClose={() => setCreating(false)} onSaved={reload} onBack={() => setCreationType(null)} onBusyChange={setCreationBusy} />
         : creationType === "mieru" ? <MieruForm embedded onBusyChange={setCreationBusy} proxy={null} nodes={nodes} onClose={() => setCreating(false)} onSaved={reload} onBack={() => setCreationType(null)} />
         : realm.loaded && items !== null ? <RealmProxyForm embedded rule={null} nodes={nodes} proxies={items ?? []} hosts={realm.hosts} rules={realm.rules} ready={realm.loaded && !realm.error && !error} site={site} refusal={refusal} onClose={() => setCreating(false)} onSaved={realmSaved} onRefresh={realm.reload} onBack={() => setCreationType(null)} onBusyChange={setCreationBusy} />
@@ -590,7 +593,7 @@ function ProxyPage({ nodes, site, refusal, search, go }: { nodes: Node[]; site: 
       {detailHost && <RealmEntryDialog key={detailHost.node_id} host={detailHost} rule={detailRule} traffic={realm.traffic} onClose={() => setDetail(null)} />}
       {deletingRealm && <ConfirmDialog title={`删除 Realm 代理「${deletingRealm.name}」？`} description="当前转发规则和订阅入口将移除；目标代理、入口节点、其他转发规则及历史流量保留。" confirmLabel="删除 Realm 代理" busy={realmBusy} onClose={() => setDeletingRealm(null)} onConfirm={() => { void realmAction(async () => { await api(`/realm/rules/${deletingRealm.id}`, { method: "DELETE" }); setDeletingRealm(null) }, "已删除 Realm 规则，等待同步") }} />}
       {typeFilter !== "vless" && realm.traffic.rules.some((r) => !r.active) && <details className="space-y-3 rounded-lg border p-4"><summary className="cursor-pointer text-sm font-medium">已删除 Realm 规则的历史流量</summary>{realm.traffic.rules.filter((r) => !r.active && (nodeFilter === "all" || nodeFilter === String(r.node_id))).map((r) => <div key={r.key} className="space-y-1 border-t pt-3"><p className="text-sm">{nodeById.get(r.node_id)?.name ?? `节点 ${r.node_id}`} / {r.name}</p><TrafficSummary items={[r]} /></div>)}</details>}
-      {editing && (editing.protocol === "hysteria2" ? <Hysteria2Form nodes={nodes} proxy={editing} onClose={() => setEditing(null)} onSaved={reload} /> : editing.protocol === "mieru" ? <MieruForm nodes={nodes} proxy={editing} onClose={() => setEditing(null)} onSaved={reload} /> : <ProxyForm nodes={nodes} proxy={editing} onClose={() => setEditing(null)} onSaved={reload} />)}
+      {editing && (editing.protocol === "snell" ? <SnellForm nodes={nodes} proxy={editing} onClose={() => setEditing(null)} onSaved={reload} /> : editing.protocol === "hysteria2" ? <Hysteria2Form nodes={nodes} proxy={editing} onClose={() => setEditing(null)} onSaved={reload} /> : editing.protocol === "mieru" ? <MieruForm nodes={nodes} proxy={editing} onClose={() => setEditing(null)} onSaved={reload} /> : <ProxyForm nodes={nodes} proxy={editing} onClose={() => setEditing(null)} onSaved={reload} />)}
       {deleting && <ConfirmDialog
         title={`删除代理「${displayProxyName(deleting, nodeById.get(deleting.node_id))}」？`}
         description="删除会一并解除所有关联用户授权，并自动同步对应节点的代理配置。"

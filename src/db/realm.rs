@@ -251,7 +251,7 @@ impl Db {
         }
         let target: Option<(i64, bool)> = tx
             .query_row(
-                "SELECT node_id,enabled FROM proxies WHERE id=?1 AND protocol<>'hysteria2'",
+                "SELECT node_id,enabled FROM proxies WHERE id=?1 AND protocol NOT IN ('hysteria2','snell')",
                 [body.target_proxy_id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
