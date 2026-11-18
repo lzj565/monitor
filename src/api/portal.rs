@@ -337,7 +337,7 @@ pub(super) fn mihomo_proxy(user_id: i64, proxy: &crate::db::UserPortalProxy) -> 
         let settings = proxy.hysteria2.as_ref().expect("HY2 settings");
         let mut text = format!("- name: {}\n  type: hysteria2\n  server: {}\n  port: {}\n  password: {}\n  sni: {}\n  skip-cert-verify: true\n  alpn: [h3]\n  up: {}\n  down: {}",yaml_string(&name),yaml_string(&proxy.address),proxy.port,yaml_string(&proxy.uuid),yaml_string(&proxy.server_name),settings["up_mbps"],settings["down_mbps"]);
         if let Some(password) = settings["obfs_password"].as_str().filter(|s| !s.is_empty()) {
-            text.push_str(&format!("\n  obfs: salamander\n  obfs-password: {}",yaml_string(password)));
+            text.push_str(&format!("\n  obfs: salamander\n  obfs-password: {}", yaml_string(password)));
         }
         return text;
     }

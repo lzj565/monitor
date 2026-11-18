@@ -45,7 +45,9 @@ impl Db {
     ) -> Result<std::result::Result<i64, ProxyWriteIssue>> {
         let stored = if draft.protocol == "hysteria2" {
             crate::hysteria2::persisted_config(&draft.config, None)?
-        } else { draft.config.clone() };
+        } else {
+            draft.config.clone()
+        };
         let config = serde_json::to_string(&stored)?;
         let mut conn = self.conn();
         let tx = conn.transaction()?;
@@ -96,7 +98,9 @@ impl Db {
         let previous = self.proxy(id)?;
         let stored = if draft.protocol == "hysteria2" {
             crate::hysteria2::persisted_config(&draft.config, previous.as_ref().map(|p| &p.config))?
-        } else { draft.config.clone() };
+        } else {
+            draft.config.clone()
+        };
         let config = serde_json::to_string(&stored)?;
         let conn = self.conn();
         let current_node_id: Option<i64> =

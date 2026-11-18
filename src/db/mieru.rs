@@ -405,8 +405,8 @@ mod tests {
         db.conn().execute("INSERT OR IGNORE INTO user_realm_authorizations SELECT a.user_id,r.id FROM user_proxy_authorizations a JOIN realm_rules r ON r.target_proxy_id=a.proxy_id WHERE a.enabled=1",[]).unwrap();
         let portal = db.active_user_portal_proxies(user, Utc::now().timestamp()).unwrap();
         assert_eq!(portal.len(), 2);
-        assert_eq!(portal[1].name, "HK-MY-entry-realm");
-        assert_eq!(db.realm_rules().unwrap()[0]["name"], "HK-MY-entry-realm");
+        assert_eq!(portal[1].name, "🇲🇾HK-MY-entry-realm");
+        assert_eq!(db.realm_rules().unwrap()[0]["name"], "🇲🇾HK-MY-entry-realm");
         assert_eq!(db.realm_rules().unwrap()[0]["custom_name"], "entry");
         assert_eq!(portal[1].protocol, "mieru");
         assert_eq!(portal[1].address, "relay.example.com");

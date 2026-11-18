@@ -2316,7 +2316,12 @@ fn a_result_left_by_a_deleted_probe_does_not_stop_the_rollup() {
     db.insert_metric(id, hour, &serde_json::json!({"cpu": 1.0})).unwrap();
     db.insert_metric(id, now - 60, &serde_json::json!({"cpu": 1.0})).unwrap();
     assert!(db.roll_up(now, 1).unwrap() > 0);
-    let folded: i64 = db.conn().query_row("SELECT count(*) FROM metric_hour WHERE node_id=?1 AND ts=?2", params![id, hour], |row| row.get(0)).unwrap();
+    let folded: i64 = db
+        .conn()
+        .query_row("SELECT count(*) FROM metric_hour WHERE node_id=?1 AND ts=?2", params![id, hour], |row| {
+            row.get(0)
+        })
+        .unwrap();
     assert_eq!(folded, 1, "the hour is folded");
 }
 

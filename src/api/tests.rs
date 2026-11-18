@@ -2323,10 +2323,10 @@ async fn component_profile_api_and_installer_token_are_scoped_to_the_node() {
             .await;
     assert_eq!(saved["install"], json!({"singbox":true,"realm":true,"mieru":false}));
     assert_eq!(saved["components"][1]["installed"], false);
-    let bad_choice = serde_json::from_value(json!({"singbox":false,"realm":false,"mieru":false})).unwrap();
+    let all_disabled = serde_json::from_value(json!({"singbox":false,"realm":false,"mieru":false})).unwrap();
     assert_eq!(
-        crate::components::save(Admin, State(app.clone()), Path(node), Ok(Json(bad_choice))).await.status(),
-        StatusCode::BAD_REQUEST
+        crate::components::save(Admin, State(app.clone()), Path(node), Ok(Json(all_disabled))).await.status(),
+        StatusCode::OK
     );
     assert_eq!(
         crate::components::installer(State(app.clone()), HeaderMap::new()).await.status(),
@@ -2338,10 +2338,10 @@ async fn component_profile_api_and_installer_token_are_scoped_to_the_node() {
     assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
     assert_eq!(
         axum::body::to_bytes(response.into_body(), 4096).await.unwrap(),
-        "singbox=1\nrealm=1\nmieru=0\n"
+        "singbox=0\nrealm=0\nmieru=0\n"
     );
     let loaded = portal_json(crate::components::get(Admin, State(app.clone()), Path(node)).await).await;
-    assert_eq!(loaded["install"], saved["install"]);
+    assert_eq!(loaded["install"], json!({"singbox":false,"realm":false,"mieru":false}));
 }
 #[tokio::test]
 async fn registration_records_batch_choices_and_reruns_do_not_reset_them() {
@@ -2367,7 +2367,7 @@ async fn registration_records_batch_choices_and_reruns_do_not_reset_them() {
     let id = app.db.node_by_token(&token).unwrap().unwrap();
     assert_eq!(
         app.db.component_choices(id).unwrap(),
-        Some(crate::db::InstallChoices { singbox: true, realm: true, mieru: true })
+        Some(crate::db::InstallChoices { singbox: false, realm: true, mieru: true })
     );
     headers.insert("x-node-token", token.parse().unwrap());
     headers.insert("x-install-realm", "0".parse().unwrap());
@@ -2692,36 +2692,65 @@ fn external_chains_follow_renames_and_exclude_missing_or_cyclic_dependencies() {
 fn hy2_persists_certificate_and_exports_uuid_without_private_key() {
     let app = app();
     let node = app.db.create_node(&Node { name: "HY2".into(), ..Default::default() }, "hy2-node").unwrap();
-    let user = app.db.create_user(&crate::db::UserDraft { username:"hy2-user".into(), password_hash:Some("hash".into()), enabled:true, expires_at:None, traffic_limit:None, device_limit:None, traffic_reset_day:None }).unwrap().unwrap();
-    let draft = crate::db::ProxyDraft { name:"HY2 test".into(),include_node_name:false,protocol:"hysteria2".into(),address_type:"ipv6".into(),address:"::1".into(),port:24443,enabled:true,flow:Some(String::new()),config:json!({"hysteria2":{"server_name":"example.com","obfs_password":"a&b#c"}}) };
-    let id = app.db.create_proxy(node,&draft).unwrap().unwrap();
-    app.db.put_authorization(user,id,&crate::db::AuthorizationDraft { enabled:true,auth:None }).unwrap().unwrap();
+    let user = app
+        .db
+        .create_user(&crate::db::UserDraft {
+            username: "hy2-user".into(),
+            password_hash: Some("hash".into()),
+            enabled: true,
+            expires_at: None,
+            traffic_limit: None,
+            device_limit: None,
+            traffic_reset_day: None,
+        })
+        .unwrap()
+        .unwrap();
+    let draft = crate::db::ProxyDraft {
+        name: "HY2 test".into(),
+        include_node_name: false,
+        protocol: "hysteria2".into(),
+        address_type: "ipv6".into(),
+        address: "::1".into(),
+        port: 24443,
+        enabled: true,
+        flow: Some(String::new()),
+        config: json!({"hysteria2":{"server_name":"example.com","obfs_password":"a&b#c"}}),
+    };
+    let id = app.db.create_proxy(node, &draft).unwrap().unwrap();
+    app.db
+        .put_authorization(user, id, &crate::db::AuthorizationDraft { enabled: true, auth: None })
+        .unwrap()
+        .unwrap();
     let first = app.db.proxy(id).unwrap().unwrap();
-    app.db.update_proxy(id,None,&draft).unwrap().unwrap();
-    assert_eq!(first.config,app.db.proxy(id).unwrap().unwrap().config);
+    app.db.update_proxy(id, None, &draft).unwrap().unwrap();
+    assert_eq!(first.config, app.db.proxy(id).unwrap().unwrap().config);
     let uuid = app.db.user(user).unwrap().unwrap().uuid;
-    let generated = crate::proxy::generate_config(&app.db,node,chrono::Utc::now().timestamp()).unwrap();
-    assert_eq!(generated["inbounds"][0]["type"],"hysteria2");
-    assert_eq!(generated["inbounds"][0]["users"][0]["password"],uuid);
+    let generated = crate::proxy::generate_config(&app.db, node, chrono::Utc::now().timestamp()).unwrap();
+    assert_eq!(generated["inbounds"][0]["type"], "hysteria2");
+    assert_eq!(generated["inbounds"][0]["users"][0]["password"], uuid);
     if let Some(binary) = std::env::var_os("HY2_TEST_SINGBOX") {
-        let path = std::env::temp_dir().join(format!("monitor-hy2-{}.json",std::process::id()));
-        std::fs::write(&path,serde_json::to_vec(&generated).unwrap()).unwrap();
+        let path = std::env::temp_dir().join(format!("monitor-hy2-{}.json", std::process::id()));
+        std::fs::write(&path, serde_json::to_vec(&generated).unwrap()).unwrap();
         if let Some(destination) = std::env::var_os("HY2_TEST_CONFIG_OUTPUT") {
-            std::fs::write(destination,serde_json::to_vec(&generated).unwrap()).unwrap();
+            std::fs::write(destination, serde_json::to_vec(&generated).unwrap()).unwrap();
         }
-        let checked = std::process::Command::new(binary).args(["check","-c"]).arg(&path).output().unwrap();
+        let checked = std::process::Command::new(binary).args(["check", "-c"]).arg(&path).output().unwrap();
         std::fs::remove_file(&path).unwrap();
-        assert!(checked.status.success(),"{}",String::from_utf8_lossy(&checked.stderr));
+        assert!(checked.status.success(), "{}", String::from_utf8_lossy(&checked.stderr));
     }
-    let entries = user_portal_items(&app,user).unwrap();
-    assert_eq!(entries.len(),1);
+    let entries = user_portal_items(&app, user).unwrap();
+    assert_eq!(entries.len(), 1);
     let serialized = serde_json::to_string(&entries).unwrap();
     assert!(!serialized.contains("PRIVATE KEY"));
     let url = entries[0]["hysteria2_url"].as_str().unwrap();
     assert!(url.contains("@[::1]:24443"));
-    assert!(url.contains(&format!("obfs-password={}",uri_component("a&b#c"))));
+    assert!(url.contains(&format!("obfs-password={}", uri_component("a&b#c"))));
     assert!(url.contains("pinSHA256="));
     assert!(entries[0]["mihomo_yaml"].as_str().unwrap().contains("type: hysteria2"));
-    app.db.delete_authorization(user,id).unwrap();
-    assert!(crate::proxy::generate_config(&app.db,node,chrono::Utc::now().timestamp()).unwrap()["inbounds"][0]["users"].as_array().unwrap().is_empty());
+    app.db.delete_authorization(user, id).unwrap();
+    assert!(crate::proxy::generate_config(&app.db, node, chrono::Utc::now().timestamp()).unwrap()
+        ["inbounds"][0]["users"]
+        .as_array()
+        .unwrap()
+        .is_empty());
 }

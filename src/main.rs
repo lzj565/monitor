@@ -33,10 +33,10 @@ mod components;
 mod db;
 mod external_proxy;
 mod frontend;
+mod hysteria2;
 mod mieru;
 mod notify;
 mod proxy;
-mod hysteria2;
 mod realm;
 mod uploads;
 

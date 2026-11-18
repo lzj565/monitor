@@ -13,22 +13,41 @@ pub struct Settings {
     #[serde(default = "default_bandwidth")]
     pub down_mbps: u32,
 }
-fn default_bandwidth() -> u32 { 100 }
+fn default_bandwidth() -> u32 {
+    100
+}
 impl Settings {
     pub fn validate(&self) -> Result<(), &'static str> {
         let host = &self.server_name;
-        if host.is_empty() || host.len() > 253 || !host.split('.').all(|label| {
-            !label.is_empty() && label.len() <= 63
-                && !label.starts_with('-') && !label.ends_with('-')
-                && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-        }) { return Err("invalid HY2 server name"); }
-        if self.up_mbps == 0 || self.down_mbps == 0 { return Err("HY2 bandwidth must be positive"); }
+        if host.is_empty()
+            || host.len() > 253
+            || !host.split('.').all(|label| {
+                !label.is_empty()
+                    && label.len() <= 63
+                    && !label.starts_with('-')
+                    && !label.ends_with('-')
+                    && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            })
+        {
+            return Err("invalid HY2 server name");
+        }
+        if self.up_mbps == 0 || self.down_mbps == 0 {
+            return Err("HY2 bandwidth must be positive");
+        }
         if self.obfs_password.len() > 1024 || self.obfs_password.chars().any(char::is_control) {
             return Err("invalid Salamander password");
         }
         Ok(())
     }
-    pub fn inbound(&self, tag: &str, listen: &str, port: u16, users: Vec<Value>, certificate: &str, private_key: &str) -> Value {
+    pub fn inbound(
+        &self,
+        tag: &str,
+        listen: &str,
+        port: u16,
+        users: Vec<Value>,
+        certificate: &str,
+        private_key: &str,
+    ) -> Value {
         let mut result = json!({"type":"hysteria2", "tag":tag, "listen":listen,
             "listen_port":port, "users":users,
             "tls":{"enabled":true,"server_name":self.server_name,"alpn":["h3"],
@@ -62,7 +81,10 @@ mod tests {
         assert_eq!(inbound["users"], json!(users));
         assert!(inbound.get("obfs").is_none());
         settings.obfs_password = "secret".into();
-        assert_eq!(settings.inbound("proxy-1", "::", 443, users, "cert", "key")["obfs"]["type"], "salamander");
+        assert_eq!(
+            settings.inbound("proxy-1", "::", 443, users, "cert", "key")["obfs"]["type"],
+            "salamander"
+        );
     }
 }
 
@@ -71,7 +93,11 @@ pub fn persisted_config(settings: &Value, previous: Option<&Value>) -> anyhow::R
     let typed: Settings = serde_json::from_value(settings["hysteria2"].clone())?;
     typed.validate().map_err(anyhow::Error::msg)?;
     let mut config = serde_json::to_value(&typed)?;
-    if let Some(old) = previous.filter(|old| old["hysteria2"]["server_name"] == config["server_name"] && old["certificate"].is_string() && old["private_key"].is_string()) {
+    if let Some(old) = previous.filter(|old| {
+        old["hysteria2"]["server_name"] == config["server_name"]
+            && old["certificate"].is_string()
+            && old["private_key"].is_string()
+    }) {
         config["certificate"] = old["certificate"].clone();
         config["private_key"] = old["private_key"].clone();
     } else {
@@ -85,7 +111,10 @@ pub fn persisted_config(settings: &Value, previous: Option<&Value>) -> anyhow::R
 }
 pub fn settings(config: &Value) -> anyhow::Result<Settings> {
     let mut public = config["hysteria2"].clone();
-    if let Some(map) = public.as_object_mut() { map.remove("certificate"); map.remove("private_key"); }
+    if let Some(map) = public.as_object_mut() {
+        map.remove("certificate");
+        map.remove("private_key");
+    }
     Ok(serde_json::from_value(public)?)
 }
 
@@ -98,18 +127,27 @@ mod persistence_tests {
         let first = persisted_config(&request, None).unwrap();
         let second = persisted_config(&request, Some(&first)).unwrap();
         assert_eq!(first, second);
-        let changed = persisted_config(&json!({"hysteria2":{"server_name":"other.example.com"}}), Some(&first)).unwrap();
+        let changed =
+            persisted_config(&json!({"hysteria2":{"server_name":"other.example.com"}}), Some(&first))
+                .unwrap();
         assert_ne!(first["certificate"], changed["certificate"]);
         assert!(settings(&first).is_ok());
-        assert!(!serde_json::to_value(settings(&first).unwrap()).unwrap().to_string().contains("PRIVATE KEY"));
+        assert!(!serde_json::to_value(settings(&first).unwrap())
+            .unwrap()
+            .to_string()
+            .contains("PRIVATE KEY"));
     }
 }
 
 pub fn certificate_fingerprint(config: &Value) -> anyhow::Result<String> {
     use base64::Engine;
     use sha2::{Digest, Sha256};
-    let encoded: String = config["certificate"].as_str().ok_or_else(||anyhow::anyhow!("missing certificate"))?
-        .lines().filter(|line| !line.starts_with("-----")).collect();
+    let encoded: String = config["certificate"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("missing certificate"))?
+        .lines()
+        .filter(|line| !line.starts_with("-----"))
+        .collect();
     let der = base64::engine::general_purpose::STANDARD.decode(encoded)?;
     Ok(hex::encode(Sha256::digest(der)))
 }
@@ -120,13 +158,16 @@ mod request_tests {
     #[test]
     fn hy2_request_requires_udp_port_and_empty_flow() {
         let mut request = json!({"name":"HY2","protocol":"hysteria2","address_type":"domain","address":"example.com","port":443,"enabled":true,"config":{"hysteria2":{"server_name":"example.com"}}});
-        let parse = |value: Value| serde_json::from_value::<crate::proxy::ProxyRequest>(value).unwrap().into_draft();
+        let parse =
+            |value: Value| serde_json::from_value::<crate::proxy::ProxyRequest>(value).unwrap().into_draft();
         assert!(parse(request.clone()).is_ok());
         request["flow"] = json!("xtls-rprx-vision");
         assert!(parse(request.clone()).is_err());
-        request["flow"] = json!(""); request["port"] = json!(0);
+        request["flow"] = json!("");
+        request["port"] = json!(0);
         assert!(parse(request.clone()).is_err());
-        request["port"] = json!(443); request["config"]["hysteria2"]["down_mbps"] = json!(0);
+        request["port"] = json!(443);
+        request["config"]["hysteria2"]["down_mbps"] = json!(0);
         assert!(parse(request).is_err());
     }
 }

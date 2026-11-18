@@ -77,9 +77,17 @@ impl ProxyRequest {
             if self.port == 0 || self.flow.as_deref().is_some_and(|f| !f.is_empty()) {
                 return Err(InputError::new("INVALID_PROXY_CONFIG", "HY2 requires a port and empty flow"));
             }
-            return Ok(ProxyDraft { name: name.into(), include_node_name: self.include_node_name,
-                protocol: self.protocol, address_type: self.address_type, address: self.address,
-                port: self.port.into(), enabled: self.enabled, flow: Some(String::new()), config: self.config });
+            return Ok(ProxyDraft {
+                name: name.into(),
+                include_node_name: self.include_node_name,
+                protocol: self.protocol,
+                address_type: self.address_type,
+                address: self.address,
+                port: self.port.into(),
+                enabled: self.enabled,
+                flow: Some(String::new()),
+                config: self.config,
+            });
         }
         if self.protocol == "mieru" {
             validate_address(&self.address_type, &self.address)?;
@@ -305,17 +313,32 @@ pub fn generate_config(db: &Db, node_id: i64, now: i64) -> anyhow::Result<Value>
     let mut inbounds = Vec::new();
     let mut stats_inbounds = Vec::new();
     let mut stats_users = BTreeSet::new();
-    for proxy in db.proxies_for_node(node_id)?.into_iter().filter(|p| p.enabled && matches!(p.protocol.as_str(), "vless" | "hysteria2")) {
+    for proxy in db
+        .proxies_for_node(node_id)?
+        .into_iter()
+        .filter(|p| p.enabled && matches!(p.protocol.as_str(), "vless" | "hysteria2"))
+    {
         if proxy.protocol == "hysteria2" {
             let settings = crate::hysteria2::settings(&proxy.config)?;
-            let users = db.active_users_for_proxy(proxy.id, now)?.into_iter().map(|auth| {
-                if let Some(name) = auth["name"].as_str() { stats_users.insert(name.to_owned()); }
-                json!({"name":auth["name"],"password":auth["uuid"]})
-            }).collect();
+            let users = db
+                .active_users_for_proxy(proxy.id, now)?
+                .into_iter()
+                .map(|auth| {
+                    if let Some(name) = auth["name"].as_str() {
+                        stats_users.insert(name.to_owned());
+                    }
+                    json!({"name":auth["name"],"password":auth["uuid"]})
+                })
+                .collect();
             let tag = format!("proxy-{}", proxy.id);
-            inbounds.push(settings.inbound(&tag, listen, proxy.port as u16, users,
+            inbounds.push(settings.inbound(
+                &tag,
+                listen,
+                proxy.port as u16,
+                users,
                 proxy.config["certificate"].as_str().context("missing HY2 certificate")?,
-                proxy.config["private_key"].as_str().context("missing HY2 private key")?));
+                proxy.config["private_key"].as_str().context("missing HY2 private key")?,
+            ));
             stats_inbounds.push(tag);
             continue;
         }

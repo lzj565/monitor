@@ -1,3 +1,4 @@
+import { ProxyAddressField, defaultAddressType, nodeAddress } from "./ProxyAddressField"
 import { Hysteria2Form } from "./admin/Hysteria2"
 import { ExternalAuthorization, ExternalAuthorizedSummary } from "./admin/ExternalProxies"
 import { normalizeUserUuid } from "@/lib/user-uuid"
@@ -152,16 +153,6 @@ function realityReady(reality: Proxy["config"]["reality"]): boolean {
   )
 }
 
-function nodeAddress(node: Node | undefined, type: "ipv4" | "ipv6"): string {
-  return node?.addresses?.find(({ address }) => (type === "ipv6") === address.includes(":"))?.address ?? ""
-}
-
-function defaultAddressType(node: Node | undefined): ProxyDraft["address_type"] {
-  if (nodeAddress(node, "ipv4")) return "ipv4"
-  if (nodeAddress(node, "ipv6")) return "ipv6"
-  return "domain"
-}
-
 function ProxyForm({ proxy, nodes, onClose, onSaved, onBack, embedded, onBusyChange }: {
   proxy: Proxy | null
   nodes: Node[]
@@ -224,10 +215,6 @@ function ProxyForm({ proxy, nodes, onClose, onSaved, onBack, embedded, onBusyCha
     if (addressType !== "domain" && !nodeAddress(nextNode, addressType)) {
       setAddressType(defaultAddressType(nextNode))
     }
-  }
-
-  function changeAddressType(type: ProxyDraft["address_type"]) {
-    setAddressType(type)
   }
 
   function regeneratePair() {
@@ -334,25 +321,7 @@ function ProxyForm({ proxy, nodes, onClose, onSaved, onBack, embedded, onBusyCha
               </Field>
             </div>
 
-            <section className="space-y-2 border-t pt-3">
-              <Field label="连接地址 *" hint={addressType === "domain" ? undefined : "自动采用所属节点的可连接地址。"}>
-                  <div className="mb-2 flex gap-1">
-                    {([["ipv4", "IPv4"], ["ipv6", "IPv6"], ["domain", "自定义"]] as const).map(([type, label]) => <Button key={type} type="button" size="sm" variant={addressType === type ? "default" : "outline"} disabled={type !== "domain" && !nodeAddress(selectedNode, type)} onClick={() => changeAddressType(type)}>{label}</Button>)}
-                  </div>
-                  <div className="flex gap-2">
-                    <Input
-                      required
-                      readOnly={addressType !== "domain"}
-                      value={address}
-                      onChange={(event) => setCustomAddress(event.target.value)}
-                      placeholder={addressType === "domain" ? "hk.example.com 或 IP 地址" : "节点尚未上报此地址"}
-                    />
-                    <Badge variant="outline" className={`h-9 shrink-0 px-3 ${addressType === "domain" ? "" : "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"}`}>
-                      {addressType === "domain" ? "自定义" : addressType.toUpperCase()}
-                    </Badge>
-                  </div>
-              </Field>
-            </section>
+            <ProxyAddressField selectedNode={selectedNode} addressType={addressType} address={address} changeAddressType={setAddressType} setCustomAddress={setCustomAddress} />
 
             <Card className="gap-0 overflow-hidden p-0">
               <button type="button" aria-expanded={advanced} className="flex w-full items-center gap-3 px-4 py-2.5 text-left hover:bg-muted/40" onClick={() => setAdvanced((open) => !open)}>

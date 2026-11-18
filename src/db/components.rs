@@ -190,7 +190,10 @@ mod tests {
         let (db, id) = fixture();
         db.conn().execute_batch("DROP TABLE node_components; PRAGMA user_version=25;").unwrap();
         migrate(&db.conn(), 25).unwrap();
-        assert_eq!(db.component_choices(id).unwrap(), Some(InstallChoices::default()));
+        assert_eq!(
+            db.component_choices(id).unwrap(),
+            Some(InstallChoices { singbox: true, realm: false, mieru: false })
+        );
         let choices = InstallChoices { singbox: true, realm: true, mieru: false };
         db.save_component_choices(id, &choices).unwrap();
         migrate(&db.conn(), 25).unwrap();
