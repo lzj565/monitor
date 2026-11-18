@@ -99,7 +99,16 @@ pub(super) fn user_portal_items(app: &App, user: i64) -> anyhow::Result<Vec<Valu
             proxy.name=name.clone();proxy.include_node_name=false;
             item["mihomo_yaml"]=json!(mihomo_proxy(user,&proxy));
             let host=if proxy.address.contains(':'){format!("[{}]",proxy.address)}else{proxy.address.clone()};
-            if proxy.protocol=="mieru" {
+            if proxy.protocol=="hysteria2" {
+                let settings = proxy.hysteria2.as_ref().unwrap();
+                let mut link = format!("hysteria2://{}@{}:{}?sni={}&insecure=1", uri_component(&proxy.uuid),host,proxy.port,uri_component(&proxy.server_name));
+                if let Some(password) = settings["obfs_password"].as_str().filter(|s| !s.is_empty()) {
+                    link.push_str(&format!("&obfs=salamander&obfs-password={}",uri_component(password)));
+                }
+                if let Some(pin) = settings["pin_sha256"].as_str() { link.push_str(&format!("&pinSHA256={pin}")); }
+                link.push_str(&format!("#{}",uri_component(&name)));
+                item["hysteria2_url"]=json!(link);
+            } else if proxy.protocol=="mieru" {
                 item["mieru_url"]=json!(format!("mierus://{}:{}@{}?profile={}&port={}&protocol=TCP",uri_component(&format!("user-{user}")),uri_component(proxy.mieru_password.as_deref().unwrap_or("")),host,uri_component(&name),proxy.port));
             } else {
                 let flow=if proxy.flow.is_empty(){proxy::DEFAULT_FLOW}else{&proxy.flow};
@@ -324,6 +333,14 @@ pub(super) fn yaml_ip_or_string(value: &str) -> String {
 
 pub(super) fn mihomo_proxy(user_id: i64, proxy: &crate::db::UserPortalProxy) -> String {
     let name = crate::db::displayed_proxy_name(&proxy.name, proxy.include_node_name, &proxy.node_country);
+    if proxy.protocol == "hysteria2" {
+        let settings = proxy.hysteria2.as_ref().expect("HY2 settings");
+        let mut text = format!("- name: {}\n  type: hysteria2\n  server: {}\n  port: {}\n  password: {}\n  sni: {}\n  skip-cert-verify: true\n  alpn: [h3]\n  up: {}\n  down: {}",yaml_string(&name),yaml_string(&proxy.address),proxy.port,yaml_string(&proxy.uuid),yaml_string(&proxy.server_name),settings["up_mbps"],settings["down_mbps"]);
+        if let Some(password) = settings["obfs_password"].as_str().filter(|s| !s.is_empty()) {
+            text.push_str(&format!("\n  obfs: salamander\n  obfs-password: {}",yaml_string(password)));
+        }
+        return text;
+    }
     if proxy.protocol == "mieru" {
         return format!(
             "- name: {}\n  type: mieru\n  server: {}\n  port: {}\n  transport: TCP\n  udp: true\n  username: {}\n  password: {}\n  multiplexing: MULTIPLEXING_OFF\n  handshake-mode: HANDSHAKE_NO_WAIT",
@@ -443,7 +460,26 @@ pub async fn subscription(
                         proxy.include_node_name = false;
                     }
                 }
-                ("application/json; charset=utf-8", sing_box_subscription(&uuid, &proxies).to_string())
+                proxies.retain(|p| names.iter().any(|item| item["entry_key"] == db::internal_entry_key(p.id) && item["protocol"] == "vless"));
+                let mut config = sing_box_subscription(&uuid, &proxies);
+                let outbounds = config["outbounds"].as_array_mut().unwrap();
+                let mut hy2_tags = Vec::new();
+                for item in names.iter().filter(|item| item["protocol"] == "hysteria2" && item["hidden"] != true) {
+                    let settings = &item["hysteria2"];
+                    let mut outbound = json!({"type":"hysteria2","tag":item["name"],"server":item["address"],"server_port":item["port"],"password":uuid,"up_mbps":settings["up_mbps"],"down_mbps":settings["down_mbps"],"tls":{"enabled":true,"server_name":item["server_name"],"insecure":true,"alpn":["h3"]}});
+                    if let Some(password) = settings["obfs_password"].as_str().filter(|s| !s.is_empty()) { outbound["obfs"]=json!({"type":"salamander","password":password}); }
+                    hy2_tags.push(item["name"].clone());
+                    outbounds.push(outbound);
+                }
+                if !hy2_tags.is_empty() {
+                    if let Some(selector) = outbounds.iter_mut().find(|o| o["type"] == "selector") {
+                        selector["outbounds"].as_array_mut().unwrap().extend(hy2_tags);
+                    } else {
+                        outbounds.push(json!({"type":"selector","tag":"Proxy","default":hy2_tags[0],"outbounds":hy2_tags}));
+                    }
+                    config["route"]["final"]=json!("Proxy");
+                }
+                ("application/json; charset=utf-8", config.to_string())
             }
             _ => return api_error(StatusCode::NOT_FOUND, "SUBSCRIPTION_FORMAT_NOT_FOUND", "订阅格式不存在"),
         };

@@ -36,6 +36,7 @@ mod frontend;
 mod mieru;
 mod notify;
 mod proxy;
+mod hysteria2;
 mod realm;
 mod uploads;
 

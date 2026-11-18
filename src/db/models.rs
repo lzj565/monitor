@@ -172,6 +172,8 @@ pub struct UserLoginRecord {
 #[derive(Debug, Clone, Serialize)]
 pub struct UserPortalProxy {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub hysteria2: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub mieru_password: Option<String>,
     pub realm_target_node_id: Option<i64>,
     pub id: i64,

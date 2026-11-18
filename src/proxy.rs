@@ -69,6 +69,18 @@ impl ProxyRequest {
         if name.is_empty() || name.chars().count() > 128 {
             return Err(InputError::new("INVALID_PROXY_CONFIG", "name must contain 1 to 128 characters"));
         }
+        if self.protocol == "hysteria2" {
+            validate_address(&self.address_type, &self.address)?;
+            let config: crate::hysteria2::Settings = serde_json::from_value(self.config["hysteria2"].clone())
+                .map_err(|e| InputError::new("INVALID_PROXY_CONFIG", e.to_string()))?;
+            config.validate().map_err(|e| InputError::new("INVALID_PROXY_CONFIG", e))?;
+            if self.port == 0 || self.flow.as_deref().is_some_and(|f| !f.is_empty()) {
+                return Err(InputError::new("INVALID_PROXY_CONFIG", "HY2 requires a port and empty flow"));
+            }
+            return Ok(ProxyDraft { name: name.into(), include_node_name: self.include_node_name,
+                protocol: self.protocol, address_type: self.address_type, address: self.address,
+                port: self.port.into(), enabled: self.enabled, flow: Some(String::new()), config: self.config });
+        }
         if self.protocol == "mieru" {
             validate_address(&self.address_type, &self.address)?;
             if self.port < 1025
@@ -293,7 +305,20 @@ pub fn generate_config(db: &Db, node_id: i64, now: i64) -> anyhow::Result<Value>
     let mut inbounds = Vec::new();
     let mut stats_inbounds = Vec::new();
     let mut stats_users = BTreeSet::new();
-    for proxy in db.proxies_for_node(node_id)?.into_iter().filter(|p| p.enabled && p.protocol == "vless") {
+    for proxy in db.proxies_for_node(node_id)?.into_iter().filter(|p| p.enabled && matches!(p.protocol.as_str(), "vless" | "hysteria2")) {
+        if proxy.protocol == "hysteria2" {
+            let settings = crate::hysteria2::settings(&proxy.config)?;
+            let users = db.active_users_for_proxy(proxy.id, now)?.into_iter().map(|auth| {
+                if let Some(name) = auth["name"].as_str() { stats_users.insert(name.to_owned()); }
+                json!({"name":auth["name"],"password":auth["uuid"]})
+            }).collect();
+            let tag = format!("proxy-{}", proxy.id);
+            inbounds.push(settings.inbound(&tag, listen, proxy.port as u16, users,
+                proxy.config["certificate"].as_str().context("missing HY2 certificate")?,
+                proxy.config["private_key"].as_str().context("missing HY2 private key")?));
+            stats_inbounds.push(tag);
+            continue;
+        }
         let config: VlessProxyConfig = serde_json::from_value(proxy.config.clone())
             .with_context(|| format!("stored VLESS config for proxy {} is invalid", proxy.id))?;
         let users: Vec<Value> = db
@@ -371,7 +396,7 @@ struct VlessUser {
 }
 
 pub fn supported_protocol(proxy: &db::Proxy) -> bool {
-    matches!(proxy.protocol.as_str(), "vless" | "mieru")
+    matches!(proxy.protocol.as_str(), "vless" | "mieru" | "hysteria2")
 }
 
 #[cfg(test)]

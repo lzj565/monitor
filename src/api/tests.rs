@@ -198,6 +198,7 @@ fn client_subscriptions_default_empty_flow_to_vision() {
     assert_eq!(subscription_label(&regional_proxy), "🇭🇰HK-proxy-3");
     let uuid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
     let portal_proxy = |p: crate::db::UserSubscriptionProxy| crate::db::UserPortalProxy {
+        hysteria2: None,
         id: p.id,
         node_id: 1,
         node_name: p.node_name,
@@ -2685,4 +2686,42 @@ fn external_chains_follow_renames_and_exclude_missing_or_cyclic_dependencies() {
     assert_eq!(proxies[1]["dialer-proxy"], "custom parent");
     let selected = config["proxy-groups"][0]["proxies"].as_array().unwrap();
     assert_eq!(selected, &vec![json!("child"), json!("DIRECT")]);
+}
+
+#[test]
+fn hy2_persists_certificate_and_exports_uuid_without_private_key() {
+    let app = app();
+    let node = app.db.create_node(&Node { name: "HY2".into(), ..Default::default() }, "hy2-node").unwrap();
+    let user = app.db.create_user(&crate::db::UserDraft { username:"hy2-user".into(), password_hash:Some("hash".into()), enabled:true, expires_at:None, traffic_limit:None, device_limit:None, traffic_reset_day:None }).unwrap().unwrap();
+    let draft = crate::db::ProxyDraft { name:"HY2 test".into(),include_node_name:false,protocol:"hysteria2".into(),address_type:"ipv6".into(),address:"::1".into(),port:24443,enabled:true,flow:Some(String::new()),config:json!({"hysteria2":{"server_name":"example.com","obfs_password":"a&b#c"}}) };
+    let id = app.db.create_proxy(node,&draft).unwrap().unwrap();
+    app.db.put_authorization(user,id,&crate::db::AuthorizationDraft { enabled:true,auth:None }).unwrap().unwrap();
+    let first = app.db.proxy(id).unwrap().unwrap();
+    app.db.update_proxy(id,None,&draft).unwrap().unwrap();
+    assert_eq!(first.config,app.db.proxy(id).unwrap().unwrap().config);
+    let uuid = app.db.user(user).unwrap().unwrap().uuid;
+    let generated = crate::proxy::generate_config(&app.db,node,chrono::Utc::now().timestamp()).unwrap();
+    assert_eq!(generated["inbounds"][0]["type"],"hysteria2");
+    assert_eq!(generated["inbounds"][0]["users"][0]["password"],uuid);
+    if let Some(binary) = std::env::var_os("HY2_TEST_SINGBOX") {
+        let path = std::env::temp_dir().join(format!("monitor-hy2-{}.json",std::process::id()));
+        std::fs::write(&path,serde_json::to_vec(&generated).unwrap()).unwrap();
+        if let Some(destination) = std::env::var_os("HY2_TEST_CONFIG_OUTPUT") {
+            std::fs::write(destination,serde_json::to_vec(&generated).unwrap()).unwrap();
+        }
+        let checked = std::process::Command::new(binary).args(["check","-c"]).arg(&path).output().unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(checked.status.success(),"{}",String::from_utf8_lossy(&checked.stderr));
+    }
+    let entries = user_portal_items(&app,user).unwrap();
+    assert_eq!(entries.len(),1);
+    let serialized = serde_json::to_string(&entries).unwrap();
+    assert!(!serialized.contains("PRIVATE KEY"));
+    let url = entries[0]["hysteria2_url"].as_str().unwrap();
+    assert!(url.contains("@[::1]:24443"));
+    assert!(url.contains(&format!("obfs-password={}",uri_component("a&b#c"))));
+    assert!(url.contains("pinSHA256="));
+    assert!(entries[0]["mihomo_yaml"].as_str().unwrap().contains("type: hysteria2"));
+    app.db.delete_authorization(user,id).unwrap();
+    assert!(crate::proxy::generate_config(&app.db,node,chrono::Utc::now().timestamp()).unwrap()["inbounds"][0]["users"].as_array().unwrap().is_empty());
 }

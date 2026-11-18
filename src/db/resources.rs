@@ -43,7 +43,10 @@ impl Db {
         node_id: i64,
         draft: &ProxyDraft,
     ) -> Result<std::result::Result<i64, ProxyWriteIssue>> {
-        let config = serde_json::to_string(&draft.config)?;
+        let stored = if draft.protocol == "hysteria2" {
+            crate::hysteria2::persisted_config(&draft.config, None)?
+        } else { draft.config.clone() };
+        let config = serde_json::to_string(&stored)?;
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let node_exists: bool =
@@ -90,7 +93,11 @@ impl Db {
         target_node_id: Option<i64>,
         draft: &ProxyDraft,
     ) -> Result<std::result::Result<(), ProxyWriteIssue>> {
-        let config = serde_json::to_string(&draft.config)?;
+        let previous = self.proxy(id)?;
+        let stored = if draft.protocol == "hysteria2" {
+            crate::hysteria2::persisted_config(&draft.config, previous.as_ref().map(|p| &p.config))?
+        } else { draft.config.clone() };
+        let config = serde_json::to_string(&stored)?;
         let conn = self.conn();
         let current_node_id: Option<i64> =
             conn.query_row("SELECT node_id FROM proxies WHERE id=?1", [id], |r| r.get(0)).optional()?;
@@ -451,7 +458,7 @@ impl Db {
         reset_due_user_traffic(&tx, now)?;
         let proxy_ids = {
             let mut stmt = tx.prepare(
-                "SELECT id FROM proxies WHERE node_id=?1 AND enabled=1 AND protocol='vless' ORDER BY id",
+                "SELECT id FROM proxies WHERE node_id=?1 AND enabled=1 AND protocol IN ('vless','hysteria2') ORDER BY id",
             )?;
             let rows = stmt.query_map([node_id], |r| r.get::<_, i64>(0))?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
@@ -461,7 +468,7 @@ impl Db {
                 "SELECT DISTINCT u.id,u.username FROM users u
                  JOIN user_proxy_authorizations a ON a.user_id=u.id
                  JOIN proxies p ON p.id=a.proxy_id
-                 WHERE p.node_id=?1 AND p.protocol='vless' AND p.enabled=1 AND a.enabled=1 AND u.enabled=1
+                 WHERE p.node_id=?1 AND p.protocol IN ('vless','hysteria2') AND p.enabled=1 AND a.enabled=1 AND u.enabled=1
                        AND (u.expires_at IS NULL OR u.expires_at>?2)
                  ORDER BY u.id",
             )?;
@@ -650,6 +657,7 @@ impl Db {
         let mut proxies = stmt
             .query_map(params![id, now], |r| {
                 Ok(UserPortalProxy {
+                    hysteria2: None,
                     mieru_password: None,
                     id: r.get(0)?,
                     node_id: r.get(1)?,
@@ -676,6 +684,15 @@ impl Db {
         drop(stmt);
         drop(conn);
         for proxy in &mut proxies {
+            if proxy.protocol == "hysteria2" {
+                if let Some(stored) = self.proxy(proxy.id)? {
+                    let settings = crate::hysteria2::settings(&stored.config)?;
+                    proxy.server_name = settings.server_name.clone();
+                    let mut public = serde_json::to_value(settings)?;
+                    public["pin_sha256"] = crate::hysteria2::certificate_fingerprint(&stored.config)?.into();
+                    proxy.hysteria2 = Some(public);
+                }
+            }
             if proxy.protocol == "mieru" {
                 proxy.mieru_password = Some(self.mieru_password(false)?);
             }
@@ -1190,7 +1207,7 @@ impl Db {
             "SELECT DISTINCT u.username FROM users u
              JOIN user_proxy_authorizations a ON a.user_id=u.id
              JOIN proxies p ON p.id=a.proxy_id
-             WHERE p.node_id=?1 AND p.protocol='vless' AND p.enabled=1 AND a.enabled=1 AND u.enabled=1
+             WHERE p.node_id=?1 AND p.protocol IN ('vless','hysteria2') AND p.enabled=1 AND a.enabled=1 AND u.enabled=1
                AND u.expires_at IS NOT NULL AND u.expires_at<=?2",
         )?;
         let rows = stmt.query_map(params![node_id, now], |r| r.get::<_, String>(0))?;

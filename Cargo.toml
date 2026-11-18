@@ -1,6 +1,6 @@
 [package]
 name = "monitor-hub"
-version = "1.5.14"
+version = "1.5.15"
 edition = "2021"
 license = "MIT"
 description = "Lightweight server monitoring hub"
@@ -8,6 +8,7 @@ repository = "https://github.com/lzj565/monitor"
 
 [dependencies]
 anyhow = "1"
+rcgen = "0.13"
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

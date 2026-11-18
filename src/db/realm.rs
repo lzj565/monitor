@@ -250,7 +250,7 @@ impl Db {
             refuse!("入口节点不存在");
         }
         let target: Option<(i64, bool)> = tx
-            .query_row("SELECT node_id,enabled FROM proxies WHERE id=?1", [body.target_proxy_id], |r| {
+            .query_row("SELECT node_id,enabled FROM proxies WHERE id=?1 AND protocol<>'hysteria2'", [body.target_proxy_id], |r| {
                 Ok((r.get(0)?, r.get(1)?))
             })
             .optional()?;
