@@ -727,8 +727,6 @@ async fn main() -> Result<()> {
     }
     tokio::spawn(housekeeping(app.clone()));
     tokio::spawn(command::cleanup_loop(app.clone()));
-    tokio::spawn(realm::reconcile(app.clone()));
-    tokio::spawn(mieru::reconcile(app.clone()));
     tokio::spawn(notify::deliver(app.clone(), inbox));
     tokio::spawn(notify::watch(app.clone()));
 
@@ -761,16 +759,6 @@ fn router(app: Shared) -> Router {
     Router::new()
         // Read paths; the public page reaches these unauthenticated.
         .route("/api/nodes/{id}/components", get(components::get).put(components::save))
-        .route("/api/mieru/hosts", get(mieru::hosts))
-        .route("/api/mieru/hosts/{id}/config", get(mieru::preview))
-        .route("/api/mieru/credential", get(mieru::credential).post(mieru::reset_credential))
-        .route("/api/realm/traffic", get(api::realm_traffic))
-        .route("/api/realm/hosts", get(api::realm_hosts).put(api::realm_save_host))
-        .route("/api/realm/hosts/{id}", delete(api::realm_delete_host))
-        .route("/api/realm/hosts/{id}/config", get(api::realm_preview))
-        .route("/api/realm/hosts/{id}/operations", post(api::realm_operation))
-        .route("/api/realm/rules", get(api::realm_rules).post(api::realm_create_rule))
-        .route("/api/realm/rules/{id}", put(api::realm_update_rule).delete(api::realm_delete_rule))
         .route("/api/me", get(api::me))
         .route("/api/nodes", get(api::nodes))
         .route("/api/nodes/{id}/metrics", get(api::metrics))
@@ -924,8 +912,6 @@ fn router(app: Shared) -> Router {
                 .route("/install.sh", get(install_script))
                 .route("/agent/{arch}", get(agent_binary))
                 .route("/sing-box/{asset}", get(sing_box_asset))
-                .route("/realm/{asset}", get(realm_asset))
-                .route("/mieru/{asset}", get(mieru::asset))
                 .layer(tower_http::limit::RequestBodyLimitLayer::new(64 * 1024))
                 .with_state(app.clone()),
         )

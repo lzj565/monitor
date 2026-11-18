@@ -66,7 +66,7 @@ impl Db {
         if rows.is_empty() {
             return Ok(None);
         }
-        anyhow::ensure!(rows.len() == 3, "incomplete component profile");
+        anyhow::ensure!(rows.iter().any(|(component, _)| component == "singbox"), "incomplete component profile");
         let mut choices = InstallChoices::default();
         for (c, on) in rows {
             match c.as_str() {
@@ -194,7 +194,7 @@ mod tests {
             db.component_choices(id).unwrap(),
             Some(InstallChoices { singbox: true, realm: false, mieru: false })
         );
-        let choices = InstallChoices { singbox: true, realm: true, mieru: false };
+        let choices = InstallChoices { singbox: false, realm: false, mieru: false };
         db.save_component_choices(id, &choices).unwrap();
         migrate(&db.conn(), 25).unwrap();
         assert_eq!(db.component_choices(id).unwrap(), Some(choices));

@@ -43,16 +43,7 @@ UNINSTALL=""
 UPGRADE=""
 SINGBOX_API_PORT=""
 API_PORT_HELPER=""
-MIERU_OPTION=""
-MIERU_STATE=unchanged
 SINGBOX_OPTION=""
-REALM_OPTION=""
-REALM="$ROOT/realm"
-REALM_CONFIG="$CONFIG_DIR/realm.json"
-REALM_UNIT="/etc/systemd/system/monitor-realm.service"
-REALM_RC="/etc/init.d/monitor-realm"
-REALM_STATE="unchanged"
-REALM_STAGED=""
 
 if [ -t 1 ] && [ -z "${NO_COLOR+x}" ]; then
 	C_BLUE=$(printf '\033[1;34m')
@@ -83,7 +74,6 @@ cleanup() {
 	[ -z "$TMP_DIR" ] || rm -rf "$TMP_DIR"
 	[ -z "$AGENT_CANDIDATE" ] || rm -f "$AGENT_CANDIDATE"
 	[ -z "$SING_BOX_STAGED" ] || rm -f "$SING_BOX_STAGED"
-	[ -z "$REALM_STAGED" ] || rm -f "$REALM_STAGED"
 }
 on_exit() {
 	status=$?
@@ -323,22 +313,6 @@ print_summary() {
 		detail "Service" "$SERVICE_NAME"
 	fi
 	detail "Status" "$SING_BOX_STATUS"
-	printf '\nmieru\n'
-	detail "Status" "$MIERU_STATE"
-	printf '\nRealm\n'
-	detail "Status" "$REALM_STATE"
-	if [ "$REALM_STATE" != unchanged ]; then
-		detail "Config" "$REALM_CONFIG"
-		if [ "$REALM_STATE" != uninstalled ]; then
-			detail "Version" "2.9.6"
-			detail "Binary" "$REALM"
-			if [ "$INIT" = systemd ]; then
-				detail "配置后启动" "systemctl enable --now monitor-realm"
-			else
-				detail "配置后启动" "rc-update add monitor-realm default; rc-service monitor-realm start"
-			fi
-		fi
-	fi
 	printf '\n常用命令\n'
 	if [ "$INIT" = systemd ]; then
 		detail "Agent 状态" "systemctl status monitor-agent"
@@ -356,267 +330,54 @@ print_summary() {
 	detail "配置检查" "$SING_BOX check -c $SING_BOX_CONFIG"
 }
 
-# BEGIN Realm helpers
-realm_owned() {
-	[ ! -L "$REALM" ] && [ ! -L "$REALM_UNIT" ] && [ ! -L "$REALM_RC" ] &&
-	[ -f "$ROOT/.realm-managed" ] &&
-		{ [ ! -e "$REALM_UNIT" ] || grep -F '# Managed by monitor installer' "$REALM_UNIT" >/dev/null; } &&
-		{ [ ! -e "$REALM_RC" ] || grep -F '# Managed by monitor installer' "$REALM_RC" >/dev/null; }
-}
-
-manage_realm() {
-	[ -n "$REALM_OPTION" ] || return 0
-	CURRENT_STEP="Realm"
-	if ! realm_owned; then
-		if [ -e "$REALM" ] || [ -L "$REALM" ] || [ -e "$REALM_UNIT" ] || [ -L "$REALM_UNIT" ] || [ -e "$REALM_RC" ] || [ -L "$REALM_RC" ]; then
-			fail "Realm paths are not owned by monitor; refusing to overwrite or remove them"
-		fi
-		if [ "$REALM_OPTION" = --no-realm ]; then
-			info "Realm 安装开关已关闭，未安装，跳过"
-			REALM_STATE=uninstalled; return 0
-		fi
-	fi
-	REALM_RUNNING=""
-	if [ "$INIT" = systemd ]; then
-		systemctl is-active --quiet monitor-realm && REALM_RUNNING=1
-	else
-		rc-service monitor-realm status >/dev/null 2>&1 && REALM_RUNNING=1
-	fi
-	if [ "$REALM_OPTION" = --no-realm ]; then
-		info "Realm 安装开关已关闭，正在卸载托管程序和服务"
-		if [ "$INIT" = systemd ]; then
-			if [ -e "$REALM_UNIT" ]; then
-				systemctl disable --now monitor-realm || fail "cannot stop/disable Realm"
-			fi
-		else
-			if [ -e "$REALM_RC" ]; then
-				rc-service monitor-realm stop || fail "cannot stop Realm"
-				if rc-update show default | grep -E '^[[:space:]]*monitor-realm[[:space:]]' >/dev/null; then
-					rc-update del monitor-realm default || fail "cannot disable Realm"
-				fi
-			fi
-		fi
-		rm -f "$REALM" "$REALM_UNIT" "$REALM_RC" "$ROOT/.realm-managed"
-		[ "$INIT" != systemd ] || systemctl daemon-reload
-		REALM_STATE=uninstalled
-		success "Realm 已卸载，配置保留"
-		return 0
-	fi
-	case "$ARCH" in
-	x86_64) REALM_SHA=b1cc335547bea8bb2a88178bef12ec7f2363e36200e7ea1d4e1e67627929bf65 ;;
-	aarch64) REALM_SHA=f4c0318dd86854da483dcb7645b4f39cae2cc3f91c688fef969d53220b949488 ;;
-	*) fail "unsupported Realm architecture" ;;
-	esac
-	info "正在下载 Realm 2.9.6（${ARCH}）"
-	mkdir -p "$TMP_DIR/realm"
-	REALM_ARCHIVE="$TMP_DIR/realm.tar.gz"
-	TRIES=0
-	while :; do
-		CODE=$(curl -sSL --max-time 300 -w '%{http_code}' "${SERVER%/}/realm/$ARCH" -o "$REALM_ARCHIVE") || fail "Realm download failed"
-		[ "$CODE" = 503 ] && [ "$TRIES" -lt 5 ] || break
-		TRIES=$((TRIES + 1))
-		sleep 5
-	done
-	[ "$CODE" = 200 ] || fail "Realm download failed (HTTP $CODE)"
-	info "正在校验 Realm 安装包"
-	[ "$(sha256sum "$REALM_ARCHIVE" | awk '{print $1}')" = "$REALM_SHA" ] || fail "Realm checksum mismatch"
-	# Extract only the executable, never arbitrary archive paths.
-	REALM_MEMBER=$(tar -tzf "$REALM_ARCHIVE" | sed -n '/^\(\.\/\)\{0,1\}realm$/p' | head -n 1)
-	[ -n "$REALM_MEMBER" ] || fail "Realm archive has no executable"
-	tar -xOzf "$REALM_ARCHIVE" "$REALM_MEMBER" > "$TMP_DIR/realm/realm" || fail "cannot extract Realm"
-	chmod 0755 "$TMP_DIR/realm/realm"
-	"$TMP_DIR/realm/realm" --version | grep -F '2.9.6' >/dev/null || fail "Realm version check failed"
-	if [ ! -e "$REALM_CONFIG" ] && [ ! -L "$REALM_CONFIG" ]; then
-		printf '%s\n' '{"log":{"level":"warn"},"endpoints":[]}' > "$REALM_CONFIG"
-		chmod 0600 "$REALM_CONFIG"
-	fi
-	info "正在安装 Realm 程序并配置服务"
-	REALM_STAGED="$ROOT/.realm.$$"
-	install -m 0755 "$TMP_DIR/realm/realm" "$REALM_STAGED"
-	mv -f "$REALM_STAGED" "$REALM"
-	REALM_STAGED=""
-	touch "$ROOT/.realm-managed"
-	if [ "$INIT" = systemd ]; then
-		cat > "$REALM_UNIT" <<UNIT
-# Managed by monitor installer
-[Unit]
-Description=Monitor Realm relay
-After=network-online.target
-Wants=network-online.target
-[Service]
-ExecStart=$REALM -c $REALM_CONFIG
-Restart=on-failure
-RestartSec=5
-[Install]
-WantedBy=multi-user.target
-UNIT
-		chmod 0644 "$REALM_UNIT"
-		systemctl daemon-reload
-	else
-		cat > "$REALM_RC" <<RC
-#!/sbin/openrc-run
-# Managed by monitor installer
-command="$REALM"
-command_args="-c $REALM_CONFIG"
-command_background=true
-pidfile="/run/monitor-realm.pid"
-output_log="/var/log/monitor-realm.log"
-error_log="/var/log/monitor-realm.log"
-depend() {
-    need net
-}
-RC
-		chmod 0755 "$REALM_RC"
-	fi
-	REALM_STATE="installed; configure before starting"
-	if [ -n "$REALM_RUNNING" ]; then
-		info "正在重启 Realm 并检查运行状态"
-		if [ "$INIT" = systemd ]; then
-			systemctl restart monitor-realm && systemctl is-active --quiet monitor-realm || fail "Realm restart failed"
-		else
-			rc-service monitor-realm restart && rc-service monitor-realm status >/dev/null || fail "Realm restart failed"
-		fi
-		REALM_STATE=running
-		success "Realm 安装完成，服务运行中"
-	else
-		success "Realm 安装完成，服务未启动，等待配置"
-	fi
-}
-# END Realm helpers
-
-# BEGIN mieru helpers
-manage_mieru() {
-    [ -n "$MIERU_OPTION" ] || return 0
-    CURRENT_STEP=mieru
-    MIERU="$ROOT/mita"
-    MIERU_CONFIG="$CONFIG_DIR/mieru.json"
-    MIERU_UNIT=/etc/systemd/system/monitor-mieru.service
-    MIERU_RC=/etc/init.d/monitor-mieru
-    if [ ! -f "$ROOT/.mieru-managed" ] && [ ! -f "$ROOT/.mieru-preserved" ]; then
-        for path in "$MIERU" "$MIERU_CONFIG" "$MIERU_UNIT" "$MIERU_RC" /etc/mita /var/lib/mita /run/monitor-mieru; do
-            [ ! -e "$path" ] && [ ! -L "$path" ] || fail "mieru paths are not owned by monitor: $path"
-        done
-        if command -v mita >/dev/null 2>&1; then fail "an unmanaged mita installation already exists"; fi
-    fi
-    for path in "$MIERU" "$MIERU_CONFIG" "$ROOT/.mieru-managed" "$ROOT/.mieru-preserved" "$MIERU_UNIT" "$MIERU_RC"; do
-        [ ! -L "$path" ] || fail "mieru managed path is a symlink: $path"
+# Retire only installations carrying Monitor ownership markers.
+retire_component() (
+    component=$1
+    service=monitor-$component
+    unit=/etc/systemd/system/$service.service
+    rc=/etc/init.d/$service
+    marker=$ROOT/.$component-managed
+    preserved=$ROOT/.$component-preserved
+    [ -f "$marker" ] || [ -f "$preserved" ] || exit 0
+    [ ! -L "$marker" ] && [ ! -L "$preserved" ] && [ ! -L "$CONFIG_DIR" ] ||
+        fail "unsafe path while removing $service"
+    for definition in "$unit" "$rc"; do
+        [ ! -L "$definition" ] || fail "service definition is a symlink: $definition"
+        [ ! -e "$definition" ] || grep -Fq '# Managed by monitor installer' "$definition" ||
+            fail "unmanaged service definition: $definition"
     done
-    if [ "$MIERU_OPTION" = --no-mieru ]; then
-        if [ -f "$ROOT/.mieru-managed" ]; then
-            info "mieru 安装开关已关闭，正在卸载托管程序和服务"
-            if [ "$INIT" = systemd ]; then systemctl disable --now monitor-mieru || fail "cannot stop mieru"; else
-                rc-service monitor-mieru stop || fail "cannot stop mieru"
-                rc-update del monitor-mieru default >/dev/null 2>&1 || true
-            fi
-            touch "$ROOT/.mieru-preserved"
-            rm -f "$MIERU" "$MIERU_UNIT" "$MIERU_RC" "$ROOT/.mieru-managed"
-            [ "$INIT" != systemd ] || systemctl daemon-reload
-            success "mieru 已卸载，配置和流量数据保留"
-        else
-            info "mieru 安装开关已关闭，未安装，跳过"
+    if [ -d /run/systemd/system ] && [ -f "$unit" ]; then
+        systemctl disable --now "$service" || fail "cannot stop $service"
+    elif [ -e /run/openrc/softlevel ] && [ -f "$rc" ]; then
+        if rc-service "$service" status >/dev/null 2>&1; then
+            rc-service "$service" stop || fail "cannot stop $service"
         fi
-        MIERU_STATE=uninstalled
-        return 0
+        if rc-update show default | grep -Eq "^[[:space:]]*$service[[:space:]]"; then
+            rc-update del "$service" default || fail "cannot disable $service"
+        fi
+    elif [ -e "$unit" ] || [ -e "$rc" ]; then
+        fail "cannot determine active init system for $service"
     fi
-    case "$ARCH" in
-        x86_64) MIERU_SHA=ea35fdef84bef1378f32b74a2d5a883d508a49dd4e64dba9a3a8363beed5798c ;;
-        aarch64) MIERU_SHA=853eb8c3221ce294afffd7d690dbece929c4e774ed3d81c209b71446b515d1c6 ;;
-        *) fail "unsupported mieru architecture" ;;
+    case "$component" in
+        realm)
+            rm -f "$ROOT/realm" "$CONFIG_DIR/realm.json" "$CONFIG_DIR/realm-state.json" \
+                "$CONFIG_DIR/realm-traffic.db" "$CONFIG_DIR/realm-traffic.db-wal" "$CONFIG_DIR/realm-traffic.db-shm"
+            ;;
+        mieru)
+            rm -f "$ROOT/mita" "$CONFIG_DIR/mieru.json" "$CONFIG_DIR/mieru-state.json"
+            rm -rf /run/monitor-mieru
+            ;;
     esac
-    info "正在下载 mieru 3.39.0（${ARCH}）"
-    curl -fsSL --max-time 300 "${SERVER%/}/mieru/$ARCH" -o "$TMP_DIR/mita.tar.gz" || fail "mita download failed"
-    info "正在校验 mieru 安装包"
-    [ "$(sha256sum "$TMP_DIR/mita.tar.gz" | awk '{print $1}')" = "$MIERU_SHA" ] || fail "mita checksum mismatch"
-    MIERU_MEMBER=$(tar -tzf "$TMP_DIR/mita.tar.gz" | sed -n '/^\(\.\/\)\{0,1\}mita$/p' | head -n 1)
-    [ -n "$MIERU_MEMBER" ] || fail "mita archive has no executable"
-    tar -xOzf "$TMP_DIR/mita.tar.gz" "$MIERU_MEMBER" > "$TMP_DIR/mita" || fail "cannot extract mita"
-    chmod 0755 "$TMP_DIR/mita"
-    "$TMP_DIR/mita" version | grep -F '3.39.0' >/dev/null || fail "mita version mismatch"
-    info "正在安装 mieru 程序并配置服务"
-    getent group mita >/dev/null 2>&1 || { groupadd --system mita 2>/dev/null || addgroup -S mita; }
-    id mita >/dev/null 2>&1 || { useradd --system -g mita --home-dir /nonexistent --shell /usr/sbin/nologin mita 2>/dev/null || adduser -S -D -H -G mita mita; }
-    mkdir -p /var/lib/mita /run/monitor-mieru
-    chown mita:mita /var/lib/mita /run/monitor-mieru
-    chmod 0750 /var/lib/mita /run/monitor-mieru
-    if [ ! -f "$MIERU_CONFIG" ]; then
-        (umask 077; printf '%s\n' '{"portBindings":[],"users":[],"loggingLevel":"WARN"}' > "$MIERU_CONFIG")
-    fi
-    chown mita:mita "$MIERU_CONFIG"
-    chmod 0600 "$MIERU_CONFIG"
-    # Keep the previous binary and running state until the replacement passes health checks.
-    MIERU_RUNNING=""
-    if [ "$INIT" = systemd ]; then systemctl is-active --quiet monitor-mieru && MIERU_RUNNING=1 || true; else rc-service monitor-mieru status >/dev/null 2>&1 && MIERU_RUNNING=1 || true; fi
-    [ ! -f "$MIERU" ] || cp -p "$MIERU" "$TMP_DIR/mita.old"
-    [ ! -f "$MIERU_UNIT" ] || cp -p "$MIERU_UNIT" "$TMP_DIR/mieru-unit.old"
-    [ ! -f "$MIERU_RC" ] || cp -p "$MIERU_RC" "$TMP_DIR/mieru-rc.old"
-    install -m 0755 "$TMP_DIR/mita" "$ROOT/.mita.$$"
-    mv -f "$ROOT/.mita.$$" "$MIERU"
-    if [ "$INIT" = systemd ]; then
-        cat > "$MIERU_UNIT" <<UNIT
-# Managed by monitor installer
-[Unit]
-Description=Monitor mieru server
-After=network-online.target
-Wants=network-online.target
-[Service]
-User=mita
-Group=mita
-RuntimeDirectory=monitor-mieru
-RuntimeDirectoryMode=0750
-Environment=MITA_CONFIG_JSON_FILE=$MIERU_CONFIG
-Environment=MITA_UDS_PATH=/run/monitor-mieru/mita.sock
-ExecStart=$MIERU run
-Restart=on-failure
-RestartSec=5
-[Install]
-WantedBy=multi-user.target
-UNIT
-        chmod 0644 "$MIERU_UNIT"
-        systemctl daemon-reload
-    else
-        cat > "$MIERU_RC" <<RC
-#!/sbin/openrc-run
-# Managed by monitor installer
-command="$MIERU"
-command_args="run"
-command_user="mita:mita"
-supervisor="supervise-daemon"
-respawn_delay=5
-export MITA_CONFIG_JSON_FILE="$MIERU_CONFIG"
-export MITA_UDS_PATH=/run/monitor-mieru/mita.sock
-start_pre() { checkpath --directory --owner mita:mita --mode 0750 /run/monitor-mieru; }
-depend() { need net; }
-RC
-        chmod 0755 "$MIERU_RC"
-    fi
-    touch "$ROOT/.mieru-managed"
-    if [ -n "$MIERU_RUNNING" ]; then
-        info "正在重启 mieru 并检查运行状态"
-        if [ "$INIT" = systemd ]; then
-            if ! systemctl restart monitor-mieru || ! systemctl is-active --quiet monitor-mieru; then
-                [ ! -f "$TMP_DIR/mita.old" ] || cp -p "$TMP_DIR/mita.old" "$MIERU"
-                [ ! -f "$TMP_DIR/mieru-unit.old" ] || cp -p "$TMP_DIR/mieru-unit.old" "$MIERU_UNIT"
-                systemctl daemon-reload
-                systemctl restart monitor-mieru || true
-                fail "mita upgrade failed; restored previous binary"
-            fi
-        else
-            if ! rc-service monitor-mieru restart || ! rc-service monitor-mieru status; then
-                [ ! -f "$TMP_DIR/mita.old" ] || cp -p "$TMP_DIR/mita.old" "$MIERU"
-                [ ! -f "$TMP_DIR/mieru-rc.old" ] || cp -p "$TMP_DIR/mieru-rc.old" "$MIERU_RC"
-                rc-service monitor-mieru restart || true
-                fail "mita upgrade failed; restored previous binary"
-            fi
-        fi
-    fi
-    MIERU_STATE=installed
-    if [ -n "$MIERU_RUNNING" ]; then
-        success "mieru 安装完成，服务运行中"
-    else
-        success "mieru 安装完成，服务未启动，等待配置"
-    fi
+    rm -f "$unit" "$rc"
+    [ ! -d /run/systemd/system ] || systemctl daemon-reload || fail "cannot reload systemd"
+    rm -f "$marker" "$preserved"
+)
+
+retire_legacy_components() {
+    retire_component realm
+    retire_component mieru
 }
-# END mieru helpers
+
 
 # BEGIN component profile helpers
 # Keep a newly issued token across a later profile/download failure, without replacing the running Agent env.
@@ -638,22 +399,16 @@ cache_registration() {
 load_component_profile() {
     info "读取节点已保存的安装选项"
     curl -fsSL --max-time 30 -H "Authorization: Bearer $TOKEN" "${SERVER%/}/api/agent/components" -o "$TMP_DIR/components.profile" || fail "cannot read saved component choices; no programs or services changed"
-    PROFILE_SINGBOX_COUNT=0 PROFILE_REALM_COUNT=0 PROFILE_MIERU_COUNT=0
-    PROFILE_REALM='' PROFILE_MIERU=''
+    PROFILE_SINGBOX_COUNT=0
     while IFS= read -r PROFILE_LINE || [ -n "$PROFILE_LINE" ]; do
         case "$PROFILE_LINE" in
             singbox=0) PROFILE_SINGBOX_COUNT=$((PROFILE_SINGBOX_COUNT + 1)); PROFILE_SINGBOX=--no-sing-box ;;
             singbox=1) PROFILE_SINGBOX=--sing-box; PROFILE_SINGBOX_COUNT=$((PROFILE_SINGBOX_COUNT + 1)) ;;
-            realm=0) PROFILE_REALM_COUNT=$((PROFILE_REALM_COUNT + 1)); PROFILE_REALM=--no-realm ;;
-            realm=1) PROFILE_REALM_COUNT=$((PROFILE_REALM_COUNT + 1)); PROFILE_REALM=--realm ;;
-            mieru=0) PROFILE_MIERU_COUNT=$((PROFILE_MIERU_COUNT + 1)); PROFILE_MIERU=--no-mieru ;;
-            mieru=1) PROFILE_MIERU_COUNT=$((PROFILE_MIERU_COUNT + 1)); PROFILE_MIERU=--mieru ;;
+            realm=0 | realm=1 | mieru=0 | mieru=1) ;;
             *) fail "invalid saved component choices" ;;
         esac
     done < "$TMP_DIR/components.profile"
-    [ "$PROFILE_SINGBOX_COUNT:$PROFILE_REALM_COUNT:$PROFILE_MIERU_COUNT" = 1:1:1 ] || fail "incomplete saved component choices"
-    [ -n "$REALM_OPTION" ] || REALM_OPTION=$PROFILE_REALM
-    [ -n "$MIERU_OPTION" ] || MIERU_OPTION=$PROFILE_MIERU
+    [ "$PROFILE_SINGBOX_COUNT" = 1 ] || fail "incomplete saved component choices"
     SINGBOX_OPTION=$PROFILE_SINGBOX
 }
 # END component profile helpers
@@ -677,16 +432,10 @@ while [ $# -gt 0 ]; do
 	--insecure) INSECURE=1; shift ;;
 	--uninstall) UNINSTALL=1; shift ;;
 	--upgrade) UPGRADE=1; shift ;;
-    --mieru | --no-mieru)
-        [ -z "$MIERU_OPTION" ] || [ "$MIERU_OPTION" = "$1" ] || { echo "conflicting mieru flags" >&2; exit 2; }
-        MIERU_OPTION=$1; shift ;;
     --skip-sing-box) SINGBOX_OPTION=--no-sing-box; shift ;;
     --sing-box | --no-sing-box)
         [ -z "$SINGBOX_OPTION" ] || [ "$SINGBOX_OPTION" = "$1" ] || { echo "conflicting sing-box flags" >&2; exit 2; }
         SINGBOX_OPTION=$1; shift ;;
-	--realm | --no-realm)
-		[ -z "$REALM_OPTION" ] || [ "$REALM_OPTION" = "$1" ] || { echo "--realm and --no-realm are mutually exclusive" >&2; exit 2; }
-		REALM_OPTION=$1; shift ;;
 	*) echo "unknown option: $1" >&2; exit 2 ;;
 	esac
 done
@@ -723,12 +472,11 @@ success "系统检查完成"
 # hub may be installed in $ROOT as well, so the directory is removed only once
 # empty.
 if [ -n "$UNINSTALL" ]; then
+	retire_legacy_components
 	rc-service monitor-agent stop 2>/dev/null || true
 	rc-update del monitor-agent default >/dev/null 2>&1 || true
 	systemctl disable --now monitor-agent 2>/dev/null || true
-	rm -f "$UNIT_FILE" "$RC_FILE" "$LOG_FILE" "$BIN" "$BIN.old" "$ENV_FILE" "$REGISTRATION_FILE" "$ROOT/agent.env" \
-		"$UNIT_FILE".install-* "$RC_FILE".install-*
-	rm -rf "$ROOT"/.install-*
+	rm -f "$UNIT_FILE" "$RC_FILE" "$LOG_FILE" "$BIN" "$BIN.old" "$ENV_FILE" "$REGISTRATION_FILE" "$ROOT/agent.env"
 	systemctl daemon-reload 2>/dev/null || true
 	userdel monitor-agent 2>/dev/null || deluser monitor-agent 2>/dev/null || true
 	rmdir "$CONFIG_DIR" "$ROOT" 2>/dev/null || true
@@ -775,8 +523,8 @@ if [ -n "$UPGRADE" ]; then
 fi
 
 [ -n "$SERVER" ] && { [ -n "$TOKEN" ] || [ -n "$REGISTER" ]; } || {
-	echo "usage: install.sh --server URL (--token TOKEN | --register KEY) [--interval SECONDS] [--iface LIST] [--binary FILE] [--insecure] [--realm | --no-realm] [--mieru | --no-mieru] [--sing-box | --no-sing-box]" >&2
-	echo "       install.sh --upgrade [--binary FILE] [--iface LIST] [--interval SECONDS] [--realm | --no-realm] [--mieru | --no-mieru] [--sing-box | --no-sing-box]" >&2
+	echo "usage: install.sh --server URL (--token TOKEN | --register KEY) [--interval SECONDS] [--iface LIST] [--binary FILE] [--insecure] [--sing-box | --no-sing-box]" >&2
+	echo "       install.sh --upgrade [--binary FILE] [--iface LIST] [--interval SECONDS] [--sing-box | --no-sing-box]" >&2
 	echo "       install.sh --uninstall" >&2
 	echo "--name NAME names the node --register creates, which is otherwise named after its id. < > \" ' are dropped from it; the panel renames a node freely" >&2
 	echo "--binary FILE installs an agent already placed on this machine instead of downloading it from the hub" >&2
@@ -900,40 +648,6 @@ http://*)
 	exit 2
 	;;
 esac
-# systemd by the test sd_booted(3) performs, OpenRC by the runlevel it records
-# once booted: either may be installed where it is not the running init (WSL, a
-# container), and every service call below would fail there after the key is
-# spent. Decided before
-# the download and the registration for the same reason.
-if [ -d /run/systemd/system ]; then
-	INIT=systemd
-elif [ -e /run/openrc/softlevel ] && command -v rc-update >/dev/null; then
-	INIT=openrc
-else
-	echo "this installer needs systemd or OpenRC running as the init system" >&2
-	if command -v systemctl >/dev/null || command -v rc-update >/dev/null; then
-		echo "one is installed but did not boot this machine, as in WSL or a container" >&2
-	fi
-	exit 1
-fi
-
-# Alpine ships BusyBox adduser rather than useradd: -S system, -D no password,
-# -H no home.
-add_user() {
-	if command -v useradd >/dev/null; then
-		useradd --system --no-create-home --shell /usr/sbin/nologin monitor-agent
-	else
-		adduser -S -D -H -s /sbin/nologin monitor-agent
-	fi
-}
-
-# The service user the agent runs as under either init system, created before
-# the download and the registration, so a host where this fails keeps the agent
-# it already runs and spends no registration key. One case passes this check
-# without a user and is settled after the old agent stops; see there.
-id -u monitor-agent >/dev/null 2>&1 || add_user ||
-	{ echo "cannot create the system user monitor-agent" >&2; exit 1; }
-
 case "$(uname -m)" in
 x86_64 | amd64) ARCH=x86_64; SING_BOX_ARCH=amd64 ;;
 aarch64 | arm64) ARCH=aarch64; SING_BOX_ARCH=arm64 ;;
@@ -948,31 +662,7 @@ step 1 "安装 monitor-agent"
 detail "架构" "$ARCH"
 detail "安装位置" "$BIN"
 URL="${SERVER%/}/agent/$ARCH"
-
-# Everything this install writes is written while the running agent still
-# serves, into a directory of this run's own beside the final names, the
-# download included and the binary before the registration: a full disk then
-# ends the script before a key is spent or the agent is stopped, and what
-# follows the stop is renames, which need no space. A run that stops early
-# leaves nothing behind, and a concurrent one cannot remove what this one
-# staged.
-install -d -m 0755 "$ROOT"
-# A run killed outright leaves its staging behind: a directory holding a whole
-# binary, and a service definition beside the final one. Those untouched for a
-# day belong to no live run.
-find "$ROOT" -maxdepth 1 -name '.install-*' -mmin +1440 -exec rm -rf {} \; 2>/dev/null || true
-find /etc/systemd/system /etc/init.d -maxdepth 1 -name 'monitor-agent*.install-*' -mmin +1440 \
-	-exec rm -f {} \; 2>/dev/null || true
-STAGE="" SERVICE_NEW=""
-# Staged files are removed on any exit before they take their final names, and
-# $ROOT once nothing is left in it. Until the stop below a signal is turned into
-# an exit, since dash runs no EXIT trap for a signal that kills it; from the
-# stop on, signals are ignored (see there).
-trap 'rm -f ${SERVICE_NEW:+"$SERVICE_NEW"}; [ -z "$STAGE" ] || rm -rf "$STAGE"; rmdir "$ROOT" 2>/dev/null || true' EXIT
-trap 'exit 1' HUP INT TERM
-STAGE=$(mktemp -d "$ROOT/.install-XXXXXX")
-TMP="$STAGE/monitor-agent"
-TMP_AGENT="$TMP"
+TMP_AGENT=$(mktemp)
 
 # A machine whose link to the hub cannot carry the binary in time installs one
 # uploaded beforehand: registration and the service then need only a few small
@@ -1044,16 +734,6 @@ API_PORT_HELPER=$TMP_AGENT
 info "checking sing-box V2Ray API port..."
 : # API port is selected after loading saved choices
 
-# Kept until the new binary has proved it starts; see not_started. Never over
-# an existing copy: a run that died before that check left an unproven binary
-# in $BIN, and the copy is the one that ran before it. A hard link: $BIN is
-# replaced by a rename, which leaves this inode as it was, and a link takes no
-# space.
-if [ -f "$BIN" ] && [ ! -f "$BIN.old" ]; then
-	ln "$BIN" "$STAGE/old" 2>/dev/null || cp "$BIN" "$STAGE/old"
-fi
-chmod 0755 "$TMP"
-
 # Downloaded before the registration below, because that step spends a node: the
 # key returns a token and the panel gains a row, while the env file recording it
 # is only written once the binary is in place. A download that fails after
@@ -1091,12 +771,10 @@ if [ -z "$TOKEN" ]; then
 	# A request that got no response stops here, with curl's own message. The
 	# name travels on stdin: as an
 	# argument, one beginning with @ would be read as a file to send.
-    REGISTER_SINGBOX=0 REGISTER_REALM=0 REGISTER_MIERU=0
+    REGISTER_SINGBOX=0
     [ "$SINGBOX_OPTION" != --sing-box ] || REGISTER_SINGBOX=1
-    [ "$REALM_OPTION" != --realm ] || REGISTER_REALM=1
-    [ "$MIERU_OPTION" != --mieru ] || REGISTER_MIERU=1
 	REPLY=$(printf '%s' "$NAME" | curl -sS --max-time 30 -w '\n%{http_code}' -H "Authorization: Bearer $REGISTER" \
-		-H "X-Node-Token: $HELD" -H "X-Install-Singbox: $REGISTER_SINGBOX" -H "X-Install-Realm: $REGISTER_REALM" -H "X-Install-Mieru: $REGISTER_MIERU" --data-binary @- "${SERVER%/}/api/agent/register" 2>/dev/null) || { FAIL_REASON="向 Hub 注册 monitor-agent 失败"; exit 1; }
+		-H "X-Node-Token: $HELD" -H "X-Install-Singbox: $REGISTER_SINGBOX" --data-binary @- "${SERVER%/}/api/agent/register" 2>/dev/null) || { FAIL_REASON="向 Hub 注册 monitor-agent 失败"; exit 1; }
 	CODE=$(printf '%s\n' "$REPLY" | tail -n 1)
 	TOKEN=$(printf '%s\n' "$REPLY" | sed '$d')
 	if [ "$CODE" != 200 ]; then
@@ -1110,7 +788,6 @@ if [ -z "$TOKEN" ]; then
     cache_registration
 	if [ "$TOKEN" = "$HELD" ]; then
         # Batch defaults are only for new registrations. Existing nodes retain their saved profile.
-        REALM_OPTION='' MIERU_OPTION=''
 		info "此主机已注册，保留当前 token、名称和安装选择"
 	elif [ -n "$HELD" ]; then
 		warn "旧 token 已不再对应有效节点，本次已注册为新节点；如旧节点仍存在，请在面板删除"
@@ -1118,6 +795,16 @@ if [ -z "$TOKEN" ]; then
 fi
 
 load_component_profile
+
+# Keep the existing registration and credential flow above intact. Stage the
+# validated agent beside its destination and rename atomically so a failed copy
+# cannot truncate the currently installed executable.
+install -d -m 0755 "$ROOT"
+AGENT_CANDIDATE="$ROOT/.monitor-agent.$$"
+install -m 0755 "$TMP_AGENT" "$AGENT_CANDIDATE"
+[ ! -f "$BIN" ] || [ -f "$BIN.old" ] || cp "$BIN" "$BIN.old"
+mv -f "$AGENT_CANDIDATE" "$BIN"
+success "monitor-agent binary 安装完成"
 
 # The system package binary is left in place, while the Agent and service use
 # this release's self-built binary with V2Ray API support.
@@ -1192,7 +879,7 @@ if [ ! -e "$SING_BOX_CONFIG" ] && [ ! -L "$SING_BOX_CONFIG" ]; then
 CONFIG
 	)
 fi
-"$TMP_AGENT" internal set-api-port-in-config "$SING_BOX_CONFIG" "$SINGBOX_API_PORT" || {
+"$BIN" internal set-api-port-in-config "$SING_BOX_CONFIG" "$SINGBOX_API_PORT" || {
 	FAIL_REASON="could not set sing-box V2Ray API listen address to 127.0.0.1:$SINGBOX_API_PORT"
 	fail "$FAIL_REASON"
 }
@@ -1228,8 +915,7 @@ else
         [ ! -f "$SING_BOX_RC_BACKUP" ] || mv "$SING_BOX_RC_BACKUP" "$SING_BOX_RC"
     fi
 fi
-manage_realm
-manage_mieru
+retire_legacy_components
 
 step 3 "初始化系统服务"
 if [ "$SINGBOX_OPTION" = --sing-box ]; then
@@ -1291,27 +977,41 @@ fi
 # BEGIN agent environment
 (
 	umask 077
-	cat >"$STAGE/agent.env" <<ENV
+	cat >"$ENV_FILE" <<ENV
 MONITOR_SERVER=$SERVER
 MONITOR_TOKEN=$TOKEN
 ENV
 	# An absent port uses the Agent default; an empty value is a startup error.
 	if [ "$SINGBOX_OPTION" = --sing-box ]; then
 		valid_api_port "$SINGBOX_API_PORT" || fail "invalid SINGBOX_API_PORT"
-		printf 'SINGBOX_API_PORT=%s\n' "$SINGBOX_API_PORT" >>"$STAGE/agent.env"
+		printf 'SINGBOX_API_PORT=%s\n' "$SINGBOX_API_PORT" >>"$ENV_FILE"
 	fi
-	[ -z "$IFACE" ] || printf 'MONITOR_IFACE=%s\n' "$IFACE" >>"$STAGE/agent.env"
+	[ -z "$IFACE" ] || printf 'MONITOR_IFACE=%s\n' "$IFACE" >>"$ENV_FILE"
 )
 # END agent environment
 chmod 0600 "$ENV_FILE"
 [ "$(pending_registration_token)" != "$TOKEN" ] || rm -f "$REGISTRATION_FILE"
 
-# The service definition is staged beside its final name for the reason the
-# files above are: /etc commonly shares a disk with $ROOT.
+# The new agent is not running. The binary it replaced is put back and started
+# again, so a failed upgrade leaves the machine reporting as before; the unit
+# and env file just written suit that binary as well, since an upgrade keeps the
+# token and the settings. A first install has nothing to put back.
+not_started() {
+	FAIL_REASON="monitor-agent 未能启动；查看 $1"
+	error "$FAIL_REASON"
+	[ -f "$BIN.old" ] || exit 1
+	mv -f "$BIN.old" "$BIN"
+	if [ "$INIT" = openrc ]; then
+		rc-service monitor-agent restart >/dev/null 2>&1 || true
+	else
+		systemctl restart monitor-agent || true
+	fi
+	warn "已恢复之前的 monitor-agent binary 并尝试重新启动"
+	exit 1
+}
+
 if [ "$INIT" = openrc ]; then
-	SERVICE_FILE="$RC_FILE"
-	SERVICE_NEW=$(mktemp "$RC_FILE.install-XXXXXX")
-	cat >"$SERVICE_NEW" <<RC
+	cat >"$RC_FILE" <<RC
 #!/sbin/openrc-run
 description="monitor agent"
 command="$BIN"
@@ -1332,10 +1032,37 @@ start_pre() {
 	set +a
 }
 RC
-else
-	SERVICE_FILE="$UNIT_FILE"
-	SERVICE_NEW=$(mktemp "$UNIT_FILE.install-XXXXXX")
-	cat >"$SERVICE_NEW" <<UNIT
+	chmod 0755 "$RC_FILE"
+	success "系统服务定义已初始化"
+	step 4 "启动服务"
+	if [ "$SING_BOX_SOURCE" = installer ]; then
+		rc-update add sing-box default >/dev/null
+		rc-service sing-box restart || { FAIL_REASON="sing-box 启动失败"; fail "$FAIL_REASON"; }
+		rc-service sing-box status >/dev/null 2>&1 || { FAIL_REASON="sing-box 未能进入运行状态"; fail "$FAIL_REASON"; }
+	elif [ "$SING_BOX_SOURCE" != skipped ]; then
+		rc-service sing-box status >/dev/null 2>&1 || warn "sing-box 已安装，但当前未检测到运行状态"
+	fi
+	rc-update add monitor-agent default >/dev/null
+	rc-service monitor-agent restart || not_started "$LOG_FILE"
+	# supervise-daemon reports the service started while it respawns an agent
+	# that exits at once, so the process itself is what is looked for, inside
+	# the respawn delay. pidof rather than pgrep -x, which BusyBox matches
+	# against the full path.
+	sleep 3
+	pidof monitor-agent >/dev/null || not_started "$LOG_FILE"
+	rm -f "$BIN.old"
+	AGENT_STATUS=running
+	SING_BOX_STATUS=unknown
+	if [ "$SING_BOX_SOURCE" != skipped ]; then
+		if rc-service sing-box status >/dev/null 2>&1; then SING_BOX_STATUS=running; else SING_BOX_STATUS=not-running; fi
+	fi
+	success "monitor-agent 安装并启动完成"
+	CURRENT_STEP=""
+	print_summary
+	exit 0
+fi
+
+cat >"$UNIT_FILE" <<UNIT
 [Unit]
 Description=monitor agent
 After=network-online.target
@@ -1365,86 +1092,6 @@ MemoryMax=64M
 [Install]
 WantedBy=multi-user.target
 UNIT
-	chmod 0644 "$SERVICE_NEW"
-fi
-
-# Stop an agent already running here before replacing its binary. The service
-# name is fixed, so a reinstall could never start a second copy, but without this
-# the new binary lands beneath a live process and only the restart at the end
-# picks it up. Placed after every write above, so a node that cannot fetch or
-# store the new files keeps running.
-#
-# From here to the health check the agent is down or unproven, and an
-# interrupted run would leave it so. Signals that would end or pause the run are
-# ignored until it ends, and a failed command no longer ends it: the health
-# check settles every step, reporting a running agent or rolling back. Output
-# can fail too, once the terminal has gone or a pipe reader has died.
-trap '' HUP INT QUIT TERM TSTP PIPE
-set +e
-if [ "$INIT" = openrc ]; then
-	rc-service monitor-agent stop 2>/dev/null || true
-else
-	systemctl stop monitor-agent 2>/dev/null || true
-	# An agent installed before the fixed user ran under DynamicUser=, and while
-	# it runs nss-systemd resolves its transient user of the same name: the check
-	# above passes, and useradd refuses the name as taken. Stopping the unit
-	# releases that user, so the fixed one is created here. Should that fail, the
-	# old binary and unit are still in place and are started again.
-	id -u monitor-agent >/dev/null 2>&1 || add_user || {
-		systemctl start monitor-agent 2>/dev/null || true
-		echo "cannot create the system user monitor-agent" >&2
-		exit 1
-	}
-fi
-# The new agent is not running. The binary it replaced is put back and started
-# again before anything is reported, so a failed upgrade leaves the machine
-# reporting as before; the unit and env file just written suit that binary as
-# well, since an upgrade keeps the token and the settings. A first install has
-# nothing to put back.
-not_started() {
-	if [ -f "$BIN.old" ]; then
-		mv -f "$BIN.old" "$BIN"
-		if [ "$INIT" = openrc ]; then
-			rc-service monitor-agent restart >/dev/null 2>&1
-		else
-			systemctl restart monitor-agent
-		fi
-		echo "monitor-agent did not start; see: $1" >&2
-		echo "the previous monitor-agent binary is back in place and was restarted" >&2
-	else
-		echo "monitor-agent did not start; see: $1" >&2
-	fi
-	exit 1
-}
-
-if ! { { [ ! -f "$STAGE/old" ] || mv -f "$STAGE/old" "$BIN.old"; } &&
-	mv -f "$STAGE/monitor-agent" "$BIN" &&
-	mv -f "$STAGE/agent.env" "$ENV_FILE" &&
-	mv -f "$SERVICE_NEW" "$SERVICE_FILE"; }; then
-	echo "the new files could not be renamed into place" >&2
-	not_started "the message above"
-fi
-
-if [ "$INIT" = openrc ]; then
-	# Executable only under its final name, so a staged copy left by a killed
-	# run is never taken for a service.
-	if [ "$SING_BOX_SOURCE" = installer ]; then
-		rc-update add sing-box default >/dev/null && rc-service sing-box restart ||
-			not_started "$LOG_FILE"
-	fi
-	chmod 0755 "$RC_FILE"
-	rc-update add monitor-agent default >/dev/null
-	rc-service monitor-agent restart
-	# supervise-daemon reports the service started while it respawns an agent
-	# that exits at once, so the process itself is what is looked for, inside
-	# the respawn delay. pidof rather than pgrep -x, which BusyBox matches
-	# against the full path.
-	sleep 3
-	pidof monitor-agent >/dev/null || not_started "$LOG_FILE"
-	rm -f "$BIN.old"
-	echo "monitor-agent installed; follow it with: tail -f $LOG_FILE"
-	exit 0
-fi
 
 success "系统服务定义已初始化"
 step 4 "启动服务"

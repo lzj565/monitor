@@ -224,7 +224,6 @@ pub async fn db_restore(
             app.db.check_backup(&path)?;
             app.db.restore_from(&path)?;
             info!("database restored from an uploaded backup");
-            app.db.realm_reset_applied()?;
             // Trust in the local network must be confirmed again after restore.
             app.db.set("origin_cdn_only", "off")?;
             app.agents.write().unwrap_or_else(|e| e.into_inner()).clear();

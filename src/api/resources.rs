@@ -63,52 +63,8 @@ pub async fn create_command(
             Ok(body) => body,
             Err(error) => return error.into_response(),
         };
-        if body.method.starts_with("mieru.") {
-            if body.method == "mieru.config.apply" {
-                return bad("请通过 mieru 代理页面应用配置");
-            }
-            if !app
-                .agents
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(&node_id)
-                .is_some_and(|a| a.mieru_capable)
-            {
-                return bad("节点离线或 Agent 需要升级");
-            }
-        }
-        if matches!(body.method.as_str(), "realm.config.apply" | "realm.restart" | "realm.traffic.configure")
-        {
-            return bad("请通过 Realm 页面应用配置和重启");
-        }
-        if body.method.starts_with("realm.") {
-            if !app
-                .agents
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(&node_id)
-                .is_some_and(|a| a.realm_capable)
-            {
-                return api_error(StatusCode::CONFLICT, "REALM_AGENT_REQUIRED", "节点离线或 Agent 需要升级");
-            }
-            if body.method == "realm.config.check"
-                && body
-                    .params
-                    .get("config")
-                    .is_none_or(|v| !v.is_object() || v.to_string().len() > MAX_COMMAND_CONFIG)
-            {
-                return api_error(
-                    StatusCode::BAD_REQUEST,
-                    "REALM_CONFIG_INVALID",
-                    "Realm 配置必须是 1 MiB 以内的 JSON 对象",
-                );
-            }
-        }
-        if !command::supports(&body.method) {
+        if !matches!(body.method.as_str(), "singbox.status" | "singbox.restart" | "singbox.config.get" | "singbox.config.check" | "singbox.config.apply") {
             return bad("不支持的 Agent 命令");
-        }
-        if !body.params.is_object() {
-            return bad("params 必须是 JSON 对象");
         }
         if matches!(body.method.as_str(), "singbox.config.check" | "singbox.config.apply") {
             let Some(content) = body.params.get("content").and_then(Value::as_str) else {
@@ -444,20 +400,6 @@ pub async fn delete_proxy(_: ApiAdmin, State(app): State<Shared>, Path(id): Path
             Ok(proxy) => proxy.map(|proxy| proxy.node_id),
             Err(error) => return api_internal(error),
         };
-        match app.db.realm_refs(None, Some(id)) {
-            Ok(refs) if !refs.is_empty() => {
-                return api_error(
-                    StatusCode::CONFLICT,
-                    "REALM_REFERENCED",
-                    format!(
-                        "代理仍被 Realm 规则引用：{}",
-                        refs.iter().filter_map(|r| r["name"].as_str()).collect::<Vec<_>>().join("、")
-                    ),
-                )
-            }
-            Err(e) => return fail(e),
-            _ => {}
-        }
         match app.db.delete_proxy(id) {
             Ok(true) => {
                 let sync = sync_generated_nodes(&app, node_id.into_iter().collect());
@@ -820,15 +762,6 @@ pub(super) fn sync_generated_nodes(app: &Shared, node_ids: Vec<i64>) -> SyncRepo
     let mut report = SyncReport::default();
     let node_ids = node_ids.into_iter().collect::<std::collections::BTreeSet<_>>();
     for node_id in node_ids {
-        match app.db.mieru_desired(node_id) {
-            Ok(Some(_)) => {
-                report.pending.push(NeedsNodeSync { core: "mieru", node_id, reason: "reconciling" })
-            }
-            Err(_) => {
-                report.needs_sync.push(NeedsNodeSync { core: "mieru", node_id, reason: "config_error" })
-            }
-            _ => {}
-        }
         let has_singbox_proxy = app
             .db
             .proxies_for_node(node_id)
@@ -837,12 +770,6 @@ pub(super) fn sync_generated_nodes(app: &Shared, node_ids: Vec<i64>) -> SyncRepo
             if let Err(e) = app.db.set(&format!("singbox_managed_node_{node_id}"), "1") {
                 tracing::warn!("cannot record sing-box ownership: {e:#}");
             }
-        }
-        if !has_singbox_proxy
-            && app.db.get(&format!("singbox_managed_node_{node_id}")).is_none()
-            && app.db.mieru_managed(node_id).unwrap_or(false)
-        {
-            continue;
         }
         match generated_node_config(app, node_id) {
             Ok(config) => {

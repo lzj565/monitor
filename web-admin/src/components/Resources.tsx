@@ -3,7 +3,6 @@ import { ProxyAddressField, defaultAddressType, nodeAddress } from "./ProxyAddre
 import { Hysteria2Form } from "./admin/Hysteria2"
 import { ExternalAuthorization, ExternalAuthorizedSummary } from "./admin/ExternalProxies"
 import { normalizeUserUuid } from "@/lib/user-uuid"
-import { MieruForm, MieruCredential } from "./admin/Mieru"
 import { useAdminResources, useSharedProxies, useSharedUsers } from "@/components/AdminResources"
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { AlertTriangle, ArrowRight, ChevronDown, ChevronRight, ChevronUp, Copy, Eye, EyeOff, Pencil, Plus, RefreshCw, Settings2, Trash2 } from "lucide-react"
@@ -25,8 +24,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { AdminConfirmDialog as ConfirmDialog, AdminSearchInput } from "@/components/AdminShared"
 import { DragHandle, useDragOrder } from "@/components/DragOrder"
 import { api, type Node } from "@/lib/api"
-import { proxyListItems, proxyTypeFilter, type RealmRule } from "@/lib/realm-management"
-import { useRealmProxies, RealmProxyForm, RealmProxyRow, RealmEntryDialog, TrafficSummary } from "./admin/Realm"
+import { proxyListItems, proxyTypeFilter, } from "@/lib/realm-management"
 import { bytes } from "@/lib/format"
 import { parseResetDay, parseUserLimits } from "@/lib/user-limits"
 import { proxyDraft } from "@/lib/proxy-draft"
@@ -382,25 +380,16 @@ function ProxyForm({ proxy, nodes, onClose, onSaved, onBack, embedded, onBusyCha
   return embedded ? content : <ProxyDialog busy={saving} onClose={onClose}>{content}</ProxyDialog>
 }
 
-function ProxyPage({ nodes, site, refusal, search, go }: { nodes: Node[]; site: string; refusal: string; search: string; go: Go }) {
+function ProxyPage({ nodes, search, go }: { nodes: Node[]; site: string; refusal: string; search: string; go: Go }) {
   const notifySync = useNotifySync()
   const { items, error, loading, reload } = useAllProxies()
-  const realm = useRealmProxies()
   const typeFilter = proxyTypeFilter(search)
-  const [creationType, setCreationType] = useState<"vless" | "mieru" | "hysteria2" | "snell" | "realm" | null>(null)
-  const [editingRealmId, setEditingRealmId] = useState<number | null>(null)
-  const [deletingRealm, setDeletingRealm] = useState<RealmRule | null>(null)
-  const [detail, setDetail] = useState<{ nodeId: number; ruleId?: number } | null>(null)
-  const [realmBusy, setRealmBusy] = useState(false)
-  const editingRealm = realm.rules.find((r) => r.id === editingRealmId)
-  const detailHost = realm.hosts.find((h) => h.node_id === detail?.nodeId)
-  const detailRule = realm.rules.find((r) => r.id === detail?.ruleId)
+  const [creationType, setCreationType] = useState<"vless" | "hysteria2" | "snell" | null>(null)
   const [query, setQuery] = useState("")
   const [nodeFilter, setNodeFilter] = useState("all")
   const [statusFilter, setStatusFilter] = useState("all")
   const [creating, setCreating] = useState(false)
   const [creationBusy, setCreationBusy] = useState(false)
-  const [showMieruPassword, setShowMieruPassword] = useState(false)
   const [editing, setEditing] = useState<Proxy | null>(null)
   const [deleting, setDeleting] = useState<Proxy | null>(null)
   const [removing, setRemoving] = useState(false)
@@ -408,7 +397,7 @@ function ProxyPage({ nodes, site, refusal, search, go }: { nodes: Node[]; site: 
   const [savedOrder, setSavedOrder] = useState<string[] | null>(null)
   const [orderError, setOrderError] = useState("")
   const [orderRevision, setOrderRevision] = useState(0)
-  const mixedItems = proxyListItems(items ?? [], realm.rules, nodes, { query: "", node: "all", status: "all", type: "all" }).map((item) => ({ ...item, id: item.key }))
+  const mixedItems = proxyListItems(items ?? [], [], nodes, { query: "", node: "all", status: "all", type: "all" }).map((item) => ({ ...item, id: item.key }))
   const liveKeys = mixedItems.map((item) => item.id).sort().join(",")
   useEffect(() => {
     const controller = new AbortController()
@@ -419,29 +408,20 @@ function ProxyPage({ nodes, site, refusal, search, go }: { nodes: Node[]; site: 
   }, [liveKeys, orderRevision])
   const ranks = new Map(savedOrder?.map((id, rank) => [id, rank]))
   mixedItems.sort((a, b) => (ranks.get(a.id) ?? Number.MAX_SAFE_INTEGER) - (ranks.get(b.id) ?? Number.MAX_SAFE_INTEGER))
-  const reloadOrder = () => { setOrderRevision((revision) => revision + 1); reload(); void realm.reload() }
+  const reloadOrder = () => { setOrderRevision((revision) => revision + 1); reload() }
   const drag = useDragOrder(mixedItems, "proxy-list", reloadOrder)
   const nodeById = new Map(nodes.map((node) => [node.id, node]))
-  const visibleKeys = new Set(proxyListItems(items ?? [], realm.rules, nodes, { query, node: nodeFilter, status: statusFilter, type: typeFilter }).map((item) => item.key))
+  const visibleKeys = new Set(proxyListItems(items ?? [], [], nodes, { query, node: nodeFilter, status: statusFilter, type: typeFilter }).map((item) => item.key))
   const visible = drag.order.filter((item) => visibleKeys.has(item.key))
   const searching = query.trim() !== "" || nodeFilter !== "all" || statusFilter !== "all" || typeFilter !== "all"
-  const orderReady = savedOrder !== null && !orderError && !loading && !error && realm.loaded && !realm.error && [...savedOrder].sort().join(",") === liveKeys
+  const orderReady = savedOrder !== null && !orderError && !loading && !error && [...savedOrder].sort().join(",") === liveKeys
   const dragDisabled = searching || !orderReady
-  const tableLoading = loading || (!realm.loaded && !realm.error && typeFilter !== "vless")
+  const tableLoading = loading
   const changeTypeFilter = (type: string) => {
     const params = new URLSearchParams(search)
     if (type === "all") params.delete("type"); else params.set("type", type)
     go(`/admin/proxies${params.size ? `?${params}` : ""}`)
   }
-  const realmAction = async (work: () => Promise<unknown>, message: string) => {
-    setRealmBusy(true)
-    try { await work(); toast.success(message); await realm.reload(); reload() }
-    catch (e) { toast.error((e as Error).message) }
-    finally { setRealmBusy(false) }
-  }
-  const setRealmEnabled = (rule: RealmRule, enabled: boolean) => realmAction(() => api(`/realm/rules/${rule.id}`, { method: "PUT", body: JSON.stringify({ node_id: rule.node_id, target_proxy_id: rule.target_proxy_id, name: rule.custom_name, address_type: rule.address_type, address: rule.address, listen_port: rule.listen_port, enabled }) }), enabled ? "Realm 规则已启用，等待应用" : "Realm 规则已停用，等待应用")
-  const realmSaved = () => { void realm.reload(); reload() }
-
   async function remove() {
     if (!deleting) return
     setRemoving(true)
@@ -473,7 +453,7 @@ function ProxyPage({ nodes, site, refusal, search, go }: { nodes: Node[]; site: 
   return (
     <div className="space-y-4">
       <div className="flex min-w-0 flex-wrap items-center gap-2 xl:flex-nowrap" aria-label="代理筛选与操作">
-        <Select value={typeFilter} onValueChange={changeTypeFilter}><SelectTrigger className="w-28 shrink-0" aria-label="按代理类型筛选"><SelectValue /></SelectTrigger><SelectContent position="popper"><SelectItem value="all">全部类型</SelectItem><SelectItem value="snell">Snell v6</SelectItem><SelectItem value="hysteria2">HY2</SelectItem><SelectItem value="mieru">mieru</SelectItem><SelectItem value="vless">VLESS Reality</SelectItem><SelectItem value="realm">Realm 转发</SelectItem></SelectContent></Select>
+        <Select value={typeFilter} onValueChange={changeTypeFilter}><SelectTrigger className="w-28 shrink-0" aria-label="按代理类型筛选"><SelectValue /></SelectTrigger><SelectContent position="popper"><SelectItem value="all">全部类型</SelectItem><SelectItem value="snell">Snell v6</SelectItem><SelectItem value="hysteria2">HY2</SelectItem><SelectItem value="vless">VLESS Reality</SelectItem></SelectContent></Select>
         <AdminSearchInput className="min-w-40 flex-1 basis-40" value={query} onChange={setQuery} placeholder="搜索代理名称、地址或节点" />
         <Select value={nodeFilter} onValueChange={setNodeFilter}>
           <SelectTrigger className="w-28 shrink-0" aria-label="按节点筛选"><SelectValue /></SelectTrigger>
@@ -484,13 +464,11 @@ function ProxyPage({ nodes, site, refusal, search, go }: { nodes: Node[]; site: 
         </Select>
         <StatusFilter value={statusFilter} onChange={setStatusFilter} labels={[["all", "全部状态"], ["enabled", "已启用"], ["disabled", "已停用"]]} />
         <div className="ml-auto flex shrink-0 items-center gap-2">
-          {(typeFilter === "all" || typeFilter === "mieru") && <Button variant="outline" onClick={() => setShowMieruPassword(true)}>mieru 连接密码</Button>}
           <Button disabled={!nodes.length} onClick={() => { setCreationType(null); setCreating(true) }}><Plus /> 新增代理</Button>
         </div>
       </div>
 
       {orderError && <p role="alert" className="text-sm text-destructive">读取排序失败：{orderError}<Button variant="link" onClick={() => setOrderRevision((v) => v + 1)}>重试</Button></p>}
-      {realm.error && <div role="alert" className="text-sm text-destructive">读取 Realm 配置失败：{realm.error}，保留上次结果。<Button size="sm" variant="outline" className="ml-2" onClick={() => void realm.reload()}>重试</Button></div>}
       <Card className="overflow-x-auto p-0">
         <Table className="table-auto min-w-max">
           <TableHeader className="bg-muted/50">
@@ -508,10 +486,7 @@ function ProxyPage({ nodes, site, refusal, search, go }: { nodes: Node[]; site: 
           </TableHeader>
           <TableBody>
             {visible.map((item) => {
-              if (item.kind === "realm") {
-                const rule = item.rule
-                return <RealmProxyRow key={item.key} rowProps={drag.row(item.id)} dragHandle={<DragHandle {...drag.handle(item.id)} name={rule.name} disabled={dragDisabled} />} rule={rule} host={realm.hosts.find((h) => h.node_id === rule.node_id)} nodes={nodes} busy={realmBusy} onEdit={() => setEditingRealmId(rule.id)} onDelete={() => setDeletingRealm(rule)} onDetail={() => setDetail({ nodeId: rule.node_id, ruleId: rule.id })} onEnabled={(enabled) => void setRealmEnabled(rule, enabled)} />
-              }
+              if (item.kind !== "proxy") return null
               const proxy = item.proxy
               const node = nodeById.get(proxy.node_id)
               const proxyName = displayProxyName(proxy, node)
@@ -559,9 +534,9 @@ function ProxyPage({ nodes, site, refusal, search, go }: { nodes: Node[]; site: 
                 </TableRow>
               )
             })}
-            {!tableLoading && !error && !realm.error && !visible.length && (
+            {!tableLoading && !error && !visible.length && (
               <TableRow><TableCell colSpan={9} className="py-10 text-center text-sm text-muted-foreground">
-                {!items?.length && !realm.rules.length ? (nodes.length ? "还没有代理，右上角新增" : "先添加节点，再创建托管代理") : "没有匹配的代理"}
+                {!items?.length ? (nodes.length ? "还没有代理，右上角新增" : "先添加节点，再创建托管代理") : "没有匹配的代理"}
               </TableCell></TableRow>
             )}
             {tableLoading && <TableRow><TableCell colSpan={9} className="p-4"><Skeleton className="h-10 w-full" /></TableCell></TableRow>}
@@ -573,27 +548,17 @@ function ProxyPage({ nodes, site, refusal, search, go }: { nodes: Node[]; site: 
         </Table>
       </Card>
 
-      {showMieruPassword && <MieruCredential onClose={() => setShowMieruPassword(false)} />}
       {creating && <ProxyDialog compact={creationType === null} busy={creationBusy} onClose={() => setCreating(false)}>
         {creationType === null ? <><DialogHeader className="px-5 pt-5 pb-3 text-left"><DialogTitle>选择代理类型</DialogTitle><DialogDescription>选择要创建的代理服务</DialogDescription></DialogHeader><div className="flex flex-col gap-2 px-5 pb-5">{([
           ["vless", "VLESS Reality", "配置节点上的代理服务"],
           ["snell", "Snell v6", "单端口 TCP 代理"],
           ["hysteria2", "HY2", "单端口 UDP 代理"],
-          ["mieru", "mieru", "单端口 TCP 代理"],
-          ["realm", "Realm 转发", "监听端口转发到已有代理"],
         ] as const).map(([type, title, description]) => <Button key={type} className="group h-auto w-full justify-between gap-3 rounded-lg px-4 py-3 text-left" variant="outline" onClick={() => setCreationType(type)}><span className="flex min-w-0 flex-col gap-1"><strong className="whitespace-nowrap text-sm font-medium">{title}</strong><span className="whitespace-nowrap text-xs font-normal text-muted-foreground">{description}</span></span><ArrowRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground transition-transform group-hover:translate-x-0.5" /></Button>)}</div></>
         : creationType === "vless" ? <ProxyForm embedded nodes={nodes} proxy={null} onClose={() => setCreating(false)} onSaved={reload} onBack={() => setCreationType(null)} onBusyChange={setCreationBusy} />
         : creationType === "snell" ? <SnellForm embedded proxy={null} nodes={nodes} onClose={() => setCreating(false)} onSaved={reload} onBack={() => setCreationType(null)} onBusyChange={setCreationBusy} />
-        : creationType === "hysteria2" ? <Hysteria2Form embedded proxy={null} nodes={nodes} onClose={() => setCreating(false)} onSaved={reload} onBack={() => setCreationType(null)} onBusyChange={setCreationBusy} />
-        : creationType === "mieru" ? <MieruForm embedded onBusyChange={setCreationBusy} proxy={null} nodes={nodes} onClose={() => setCreating(false)} onSaved={reload} onBack={() => setCreationType(null)} />
-        : realm.loaded && items !== null ? <RealmProxyForm embedded rule={null} nodes={nodes} proxies={items ?? []} hosts={realm.hosts} rules={realm.rules} ready={realm.loaded && !realm.error && !error} site={site} refusal={refusal} onClose={() => setCreating(false)} onSaved={realmSaved} onRefresh={realm.reload} onBack={() => setCreationType(null)} onBusyChange={setCreationBusy} />
-        : <><DialogHeader className="px-6 pt-6"><DialogTitle>新增 Realm 代理</DialogTitle><DialogDescription>{realm.error || error || "正在读取节点与代理配置…"}</DialogDescription></DialogHeader><div className="flex gap-2 p-6"><Button variant="outline" onClick={() => { void realm.reload(); reload() }}>重试读取</Button><Button variant="ghost" onClick={() => setCreationType(null)}>返回选择类型</Button></div></>}
+        : creationType === "hysteria2" ? <Hysteria2Form embedded proxy={null} nodes={nodes} onClose={() => setCreating(false)} onSaved={reload} onBack={() => setCreationType(null)} onBusyChange={setCreationBusy} /> : null}
       </ProxyDialog>}
-      {editingRealm && <RealmProxyForm key={editingRealm.id} rule={editingRealm} nodes={nodes} proxies={items ?? []} hosts={realm.hosts} rules={realm.rules} ready={realm.loaded && !realm.error && items !== null && !error} site={site} refusal={refusal} onClose={() => setEditingRealmId(null)} onSaved={realmSaved} onRefresh={realm.reload} />}
-      {detailHost && <RealmEntryDialog key={detailHost.node_id} host={detailHost} rule={detailRule} traffic={realm.traffic} onClose={() => setDetail(null)} />}
-      {deletingRealm && <ConfirmDialog title={`删除 Realm 代理「${deletingRealm.name}」？`} description="当前转发规则和订阅入口将移除；目标代理、入口节点、其他转发规则及历史流量保留。" confirmLabel="删除 Realm 代理" busy={realmBusy} onClose={() => setDeletingRealm(null)} onConfirm={() => { void realmAction(async () => { await api(`/realm/rules/${deletingRealm.id}`, { method: "DELETE" }); setDeletingRealm(null) }, "已删除 Realm 规则，等待同步") }} />}
-      {typeFilter !== "vless" && realm.traffic.rules.some((r) => !r.active) && <details className="space-y-3 rounded-lg border p-4"><summary className="cursor-pointer text-sm font-medium">已删除 Realm 规则的历史流量</summary>{realm.traffic.rules.filter((r) => !r.active && (nodeFilter === "all" || nodeFilter === String(r.node_id))).map((r) => <div key={r.key} className="space-y-1 border-t pt-3"><p className="text-sm">{nodeById.get(r.node_id)?.name ?? `节点 ${r.node_id}`} / {r.name}</p><TrafficSummary items={[r]} /></div>)}</details>}
-      {editing && (editing.protocol === "snell" ? <SnellForm nodes={nodes} proxy={editing} onClose={() => setEditing(null)} onSaved={reload} /> : editing.protocol === "hysteria2" ? <Hysteria2Form nodes={nodes} proxy={editing} onClose={() => setEditing(null)} onSaved={reload} /> : editing.protocol === "mieru" ? <MieruForm nodes={nodes} proxy={editing} onClose={() => setEditing(null)} onSaved={reload} /> : <ProxyForm nodes={nodes} proxy={editing} onClose={() => setEditing(null)} onSaved={reload} />)}
+      {editing && (editing.protocol === "snell" ? <SnellForm nodes={nodes} proxy={editing} onClose={() => setEditing(null)} onSaved={reload} /> : editing.protocol === "hysteria2" ? <Hysteria2Form nodes={nodes} proxy={editing} onClose={() => setEditing(null)} onSaved={reload} /> : <ProxyForm nodes={nodes} proxy={editing} onClose={() => setEditing(null)} onSaved={reload} />)}
       {deleting && <ConfirmDialog
         title={`删除代理「${displayProxyName(deleting, nodeById.get(deleting.node_id))}」？`}
         description="删除会一并解除所有关联用户授权，并自动同步对应节点的代理配置。"
@@ -1025,15 +990,10 @@ function SubscriptionForm({ user, proxies, nodes, accesses, ready, onClose, onSa
   onClose: () => void
   onSaved: () => void
 }) {
-  const [tab, setTab] = useState<"proxy" | "realm" | "external">("proxy")
+  const [tab, setTab] = useState<"proxy" | "external">("proxy")
   const [externalState, setExternalState] = useState({ dirty: false, saving: false, count: 0 })
   const [confirmClose, setConfirmClose] = useState(false)
   const [proxyBaseline, setProxyBaseline] = useState(JSON.stringify({ ids: accesses.filter(item => item.access.enabled).map(item => item.proxy.id).sort((a,b) => a-b), auto: user.auto_authorize_new_proxies }))
-  const [realmBaseline, setRealmBaseline] = useState("[]")
-  const realm = useRealmProxies()
-  const [realmIds,setRealmIds]=useState<number[]>([])
-  const [realmReady,setRealmReady]=useState(false)
-  useEffect(()=>{ void api<{realm_items:number[]}>(`/users/${user.id}/proxies`).then(r=>{setRealmIds(r.realm_items);setRealmBaseline(JSON.stringify([...r.realm_items].sort((a,b) => a-b)));setRealmReady(true)}).catch(e=>toast.error(e.message)) },[user.id])
   const notifySync = useNotifySync()
   const [autoAuthorizeNewProxies, setAutoAuthorizeNewProxies] = useState(user.auto_authorize_new_proxies)
   const [proxyQuery, setProxyQuery] = useState("")
@@ -1045,7 +1005,6 @@ function SubscriptionForm({ user, proxies, nodes, accesses, ready, onClose, onSa
   const ranks = new Map(savedOrder.map((id, index) => [id, index]))
   const entries = [
     ...proxies.map(p => ({ key: `proxy:${p.id}`, id: p.id, name: displayProxyName(p, nodes.find(n => n.id === p.node_id)), node: nodes.find(n => n.id === p.node_id)?.name ?? "", address: p.address, port: p.port, realm: false, protocol: p.protocol })),
-    ...realm.rules.map(r => ({ key: `realm:${r.id}`, id: r.id, name: r.name, node: nodes.find(n => n.id === r.node_id)?.name ?? "", address: r.address, port: r.listen_port, realm: true, protocol: "Realm" })),
   ].sort((a,b) => (ranks.get(a.key) ?? Number.MAX_SAFE_INTEGER) - (ranks.get(b.key) ?? Number.MAX_SAFE_INTEGER))
   const selectedProxies = proxies.filter((proxy) => selectedIds.has(proxy.id))
   const query = proxyQuery.trim().toLocaleLowerCase()
@@ -1060,26 +1019,24 @@ function SubscriptionForm({ user, proxies, nodes, accesses, ready, onClose, onSa
   }
 
   const proxySignature = JSON.stringify({ ids: [...selectedIds].sort((a,b) => a-b), auto: autoAuthorizeNewProxies })
-  const realmSignature = JSON.stringify([...realmIds].sort((a,b) => a-b))
   function close() {
     if (saving || externalState.saving) return
-    if (proxySignature !== proxyBaseline || realmSignature !== realmBaseline || externalState.dirty) setConfirmClose(true)
+    if (proxySignature !== proxyBaseline || externalState.dirty) setConfirmClose(true)
     else onClose()
   }
 
   async function save(event: React.FormEvent) {
     event.preventDefault()
-    if (!ready || (tab === "realm" && !realmReady) || savingRef.current || tab === "external") return
+    if (!ready || savingRef.current || tab === "external") return
     savingRef.current = true
     setSaving(true)
     try {
       const result = await api<{ sync: SyncReport }>(`/users/${user.id}/proxies`, { method: "PUT", body: JSON.stringify({
         scope: tab, items: tab === "proxy" ? selectedProxies.map(proxy => ({ proxy_id: proxy.id, enabled: true })) : [],
-        ...(tab === "proxy" ? { auto_authorize_new_proxies: autoAuthorizeNewProxies } : { realm_rule_ids: realmIds }),
+        auto_authorize_new_proxies: autoAuthorizeNewProxies,
       }) })
       notifySync("订阅已更新", result.sync)
       if (tab === "proxy") setProxyBaseline(proxySignature)
-      else setRealmBaseline(realmSignature)
       onSaved()
     } catch (error) {
       toast.error(`订阅授权未能保存：${(error as Error).message}`)
@@ -1099,13 +1056,13 @@ function SubscriptionForm({ user, proxies, nodes, accesses, ready, onClose, onSa
             <DialogDescription>勾选需要授权的节点；取消全部勾选并保存可清空授权。</DialogDescription>
           </DialogHeader>
           <div role="tablist" aria-label="订阅入口类型" className="flex gap-2 px-6 pb-4">
-            {([ ["proxy", "节点"], ["realm", "Realm"], ["external", "外部节点"] ] as const).map(([value, label]) => <Button key={value} type="button" role="tab" aria-selected={tab === value} disabled={saving || externalState.saving} variant={tab === value ? "default" : "outline"} onKeyDown={event => { if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) { event.preventDefault(); const buttons = Array.from(event.currentTarget.parentElement!.querySelectorAll<HTMLButtonElement>("[role=tab]")); const index = buttons.indexOf(event.currentTarget); buttons[event.key === "Home" ? 0 : event.key === "End" ? 2 : (index + (event.key === "ArrowRight" ? 1 : 2)) % 3]?.click(); buttons[event.key === "Home" ? 0 : event.key === "End" ? 2 : (index + (event.key === "ArrowRight" ? 1 : 2)) % 3]?.focus() } }} onClick={() => setTab(value)}>{label}（{value === "proxy" ? selectedIds.size : value === "realm" ? realmIds.length : externalState.count}）</Button>)}
+            {([ ["proxy", "节点"], ["external", "外部节点"] ] as const).map(([value, label]) => <Button key={value} type="button" role="tab" aria-selected={tab === value} disabled={saving || externalState.saving} variant={tab === value ? "default" : "outline"} onKeyDown={event => { if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) { event.preventDefault(); const buttons = Array.from(event.currentTarget.parentElement!.querySelectorAll<HTMLButtonElement>("[role=tab]")); const index = buttons.indexOf(event.currentTarget); buttons[event.key === "Home" ? 0 : event.key === "End" ? 1 : (index + (event.key === "ArrowRight" ? 1 : 1)) % 2]?.click(); buttons[event.key === "Home" ? 0 : event.key === "End" ? 1 : (index + (event.key === "ArrowRight" ? 1 : 1)) % 2]?.focus() } }} onClick={() => setTab(value)}>{label}（{value === "proxy" ? selectedIds.size : externalState.count}）</Button>)}
           </div>
           <div hidden={tab !== "external"} className="min-h-0 overflow-y-auto px-6"><ExternalAuthorization userId={user.id} onState={setExternalState} /></div>
           <div hidden={tab === "external"} className="shrink-0 space-y-3 px-6 pb-4">
             <div className="flex flex-wrap items-center gap-2">
-              <Button type="button" variant="outline" size="sm" disabled={!ready || saving} onClick={() => { if (tab === "proxy") setSelectedIds(new Set(proxies.map((proxy) => proxy.id))); else setRealmIds(realm.rules.map(r => r.id)) }}>全选入口</Button>
-              <Button type="button" variant="outline" size="sm" disabled={!ready || saving} onClick={() => { if (tab === "proxy") setSelectedIds(new Set()); else setRealmIds([]) }}>清空选择</Button>
+              <Button type="button" variant="outline" size="sm" disabled={!ready || saving} onClick={() => { setSelectedIds(new Set(proxies.map((proxy) => proxy.id))) }}>全选入口</Button>
+              <Button type="button" variant="outline" size="sm" disabled={!ready || saving} onClick={() => { setSelectedIds(new Set()) }}>清空选择</Button>
             </div>
             <label hidden={tab !== "proxy"} className="items-center justify-between gap-3">
               <span className="space-y-1"><span className="block text-sm font-medium">自动授权新增代理</span><span className="block text-xs text-muted-foreground">保存后新建的托管代理会自动加入此用户订阅（不含外部导入），已有代理仍按勾选结果授权。</span></span>
@@ -1115,19 +1072,18 @@ function SubscriptionForm({ user, proxies, nodes, accesses, ready, onClose, onSa
           </div>
           <div hidden={tab === "external"} className="min-h-0 flex-1 overflow-y-auto px-6 pb-4">
             <div className="rounded-md border">
-              {entries.filter(entry => entry.realm === (tab === "realm")).filter(entry => !query || `${entry.name} ${entry.node} ${entry.address}`.toLocaleLowerCase().includes(query)).map(entry => <label key={entry.key} className="flex cursor-pointer items-start gap-3 border-b px-4 py-3 last:border-0 hover:bg-muted/30">
-                <input type="checkbox" className="mt-1 size-4 shrink-0 accent-primary" disabled={!ready || (tab === "realm" && !realmReady) || saving} checked={entry.realm ? realmIds.includes(entry.id) : selectedIds.has(entry.id)} onChange={e => entry.realm ? setRealmIds(ids => e.target.checked ? [...ids, entry.id] : ids.filter(id => id !== entry.id)) : setProxySelected(entry.id, e.target.checked)} />
+              {entries.filter(entry => !query || `${entry.name} ${entry.node} ${entry.address}`.toLocaleLowerCase().includes(query)).map(entry => <label key={entry.key} className="flex cursor-pointer items-start gap-3 border-b px-4 py-3 last:border-0 hover:bg-muted/30">
+                <input type="checkbox" className="mt-1 size-4 shrink-0 accent-primary" disabled={!ready || saving} checked={selectedIds.has(entry.id)} onChange={e => setProxySelected(entry.id, e.target.checked)} />
                 <span className="min-w-0 space-y-1"><span className="flex flex-wrap items-center gap-2"><span className="break-all text-sm font-medium">{entry.name}</span><Badge variant="outline">{entry.protocol}</Badge></span><span className="block break-all text-xs text-muted-foreground">{entry.node} · {entry.address}:{entry.port}</span></span>
               </label>)}
-              {!entries.filter(e => e.realm === (tab === "realm")).length && <p className="p-4 text-sm text-muted-foreground">目前没有可授权的入口</p>}
+              {!entries.length && <p className="p-4 text-sm text-muted-foreground">目前没有可授权的入口</p>}
               {query && entries.length > 0 && !entries.some(e => `${e.name} ${e.node} ${e.address}`.toLocaleLowerCase().includes(query)) && <p className="p-4 text-sm text-muted-foreground">没有匹配的入口</p>}
-              {realm.error && <p role="alert">{realm.error}</p>}
             </div>
           </div>
           <DialogFooter className="shrink-0 items-center border-t px-6 py-4">
-            <span className="mr-auto text-sm text-muted-foreground">{tab === "proxy" ? `已选择 ${selectedProxies.length} 个节点` : tab === "realm" ? `已选择 ${realmIds.length} 个 Realm` : "外部节点独立保存"}</span>
+            <span className="mr-auto text-sm text-muted-foreground">{tab === "proxy" ? `已选择 ${selectedProxies.length} 个节点` : "外部节点独立保存"}</span>
             <Button type="button" variant="ghost" disabled={saving || externalState.saving} onClick={close}>关闭</Button>
-            {tab !== "external" && <Button type="submit" disabled={saving || !ready || (tab === "realm" && !realmReady)}>{saving ? "保存中..." : tab === "proxy" ? "保存节点授权" : "保存 Realm 授权"}</Button>}
+            {tab !== "external" && <Button type="submit" disabled={saving || !ready}>{saving ? "保存中..." : "保存节点授权"}</Button>}
           </DialogFooter>
         </form>
       </DialogContent>

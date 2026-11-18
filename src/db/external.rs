@@ -280,7 +280,7 @@ impl Db {
 }
 impl Db {
     pub fn internal_default_names(&self) -> Result<std::collections::HashMap<i64, String>> {
-        let mut names = {
+        let names = {
             let conn = self.conn();
             let mut stmt=conn.prepare("SELECT p.id,p.name,p.include_node_name,COALESCE(n.country,'') FROM proxies p JOIN node n ON n.id=p.node_id")?;
             let rows = stmt
@@ -293,9 +293,6 @@ impl Db {
                 .collect::<rusqlite::Result<std::collections::HashMap<_, _>>>()?;
             rows
         };
-        for entry in self.realm_subscription_entries()? {
-            names.insert(-entry.id, entry.name);
-        }
         Ok(names)
     }
 }

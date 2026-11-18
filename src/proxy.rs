@@ -106,33 +106,10 @@ impl ProxyRequest {
                 config: self.config,
             });
         }
-        if self.protocol == "mieru" {
-            validate_address(&self.address_type, &self.address)?;
-            if self.port < 1025
-                || self.config != json!({"transport":"tcp"})
-                || self.flow.as_deref().is_some_and(|f| !f.is_empty())
-            {
-                return Err(InputError::new(
-                    "INVALID_PROXY_CONFIG",
-                    "mieru requires TCP, port 1025–65535 and an empty flow",
-                ));
-            }
-            return Ok(ProxyDraft {
-                name: name.into(),
-                include_node_name: self.include_node_name,
-                protocol: self.protocol,
-                address_type: self.address_type,
-                address: self.address,
-                port: self.port.into(),
-                enabled: self.enabled,
-                flow: Some(String::new()),
-                config: self.config,
-            });
-        }
         if self.protocol != "vless" {
             return Err(InputError::new(
                 "INVALID_PROXY_PROTOCOL",
-                "Only VLESS and mieru protocols are supported",
+                "Unsupported managed proxy protocol",
             ));
         }
         validate_address(&self.address_type, &self.address)?;

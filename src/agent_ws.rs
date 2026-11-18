@@ -768,32 +768,6 @@ fn dispatch(
                 session.last_components = Some(arrival.tick);
             }
         }
-        "realm.traffic" => {
-            let agents = app.agents.read().unwrap_or_else(|e| e.into_inner());
-            let current = agents
-                .get(&node_id)
-                .filter(|a| session.greeted && a.session == session.tag && a.realm_traffic_capable);
-            if let Some(agent) = current {
-                let ack = app.db.realm_traffic_record(node_id, &rpc.params)?;
-                let _ = agent.tx.try_send(ack.to_string());
-            }
-        }
-        "mieru.traffic" if session.greeted => {
-            let current = app
-                .agents
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(&node_id)
-                .is_some_and(|a| a.session == session.tag && a.mieru_traffic_capable);
-            if current
-                && session
-                    .last_mieru_traffic
-                    .is_none_or(|last| arrival.tick.duration_since(last) >= PROXY_TRAFFIC_SPACING)
-            {
-                session.last_mieru_traffic = Some(arrival.tick);
-                app.db.record_mieru_traffic(node_id, &rpc.params, arrival.at.timestamp())?;
-            }
-        }
         "proxy.traffic" if !session.greeted => {
             session.complain(node_id, "proxy traffic arrived before hello and was ignored");
         }

@@ -2146,132 +2146,7 @@ async fn a_history_window_stops_at_the_retention_window() {
     assert_eq!(step(&month), 3_600, "in whole hours, as no hourly row may straddle two points");
 }
 
-#[tokio::test]
-async fn mieru_exports_in_clash_and_native_subscription_is_removed() {
-    let app = std::sync::Arc::new(app());
-    let node = app
-        .db
-        .create_node(&crate::db::Node { name: "mieru-api".into(), ..Default::default() }, "mieru-test-token")
-        .unwrap();
-    let request=serde_json::from_value(json!({"name":"mieru","protocol":"mieru","address_type":"domain","address":"proxy.example.com","port":24061,"enabled":true,"config":{"transport":"tcp"}})).unwrap();
-    let response = create_proxy(ApiAdmin, State(app.clone()), Path(node), Ok(Json(request))).await;
-    assert_eq!(response.status(), StatusCode::CREATED);
-    let value: Value =
-        serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap())
-            .unwrap();
-    let proxy = value["id"].as_i64().unwrap();
-    let user = app.db.user_login_record("admin").unwrap().unwrap().id;
-    let request = serde_json::from_value(json!({"enabled":true})).unwrap();
-    assert_eq!(
-        put_user_proxy(ApiAdmin, State(app.clone()), Path((user, proxy)), Ok(Json(request))).await.status(),
-        StatusCode::OK
-    );
-    let portal = portal_json(user_proxies(UserAuth(user), State(app.clone())).await).await;
-    let row = &portal["items"][0];
-    assert!(row["mieru_url"].as_str().unwrap().starts_with("mierus://"));
-    assert!(row.get("mieru_config").is_none());
-    let yaml = row["mihomo_yaml"].as_str().unwrap();
-    for expected in [
-        "type: mieru",
-        "server: proxy.example.com",
-        "port: 24061",
-        "transport: TCP",
-        "udp: true",
-        "multiplexing: MULTIPLEXING_OFF",
-        "handshake-mode: HANDSHAKE_NO_WAIT",
-    ] {
-        assert!(yaml.contains(expected), "missing {expected}");
-    }
-    assert!(yaml.contains(&format!("username: user-{user}")));
-    assert!(yaml.contains(&format!("password: {}", app.db.mieru_password(false).unwrap())));
-    assert!(row.get("vless_url").is_none());
-    assert!(row.get("mieru_password").is_none());
-    let token = app.db.user_subscription_token(user).unwrap().unwrap();
-    let native = subscription(State(app.clone()), Path((token.clone(), "mieru".into()))).await;
-    assert_eq!(native.status(), StatusCode::NOT_FOUND);
-    let links = portal_json(user_subscription_links(UserAuth(user), State(app.clone())).await).await;
-    assert!(links.get("mieru").is_none());
-    let clash = subscription(State(app.clone()), Path((token.clone(), "clash".into()))).await;
-    assert_eq!(clash.status(), StatusCode::OK);
-    assert_eq!(clash.headers()[header::CACHE_CONTROL], "no-store");
-    let body = String::from_utf8(axum::body::to_bytes(clash.into_body(), usize::MAX).await.unwrap().to_vec())
-        .unwrap();
-    assert!(body.contains(&yaml.lines().map(|line| format!("  {line}\n")).collect::<String>()));
-    assert!(body.contains("proxy-groups:"));
-    assert!(!body.contains("type: vless"));
-    let relay = app
-        .db
-        .create_node(&crate::db::Node { name: "relay".into(), ..Default::default() }, "relay-token")
-        .unwrap();
-    app.db.realm_save_host(&crate::db::RealmHostInput { node_id: relay, enabled: true }).unwrap();
-    app.db
-        .realm_save_rule(
-            None,
-            &crate::db::RealmRuleInput {
-                node_id: relay,
-                target_proxy_id: proxy,
-                name: "relay".into(),
-                address_type: "domain".into(),
-                address: "relay.example.com".into(),
-                listen_port: 24443,
-                enabled: true,
-            },
-        )
-        .unwrap();
-    let desired = app.db.realm_desired(relay).unwrap();
-    app.db.realm_applied(&desired).unwrap();
-    app.db
-        .replace_entry_authorizations(
-            user,
-            &app.db
-                .authorizations_for_user(user)
-                .unwrap()
-                .unwrap()
-                .iter()
-                .map(|a| (a.proxy.id, a.access.enabled))
-                .collect::<Vec<_>>(),
-            None,
-            Some(
-                &app.db.realm_rules().unwrap().iter().map(|r| r["id"].as_i64().unwrap()).collect::<Vec<_>>(),
-            ),
-        )
-        .unwrap()
-        .unwrap();
-    let mut proxies = app.db.active_user_portal_proxies(user, Utc::now().timestamp()).unwrap();
-    assert_eq!(proxies.len(), 2);
-    let relayed = mihomo_proxy(user, &proxies[1]);
-    assert!(relayed.contains("server: relay.example.com"));
-    assert!(relayed.contains("port: 24443"));
-    assert!(relayed.contains("-realm"));
-    assert_eq!(proxies[0].mieru_password, proxies[1].mieru_password);
-    let mut vless = proxies[0].clone();
-    vless.protocol = "vless".into();
-    vless.name = "VLESS".into();
-    vless.id = 999;
-    proxies.push(vless);
-    let mixed = clash_subscription(user, &proxies);
-    assert_eq!(mixed.matches("type: mieru").count(), 2);
-    assert_eq!(mixed.matches("type: vless").count(), 1);
-    assert_eq!(mixed.matches("      - ").count(), 4);
-    let mut escaped = proxies[0].clone();
-    escaped.name = "name: #test".into();
-    escaped.address = "2001:db8::1".into();
-    escaped.mieru_password = Some("true".into());
-    let special = mihomo_proxy(user, &escaped);
-    assert!(special.contains("name: \"name: #test\""));
-    assert!(special.contains("password: \"true\""));
-    assert!(special.contains("server: 2001:db8::1"));
-    assert!(clash_subscription(user, &[]).starts_with("proxies: []\n"));
-    let request = serde_json::from_value(json!({"enabled":false})).unwrap();
-    assert_eq!(
-        put_user_proxy(ApiAdmin, State(app.clone()), Path((user, proxy)), Ok(Json(request))).await.status(),
-        StatusCode::OK
-    );
-    assert!(app.db.active_user_portal_proxies(user, Utc::now().timestamp()).unwrap().is_empty());
-    let legacy = portal_json(subscription(State(app.clone()), Path((token, "sing-box".into()))).await).await;
-    assert_eq!(legacy["outbounds"].as_array().unwrap().len(), 1);
-    assert_eq!(legacy["outbounds"][0]["type"], "direct");
-}
+
 
 #[tokio::test]
 async fn deleting_last_vless_still_clears_singbox_on_a_mixed_node() {
@@ -2388,22 +2263,7 @@ async fn registration_records_batch_choices_and_reruns_do_not_reset_them() {
     assert!(app.db.component_choices(id).unwrap().unwrap().mieru);
 }
 
-#[tokio::test]
-async fn global_mieru_password_endpoint_is_stable_and_reset_is_global() {
-    let app = std::sync::Arc::new(app());
-    let response = crate::mieru::credential(Admin, State(app.clone())).await;
-    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
-    let first = portal_json(response).await;
-    assert!(first.get("username").is_none());
-    assert_eq!(first["password"], app.db.mieru_password(false).unwrap());
-    let second = portal_json(crate::mieru::credential(Admin, State(app.clone())).await).await;
-    assert_eq!(first, second);
-    let reset = crate::mieru::reset_credential(Admin, State(app.clone())).await;
-    assert_eq!(reset.headers()[header::CACHE_CONTROL], "no-store");
-    let reset = portal_json(reset).await;
-    assert_ne!(first["password"], reset["password"]);
-    assert_eq!(reset["password"], app.db.mieru_password(false).unwrap());
-}
+
 
 #[tokio::test]
 async fn manual_uuid_updates_exports_and_online_offline_sync() {
@@ -2526,51 +2386,15 @@ async fn mixed_external_portal_and_subscriptions_preserve_credentials_and_isolat
         .unwrap()
         .unwrap();
     let target = node(&app, "target", true);
-    let relay = node(&app, "relay", true);
     let direct=app.db.create_proxy(target,&crate::db::ProxyDraft{name:"same".into(),include_node_name:false,protocol:"vless".into(),address_type:"domain".into(),address:"internal.example.com".into(),port:24060,enabled:true,flow:None,config:json!({"reality":{"server_name":"edge.example.com","public_key":"public-key","short_id":"abcd"}})}).unwrap().unwrap();
     app.db
         .put_authorization(user, direct, &crate::db::AuthorizationDraft { enabled: true, auth: None })
         .unwrap()
         .unwrap();
-    app.db.realm_save_host(&crate::db::RealmHostInput { node_id: relay, enabled: true }).unwrap();
-    let realm = app
-        .db
-        .realm_save_rule(
-            None,
-            &crate::db::RealmRuleInput {
-                node_id: relay,
-                target_proxy_id: direct,
-                name: "same".into(),
-                address_type: "domain".into(),
-                address: "relay.example.com".into(),
-                listen_port: 24062,
-                enabled: true,
-            },
-        )
-        .unwrap();
-    let desired = app.db.realm_desired(relay).unwrap();
-    app.db.realm_applied(&desired).unwrap();
-    app.db
-        .replace_entry_authorizations(
-            user,
-            &app.db
-                .authorizations_for_user(user)
-                .unwrap()
-                .unwrap()
-                .iter()
-                .map(|a| (a.proxy.id, a.access.enabled))
-                .collect::<Vec<_>>(),
-            None,
-            Some(
-                &app.db.realm_rules().unwrap().iter().map(|r| r["id"].as_i64().unwrap()).collect::<Vec<_>>(),
-            ),
-        )
-        .unwrap()
-        .unwrap();
     let config = json!({"name":"same","type":"vless","server":"external.example.com","port":443,"uuid":"imported-original-uuid","tls":true,"ws-opts":{"path":"/original"}});
     let external = app.db.import_external_proxies(std::slice::from_ref(&config)).unwrap()[0];
     app.db.replace_external_authorizations(user, &[external]).unwrap();
-    let keys = vec![format!("external:{external}"), format!("realm:{realm}"), format!("proxy:{direct}")];
+    let keys = vec![format!("external:{external}"), format!("proxy:{direct}")];
     app.db.reorder_user_entries(user, &keys, now).unwrap();
     let rows = user_portal_items(&app, user).unwrap();
     assert_eq!(rows.iter().map(|r| r["entry_key"].as_str().unwrap().to_owned()).collect::<Vec<_>>(), keys);
@@ -2580,11 +2404,11 @@ async fn mixed_external_portal_and_subscriptions_preserve_credentials_and_isolat
     let yaml = combined_clash_subscription(&rows);
     let exported: Value = serde_yaml_ng::from_str(&yaml).unwrap();
     let proxies = exported["proxies"].as_array().unwrap();
-    assert_eq!(proxies.len(), 3);
+    assert_eq!(proxies.len(), 2);
     assert_eq!(proxies[0]["uuid"], "imported-original-uuid");
     assert_eq!(proxies[0]["ws-opts"], config["ws-opts"]);
     let names: std::collections::HashSet<_> = proxies.iter().map(|p| p["name"].as_str().unwrap()).collect();
-    assert_eq!(names.len(), 3);
+    assert_eq!(names.len(), 2);
     let selected = exported["proxy-groups"][0]["proxies"].as_array().unwrap();
     for (p, s) in proxies.iter().zip(selected) {
         assert_eq!(p["name"], *s);
@@ -2594,7 +2418,7 @@ async fn mixed_external_portal_and_subscriptions_preserve_credentials_and_isolat
     assert_eq!(rows[0]["name"], "私人名字");
     assert!(rows[0]["mihomo_yaml"].as_str().unwrap().contains("私人名字"));
     let filtered: Value = serde_yaml_ng::from_str(&combined_clash_subscription(&rows)).unwrap();
-    assert_eq!(filtered["proxies"].as_array().unwrap().len(), 2);
+    assert_eq!(filtered["proxies"].as_array().unwrap().len(), 1);
     let token = app.db.user_subscription_token(user).unwrap().unwrap();
     let response = subscription(State(app.clone()), Path((token.clone(), "sing-box".into()))).await;
     let native = portal_json(response).await;

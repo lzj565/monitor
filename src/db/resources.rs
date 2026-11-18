@@ -176,7 +176,7 @@ impl Db {
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT u.id,u.username,u.uuid,u.enabled,u.expires_at,u.created_at,u.updated_at,
-                    ((SELECT COUNT(*) FROM user_proxy_authorizations a WHERE a.user_id=u.id AND a.direct_visible=1)+(SELECT COUNT(*) FROM user_realm_authorizations a WHERE a.user_id=u.id)),
+                    ((SELECT COUNT(*) FROM user_proxy_authorizations a WHERE a.user_id=u.id AND a.direct_visible=1)),
                     u.traffic_limit,u.device_limit,u.traffic_reset_day,u.auto_authorize_new_proxies
              FROM users u WHERE (?1 IS NULL OR u.enabled=?1) ORDER BY u.id",
         )?;
@@ -191,7 +191,7 @@ impl Db {
             .conn()
             .query_row(
                 "SELECT u.id,u.username,u.uuid,u.enabled,u.expires_at,u.created_at,u.updated_at,
-                        ((SELECT COUNT(*) FROM user_proxy_authorizations a WHERE a.user_id=u.id AND a.direct_visible=1)+(SELECT COUNT(*) FROM user_realm_authorizations a WHERE a.user_id=u.id)),
+                        ((SELECT COUNT(*) FROM user_proxy_authorizations a WHERE a.user_id=u.id AND a.direct_visible=1)),
                     u.traffic_limit,u.device_limit,u.traffic_reset_day,u.auto_authorize_new_proxies
                  FROM users u WHERE u.id=?1",
                 [id],
@@ -717,7 +717,6 @@ impl Db {
                 proxy.mieru_password = Some(self.mieru_password(false)?);
             }
         }
-        let direct = proxies.clone();
         let direct_ids: std::collections::HashSet<i64> = {
             let conn = self.conn();
             let mut stmt = conn.prepare(
@@ -727,32 +726,6 @@ impl Db {
             rows
         };
         proxies.retain(|p| direct_ids.contains(&p.id));
-        let realm_ids = self.realm_authorization_ids(id)?;
-        for entry in self.realm_subscription_entries()? {
-            if !realm_ids.contains(&entry.id) {
-                continue;
-            }
-            if let Some(base) = direct.iter().find(|p| p.id == entry.target_proxy_id) {
-                let mut item = base.clone();
-                item.id = -entry.id;
-                item.realm_target_node_id = Some(item.node_id);
-                item.node_id = entry.source_node_id;
-                item.node_name = entry.source_name.clone();
-                item.name = entry.name.clone();
-                item.include_node_name = false;
-                item.address = entry.address;
-                item.address_type = if item.address.parse::<std::net::Ipv4Addr>().is_ok() {
-                    "ipv4"
-                } else if item.address.parse::<std::net::Ipv6Addr>().is_ok() {
-                    "ipv6"
-                } else {
-                    "domain"
-                }
-                .into();
-                item.port = entry.port;
-                proxies.push(item);
-            }
-        }
         let prefs = self.entry_preferences(id)?;
         for p in &mut proxies {
             if let Some((_, _, name)) = prefs.get(&p.id) {
@@ -829,7 +802,6 @@ impl Db {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(stmt);
         drop(conn);
-        let direct = proxies.clone();
         let direct_ids: std::collections::HashSet<i64> = {
             let conn = self.conn();
             let mut stmt = conn.prepare(
@@ -839,21 +811,6 @@ impl Db {
             rows
         };
         proxies.retain(|p| direct_ids.contains(&p.id));
-        let realm_ids = self.realm_authorization_ids(id)?;
-        for entry in self.realm_subscription_entries()? {
-            if !realm_ids.contains(&entry.id) {
-                continue;
-            }
-            if let Some(base) = direct.iter().find(|p| p.id == entry.target_proxy_id) {
-                let mut item = base.clone();
-                item.id = -entry.id;
-                item.name = entry.name.clone();
-                item.include_node_name = false;
-                item.address = entry.address;
-                item.port = entry.port;
-                proxies.push(item);
-            }
-        }
         let prefs = self.entry_preferences(id)?;
         proxies.retain(|p| !prefs.get(&p.id).is_some_and(|v| v.1));
         for p in &mut proxies {
@@ -1116,11 +1073,8 @@ impl Db {
         self.replace_entry_authorizations(user_id, items, auto_authorize_new_proxies, None)
     }
     pub fn realm_authorization_ids(&self, user: i64) -> Result<Vec<i64>> {
-        let conn = self.conn();
-        let mut stmt =
-            conn.prepare("SELECT rule_id FROM user_realm_authorizations WHERE user_id=?1 ORDER BY rule_id")?;
-        let rows = stmt.query_map([user], |r| r.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
+        let _ = user;
+        Ok(Vec::new())
     }
     pub fn replace_entry_authorizations(
         &self,
@@ -1137,7 +1091,7 @@ impl Db {
         user_id: i64,
         items: &[(i64, bool)],
         auto_authorize_new_proxies: Option<bool>,
-        realm_ids: Option<&[i64]>,
+        _realm_ids: Option<&[i64]>,
         realm_only: bool,
     ) -> Result<std::result::Result<Vec<i64>, AuthorizationWriteIssue>> {
         let mut conn = self.conn();
@@ -1178,26 +1132,6 @@ impl Db {
                 )?;
             }
         }
-        if let Some(ids) = realm_ids {
-            let mut seen = std::collections::HashSet::new();
-            for rule in ids {
-                if !seen.insert(*rule)
-                    || !tx.query_row("SELECT EXISTS(SELECT 1 FROM realm_rules WHERE id=?1)", [rule], |r| {
-                        r.get::<_, bool>(0)
-                    })?
-                {
-                    return Ok(Err(AuthorizationWriteIssue::ProxyNotFound));
-                }
-            }
-            tx.execute("DELETE FROM user_realm_authorizations WHERE user_id=?1", [user_id])?;
-            for rule in ids {
-                tx.execute(
-                    "INSERT INTO user_realm_authorizations(user_id,rule_id) VALUES(?1,?2)",
-                    params![user_id, rule],
-                )?;
-            }
-        }
-        tx.execute("INSERT OR IGNORE INTO user_proxy_authorizations(user_id,proxy_id,enabled,auth,created_at,updated_at,direct_visible) SELECT ?1,r.target_proxy_id,1,'{}',?2,?2,0 FROM user_realm_authorizations a JOIN realm_rules r ON r.id=a.rule_id WHERE a.user_id=?1",params![user_id,now])?;
         {
             let mut stmt=tx.prepare("SELECT DISTINCT p.node_id FROM user_proxy_authorizations a JOIN proxies p ON p.id=a.proxy_id WHERE a.user_id=?1")?;
             node_ids.extend(
@@ -1210,7 +1144,6 @@ impl Db {
                 params![user_id, enabled, now],
             )?;
         }
-        super::realm::refresh_realm_credentials(&tx)?;
         tx.commit()?;
         Ok(Ok(node_ids.into_iter().collect()))
     }

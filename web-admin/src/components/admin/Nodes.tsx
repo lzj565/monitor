@@ -14,7 +14,6 @@ import { AdminConfirmDialog as ConfirmDialog, AdminSearchInput } from "@/compone
 import { DragHandle, useDragOrder } from "@/components/DragOrder"
 import { api, byName, groupsOf, badIfaceName, changes, currentIface, GIB, ifaceChoice, ifaceSpec, inGroup, provisioningSite, trafficCorrection, type IfaceChoice, type Node } from "@/lib/api"
 import { NodeComponents } from "./NodeComponents"
-import { realmArg } from "@/lib/realm"
 import { addMonths, bytes, cycleMonths, FOREVER, money, uptime } from "@/lib/format"
 import { Segments, TRAFFIC_FIELDS, TRAFFIC_MODES, nameText, copy, Addresses, searchNodes, useGroupFilter, GroupFilter, NodePicker, Command, Field, OptionRow, GroupInput } from "./Shared"
 import { type Settings, useSettings } from "./hooks"
@@ -496,11 +495,7 @@ export function installCommand(site: string, token: string, seconds: number | un
   return scriptCommand(site, (s) => [`--server ${s}`, `--token ${token}`, ...intervalArg(seconds), ...ifaceArg(iface)])
 }
 
-function RealmOption({ on, setOn }: { on: boolean; setOn: (on: boolean) => void }) {
-  return <OptionRow title="安装 Realm" hint="关闭后卸载托管组件，配置保留。">
-    <Switch checked={on} onCheckedChange={setOn} aria-label="安装 Realm" />
-  </OptionRow>
-}
+
 
 export function intervalArg(seconds: number | undefined) {
   return seconds === undefined ? [] : [`--interval ${seconds}`]
@@ -516,8 +511,8 @@ export function ifaceArg(iface: string | undefined) {
 // within the window it opened, and each machine exchanges it for a token of its
 // own, so unlike an install command this text is no one's credential and can be
 // sent to every machine as it is.
-export function registerCommand(site: string, key: string, seconds: number | undefined, iface: string | undefined, realm?: boolean, mieru?: boolean, singbox = false) {
-  return scriptCommand(site, (s) => [`--server ${s}`, `--register ${key}`, ...intervalArg(seconds), ...ifaceArg(iface), singbox ? "--sing-box" : "--no-sing-box", ...realmArg(realm ?? false), mieru ? "--mieru" : "--no-mieru"])
+export function registerCommand(site: string, key: string, seconds: number | undefined, iface: string | undefined, _realm?: boolean, _mieru?: boolean, singbox = false) {
+  return scriptCommand(site, (s) => [`--server ${s}`, `--register ${key}`, ...intervalArg(seconds), ...ifaceArg(iface), singbox ? "--sing-box" : "--no-sing-box"])
 }
 
 // Carries no token, so it is the same for every node and remains valid after the
@@ -598,9 +593,7 @@ export function RegisterDialog({ site, reg, onClose }: {
   const iface = useIfaceOption(undefined)
   const interval = useIntervalOption()
   const [singbox, setSingbox] = useState(false)
-  const [realm, setRealm] = useState(false)
-  const [mieru, setMieru] = useState(false)
-  const command = reg.left > 0 && iface.valid ? registerCommand(site, reg.key, interval.flag, iface.flag, realm, mieru, singbox) : ""
+  const command = reg.left > 0 && iface.valid ? registerCommand(site, reg.key, interval.flag, iface.flag, undefined, undefined, singbox) : ""
   const clock = `${Math.floor(reg.left / 60)}:${String(reg.left % 60).padStart(2, "0")}`
 
   return (
@@ -619,8 +612,6 @@ export function RegisterDialog({ site, reg, onClose }: {
             <h3 className="text-sm font-medium">安装选项</h3>
             <IntervalOption option={interval} batch />
             <IfaceOption option={iface} batch />
-            <RealmOption on={realm} setOn={setRealm} />
-            <OptionRow title="安装 mieru" hint="关闭后卸载托管组件，配置保留。"><Switch checked={mieru} onCheckedChange={setMieru} aria-label="安装 mieru" /></OptionRow>
             <OptionRow title="安装 sing-box" hint="默认不安装"><Switch checked={singbox} onCheckedChange={setSingbox} aria-label="安装 sing-box" /></OptionRow>
           </section>
           {reg.left > 0 ? (

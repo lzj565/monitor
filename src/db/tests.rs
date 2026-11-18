@@ -1764,8 +1764,8 @@ fn an_upgraded_release_matches_a_fresh_database() {
     let upgraded = dump(&db.conn());
     assert_eq!(
         upgraded.len(),
-        PRE_RESOURCE_TABLES.len() + 2 + ID_TABLES.len() + 3,
-        "every old row survives, three default components and admin are seeded, and the reset marker is recorded: {upgraded:#?}"
+        PRE_RESOURCE_TABLES.len() + 2 + ID_TABLES.len() + 1,
+        "every old row survives, sing-box and admin are seeded, and the reset marker is recorded: {upgraded:#?}"
     );
 
     // An earlier build opening the file stamps its own version, so the next
@@ -2733,7 +2733,7 @@ fn numeric_preferences_migrate_from_28_and_unreleased_29_without_data_loss() {
         let prefs = fresh.all_entry_preferences(uid).unwrap();
         assert_eq!(prefs["proxy:7"].2, "direct-name");
         assert!(prefs["proxy:7"].1);
-        assert_eq!(prefs["realm:8"].0, Some(1));
+        assert!(!prefs.contains_key("realm:8"));
         let copy = format!("{}.copy", scratch.0);
         fresh.backup_into(&copy).unwrap();
         fresh.check_backup(&copy).unwrap();
@@ -2754,4 +2754,28 @@ fn external_metadata_is_optional_and_admin_rename_preserves_chain() {
     db.update_external_proxy(ids[0], Some(&renamed), None).unwrap();
     assert_eq!(db.external_proxy_config(ids[1]).unwrap().unwrap()["dialer-proxy"], "renamed");
     assert_eq!(db.external_proxy_config(ids[0]).unwrap().unwrap(), renamed);
+}
+
+#[test]
+fn v32_retires_managed_components_and_preserves_external_mieru() {
+    let db = Db::open(":memory:").unwrap();
+    let conn = db.conn();
+    conn.execute_batch(
+        "CREATE TABLE realm_hosts(id INTEGER PRIMARY KEY);
+         INSERT INTO realm_hosts VALUES(1);
+         CREATE TABLE mieru_hosts(id INTEGER PRIMARY KEY);
+         INSERT INTO mieru_hosts VALUES(1);
+         INSERT INTO setting(key,value) VALUES('mieru_shared_password','fixture');
+         INSERT INTO external_proxies(name,protocol,config,created_at,updated_at)
+         VALUES('external fixture','mieru','{}',0,0);
+         PRAGMA user_version = 31;",
+    ).unwrap();
+    migrate(&conn, 31).unwrap();
+    migrate(&conn, 32).unwrap();
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+    assert_eq!(version, 32);
+    let count: i64 = conn.query_row("SELECT count(*) FROM sqlite_master WHERE name IN ('realm_hosts','mieru_hosts')", [], |r| r.get(0)).unwrap();
+    assert_eq!(count, 0);
+    let count: i64 = conn.query_row("SELECT count(*) FROM external_proxies WHERE protocol='mieru'", [], |r| r.get(0)).unwrap();
+    assert_eq!(count, 1);
 }

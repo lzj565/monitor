@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react"
+import { Pencil, Trash2, Upload } from "lucide-react"
 import { toast } from "sonner"
 import { api } from "@/lib/api"
 import { Button } from "@/components/ui/button"
@@ -56,15 +57,15 @@ export function ExternalImportDialog({ editing, onClose }: { editing?: ExternalP
     } catch (e) { setError((e as Error).message) }
     finally { setBusy(false) }
   }
-  return <Dialog open onOpenChange={open => !open && !busy && onClose()}><DialogContent className="flex max-h-[90dvh] flex-col sm:max-w-3xl">
-    <DialogHeader><DialogTitle>{editing ? `编辑外部代理：${editing.name}` : "导入外部代理"}</DialogTitle><DialogDescription>粘贴单个代理、完整 Mihomo 配置或静态代理列表，支持 Snell v6。仅导入代理，不导入分组、规则或远程 providers。保留原凭据，仅用于 Mihomo，不采集统计。校验不代表连接实测。</DialogDescription></DialogHeader>
-    <div className="min-h-0 space-y-3 overflow-y-auto">
+  return <Dialog open onOpenChange={open => !open && !busy && onClose()}><DialogContent className="flex max-h-[90dvh] flex-col gap-0 overflow-hidden p-0 sm:max-w-3xl">
+    <DialogHeader className="shrink-0 border-b px-6 py-4"><DialogTitle>{editing ? `编辑外部代理：${editing.name}` : "导入外部代理"}</DialogTitle><DialogDescription>粘贴单个代理、完整 Mihomo 配置或静态代理列表，支持 Snell v6。仅导入代理，不导入分组、规则或远程 providers。保留原凭据，仅用于 Mihomo，不采集统计。校验不代表连接实测。</DialogDescription></DialogHeader>
+    <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-6 py-4">
       {error && <div role="alert" className="text-sm text-destructive">{error}{editing && !yaml && <Button variant="link" onClick={load}>重试读取</Button>}</div>}
-      <label className="block space-y-2"><span className="text-sm font-medium">YAML 配置（最多 1 MiB / 500 条）</span><textarea aria-label="YAML 配置" className="min-h-52 w-full rounded-md border bg-background p-3 font-mono text-xs" value={yaml} disabled={busy || loading} onChange={e => { setYaml(e.target.value); setRows(null); setDirty(false); setIgnored(false); setError("") }} placeholder={'proxies:\n  - name: 示例\n    type: trojan\n    server: example.com\n    port: 443\n    password: your-password'} /></label>
+      <label className="block space-y-2"><span className="text-sm font-medium">YAML / JSON 配置（最多 1 MiB / 500 条）</span><textarea aria-label="YAML / JSON 配置" className="min-h-52 w-full resize-y rounded-md border bg-muted/30 p-3 font-mono text-sm leading-relaxed" value={yaml} disabled={busy || loading} onChange={e => { setYaml(e.target.value); setRows(null); setDirty(false); setIgnored(false); setError("") }} placeholder={'proxies:\n  - name: 示例\n    type: trojan\n    server: example.com\n    port: 443\n    password: your-password'} /></label>
       {ignored && <p className="text-sm text-muted-foreground">仅导入 proxies，其他配置未导入。</p>}
       {rows && <div className="space-y-2">{rows.map((r, i) => <div key={r.index} className="space-y-2 rounded-md border p-3"><label className="flex items-center gap-2 text-sm"><span className="shrink-0">第 {i + 1} 条</span><Input aria-label={`第 ${i + 1} 条名称`} disabled={busy} value={typeof r.config?.name === "string" ? r.config.name : ""} onChange={e => { setRows(rows.map((row, j) => j === i ? { ...row, config: { ...row.config, name: e.target.value } } : row)); setDirty(true) }} /></label><p className="break-all text-xs text-muted-foreground">{String(r.config?.type ?? "未知协议")} · {String(r.config?.server ?? "缺少地址")}:{String(r.config?.port ?? "—")}</p>{r.warning && <p className="text-sm text-muted-foreground">{r.warning}</p>}{r.error && <p role="alert" className="text-sm text-destructive">{r.error}</p>}</div>)}</div>}
     </div>
-    <DialogFooter className="flex-wrap"><Button variant="ghost" disabled={busy} onClick={onClose}>取消</Button><Button variant="outline" disabled={busy || loading || !yaml.trim()} onClick={() => void preview()}>{busy ? "处理中…" : rows ? "重新校验" : "解析预览"}</Button><Button disabled={busy || loading || !rows || dirty || !!error || rows.some(r => r.error !== null)} onClick={() => void save()}>{editing ? "保存配置" : "确认导入"}</Button></DialogFooter>
+    <DialogFooter className="shrink-0 flex-wrap border-t px-6 py-3"><Button variant="ghost" disabled={busy} onClick={onClose}>取消</Button><Button variant="outline" disabled={busy || loading || !yaml.trim()} onClick={() => void preview()}>{busy ? "处理中…" : rows ? "重新校验" : "解析预览"}</Button><Button disabled={busy || loading || !rows || dirty || !!error || rows.some(r => r.error !== null)} onClick={() => void save()}>{editing ? "保存配置" : "确认导入"}</Button></DialogFooter>
   </DialogContent></Dialog>
 }
 
@@ -78,7 +79,7 @@ export function ExternalProxyRow({ proxy }: { proxy: ExternalProxy }) {
     catch (e) { toast.error((e as Error).message) }
     finally { setBusy(false) }
   }
-  return <TableRow><TableCell className="max-w-64 break-all font-medium">{proxy.name}</TableCell><TableCell><Badge variant="outline">外部导入 · {proxy.protocol}</Badge></TableCell><TableCell className="font-mono text-xs">{proxy.address ?? "—"}</TableCell><TableCell>{proxy.port ?? "—"}</TableCell><TableCell><Switch checked={proxy.enabled} disabled={busy} aria-label={`${proxy.enabled ? "停用" : "启用"}外部代理${proxy.name}`} onCheckedChange={v => void mutate(false, v)} /></TableCell><TableCell><div className="flex justify-end gap-2"><Button size="sm" variant="outline" disabled={busy} onClick={() => setEditing(true)}>编辑配置</Button><Button size="sm" variant="ghost" disabled={busy} onClick={() => void mutate(true)}>删除</Button></div>{editing && <ExternalImportDialog editing={proxy} onClose={() => setEditing(false)} />}</TableCell></TableRow>
+  return <TableRow><TableCell className="max-w-64 break-all font-medium">{proxy.name}</TableCell><TableCell><Badge variant="outline">{proxy.protocol}</Badge></TableCell><TableCell className="max-w-56 break-all font-mono text-xs">{proxy.address ?? "—"}</TableCell><TableCell>{proxy.port ?? "—"}</TableCell><TableCell><Switch checked={proxy.enabled} disabled={busy} aria-label={`${proxy.enabled ? "停用" : "启用"}外部代理${proxy.name}`} onCheckedChange={v => void mutate(false, v)} /></TableCell><TableCell><div className="flex justify-end gap-2"><Button size="icon" variant="ghost" title="编辑配置" aria-label={`编辑 ${proxy.name}`} disabled={busy} onClick={() => setEditing(true)}><Pencil /></Button><Button size="icon" variant="ghost" title="删除" aria-label={`删除 ${proxy.name}`} disabled={busy} onClick={() => void mutate(true)}><Trash2 /></Button></div>{editing && <ExternalImportDialog editing={proxy} onClose={() => setEditing(false)} />}</TableCell></TableRow>
 }
 
 export function ExternalAuthorization({ userId, onState }: { userId: number; onState?: (state: { dirty: boolean; saving: boolean; count: number }) => void }) {
@@ -132,7 +133,7 @@ export function ExternalProxiesPage() {
   const visible = items.filter(p => `${p.name} ${p.protocol} ${p.address}`.toLowerCase().includes(query.trim().toLowerCase()) && (status === "all" || p.enabled === (status === "enabled")))
   return <div className="space-y-4">
     <div><h1 className="text-lg font-semibold">外部代理</h1><p className="mt-1 text-sm text-muted-foreground">独立管理导入的 Mihomo 代理，不关联节点、不采集统计。在“订阅”中为用户分配授权。</p></div>
-    <div className="flex flex-wrap items-center gap-2"><Input className="min-w-40 flex-1" aria-label="搜索外部代理" placeholder="搜索名称、协议或地址" value={query} onChange={e => setQuery(e.target.value)} /><select aria-label="外部代理状态筛选" className="h-9 rounded-md border bg-background px-3 text-sm" value={status} onChange={e => setStatus(e.target.value)}><option value="all">全部状态</option><option value="enabled">已启用</option><option value="disabled">已停用</option></select><Button onClick={() => setImporting(true)}>导入外部代理</Button></div>
+    <div className="flex flex-wrap items-center gap-2 rounded-md border bg-card p-3"><Input className="min-w-40 flex-1" aria-label="搜索外部代理" placeholder="搜索名称、协议或地址" value={query} onChange={e => setQuery(e.target.value)} /><select aria-label="外部代理状态筛选" className="h-9 rounded-md border bg-background px-3 text-sm" value={status} onChange={e => setStatus(e.target.value)}><option value="all">全部状态</option><option value="enabled">已启用</option><option value="disabled">已停用</option></select><Button onClick={() => setImporting(true)}><Upload />导入外部代理</Button></div>
     {error && <div role="alert" className="text-sm text-destructive">加载外部代理失败：{error}<Button variant="link" onClick={() => void reload()}>重试</Button></div>}
     <div className="overflow-x-auto rounded-md border"><Table><TableHeader><TableRow>{["名称", "协议", "地址", "端口", "启用状态", "操作"].map(label => <TableHead key={label}>{label}</TableHead>)}</TableRow></TableHeader><TableBody>{loading ? <TableRow><TableCell colSpan={6}>读取中…</TableCell></TableRow> : visible.map(proxy => <ExternalProxyRow key={proxy.id} proxy={proxy} />)}{!loading && !error && !visible.length && <TableRow><TableCell colSpan={6} className="py-10 text-center text-muted-foreground">{items.length ? "没有匹配的外部代理" : "尚无外部代理，可直接导入，无需添加节点。"}</TableCell></TableRow>}</TableBody></Table></div>
     {importing && <ExternalImportDialog onClose={() => setImporting(false)} />}

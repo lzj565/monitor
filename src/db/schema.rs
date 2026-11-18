@@ -286,7 +286,7 @@ CREATE TABLE IF NOT EXISTS proxy_node_traffic (
 /// cannot: `open` runs `SCHEMA` before migrating, and on an older file the
 /// column is not there yet. `an_upgraded_release_matches_a_fresh_database`
 /// holds every migration to these rules, starting from v1.0.0's schema.
-pub(super) const SCHEMA_VERSION: i64 = 31;
+pub(super) const SCHEMA_VERSION: i64 = 32;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -661,25 +661,34 @@ pub(super) fn migrate(conn: &Connection, from: i64) -> Result<()> {
         tx.execute_batch("INSERT INTO node_components SELECT * FROM node_components_required; DROP TABLE node_components_required;")?;
     }
     tx.execute_batch(COMPONENT_SCHEMA)?;
-    tx.execute_batch("INSERT OR IGNORE INTO node_components(node_id,component,desired_installed) SELECT id,'singbox',1 FROM node UNION ALL SELECT id,'realm',0 FROM node UNION ALL SELECT id,'mieru',0 FROM node")?;
-    prepare_realm_schema(&tx)?;
-    tx.execute_batch(REALM_SCHEMA)?;
+    tx.execute_batch("INSERT OR IGNORE INTO node_components(node_id,component,desired_installed) SELECT id,'singbox',1 FROM node")?;
     add_column(&tx, "user_proxy_authorizations", "direct_visible INTEGER NOT NULL DEFAULT 1")?;
-    tx.execute_batch("CREATE TABLE IF NOT EXISTS user_realm_authorizations(user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, rule_id INTEGER NOT NULL REFERENCES realm_rules(id) ON DELETE CASCADE, PRIMARY KEY(user_id,rule_id));")?;
-    if from < 31 {
-        tx.execute_batch("INSERT OR IGNORE INTO user_realm_authorizations SELECT a.user_id,r.id FROM user_proxy_authorizations a JOIN realm_rules r ON r.target_proxy_id=a.proxy_id WHERE a.enabled=1;")?;
-    }
-
-    tx.execute_batch(MIERU_SCHEMA)?;
-    add_column(&tx, "mieru_hosts", "traffic_error TEXT NOT NULL DEFAULT ''")?;
-    add_column(&tx, "mieru_hosts", "traffic_received INTEGER NOT NULL DEFAULT 0")?;
+    tx.execute_batch(
+        "DELETE FROM user_entry_preferences WHERE entry_key LIKE 'realm:%';
+         DROP TABLE IF EXISTS user_realm_authorizations;
+         DROP TABLE IF EXISTS realm_rules;
+         DROP TABLE IF EXISTS realm_hosts;
+         DROP TABLE IF EXISTS realm_traffic_rules;
+         DROP TABLE IF EXISTS realm_traffic_buckets;
+         DROP TABLE IF EXISTS realm_traffic_status;
+         DROP TABLE IF EXISTS mieru_traffic_sources;
+         DROP TABLE IF EXISTS mieru_hosts;
+         DROP TABLE IF EXISTS user_proxy_credentials;
+         DROP INDEX IF EXISTS idx_one_mieru_per_node;
+         DELETE FROM user_proxy_authorizations WHERE direct_visible = 0;
+         DELETE FROM proxy_list_order WHERE key LIKE 'realm:%';
+         DELETE FROM node_components WHERE component IN ('realm', 'mieru');
+         DELETE FROM setting WHERE key = 'mieru_shared_password';",
+    )?;
     if columns_of(&tx, "proxies")?.contains("protocol") {
-        tx.execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS idx_one_mieru_per_node ON proxies(node_id) WHERE protocol='mieru'")?;
-        tx.execute("INSERT OR IGNORE INTO setting(key,value) SELECT DISTINCT 'singbox_managed_node_' || node_id,'1' FROM proxies WHERE protocol='vless'",[])?;
+        tx.execute_batch("DELETE FROM user_entry_preferences WHERE entry_key IN
+            (SELECT 'proxy:' || id FROM proxies WHERE protocol = 'mieru');
+            DELETE FROM proxy_list_order WHERE key IN
+            (SELECT 'proxy:' || id FROM proxies WHERE protocol = 'mieru');
+            DELETE FROM proxies WHERE protocol = 'mieru';
+            INSERT OR IGNORE INTO setting(key,value)
+            SELECT DISTINCT 'singbox_managed_node_' || node_id,'1' FROM proxies WHERE protocol='vless';")?;
     }
-    tx.execute_batch(REALM_TRAFFIC_SCHEMA)?;
-    tx.execute("UPDATE realm_rules SET traffic_key=lower(hex(randomblob(16))) WHERE traffic_key=''", [])?;
-    tx.execute("INSERT OR IGNORE INTO realm_traffic_rules(key,node_id,rule_id,name) SELECT traffic_key,node_id,id,name FROM realm_rules",[])?;
     tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     tx.commit()?;
     Ok(())
@@ -717,7 +726,7 @@ pub(super) fn seed_default_admin(conn: &Connection) -> Result<()> {
 }
 
 /// Every table a backup must carry before this build will restore it.
-pub(super) const TABLES: [&str; 30] = [
+pub(super) const TABLES: [&str; 21] = [
     "setting",
     "node",
     "proxies",
@@ -735,19 +744,10 @@ pub(super) const TABLES: [&str; 30] = [
     "user_entry_preferences",
     "metric_hour",
     "ping_hour",
-    "realm_hosts",
-    "realm_rules",
-    "realm_traffic_rules",
-    "realm_traffic_buckets",
-    "realm_traffic_status",
-    "user_proxy_credentials",
-    "mieru_hosts",
-    "mieru_traffic_sources",
     "node_components",
     "proxy_list_order",
     "external_proxies",
     "user_external_proxy_authorizations",
-    "user_realm_authorizations",
 ];
 pub(super) const PRE_RESOURCE_TABLES: [&str; 8] =
     ["setting", "node", "traffic", "metric", "ping_task", "ping_node", "ping_record", "session"];
