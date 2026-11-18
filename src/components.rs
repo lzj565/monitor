@@ -53,7 +53,7 @@ pub async fn save(
 pub async fn installer(State(app): State<Shared>, headers: HeaderMap) -> Response {
     crate::blocking::response(move || {
         let id = match agent_ws::authenticate(&app, &headers) {
-            Ok(id) => id,
+            Ok((id, _)) => id,
             Err(e) => return api::answer(StatusCode::UNAUTHORIZED, e),
         };
         match app.db.component_choices(id) {

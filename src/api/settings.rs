@@ -162,7 +162,7 @@ pub async fn save_settings(
             }
             let saved = match key.as_str() {
                 "github_allowed_users" => app.db.set_github_allowed(value),
-                _ => app.db.set(key, value),
+                _ => app.db.set(key, crate::notify::stored(key, value)),
             };
             if let Err(e) = saved {
                 return fail(e);

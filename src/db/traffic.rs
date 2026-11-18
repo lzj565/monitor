@@ -430,27 +430,29 @@ impl Db {
     /// to respect. Hours before `keep_days` are skipped rather than folded, as
     /// `prune` would drop them next.
     pub fn roll_up(&self, now: i64, keep_days: i64) -> Result<usize> {
-        {
+        let newest = {
             let conn = self.conn();
             if rolled(&conn)?.is_none() {
-                let from = oldest(&conn, &["metric", "ping_record"])?.unwrap_or(now);
-                conn.execute(
-                    "INSERT OR REPLACE INTO setting (key, value) VALUES (?1, ?2)",
-                    params![ROLLED, (from.div_euclid(3_600) * 3_600).to_string()],
-                )?;
+                if let Some(from) = oldest(&conn, &["metric", "ping_record"])? {
+                    conn.execute(
+                        "INSERT OR REPLACE INTO setting (key, value) VALUES (?1, ?2)",
+                        params![ROLLED, (from.div_euclid(3_600) * 3_600).to_string()],
+                    )?;
+                }
             }
-        }
+            newest(&conn, &["metric", "ping_record"])?
+        };
+        let Some(newest) = newest else { return Ok(0) };
         let floor = (now - keep_days * 86_400).div_euclid(3_600) * 3_600;
+        let last = (now - 3_600 - LATE).min(newest - 3_600);
         let mut folded = 0;
-        while !halted() && self.fold_next(floor, now - 3_600 - LATE)? {
+        while !halted() && self.fold_next(floor, last)? {
             let_waiters_in();
             folded += 1;
         }
         Ok(folded)
     }
-}
 
-impl Db {
     /// Folds the hour at the watermark, or at `floor` when the watermark is
     /// older, into `metric_hour` and `ping_hour` and moves the watermark past
     /// it, in one transaction: a failure leaves the hour to be folded again
@@ -477,8 +479,9 @@ impl Db {
         let Some(hour) = rolled(&tx)?.map(|h| h.max(floor)).filter(|&h| h <= last) else {
             return Ok(false);
         };
-        tx.prepare_cached(
-            "INSERT OR REPLACE INTO metric_hour
+        let mut wrote = tx
+            .prepare_cached(
+                "INSERT OR REPLACE INTO metric_hour
                (node_id, ts, minutes, cpu, cpu_max, mem_used, swap_used, disk_used, net_rx, net_tx,
                 net_rx_max, net_tx_max, tcp, udp, procs)
              SELECT node_id, ?1, COUNT(*), AVG(cpu), MAX(MAX(cpu, cpu_max)), CAST(AVG(mem_used) AS INTEGER),
@@ -489,8 +492,8 @@ impl Db {
                     CAST(ROUND(AVG(procs)) AS INTEGER)
              FROM metric WHERE node_id IN (SELECT id FROM node) AND ts>=?1 AND ts<?1+3600
              GROUP BY node_id",
-        )?
-        .execute([hour])?;
+            )?
+            .execute([hour])?;
         let nodes: Vec<i64> = tx
             .prepare_cached("SELECT id FROM node")?
             .query_map([], |r| r.get(0))?
@@ -511,12 +514,22 @@ impl Db {
             )?;
             for (task, mut t) in probes {
                 let median = t.median();
-                write.execute(params![node, task, hour, t.answered(), t.lost, median, t.lo, t.hi])?;
+                wrote +=
+                    write.execute(params![node, task, hour, t.answered(), t.lost, median, t.lo, t.hi])?;
             }
         }
+        // An empty hour moves the watermark to the next hour holding a row, so a
+        // fleet silent for months, or a hub stopped as long, resumes in one
+        // step rather than a transaction per hour it missed.
+        let next = if wrote == 0 {
+            edge(&tx, &["metric", "ping_record"], false, hour + 3_600)?
+                .map_or(hour + 3_600, |ts| (ts.div_euclid(3_600) * 3_600).max(hour + 3_600))
+        } else {
+            hour + 3_600
+        };
         tx.execute(
             "INSERT OR REPLACE INTO setting (key, value) VALUES (?1, ?2)",
-            params![ROLLED, (hour + 3_600).to_string()],
+            params![ROLLED, next.to_string()],
         )?;
         tx.commit()?;
         Ok(true)

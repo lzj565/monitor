@@ -420,17 +420,32 @@ pub(super) fn rolled(conn: &Connection) -> Result<Option<i64>> {
     Ok(value.and_then(|v| v.parse().ok()))
 }
 
-/// The earliest `ts` across `tables`, sought node by node: every key here
-/// begins with `node_id`, and `MIN(ts)` over a whole table scans it, 15.9 s at
-/// 90 days of 100 nodes against 1.8 ms this way. `tables` are names from
-/// [`TABLES`].
+/// The earliest `ts` across `tables`; see [`edge`].
 pub(super) fn oldest(conn: &Connection, tables: &[&str]) -> Result<Option<i64>> {
+    edge(conn, tables, false, i64::MIN)
+}
+
+/// The latest `ts` across `tables`; see [`edge`].
+pub(super) fn newest(conn: &Connection, tables: &[&str]) -> Result<Option<i64>> {
+    edge(conn, tables, true, i64::MIN)
+}
+
+/// The earliest, or with `latest` the latest, `ts` at or after `from` across
+/// `tables`, sought node by node: every key here begins with `node_id`, and
+/// `MIN(ts)` over a whole table scans it, 15.9 s at 90 days of 100 nodes
+/// against 1.8 ms this way. `tables` are names from [`TABLES`].
+pub(super) fn edge(conn: &Connection, tables: &[&str], latest: bool, from: i64) -> Result<Option<i64>> {
+    let aggregate = if latest { "MAX" } else { "MIN" };
     let per_node: Vec<String> = tables
         .iter()
-        .map(|t| format!("SELECT (SELECT MIN(ts) FROM {t} WHERE node_id=n.id) AS ts FROM node n"))
+        .map(|t| {
+            format!(
+                "SELECT (SELECT {aggregate}(ts) FROM {t} WHERE node_id=n.id AND ts>=?1) AS ts FROM node n"
+            )
+        })
         .collect();
-    let sql = format!("SELECT MIN(ts) FROM ({})", per_node.join(" UNION ALL "));
-    Ok(conn.query_row(&sql, [], |r| r.get(0))?)
+    let sql = format!("SELECT {aggregate}(ts) FROM ({})", per_node.join(" UNION ALL "));
+    Ok(conn.query_row(&sql, [from], |r| r.get(0))?)
 }
 
 /// Probe results as the latency fold receives them. A stored result is a

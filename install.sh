@@ -726,7 +726,9 @@ if [ -n "$UNINSTALL" ]; then
 	rc-service monitor-agent stop 2>/dev/null || true
 	rc-update del monitor-agent default >/dev/null 2>&1 || true
 	systemctl disable --now monitor-agent 2>/dev/null || true
-	rm -f "$UNIT_FILE" "$RC_FILE" "$LOG_FILE" "$BIN" "$BIN.old" "$ENV_FILE" "$REGISTRATION_FILE" "$ROOT/agent.env"
+	rm -f "$UNIT_FILE" "$RC_FILE" "$LOG_FILE" "$BIN" "$BIN.old" "$ENV_FILE" "$REGISTRATION_FILE" "$ROOT/agent.env" \
+		"$UNIT_FILE".install-* "$RC_FILE".install-*
+	rm -rf "$ROOT"/.install-*
 	systemctl daemon-reload 2>/dev/null || true
 	userdel monitor-agent 2>/dev/null || deluser monitor-agent 2>/dev/null || true
 	rmdir "$CONFIG_DIR" "$ROOT" 2>/dev/null || true
@@ -898,6 +900,40 @@ http://*)
 	exit 2
 	;;
 esac
+# systemd by the test sd_booted(3) performs, OpenRC by the runlevel it records
+# once booted: either may be installed where it is not the running init (WSL, a
+# container), and every service call below would fail there after the key is
+# spent. Decided before
+# the download and the registration for the same reason.
+if [ -d /run/systemd/system ]; then
+	INIT=systemd
+elif [ -e /run/openrc/softlevel ] && command -v rc-update >/dev/null; then
+	INIT=openrc
+else
+	echo "this installer needs systemd or OpenRC running as the init system" >&2
+	if command -v systemctl >/dev/null || command -v rc-update >/dev/null; then
+		echo "one is installed but did not boot this machine, as in WSL or a container" >&2
+	fi
+	exit 1
+fi
+
+# Alpine ships BusyBox adduser rather than useradd: -S system, -D no password,
+# -H no home.
+add_user() {
+	if command -v useradd >/dev/null; then
+		useradd --system --no-create-home --shell /usr/sbin/nologin monitor-agent
+	else
+		adduser -S -D -H -s /sbin/nologin monitor-agent
+	fi
+}
+
+# The service user the agent runs as under either init system, created before
+# the download and the registration, so a host where this fails keeps the agent
+# it already runs and spends no registration key. One case passes this check
+# without a user and is settled after the old agent stops; see there.
+id -u monitor-agent >/dev/null 2>&1 || add_user ||
+	{ echo "cannot create the system user monitor-agent" >&2; exit 1; }
+
 case "$(uname -m)" in
 x86_64 | amd64) ARCH=x86_64; SING_BOX_ARCH=amd64 ;;
 aarch64 | arm64) ARCH=aarch64; SING_BOX_ARCH=arm64 ;;
@@ -912,7 +948,31 @@ step 1 "安装 monitor-agent"
 detail "架构" "$ARCH"
 detail "安装位置" "$BIN"
 URL="${SERVER%/}/agent/$ARCH"
-TMP_AGENT=$(mktemp)
+
+# Everything this install writes is written while the running agent still
+# serves, into a directory of this run's own beside the final names, the
+# download included and the binary before the registration: a full disk then
+# ends the script before a key is spent or the agent is stopped, and what
+# follows the stop is renames, which need no space. A run that stops early
+# leaves nothing behind, and a concurrent one cannot remove what this one
+# staged.
+install -d -m 0755 "$ROOT"
+# A run killed outright leaves its staging behind: a directory holding a whole
+# binary, and a service definition beside the final one. Those untouched for a
+# day belong to no live run.
+find "$ROOT" -maxdepth 1 -name '.install-*' -mmin +1440 -exec rm -rf {} \; 2>/dev/null || true
+find /etc/systemd/system /etc/init.d -maxdepth 1 -name 'monitor-agent*.install-*' -mmin +1440 \
+	-exec rm -f {} \; 2>/dev/null || true
+STAGE="" SERVICE_NEW=""
+# Staged files are removed on any exit before they take their final names, and
+# $ROOT once nothing is left in it. Until the stop below a signal is turned into
+# an exit, since dash runs no EXIT trap for a signal that kills it; from the
+# stop on, signals are ignored (see there).
+trap 'rm -f ${SERVICE_NEW:+"$SERVICE_NEW"}; [ -z "$STAGE" ] || rm -rf "$STAGE"; rmdir "$ROOT" 2>/dev/null || true' EXIT
+trap 'exit 1' HUP INT TERM
+STAGE=$(mktemp -d "$ROOT/.install-XXXXXX")
+TMP="$STAGE/monitor-agent"
+TMP_AGENT="$TMP"
 
 # A machine whose link to the hub cannot carry the binary in time installs one
 # uploaded beforehand: registration and the service then need only a few small
@@ -984,6 +1044,16 @@ API_PORT_HELPER=$TMP_AGENT
 info "checking sing-box V2Ray API port..."
 : # API port is selected after loading saved choices
 
+# Kept until the new binary has proved it starts; see not_started. Never over
+# an existing copy: a run that died before that check left an unproven binary
+# in $BIN, and the copy is the one that ran before it. A hard link: $BIN is
+# replaced by a rename, which leaves this inode as it was, and a link takes no
+# space.
+if [ -f "$BIN" ] && [ ! -f "$BIN.old" ]; then
+	ln "$BIN" "$STAGE/old" 2>/dev/null || cp "$BIN" "$STAGE/old"
+fi
+chmod 0755 "$TMP"
+
 # Downloaded before the registration below, because that step spends a node: the
 # key returns a token and the panel gains a row, while the env file recording it
 # is only written once the binary is in place. A download that fails after
@@ -1048,16 +1118,6 @@ if [ -z "$TOKEN" ]; then
 fi
 
 load_component_profile
-
-# Keep the existing registration and credential flow above intact. Stage the
-# validated agent beside its destination and rename atomically so a failed copy
-# cannot truncate the currently installed executable.
-install -d -m 0755 "$ROOT"
-AGENT_CANDIDATE="$ROOT/.monitor-agent.$$"
-install -m 0755 "$TMP_AGENT" "$AGENT_CANDIDATE"
-[ ! -f "$BIN" ] || [ -f "$BIN.old" ] || cp "$BIN" "$BIN.old"
-mv -f "$AGENT_CANDIDATE" "$BIN"
-success "monitor-agent binary 安装完成"
 
 # The system package binary is left in place, while the Agent and service use
 # this release's self-built binary with V2Ray API support.
@@ -1132,7 +1192,7 @@ if [ ! -e "$SING_BOX_CONFIG" ] && [ ! -L "$SING_BOX_CONFIG" ]; then
 CONFIG
 	)
 fi
-"$BIN" internal set-api-port-in-config "$SING_BOX_CONFIG" "$SINGBOX_API_PORT" || {
+"$TMP_AGENT" internal set-api-port-in-config "$SING_BOX_CONFIG" "$SINGBOX_API_PORT" || {
 	FAIL_REASON="could not set sing-box V2Ray API listen address to 127.0.0.1:$SINGBOX_API_PORT"
 	fail "$FAIL_REASON"
 }
@@ -1231,41 +1291,27 @@ fi
 # BEGIN agent environment
 (
 	umask 077
-	cat >"$ENV_FILE" <<ENV
+	cat >"$STAGE/agent.env" <<ENV
 MONITOR_SERVER=$SERVER
 MONITOR_TOKEN=$TOKEN
 ENV
 	# An absent port uses the Agent default; an empty value is a startup error.
 	if [ "$SINGBOX_OPTION" = --sing-box ]; then
 		valid_api_port "$SINGBOX_API_PORT" || fail "invalid SINGBOX_API_PORT"
-		printf 'SINGBOX_API_PORT=%s\n' "$SINGBOX_API_PORT" >>"$ENV_FILE"
+		printf 'SINGBOX_API_PORT=%s\n' "$SINGBOX_API_PORT" >>"$STAGE/agent.env"
 	fi
-	[ -z "$IFACE" ] || printf 'MONITOR_IFACE=%s\n' "$IFACE" >>"$ENV_FILE"
+	[ -z "$IFACE" ] || printf 'MONITOR_IFACE=%s\n' "$IFACE" >>"$STAGE/agent.env"
 )
 # END agent environment
 chmod 0600 "$ENV_FILE"
 [ "$(pending_registration_token)" != "$TOKEN" ] || rm -f "$REGISTRATION_FILE"
 
-# The new agent is not running. The binary it replaced is put back and started
-# again, so a failed upgrade leaves the machine reporting as before; the unit
-# and env file just written suit that binary as well, since an upgrade keeps the
-# token and the settings. A first install has nothing to put back.
-not_started() {
-	FAIL_REASON="monitor-agent 未能启动；查看 $1"
-	error "$FAIL_REASON"
-	[ -f "$BIN.old" ] || exit 1
-	mv -f "$BIN.old" "$BIN"
-	if [ "$INIT" = openrc ]; then
-		rc-service monitor-agent restart >/dev/null 2>&1 || true
-	else
-		systemctl restart monitor-agent || true
-	fi
-	warn "已恢复之前的 monitor-agent binary 并尝试重新启动"
-	exit 1
-}
-
+# The service definition is staged beside its final name for the reason the
+# files above are: /etc commonly shares a disk with $ROOT.
 if [ "$INIT" = openrc ]; then
-	cat >"$RC_FILE" <<RC
+	SERVICE_FILE="$RC_FILE"
+	SERVICE_NEW=$(mktemp "$RC_FILE.install-XXXXXX")
+	cat >"$SERVICE_NEW" <<RC
 #!/sbin/openrc-run
 description="monitor agent"
 command="$BIN"
@@ -1286,37 +1332,10 @@ start_pre() {
 	set +a
 }
 RC
-	chmod 0755 "$RC_FILE"
-	success "系统服务定义已初始化"
-	step 4 "启动服务"
-	if [ "$SING_BOX_SOURCE" = installer ]; then
-		rc-update add sing-box default >/dev/null
-		rc-service sing-box restart || { FAIL_REASON="sing-box 启动失败"; fail "$FAIL_REASON"; }
-		rc-service sing-box status >/dev/null 2>&1 || { FAIL_REASON="sing-box 未能进入运行状态"; fail "$FAIL_REASON"; }
-	elif [ "$SING_BOX_SOURCE" != skipped ]; then
-		rc-service sing-box status >/dev/null 2>&1 || warn "sing-box 已安装，但当前未检测到运行状态"
-	fi
-	rc-update add monitor-agent default >/dev/null
-	rc-service monitor-agent restart || not_started "$LOG_FILE"
-	# supervise-daemon reports the service started while it respawns an agent
-	# that exits at once, so the process itself is what is looked for, inside
-	# the respawn delay. pidof rather than pgrep -x, which BusyBox matches
-	# against the full path.
-	sleep 3
-	pidof monitor-agent >/dev/null || not_started "$LOG_FILE"
-	rm -f "$BIN.old"
-	AGENT_STATUS=running
-	SING_BOX_STATUS=unknown
-	if [ "$SING_BOX_SOURCE" != skipped ]; then
-		if rc-service sing-box status >/dev/null 2>&1; then SING_BOX_STATUS=running; else SING_BOX_STATUS=not-running; fi
-	fi
-	success "monitor-agent 安装并启动完成"
-	CURRENT_STEP=""
-	print_summary
-	exit 0
-fi
-
-cat >"$UNIT_FILE" <<UNIT
+else
+	SERVICE_FILE="$UNIT_FILE"
+	SERVICE_NEW=$(mktemp "$UNIT_FILE.install-XXXXXX")
+	cat >"$SERVICE_NEW" <<UNIT
 [Unit]
 Description=monitor agent
 After=network-online.target
@@ -1346,6 +1365,86 @@ MemoryMax=64M
 [Install]
 WantedBy=multi-user.target
 UNIT
+	chmod 0644 "$SERVICE_NEW"
+fi
+
+# Stop an agent already running here before replacing its binary. The service
+# name is fixed, so a reinstall could never start a second copy, but without this
+# the new binary lands beneath a live process and only the restart at the end
+# picks it up. Placed after every write above, so a node that cannot fetch or
+# store the new files keeps running.
+#
+# From here to the health check the agent is down or unproven, and an
+# interrupted run would leave it so. Signals that would end or pause the run are
+# ignored until it ends, and a failed command no longer ends it: the health
+# check settles every step, reporting a running agent or rolling back. Output
+# can fail too, once the terminal has gone or a pipe reader has died.
+trap '' HUP INT QUIT TERM TSTP PIPE
+set +e
+if [ "$INIT" = openrc ]; then
+	rc-service monitor-agent stop 2>/dev/null || true
+else
+	systemctl stop monitor-agent 2>/dev/null || true
+	# An agent installed before the fixed user ran under DynamicUser=, and while
+	# it runs nss-systemd resolves its transient user of the same name: the check
+	# above passes, and useradd refuses the name as taken. Stopping the unit
+	# releases that user, so the fixed one is created here. Should that fail, the
+	# old binary and unit are still in place and are started again.
+	id -u monitor-agent >/dev/null 2>&1 || add_user || {
+		systemctl start monitor-agent 2>/dev/null || true
+		echo "cannot create the system user monitor-agent" >&2
+		exit 1
+	}
+fi
+# The new agent is not running. The binary it replaced is put back and started
+# again before anything is reported, so a failed upgrade leaves the machine
+# reporting as before; the unit and env file just written suit that binary as
+# well, since an upgrade keeps the token and the settings. A first install has
+# nothing to put back.
+not_started() {
+	if [ -f "$BIN.old" ]; then
+		mv -f "$BIN.old" "$BIN"
+		if [ "$INIT" = openrc ]; then
+			rc-service monitor-agent restart >/dev/null 2>&1
+		else
+			systemctl restart monitor-agent
+		fi
+		echo "monitor-agent did not start; see: $1" >&2
+		echo "the previous monitor-agent binary is back in place and was restarted" >&2
+	else
+		echo "monitor-agent did not start; see: $1" >&2
+	fi
+	exit 1
+}
+
+if ! { { [ ! -f "$STAGE/old" ] || mv -f "$STAGE/old" "$BIN.old"; } &&
+	mv -f "$STAGE/monitor-agent" "$BIN" &&
+	mv -f "$STAGE/agent.env" "$ENV_FILE" &&
+	mv -f "$SERVICE_NEW" "$SERVICE_FILE"; }; then
+	echo "the new files could not be renamed into place" >&2
+	not_started "the message above"
+fi
+
+if [ "$INIT" = openrc ]; then
+	# Executable only under its final name, so a staged copy left by a killed
+	# run is never taken for a service.
+	if [ "$SING_BOX_SOURCE" = installer ]; then
+		rc-update add sing-box default >/dev/null && rc-service sing-box restart ||
+			not_started "$LOG_FILE"
+	fi
+	chmod 0755 "$RC_FILE"
+	rc-update add monitor-agent default >/dev/null
+	rc-service monitor-agent restart
+	# supervise-daemon reports the service started while it respawns an agent
+	# that exits at once, so the process itself is what is looked for, inside
+	# the respawn delay. pidof rather than pgrep -x, which BusyBox matches
+	# against the full path.
+	sleep 3
+	pidof monitor-agent >/dev/null || not_started "$LOG_FILE"
+	rm -f "$BIN.old"
+	echo "monitor-agent installed; follow it with: tail -f $LOG_FILE"
+	exit 0
+fi
 
 success "系统服务定义已初始化"
 step 4 "启动服务"

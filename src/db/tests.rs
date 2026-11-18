@@ -203,7 +203,10 @@ fn vacuum_gives_the_deleted_pages_back_to_the_filesystem() {
     // Folded first, as the hourly pass does: minute rows outlive the window
     // until their hour is folded. Dated past the lateness allowance so the
     // last hour counts as complete.
+    let later = node(&db, 2);
+    db.insert_metric(later, now + 2 * 3_600, &sample).unwrap();
     db.roll_up(now + 3 * 3_600, 1).unwrap();
+    db.delete_node(later).unwrap();
     db.prune(0).unwrap();
 
     let freed = db.vacuum().unwrap();
@@ -2311,9 +2314,10 @@ fn a_result_left_by_a_deleted_probe_does_not_stop_the_rollup() {
     let hour = (now - 3 * 3_600).div_euclid(3_600) * 3_600;
     db.conn().execute("INSERT INTO ping_record VALUES (?1, 999, ?2, 42)", params![id, hour]).unwrap();
     db.insert_metric(id, hour, &serde_json::json!({"cpu": 1.0})).unwrap();
+    db.insert_metric(id, now - 60, &serde_json::json!({"cpu": 1.0})).unwrap();
     assert!(db.roll_up(now, 1).unwrap() > 0);
-    let span = Span { since: hour, step: 3_600, hourly: true };
-    assert_eq!(db.metrics(id, span).unwrap().len(), 1, "the hour is folded");
+    let folded: i64 = db.conn().query_row("SELECT count(*) FROM metric_hour WHERE node_id=?1 AND ts=?2", params![id, hour], |row| row.get(0)).unwrap();
+    assert_eq!(folded, 1, "the hour is folded");
 }
 
 /// The address seen in the other family arrives on its own connection, in no
@@ -2424,7 +2428,10 @@ fn the_hourly_tier_draws_what_the_minute_rows_would() {
     assert_eq!(db.roll_up(end + LATE - 1, 365).unwrap(), 5);
     compare(3_600);
     compare(7_200);
+    let later = node(&db, 2);
+    db.insert_metric(later, end, &serde_json::json!({"cpu": 1.0})).unwrap();
     assert_eq!(db.roll_up(end + LATE, 365).unwrap(), 1);
+    db.delete_node(later).unwrap();
     compare(3_600);
     compare(7_200);
 

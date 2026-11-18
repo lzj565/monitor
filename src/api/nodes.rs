@@ -426,6 +426,17 @@ pub(super) fn valid_target(target: &str) -> bool {
     !host.is_empty() && port.parse::<u16>().is_ok_and(|p| p > 0)
 }
 
+/// The longest probe target, in bytes: a 253-character host name with its
+/// trailing dot, then `:65535`. Every target assigned to a node travels to it
+/// in one `ping.tasks` frame, which the agent refuses past 64 KiB, the same
+/// ceiling as [`MAX_FRAME`]; refused, the agent drops the session and receives
+/// the same frame on every reconnect, and the node stays offline. Control
+/// characters are refused, so a target grows at most twofold in JSON (`"` and
+/// `\` escaped), which with each task's other fields keeps a full list near
+/// 37 KB.
+const MAX_TARGET: usize = 260;
+const _: () = assert!(Db::MAX_PROBES_PER_NODE as usize * (2 * MAX_TARGET + 64) <= MAX_FRAME);
+
 pub async fn save_ping_task(_: Admin, State(app): State<Shared>, Json(mut task): Json<PingTask>) -> Response {
     crate::blocking::response(move || {
         // Trimmed into the stored value rather than a discarded copy: what reaches
@@ -440,6 +451,12 @@ pub async fn save_ping_task(_: Admin, State(app): State<Shared>, Json(mut task):
         }
         if task.name.chars().count() > MAX_NAME {
             return bad("名称最多 64 个字");
+        }
+        if task.target.len() > MAX_TARGET {
+            return bad(&format!("目标太长，最多 {MAX_TARGET} 字节（一个汉字占 3 字节）"));
+        }
+        if task.target.chars().any(char::is_control) {
+            return bad("目标里有不可见的字符，删掉重新输入");
         }
         // A TCP probe requires an explicit port; a bare host would silently never
         // connect.

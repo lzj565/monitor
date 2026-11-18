@@ -33,6 +33,11 @@ pub struct Db {
 }
 
 impl Db {
+    #[cfg(test)]
+    pub fn execute_for_test(&self, sql: &str) {
+        self.conn().execute_batch(sql).unwrap();
+    }
+
     pub fn open(path: &str) -> Result<Self> {
         let conn = Connection::open(path)?;
         // Queried before CREATE TABLE runs: a file with no tables receives the

@@ -1,6 +1,6 @@
 [package]
 name = "monitor-hub"
-version = "1.5.13"
+version = "1.5.14"
 edition = "2021"
 license = "MIT"
 description = "Lightweight server monitoring hub"
@@ -51,6 +51,16 @@ serde_urlencoded = "0.7"
 # Only the tests need a movable clock; the relay deadline spans minutes.
 # dev-dependencies do not reach the shipped binary.
 tokio = { version = "1", features = ["test-util"] }
+
+# On top of clippy's defaults, which CI runs with -D warnings. Tests may still
+# unwrap (clippy.toml).
+[lints.clippy]
+# The release build aborts on panic, so a failed unwrap takes the whole hub
+# down, and every node's reporting with it: use ?, or expect("why this cannot
+# fail").
+unwrap_used = "warn"
+dbg_macro = "warn"
+todo = "warn"
 
 [profile.release]
 codegen-units = 1
