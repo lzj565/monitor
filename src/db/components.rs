@@ -66,7 +66,10 @@ impl Db {
         if rows.is_empty() {
             return Ok(None);
         }
-        anyhow::ensure!(rows.iter().any(|(component, _)| component == "singbox"), "incomplete component profile");
+        anyhow::ensure!(
+            rows.iter().any(|(component, _)| component == "singbox"),
+            "incomplete component profile"
+        );
         let mut choices = InstallChoices::default();
         for (c, on) in rows {
             match c.as_str() {

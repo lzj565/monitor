@@ -2769,13 +2769,22 @@ fn v32_retires_managed_components_and_preserves_external_mieru() {
          INSERT INTO external_proxies(name,protocol,config,created_at,updated_at)
          VALUES('external fixture','mieru','{}',0,0);
          PRAGMA user_version = 31;",
-    ).unwrap();
+    )
+    .unwrap();
     migrate(&conn, 31).unwrap();
     migrate(&conn, 32).unwrap();
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
     assert_eq!(version, 32);
-    let count: i64 = conn.query_row("SELECT count(*) FROM sqlite_master WHERE name IN ('realm_hosts','mieru_hosts')", [], |r| r.get(0)).unwrap();
+    let count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name IN ('realm_hosts','mieru_hosts')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
     assert_eq!(count, 0);
-    let count: i64 = conn.query_row("SELECT count(*) FROM external_proxies WHERE protocol='mieru'", [], |r| r.get(0)).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT count(*) FROM external_proxies WHERE protocol='mieru'", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(count, 1);
 }

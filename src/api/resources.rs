@@ -63,7 +63,14 @@ pub async fn create_command(
             Ok(body) => body,
             Err(error) => return error.into_response(),
         };
-        if !matches!(body.method.as_str(), "singbox.status" | "singbox.restart" | "singbox.config.get" | "singbox.config.check" | "singbox.config.apply") {
+        if !matches!(
+            body.method.as_str(),
+            "singbox.status"
+                | "singbox.restart"
+                | "singbox.config.get"
+                | "singbox.config.check"
+                | "singbox.config.apply"
+        ) {
             return bad("不支持的 Agent 命令");
         }
         if matches!(body.method.as_str(), "singbox.config.check" | "singbox.config.apply") {

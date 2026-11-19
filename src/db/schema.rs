@@ -681,13 +681,15 @@ pub(super) fn migrate(conn: &Connection, from: i64) -> Result<()> {
          DELETE FROM setting WHERE key = 'mieru_shared_password';",
     )?;
     if columns_of(&tx, "proxies")?.contains("protocol") {
-        tx.execute_batch("DELETE FROM user_entry_preferences WHERE entry_key IN
+        tx.execute_batch(
+            "DELETE FROM user_entry_preferences WHERE entry_key IN
             (SELECT 'proxy:' || id FROM proxies WHERE protocol = 'mieru');
             DELETE FROM proxy_list_order WHERE key IN
             (SELECT 'proxy:' || id FROM proxies WHERE protocol = 'mieru');
             DELETE FROM proxies WHERE protocol = 'mieru';
             INSERT OR IGNORE INTO setting(key,value)
-            SELECT DISTINCT 'singbox_managed_node_' || node_id,'1' FROM proxies WHERE protocol='vless';")?;
+            SELECT DISTINCT 'singbox_managed_node_' || node_id,'1' FROM proxies WHERE protocol='vless';",
+        )?;
     }
     tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     tx.commit()?;
