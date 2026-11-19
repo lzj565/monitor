@@ -74,6 +74,16 @@ impl ProxyRequest {
             if self.port == 0 || self.flow.as_deref().is_some_and(|f| !f.is_empty()) {
                 return Err(InputError::new("INVALID_PROXY_CONFIG", "Snell requires a port and empty flow"));
             }
+            let version = match self.config["snell"].get("version") {
+                None => None,
+                Some(value) => Some(value.as_u64().filter(|v| matches!(v, 5 | 6)).ok_or_else(|| {
+                    InputError::new("INVALID_PROXY_CONFIG", "Snell version must be 5 or 6")
+                })?),
+            };
+            let mut config = json!({"snell":{}});
+            if let Some(version) = version {
+                config["snell"]["version"] = version.into();
+            }
             return Ok(ProxyDraft {
                 name: name.into(),
                 include_node_name: self.include_node_name,
@@ -83,12 +93,12 @@ impl ProxyRequest {
                 port: self.port.into(),
                 enabled: self.enabled,
                 flow: Some(String::new()),
-                config: json!({}),
+                config,
             });
         }
         if self.protocol == "hysteria2" {
             validate_address(&self.address_type, &self.address)?;
-            let config: crate::hysteria2::Settings = serde_json::from_value(self.config["hysteria2"].clone())
+            let config: crate::hysteria2::Settings = crate::hysteria2::settings(&self.config)
                 .map_err(|e| InputError::new("INVALID_PROXY_CONFIG", e.to_string()))?;
             config.validate().map_err(|e| InputError::new("INVALID_PROXY_CONFIG", e))?;
             if self.port == 0 || self.flow.as_deref().is_some_and(|f| !f.is_empty()) {
@@ -106,11 +116,31 @@ impl ProxyRequest {
                 config: self.config,
             });
         }
+        if self.protocol == "mieru" {
+            validate_address(&self.address_type, &self.address)?;
+            if self.port < 1025
+                || self.config != json!({"transport":"tcp"})
+                || self.flow.as_deref().is_some_and(|f| !f.is_empty())
+            {
+                return Err(InputError::new(
+                    "INVALID_PROXY_CONFIG",
+                    "mieru requires TCP, port 1025–65535 and an empty flow",
+                ));
+            }
+            return Ok(ProxyDraft {
+                name: name.into(),
+                include_node_name: self.include_node_name,
+                protocol: self.protocol,
+                address_type: self.address_type,
+                address: self.address,
+                port: self.port.into(),
+                enabled: self.enabled,
+                flow: Some(String::new()),
+                config: self.config,
+            });
+        }
         if self.protocol != "vless" {
-            return Err(InputError::new(
-                "INVALID_PROXY_PROTOCOL",
-                "Unsupported managed proxy protocol",
-            ));
+            return Err(InputError::new("INVALID_PROXY_PROTOCOL", "Unsupported managed proxy protocol"));
         }
         validate_address(&self.address_type, &self.address)?;
         if self.port == 0 {
@@ -301,24 +331,44 @@ impl AuthorizationRequest {
     }
 }
 
+pub(crate) fn snell_psk(proxies: &[crate::db::Proxy]) -> &str {
+    proxies
+        .iter()
+        .filter(|proxy| proxy.enabled && proxy.protocol == "hysteria2")
+        .filter_map(|proxy| {
+            let password = proxy.config["hysteria2"]["obfs_password"].as_str()?;
+            (!password.trim().is_empty()).then_some((proxy.id, password))
+        })
+        .min_by_key(|(id, _)| *id)
+        .map_or("862314", |(_, password)| password)
+}
+
+pub(crate) fn snell_version(config: &Value) -> u64 {
+    config["snell"]["version"].as_u64().unwrap_or(6)
+}
+
 pub fn generate_config(db: &Db, node_id: i64, now: i64) -> anyhow::Result<Value> {
     let node = db.node(node_id)?.with_context(|| format!("node {node_id} not found"))?;
     let listen = if node.ipv6.is_empty() { "0.0.0.0" } else { "::" };
     let mut inbounds = Vec::new();
     let mut stats_inbounds = Vec::new();
     let mut stats_users = BTreeSet::new();
-    for proxy in db
-        .proxies_for_node(node_id)?
-        .into_iter()
-        .filter(|p| p.enabled && matches!(p.protocol.as_str(), "vless" | "hysteria2" | "snell"))
+    let proxies = db.proxies_for_node(node_id)?;
+    let psk = snell_psk(&proxies);
+    for proxy in
+        proxies.iter().filter(|p| p.enabled && matches!(p.protocol.as_str(), "vless" | "hysteria2" | "snell"))
     {
         if proxy.protocol == "snell" {
-            let psk = proxy.config["snell"]["psk"].as_str().context("missing Snell PSK")?;
             let tag = format!("proxy-{}", proxy.id);
-            inbounds.push(json!({
+            let version = snell_version(&proxy.config);
+            let mut inbound = json!({
                 "type": "snell", "tag": tag, "listen": listen, "listen_port": proxy.port,
-                "version": 6, "mode": "default", "psk": psk
-            }));
+                "version": version, "psk": psk
+            });
+            if version == 6 {
+                inbound["mode"] = json!("default");
+            }
+            inbounds.push(inbound);
             stats_inbounds.push(tag);
             continue;
         }

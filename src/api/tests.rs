@@ -200,6 +200,7 @@ fn client_subscriptions_default_empty_flow_to_vision() {
     let portal_proxy = |p: crate::db::UserSubscriptionProxy| crate::db::UserPortalProxy {
         hysteria2: None,
         snell_psk: None,
+        snell_version: None,
         id: p.id,
         node_id: 1,
         node_name: p.node_name,
@@ -2146,8 +2147,6 @@ async fn a_history_window_stops_at_the_retention_window() {
     assert_eq!(step(&month), 3_600, "in whole hours, as no hourly row may straddle two points");
 }
 
-
-
 #[tokio::test]
 async fn deleting_last_vless_still_clears_singbox_on_a_mixed_node() {
     let app = std::sync::Arc::new(app());
@@ -2262,8 +2261,6 @@ async fn registration_records_batch_choices_and_reruns_do_not_reset_them() {
     assert!(app.db.component_choices(id).unwrap().unwrap().realm);
     assert!(app.db.component_choices(id).unwrap().unwrap().mieru);
 }
-
-
 
 #[tokio::test]
 async fn manual_uuid_updates_exports_and_online_offline_sync() {
@@ -2607,8 +2604,7 @@ fn snell_shared_psk_survives_edit_and_is_exported_only_when_authorized() {
     .unwrap();
     let id = app.db.create_proxy(node, &draft).unwrap().unwrap();
     let first = app.db.proxy(id).unwrap().unwrap();
-    let psk = first.config["snell"]["psk"].as_str().unwrap();
-    assert_eq!(psk.len(), 32);
+    let psk = "862314";
     app.db.update_proxy(id, None, &draft).unwrap().unwrap();
     assert_eq!(first.config, app.db.proxy(id).unwrap().unwrap().config);
     let generated = crate::proxy::generate_config(&app.db, node, Utc::now().timestamp()).unwrap();
@@ -2626,4 +2622,26 @@ fn snell_shared_psk_survives_edit_and_is_exported_only_when_authorized() {
     assert_eq!(yaml[0]["reuse"], true);
     assert_eq!(yaml[0]["udp"], true);
     assert!(yaml[0].get("userkey").is_none());
+    let mut hy2 = draft.clone();
+    hy2.name = "HY2 password source".into();
+    hy2.protocol = "hysteria2".into();
+    hy2.port += 1;
+    hy2.config = json!({"hysteria2":{"server_name":"example.com","obfs_password":"custom-psk"}});
+    let hy2_id = app.db.create_proxy(node, &hy2).unwrap().unwrap();
+    let mut v5 = draft.clone();
+    v5.config = json!({"snell": {"version": 5}});
+    app.db.update_proxy(id, None, &v5).unwrap().unwrap();
+    let generated = crate::proxy::generate_config(&app.db, node, Utc::now().timestamp()).unwrap();
+    assert_eq!(generated["inbounds"][0]["version"], 5);
+    assert!(generated["inbounds"][0].get("mode").is_none());
+    let psk = "custom-psk";
+    assert_eq!(generated["inbounds"][0]["psk"], psk);
+    let entries = user_portal_items(&app, user).unwrap();
+    let yaml: Vec<Value> = serde_yaml_ng::from_str(entries[0]["mihomo_yaml"].as_str().unwrap()).unwrap();
+    assert_eq!(yaml[0]["version"], 5);
+    assert_eq!(yaml[0]["psk"], psk);
+    hy2.config["hysteria2"]["obfs_password"] = json!("");
+    app.db.update_proxy(hy2_id, None, &hy2).unwrap().unwrap();
+    let config = crate::proxy::generate_config(&app.db, node, Utc::now().timestamp()).unwrap();
+    assert_eq!(config["inbounds"][0]["psk"], "862314");
 }

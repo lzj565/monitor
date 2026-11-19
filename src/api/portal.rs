@@ -335,14 +335,16 @@ pub(super) fn mihomo_proxy(user_id: i64, proxy: &crate::db::UserPortalProxy) -> 
     let name = crate::db::displayed_proxy_name(&proxy.name, proxy.include_node_name, &proxy.node_country);
     if proxy.protocol == "snell" {
         return format!(
-            "- name: {}\n  type: snell\n  server: {}\n  port: {}\n  psk: {}\n  version: 6\n  reuse: true\n  mode: default\n  udp: true",
+            "- name: {}\n  type: snell\n  server: {}\n  port: {}\n  psk: {}\n  version: {}\n  reuse: true{}\n  udp: true",
             yaml_string(&name), yaml_string(&proxy.address), proxy.port,
             yaml_string(proxy.snell_psk.as_deref().expect("authorized Snell proxy has a PSK")),
+            proxy.snell_version.unwrap_or(6),
+            if proxy.snell_version == Some(5) { "" } else { "\n  mode: default" },
         );
     }
     if proxy.protocol == "hysteria2" {
         let settings = proxy.hysteria2.as_ref().expect("HY2 settings");
-        let mut text = format!("- name: {}\n  type: hysteria2\n  server: {}\n  port: {}\n  password: {}\n  sni: {}\n  skip-cert-verify: true\n  alpn: [h3]\n  up: {}\n  down: {}",yaml_string(&name),yaml_string(&proxy.address),proxy.port,yaml_string(&proxy.uuid),yaml_string(&proxy.server_name),settings["up_mbps"],settings["down_mbps"]);
+        let mut text = format!("- name: {}\n  type: hysteria2\n  server: {}\n  port: {}\n  password: {}\n  sni: {}\n  skip-cert-verify: true\n  alpn: [h3]\n  up: {}\n  down: {}",yaml_string(&name),yaml_string(&proxy.address),proxy.port,yaml_string(&proxy.uuid),yaml_string(&proxy.server_name),settings["bandwidth_mbps"],settings["bandwidth_mbps"]);
         if let Some(password) = settings["obfs_password"].as_str().filter(|s| !s.is_empty()) {
             text.push_str(&format!("\n  obfs: salamander\n  obfs-password: {}", yaml_string(password)));
         }
@@ -473,7 +475,7 @@ pub async fn subscription(
                 let mut hy2_tags = Vec::new();
                 for item in names.iter().filter(|item| item["protocol"] == "hysteria2" && item["hidden"] != true) {
                     let settings = &item["hysteria2"];
-                    let mut outbound = json!({"type":"hysteria2","tag":item["name"],"server":item["address"],"server_port":item["port"],"password":uuid,"up_mbps":settings["up_mbps"],"down_mbps":settings["down_mbps"],"tls":{"enabled":true,"server_name":item["server_name"],"insecure":true,"alpn":["h3"]}});
+                    let mut outbound = json!({"type":"hysteria2","tag":item["name"],"server":item["address"],"server_port":item["port"],"password":uuid,"up_mbps":settings["bandwidth_mbps"],"down_mbps":settings["bandwidth_mbps"],"tls":{"enabled":true,"server_name":item["server_name"],"insecure":true,"alpn":["h3"]}});
                     if let Some(password) = settings["obfs_password"].as_str().filter(|s| !s.is_empty()) { outbound["obfs"]=json!({"type":"salamander","password":password}); }
                     hy2_tags.push(item["name"].clone());
                     outbounds.push(outbound);

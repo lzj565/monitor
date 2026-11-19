@@ -9,9 +9,7 @@ pub struct Settings {
     #[serde(default)]
     pub obfs_password: String,
     #[serde(default = "default_bandwidth")]
-    pub up_mbps: u32,
-    #[serde(default = "default_bandwidth")]
-    pub down_mbps: u32,
+    pub bandwidth_mbps: u32,
 }
 fn default_bandwidth() -> u32 {
     100
@@ -31,7 +29,7 @@ impl Settings {
         {
             return Err("invalid HY2 server name");
         }
-        if self.up_mbps == 0 || self.down_mbps == 0 {
+        if self.bandwidth_mbps == 0 {
             return Err("HY2 bandwidth must be positive");
         }
         if self.obfs_password.len() > 1024 || self.obfs_password.chars().any(char::is_control) {
@@ -65,12 +63,12 @@ mod tests {
     #[test]
     fn settings_defaults_and_validation() {
         let mut settings: Settings = serde_json::from_value(json!({"server_name":"example.com"})).unwrap();
-        assert_eq!(settings.up_mbps, 100);
+        assert_eq!(settings.bandwidth_mbps, 100);
         assert!(settings.validate().is_ok());
         settings.server_name = "bad/name".into();
         assert!(settings.validate().is_err());
         settings.server_name = "example.com".into();
-        settings.down_mbps = 0;
+        settings.bandwidth_mbps = 0;
         assert!(settings.validate().is_err());
     }
     #[test]
@@ -90,7 +88,7 @@ mod tests {
 
 /// Keep certificate material separate from user-facing settings.
 pub fn persisted_config(settings: &Value, previous: Option<&Value>) -> anyhow::Result<Value> {
-    let typed: Settings = serde_json::from_value(settings["hysteria2"].clone())?;
+    let typed: Settings = self::settings(settings)?;
     typed.validate().map_err(anyhow::Error::msg)?;
     let mut config = serde_json::to_value(&typed)?;
     if let Some(old) = previous.filter(|old| {
@@ -114,6 +112,11 @@ pub fn settings(config: &Value) -> anyhow::Result<Settings> {
     if let Some(map) = public.as_object_mut() {
         map.remove("certificate");
         map.remove("private_key");
+        let up = map.remove("up_mbps");
+        let down = map.remove("down_mbps");
+        if let Some(value) = up.or(down) {
+            map.entry("bandwidth_mbps").or_insert(value);
+        }
     }
     Ok(serde_json::from_value(public)?)
 }
@@ -121,6 +124,16 @@ pub fn settings(config: &Value) -> anyhow::Result<Settings> {
 #[cfg(test)]
 mod persistence_tests {
     use super::*;
+    #[test]
+    fn legacy_bandwidth_prefers_upload_and_accepts_download_only() {
+        let mut config = json!({"hysteria2":{"server_name":"example.com","up_mbps":20,"down_mbps":40}});
+        assert_eq!(settings(&config).unwrap().bandwidth_mbps, 20);
+        config["hysteria2"].as_object_mut().unwrap().remove("up_mbps");
+        assert_eq!(settings(&config).unwrap().bandwidth_mbps, 40);
+        config["hysteria2"]["bandwidth_mbps"] = json!(50);
+        assert_eq!(settings(&config).unwrap().bandwidth_mbps, 50);
+    }
+
     #[test]
     fn certificate_is_stable_until_sni_changes() {
         let request = json!({"hysteria2":{"server_name":"example.com"}});

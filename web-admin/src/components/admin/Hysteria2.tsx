@@ -35,15 +35,14 @@ export function Hysteria2Form({ proxy, nodes, onClose, onSaved, onBack, embedded
   const [obfs, setObfs] = useState(() => proxy
     ? config?.obfs_password ?? ""
     : Array.from(crypto.getRandomValues(new Uint8Array(3)), byte => byte.toString(16).padStart(2, "0")).join(""))
-  const [up, setUp] = useState(config?.up_mbps ?? 100)
-  const [down, setDown] = useState(config?.down_mbps ?? 100)
+  const [bandwidth, setBandwidth] = useState(config?.bandwidth_mbps ?? config?.up_mbps ?? config?.down_mbps ?? 100)
   const [busy, setBusy] = useState(false)
   const form = <form className="flex min-h-0 flex-1 flex-col" onSubmit={async event => {
     event.preventDefault(); setBusy(true); onBusyChange?.(true)
     try {
       const draft: ProxyDraft = { name, address, address_type: addressType, port, enabled: proxy?.enabled ?? true,
         include_node_name: proxy?.include_node_name ?? false, protocol: "hysteria2", flow: "",
-        config: { hysteria2: { server_name: sni, obfs_password: obfs, up_mbps: up, down_mbps: down } } }
+        config: { hysteria2: { server_name: sni, obfs_password: obfs, bandwidth_mbps: bandwidth } } }
       const saved = proxy ? await updateProxy(proxy.id, draft, node) : await createProxy(node, draft)
       if (saved.sync?.needs_sync?.length) toast.warning("已保存，节点配置仍需同步")
       else toast.success("HY2 已保存，请确认节点同步结果")
@@ -60,8 +59,7 @@ export function Hysteria2Form({ proxy, nodes, onClose, onSaved, onBack, embedded
       <label className="block">UDP 端口<Input required type="number" min={1} max={65535} value={port} onChange={e => setPort(Number(e.target.value))} /></label>
       <label className="block">SNI<Input required value={sni} onChange={e => setSni(e.target.value)} /><span className="text-xs text-muted-foreground">用于生成自签证书，可直接使用默认域名。</span></label>
       <label className="block">Salamander 密码<Input type="text" autoComplete="off" spellCheck={false} value={obfs} onChange={e => setObfs(e.target.value)} /><span className="text-xs text-muted-foreground">客户端与服务端使用同一个混淆密码，留空关闭混淆。</span></label>
-      <label className="block">客户端上行 Mbps<Input required type="number" min={1} value={up} onChange={e => setUp(Number(e.target.value))} /></label>
-      <label className="block">客户端下行 Mbps<Input required type="number" min={1} value={down} onChange={e => setDown(Number(e.target.value))} /></label>
+      <label className="block">上下行带宽（Mbps）<Input required type="number" min={1} value={bandwidth} onChange={e => setBandwidth(Number(e.target.value))} /></label>
     </div>
     <DialogFooter className="shrink-0 border-t px-6 py-3">
       {onBack && <Button type="button" variant="outline" disabled={busy} onClick={onBack}>返回</Button>}

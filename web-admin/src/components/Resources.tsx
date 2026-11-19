@@ -453,7 +453,7 @@ function ProxyPage({ nodes, search, go }: { nodes: Node[]; site: string; refusal
   return (
     <div className="space-y-4">
       <div className="flex min-w-0 flex-wrap items-center gap-2 xl:flex-nowrap" aria-label="代理筛选与操作">
-        <Select value={typeFilter} onValueChange={changeTypeFilter}><SelectTrigger className="w-28 shrink-0" aria-label="按代理类型筛选"><SelectValue /></SelectTrigger><SelectContent position="popper"><SelectItem value="all">全部类型</SelectItem><SelectItem value="snell">Snell v6</SelectItem><SelectItem value="hysteria2">HY2</SelectItem><SelectItem value="vless">VLESS Reality</SelectItem></SelectContent></Select>
+        <Select value={typeFilter} onValueChange={changeTypeFilter}><SelectTrigger className="w-28 shrink-0" aria-label="按代理类型筛选"><SelectValue /></SelectTrigger><SelectContent position="popper"><SelectItem value="all">全部类型</SelectItem><SelectItem value="snell">Snell</SelectItem><SelectItem value="hysteria2">HY2</SelectItem><SelectItem value="vless">VLESS Reality</SelectItem></SelectContent></Select>
         <AdminSearchInput className="min-w-40 flex-1 basis-40" value={query} onChange={setQuery} placeholder="搜索代理名称、地址或节点" />
         <Select value={nodeFilter} onValueChange={setNodeFilter}>
           <SelectTrigger className="w-28 shrink-0" aria-label="按节点筛选"><SelectValue /></SelectTrigger>
@@ -551,7 +551,7 @@ function ProxyPage({ nodes, search, go }: { nodes: Node[]; site: string; refusal
       {creating && <ProxyDialog compact={creationType === null} busy={creationBusy} onClose={() => setCreating(false)}>
         {creationType === null ? <><DialogHeader className="px-5 pt-5 pb-3 text-left"><DialogTitle>选择代理类型</DialogTitle><DialogDescription>选择要创建的代理服务</DialogDescription></DialogHeader><div className="flex flex-col gap-2 px-5 pb-5">{([
           ["vless", "VLESS Reality", "配置节点上的代理服务"],
-          ["snell", "Snell v6", "单端口 TCP 代理"],
+          ["snell", "Snell", "单端口 TCP 代理"],
           ["hysteria2", "HY2", "单端口 UDP 代理"],
         ] as const).map(([type, title, description]) => <Button key={type} className="group h-auto w-full justify-between gap-3 rounded-lg px-4 py-3 text-left" variant="outline" onClick={() => setCreationType(type)}><span className="flex min-w-0 flex-col gap-1"><strong className="whitespace-nowrap text-sm font-medium">{title}</strong><span className="whitespace-nowrap text-xs font-normal text-muted-foreground">{description}</span></span><ArrowRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground transition-transform group-hover:translate-x-0.5" /></Button>)}</div></>
         : creationType === "vless" ? <ProxyForm embedded nodes={nodes} proxy={null} onClose={() => setCreating(false)} onSaved={reload} onBack={() => setCreationType(null)} onBusyChange={setCreationBusy} />

@@ -13,7 +13,9 @@ export function SnellForm({ proxy, nodes, onClose, onSaved, onBack, embedded, on
   onBack?: () => void; embedded?: boolean; onBusyChange?: (busy: boolean) => void
 }) {
   const [node, setNode] = useState(proxy?.node_id ?? nodes[0]?.id ?? 0)
-  const [name, setName] = useState(proxy?.name ?? "Snell v6")
+  const [name, setName] = useState(proxy?.name ?? "Snell")
+  const config = proxy?.config?.snell
+  const [version, setVersion] = useState<5 | 6>(config?.version === 5 ? 5 : 6)
   const selectedNode = nodes.find(candidate => candidate.id === node)
   const [customAddress, setCustomAddress] = useState(proxy?.address_type === "domain" ? proxy.address : "")
   const [addressType, setAddressType] = useState<AddressType>(proxy?.address_type ?? defaultAddressType(selectedNode))
@@ -36,19 +38,22 @@ export function SnellForm({ proxy, nodes, onClose, onSaved, onBack, embedded, on
     try {
       const draft: ProxyDraft = { name, address, address_type: addressType, port, enabled: proxy?.enabled ?? true,
         include_node_name: proxy?.include_node_name ?? false, protocol: "snell", flow: "",
-        config: {} }
+        config: { snell: { version } } }
       const saved = proxy ? await updateProxy(proxy.id, draft, node) : await createProxy(node, draft)
       if (saved.sync?.needs_sync?.length) toast.warning("已保存，节点配置仍需同步")
-      else toast.success("Snell v6 已保存，请确认节点同步结果")
+      else toast.success("Snell 已保存，请确认节点同步结果")
       onSaved(); onClose()
     } catch (error) { toast.error((error as Error).message) }
     finally { setBusy(false); onBusyChange?.(false) }
   }}>
-    <DialogHeader className="shrink-0 px-6 pt-5 pb-3"><DialogTitle>{proxy ? "编辑 Snell v6" : "新增 Snell v6"}</DialogTitle></DialogHeader>
+    <DialogHeader className="shrink-0 px-6 pt-5 pb-3"><DialogTitle>{proxy ? "编辑 Snell" : "新增 Snell"}</DialogTitle></DialogHeader>
     <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-6 pb-4">
-      <p className="text-sm text-muted-foreground">使用节点 sing-box。系统为每条代理生成共享 PSK。</p>
       <label className="block">节点<select aria-label="节点" className="block w-full border p-2" value={node} onChange={e => changeNode(Number(e.target.value))}>{nodes.map(n => <option key={n.id} value={n.id}>{n.name}</option>)}</select></label>
       <label className="block">名称<Input required maxLength={128} value={name} onChange={e => setName(e.target.value)} /></label>
+      <label className="block">协议版本<select className="block w-full border p-2" value={version} onChange={e => setVersion(e.target.value === "5" ? 5 : 6)}>
+        <option value={5}>Snell v5</option>
+        <option value={6}>Snell v6</option>
+      </select></label>
       <ProxyAddressField selectedNode={selectedNode} addressType={addressType} address={address} changeAddressType={setAddressType} setCustomAddress={setCustomAddress} />
       <label className="block">TCP 端口<Input required type="number" min={1} max={65535} value={port} onChange={e => setPort(Number(e.target.value))} /></label>
     </div>

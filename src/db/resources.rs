@@ -46,7 +46,7 @@ impl Db {
         let stored = if draft.protocol == "hysteria2" {
             crate::hysteria2::persisted_config(&draft.config, None)?
         } else if draft.protocol == "snell" {
-            serde_json::json!({"snell":{"psk":hex::encode(rand::random::<[u8;16]>())}})
+            serde_json::json!({"snell":{"version":crate::proxy::snell_version(&draft.config)}})
         } else {
             draft.config.clone()
         };
@@ -101,13 +101,12 @@ impl Db {
         let stored = if draft.protocol == "hysteria2" {
             crate::hysteria2::persisted_config(&draft.config, previous.as_ref().map(|p| &p.config))?
         } else if draft.protocol == "snell" {
-            previous
-                .as_ref()
-                .filter(|proxy| proxy.protocol == "snell")
-                .map(|proxy| proxy.config.clone())
-                .unwrap_or_else(
-                    || serde_json::json!({"snell":{"psk":hex::encode(rand::random::<[u8;16]>())}}),
-                )
+            let old = previous.as_ref().filter(|proxy| proxy.protocol == "snell").map(|proxy| &proxy.config);
+            let version = draft.config["snell"]["version"]
+                .as_u64()
+                .or_else(|| old.map(crate::proxy::snell_version))
+                .unwrap_or(6);
+            serde_json::json!({"snell":{"version":version}})
         } else {
             draft.config.clone()
         };
@@ -673,6 +672,7 @@ impl Db {
                 Ok(UserPortalProxy {
                     hysteria2: None,
                     snell_psk: None,
+                    snell_version: None,
                     mieru_password: None,
                     id: r.get(0)?,
                     node_id: r.get(1)?,
@@ -709,9 +709,11 @@ impl Db {
                 }
             }
             if proxy.protocol == "snell" {
-                proxy.snell_psk = self
-                    .proxy(proxy.id)?
-                    .and_then(|stored| stored.config["snell"]["psk"].as_str().map(str::to_owned));
+                if let Some(stored) = self.proxy(proxy.id)? {
+                    proxy.snell_psk =
+                        Some(crate::proxy::snell_psk(&self.proxies_for_node(stored.node_id)?).to_owned());
+                    proxy.snell_version = Some(crate::proxy::snell_version(&stored.config));
+                }
             }
             if proxy.protocol == "mieru" {
                 proxy.mieru_password = Some(self.mieru_password(false)?);
