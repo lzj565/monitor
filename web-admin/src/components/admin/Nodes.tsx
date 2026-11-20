@@ -511,7 +511,7 @@ export function ifaceArg(iface: string | undefined) {
 // within the window it opened, and each machine exchanges it for a token of its
 // own, so unlike an install command this text is no one's credential and can be
 // sent to every machine as it is.
-export function registerCommand(site: string, key: string, seconds: number | undefined, iface: string | undefined, _realm?: boolean, _mieru?: boolean, singbox = false) {
+export function registerCommand(site: string, key: string, seconds: number | undefined, iface: string | undefined, singbox = false) {
   return scriptCommand(site, (s) => [`--server ${s}`, `--register ${key}`, ...intervalArg(seconds), ...ifaceArg(iface), singbox ? "--sing-box" : "--no-sing-box"])
 }
 
@@ -593,7 +593,7 @@ export function RegisterDialog({ site, reg, onClose }: {
   const iface = useIfaceOption(undefined)
   const interval = useIntervalOption()
   const [singbox, setSingbox] = useState(false)
-  const command = reg.left > 0 && iface.valid ? registerCommand(site, reg.key, interval.flag, iface.flag, undefined, undefined, singbox) : ""
+  const command = reg.left > 0 && iface.valid ? registerCommand(site, reg.key, interval.flag, iface.flag, singbox) : ""
   const clock = `${Math.floor(reg.left / 60)}:${String(reg.left % 60).padStart(2, "0")}`
 
   return (

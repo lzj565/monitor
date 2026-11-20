@@ -13,9 +13,9 @@ export function TooltipText({ text, className }: { text: string; className?: str
   )
 }
 
-export function ProxyProtocolBadge({ protocol = "vless" }: { protocol?: string }) {
+export function ProxyProtocolBadge({ protocol = "vless", label: labelOverride }: { protocol?: string; label?: string }) {
   const label = protocol === "snell" ? "Snell" : protocol === "hysteria2" ? "HY2" : protocol === "vless" ? "VLESS + Reality" : protocol
-  return <Badge variant="outline" className="border-violet-500/35 bg-violet-500/10 font-medium text-violet-700 dark:text-violet-300">{label}</Badge>
+  return <Badge variant="outline" className="border-violet-500/35 bg-violet-500/10 font-medium text-violet-700 dark:text-violet-300">{labelOverride ?? label}</Badge>
 }
 
 export function ProxyAddressTypeBadge({ addressType }: { addressType: string }) {

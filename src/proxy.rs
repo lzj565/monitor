@@ -116,29 +116,6 @@ impl ProxyRequest {
                 config: self.config,
             });
         }
-        if self.protocol == "mieru" {
-            validate_address(&self.address_type, &self.address)?;
-            if self.port < 1025
-                || self.config != json!({"transport":"tcp"})
-                || self.flow.as_deref().is_some_and(|f| !f.is_empty())
-            {
-                return Err(InputError::new(
-                    "INVALID_PROXY_CONFIG",
-                    "mieru requires TCP, port 1025–65535 and an empty flow",
-                ));
-            }
-            return Ok(ProxyDraft {
-                name: name.into(),
-                include_node_name: self.include_node_name,
-                protocol: self.protocol,
-                address_type: self.address_type,
-                address: self.address,
-                port: self.port.into(),
-                enabled: self.enabled,
-                flow: Some(String::new()),
-                config: self.config,
-            });
-        }
         if self.protocol != "vless" {
             return Err(InputError::new("INVALID_PROXY_PROTOCOL", "Unsupported managed proxy protocol"));
         }
@@ -473,7 +450,7 @@ struct VlessUser {
 }
 
 pub fn supported_protocol(proxy: &db::Proxy) -> bool {
-    matches!(proxy.protocol.as_str(), "vless" | "mieru" | "hysteria2" | "snell")
+    matches!(proxy.protocol.as_str(), "vless" | "hysteria2" | "snell")
 }
 
 #[cfg(test)]

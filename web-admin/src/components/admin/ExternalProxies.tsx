@@ -1,10 +1,14 @@
 import { useCallback, useEffect, useState } from "react"
+import { createPortal } from "react-dom"
 import { Pencil, Trash2, Upload } from "lucide-react"
 import { toast } from "sonner"
 import { api } from "@/lib/api"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
-import { Badge } from "@/components/ui/badge"
+import { Card } from "@/components/ui/card"
+import { Skeleton } from "@/components/ui/skeleton"
+import { AdminSearchInput, StatusFilter } from "@/components/AdminShared"
+import { ProxyProtocolBadge, TooltipText } from "@/components/ProxyBadges"
 import { Switch } from "@/components/ui/switch"
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { Table, TableBody, TableHead, TableHeader, TableCell, TableRow } from "@/components/ui/table"
@@ -79,10 +83,31 @@ export function ExternalProxyRow({ proxy }: { proxy: ExternalProxy }) {
     catch (e) { toast.error((e as Error).message) }
     finally { setBusy(false) }
   }
-  return <TableRow><TableCell className="max-w-64 break-all font-medium">{proxy.name}</TableCell><TableCell><Badge variant="outline">{proxy.protocol}</Badge></TableCell><TableCell className="max-w-56 break-all font-mono text-xs">{proxy.address ?? "—"}</TableCell><TableCell>{proxy.port ?? "—"}</TableCell><TableCell><Switch checked={proxy.enabled} disabled={busy} aria-label={`${proxy.enabled ? "停用" : "启用"}外部代理${proxy.name}`} onCheckedChange={v => void mutate(false, v)} /></TableCell><TableCell><div className="flex justify-end gap-2"><Button size="icon" variant="ghost" title="编辑配置" aria-label={`编辑 ${proxy.name}`} disabled={busy} onClick={() => setEditing(true)}><Pencil /></Button><Button size="icon" variant="ghost" title="删除" aria-label={`删除 ${proxy.name}`} disabled={busy} onClick={() => void mutate(true)}><Trash2 /></Button></div>{editing && <ExternalImportDialog editing={proxy} onClose={() => setEditing(false)} />}</TableCell></TableRow>
+  return (
+    <TableRow className="h-14">
+      <TableCell className="px-3 font-medium"><TooltipText text={proxy.name} className="max-w-64" /></TableCell>
+      <TableCell className="px-3"><ProxyProtocolBadge protocol={proxy.protocol} label={proxy.protocol} /></TableCell>
+      <TableCell className="px-3"><TooltipText text={proxy.address ?? "—"} className="max-w-48 text-sm" /></TableCell>
+      <TableCell className="tnum px-3 text-sm">{proxy.port ?? "—"}</TableCell>
+      <TableCell className="px-3 text-center">
+        <Switch checked={proxy.enabled} disabled={busy} aria-label={`${proxy.enabled ? "停用" : "启用"}外部代理 ${proxy.name}`} onCheckedChange={enabled => void mutate(false, enabled)} />
+      </TableCell>
+      <TableCell className="whitespace-nowrap px-3 text-right">
+        <div className="flex items-center justify-end gap-1">
+          <Button size="icon" variant="ghost" className="max-md:size-8" title="编辑配置" aria-label={`编辑 ${proxy.name}`} disabled={busy} onClick={() => setEditing(true)}><Pencil /></Button>
+          <Button size="icon" variant="ghost" className="max-md:size-8 text-destructive hover:text-destructive" title="删除" aria-label={`删除 ${proxy.name}`} disabled={busy} onClick={() => void mutate(true)}><Trash2 /></Button>
+        </div>
+        {editing && <ExternalImportDialog editing={proxy} onClose={() => setEditing(false)} />}
+      </TableCell>
+    </TableRow>
+  )
 }
 
-export function ExternalAuthorization({ userId, onState }: { userId: number; onState?: (state: { dirty: boolean; saving: boolean; count: number }) => void }) {
+export function ExternalAuthorization({ userId, onState, saveButtonContainer }: {
+  userId: number
+  onState?: (state: { dirty: boolean; saving: boolean; count: number }) => void
+  saveButtonContainer: HTMLElement | null
+}) {
   const [baseline, setBaseline] = useState("[]")
   const { items, loading, error, reload } = useExternalProxies()
   const [selected, setSelected] = useState<Set<number>>(new Set())
@@ -108,7 +133,10 @@ export function ExternalAuthorization({ userId, onState }: { userId: number; onS
     <div className="space-y-2">{items.filter(p => `${p.name} ${p.address}`.toLowerCase().includes(query.trim().toLowerCase())).map(p => <label key={p.id} className="flex items-center gap-3 text-sm"><input type="checkbox" checked={selected.has(p.id)} disabled={!loaded || saving || loading} onChange={e => setSelected(current => { const next = new Set(current); if (e.target.checked) next.add(p.id); else next.delete(p.id); return next })} /><span className="min-w-0 break-all">{p.name} · {p.protocol} · {p.address}:{p.port}{!p.enabled && "（已停用）"}</span></label>)}</div>
     {!loading && !items.length && !error && <p className="text-sm text-muted-foreground">尚无外部代理，请先在“代理”页面导入。</p>}
     <Button type="button" variant="ghost" disabled={saving || loading} onClick={loadAccess}>重新读取授权</Button>
-    <Button type="button" variant="outline" disabled={saving || !loaded || loading || !!error || !!accessError} onClick={() => void save()}>{saving ? "保存中…" : `保存外部授权（${selected.size}）`}</Button>
+    {saveButtonContainer && createPortal(
+      <Button type="button" disabled={saving || !loaded || loading || !!error || !!accessError} onClick={() => void save()}>{saving ? "保存中…" : `保存外部授权（${selected.size}）`}</Button>,
+      saveButtonContainer,
+    )}
   </section>
 }
 
@@ -130,12 +158,49 @@ export function ExternalProxiesPage() {
   const [query, setQuery] = useState("")
   const [status, setStatus] = useState("all")
   const [importing, setImporting] = useState(false)
-  const visible = items.filter(p => `${p.name} ${p.protocol} ${p.address}`.toLowerCase().includes(query.trim().toLowerCase()) && (status === "all" || p.enabled === (status === "enabled")))
-  return <div className="space-y-4">
-    <div><h1 className="text-lg font-semibold">外部代理</h1><p className="mt-1 text-sm text-muted-foreground">独立管理导入的 Mihomo 代理，不关联节点、不采集统计。在“订阅”中为用户分配授权。</p></div>
-    <div className="flex flex-wrap items-center gap-2 rounded-md border bg-card p-3"><Input className="min-w-40 flex-1" aria-label="搜索外部代理" placeholder="搜索名称、协议或地址" value={query} onChange={e => setQuery(e.target.value)} /><select aria-label="外部代理状态筛选" className="h-9 rounded-md border bg-background px-3 text-sm" value={status} onChange={e => setStatus(e.target.value)}><option value="all">全部状态</option><option value="enabled">已启用</option><option value="disabled">已停用</option></select><Button onClick={() => setImporting(true)}><Upload />导入外部代理</Button></div>
-    {error && <div role="alert" className="text-sm text-destructive">加载外部代理失败：{error}<Button variant="link" onClick={() => void reload()}>重试</Button></div>}
-    <div className="overflow-x-auto rounded-md border"><Table><TableHeader><TableRow>{["名称", "协议", "地址", "端口", "启用状态", "操作"].map(label => <TableHead key={label}>{label}</TableHead>)}</TableRow></TableHeader><TableBody>{loading ? <TableRow><TableCell colSpan={6}>读取中…</TableCell></TableRow> : visible.map(proxy => <ExternalProxyRow key={proxy.id} proxy={proxy} />)}{!loading && !error && !visible.length && <TableRow><TableCell colSpan={6} className="py-10 text-center text-muted-foreground">{items.length ? "没有匹配的外部代理" : "尚无外部代理，可直接导入，无需添加节点。"}</TableCell></TableRow>}</TableBody></Table></div>
-    {importing && <ExternalImportDialog onClose={() => setImporting(false)} />}
-  </div>
+  const needle = query.trim().toLowerCase()
+  const visible = items.filter(proxy =>
+    `${proxy.name} ${proxy.protocol} ${proxy.address ?? ""}`.toLowerCase().includes(needle) &&
+    (status === "all" || proxy.enabled === (status === "enabled")),
+  )
+
+  return (
+    <div className="space-y-4">
+      <div className="flex min-w-0 flex-wrap items-center gap-2 xl:flex-nowrap" aria-label="外部代理筛选与操作">
+        <AdminSearchInput className="min-w-40 flex-1 basis-40" value={query} onChange={setQuery} placeholder="搜索名称、协议或地址" />
+        <StatusFilter value={status} onChange={setStatus} labels={[["all", "全部状态"], ["enabled", "已启用"], ["disabled", "已停用"]]} />
+        <div className="ml-auto flex shrink-0 items-center gap-2">
+          <Button onClick={() => setImporting(true)}><Upload />导入外部代理</Button>
+        </div>
+      </div>
+      <Card className="overflow-x-auto p-0">
+        <Table className="min-w-max table-auto">
+          <TableHeader className="bg-muted/50">
+            <TableRow>
+              <TableHead className="px-3">名称</TableHead>
+              <TableHead className="px-3">类型</TableHead>
+              <TableHead className="px-3">地址</TableHead>
+              <TableHead className="px-3">端口</TableHead>
+              <TableHead className="px-3 text-center">状态</TableHead>
+              <TableHead className="px-3 text-right">操作</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {visible.map(proxy => <ExternalProxyRow key={proxy.id} proxy={proxy} />)}
+            {!loading && !error && !visible.length && (
+              <TableRow><TableCell colSpan={6} className="py-10 text-center text-sm text-muted-foreground">
+                {items.length ? "没有匹配的外部代理" : "还没有外部代理，点击导入外部代理"}
+              </TableCell></TableRow>
+            )}
+            {loading && <TableRow><TableCell colSpan={6} className="p-4"><Skeleton className="h-10 w-full" /></TableCell></TableRow>}
+            {error && <TableRow><TableCell colSpan={6} className="py-8 text-center text-sm text-destructive">
+              <div role="alert">加载外部代理失败：{error}</div>
+              <Button variant="outline" size="sm" className="mt-3" onClick={() => void reload()}>重试</Button>
+            </TableCell></TableRow>}
+          </TableBody>
+        </Table>
+      </Card>
+      {importing && <ExternalImportDialog onClose={() => setImporting(false)} />}
+    </div>
+  )
 }

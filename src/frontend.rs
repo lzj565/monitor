@@ -104,7 +104,7 @@ fn respond(app: &App, path: &str, query: Option<&str>, known: Option<&str>, shel
         );
     }
     if path == "user" || path.starts_with("user/") {
-        let path = path.strip_prefix("user").unwrap().trim_start_matches('/');
+        let path = path.strip_prefix("user").unwrap_or(path).trim_start_matches('/');
         return embedded::<AdminAssets>(
             path,
             "面板没有构建，在 web-admin/ 下运行 npm run build",

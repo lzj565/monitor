@@ -36,7 +36,6 @@ pub enum ProxyWriteIssue {
     NodeNotFound,
     ProxyNotFound,
     PortConflict,
-    MieruInstanceConflict,
     NameConflict,
 }
 
@@ -100,6 +99,17 @@ pub struct ProxyTrafficOverview {
     pub downlink_bytes: i64,
     pub total_bytes: i64,
     pub active_users: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProxyTrafficUserSummaryRow {
+    pub user_id: i64,
+    pub username: String,
+    pub uplink_bytes: i64,
+    pub downlink_bytes: i64,
+    pub total_bytes: i64,
+    pub traffic_limit: i64,
+    pub next_reset_date: Option<chrono::NaiveDate>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -177,9 +187,6 @@ pub struct UserPortalProxy {
     pub snell_version: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hysteria2: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mieru_password: Option<String>,
-    pub realm_target_node_id: Option<i64>,
     pub id: i64,
     pub node_id: i64,
     pub node_name: String,

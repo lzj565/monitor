@@ -21,14 +21,15 @@ import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
-import { AdminConfirmDialog as ConfirmDialog, AdminSearchInput } from "@/components/AdminShared"
+import { AdminConfirmDialog as ConfirmDialog, AdminSearchInput, StatusFilter } from "@/components/AdminShared"
 import { DragHandle, useDragOrder } from "@/components/DragOrder"
 import { api, type Node } from "@/lib/api"
-import { proxyListItems, proxyTypeFilter, } from "@/lib/realm-management"
+import { proxyListItems, proxyTypeFilter, } from "@/lib/proxy-list"
 import { bytes } from "@/lib/format"
 import { parseResetDay, parseUserLimits } from "@/lib/user-limits"
 import { proxyDraft } from "@/lib/proxy-draft"
 import { countryFlag, displayProxyName } from "@/lib/proxy-name"
+import { ProxyNamePrefix } from "./ProxyNamePrefix"
 import { ProxyAddressTypeBadge, ProxyProtocolBadge, TooltipText } from "@/components/ProxyBadges"
 import { generateRealityKeyPair, generateShortId, realityKeyPairMatches } from "@/lib/reality"
 import { formatSni, parseDestination, parseSni } from "@/lib/sni"
@@ -61,7 +62,6 @@ function notifySync(message: string, sync: SyncReport | undefined, signal: Abort
     toast.success(message)
     return
   }
-  if (sync.pending?.length) toast.info(`mieru 配置已保存，等待 ${sync.pending.length} 个节点同步，可在代理编辑页查看结果`)
   const queued = sync.queued.length
   const offline = sync.needs_sync.filter((item) => item.reason === "offline").length
   const otherFailures = sync.needs_sync.length - offline
@@ -126,21 +126,6 @@ function useAllProxies() {
   return { ...result, reload }
 }
 
-function StatusFilter({ value, onChange, labels }: {
-  value: string
-  onChange: (value: string) => void
-  labels: Array<[string, string]>
-}) {
-  return (
-    <Select value={value} onValueChange={onChange}>
-      <SelectTrigger className="w-32" aria-label="按状态筛选"><SelectValue /></SelectTrigger>
-      <SelectContent position="popper">
-        {labels.map(([key, label]) => <SelectItem key={key} value={key}>{label}</SelectItem>)}
-      </SelectContent>
-    </Select>
-  )
-}
-
 function realityReady(reality: Proxy["config"]["reality"]): boolean {
   return Boolean(
     reality?.server_name.trim()
@@ -186,7 +171,6 @@ function ProxyForm({ proxy, nodes, onClose, onSaved, onBack, embedded, onBusyCha
   const address = addressType === "domain"
     ? customAddress
     : nodeAddress(selectedNode, addressType) || (proxy?.address_type === addressType ? proxy.address : "")
-  const displayName = displayProxyName({ name, include_node_name: includeNodeName, node_id: nodeId }, selectedNode)
   const currentReality = {
     enabled: true,
     server_name: initialReality?.server_name ?? "",
@@ -296,13 +280,7 @@ function ProxyForm({ proxy, nodes, onClose, onSaved, onBack, embedded, onBusyCha
 
             </div>
 
-            <div className="flex flex-wrap items-start gap-x-3 gap-y-1 text-sm">
-              <label className="inline-flex shrink-0 cursor-pointer items-center gap-2">
-                <input type="checkbox" className="size-4 accent-primary" checked={includeNodeName} onChange={(event) => setIncludeNodeName(event.target.checked)} />
-                附加节点地区前缀
-              </label>
-              <span className="text-muted-foreground">将自动生成：{name.trim() ? displayName : "代理名称"}</span>
-            </div>
+            <ProxyNamePrefix name={name} node={selectedNode} includeNodeName={includeNodeName} setIncludeNodeName={setIncludeNodeName} />
 
             <div className="grid grid-cols-1 gap-3">
               <Field label="所属节点 *">
@@ -397,7 +375,7 @@ function ProxyPage({ nodes, search, go }: { nodes: Node[]; site: string; refusal
   const [savedOrder, setSavedOrder] = useState<string[] | null>(null)
   const [orderError, setOrderError] = useState("")
   const [orderRevision, setOrderRevision] = useState(0)
-  const mixedItems = proxyListItems(items ?? [], [], nodes, { query: "", node: "all", status: "all", type: "all" }).map((item) => ({ ...item, id: item.key }))
+  const mixedItems = proxyListItems(items ?? [], nodes, { query: "", node: "all", status: "all", type: "all" }).map((item) => ({ ...item, id: item.key }))
   const liveKeys = mixedItems.map((item) => item.id).sort().join(",")
   useEffect(() => {
     const controller = new AbortController()
@@ -411,7 +389,7 @@ function ProxyPage({ nodes, search, go }: { nodes: Node[]; site: string; refusal
   const reloadOrder = () => { setOrderRevision((revision) => revision + 1); reload() }
   const drag = useDragOrder(mixedItems, "proxy-list", reloadOrder)
   const nodeById = new Map(nodes.map((node) => [node.id, node]))
-  const visibleKeys = new Set(proxyListItems(items ?? [], [], nodes, { query, node: nodeFilter, status: statusFilter, type: typeFilter }).map((item) => item.key))
+  const visibleKeys = new Set(proxyListItems(items ?? [], nodes, { query, node: nodeFilter, status: statusFilter, type: typeFilter }).map((item) => item.key))
   const visible = drag.order.filter((item) => visibleKeys.has(item.key))
   const searching = query.trim() !== "" || nodeFilter !== "all" || statusFilter !== "all" || typeFilter !== "all"
   const orderReady = savedOrder !== null && !orderError && !loading && !error && [...savedOrder].sort().join(",") === liveKeys
@@ -486,11 +464,12 @@ function ProxyPage({ nodes, search, go }: { nodes: Node[]; site: string; refusal
           </TableHeader>
           <TableBody>
             {visible.map((item) => {
-              if (item.kind !== "proxy") return null
               const proxy = item.proxy
               const node = nodeById.get(proxy.node_id)
               const proxyName = displayProxyName(proxy, node)
-              const reality = proxy.config.reality
+              const target = proxy.protocol === "hysteria2"
+                ? proxy.config.hysteria2?.server_name?.trim() || "—"
+                : proxy.config.reality?.server_name ?? "TCP"
               return (
                 <TableRow key={item.key} {...drag.row(item.id)} className="h-14">
                   <TableCell className="px-2">
@@ -520,7 +499,7 @@ function ProxyPage({ nodes, search, go }: { nodes: Node[]; site: string; refusal
                   </TableCell>
                   <TableCell className="tnum px-3 text-sm">{proxy.port}</TableCell>
                   <TableCell className="w-28 max-w-28 px-3">
-                    <TooltipText text={reality?.server_name ?? "TCP"} className="w-24 max-w-24 text-sm" />
+                    <TooltipText text={target} className="w-24 max-w-24 text-sm" />
                   </TableCell>
                   <TableCell className="px-3 text-center">
                     <Switch checked={proxy.enabled} disabled={updatingProxyId !== null} onCheckedChange={(enabled) => setProxyEnabled(proxy, enabled)} aria-label={`${proxy.enabled ? "停用" : "启用"}代理 ${proxyName}`} />
@@ -992,6 +971,7 @@ function SubscriptionForm({ user, proxies, nodes, accesses, ready, onClose, onSa
 }) {
   const [tab, setTab] = useState<"proxy" | "external">("proxy")
   const [externalState, setExternalState] = useState({ dirty: false, saving: false, count: 0 })
+  const [externalSaveButtonContainer, setExternalSaveButtonContainer] = useState<HTMLDivElement | null>(null)
   const [confirmClose, setConfirmClose] = useState(false)
   const [proxyBaseline, setProxyBaseline] = useState(JSON.stringify({ ids: accesses.filter(item => item.access.enabled).map(item => item.proxy.id).sort((a,b) => a-b), auto: user.auto_authorize_new_proxies }))
   const notifySync = useNotifySync()
@@ -1004,7 +984,7 @@ function SubscriptionForm({ user, proxies, nodes, accesses, ready, onClose, onSa
   useEffect(() => { void api<{ ids: string[] }>("/proxy-list/order").then(r => setSavedOrder(r.ids)).catch(e => toast.error(e.message)) }, [])
   const ranks = new Map(savedOrder.map((id, index) => [id, index]))
   const entries = [
-    ...proxies.map(p => ({ key: `proxy:${p.id}`, id: p.id, name: displayProxyName(p, nodes.find(n => n.id === p.node_id)), node: nodes.find(n => n.id === p.node_id)?.name ?? "", address: p.address, port: p.port, realm: false, protocol: p.protocol })),
+    ...proxies.map(p => ({ key: `proxy:${p.id}`, id: p.id, name: displayProxyName(p, nodes.find(n => n.id === p.node_id)), node: nodes.find(n => n.id === p.node_id)?.name ?? "", address: p.address, port: p.port, protocol: p.protocol })),
   ].sort((a,b) => (ranks.get(a.key) ?? Number.MAX_SAFE_INTEGER) - (ranks.get(b.key) ?? Number.MAX_SAFE_INTEGER))
   const selectedProxies = proxies.filter((proxy) => selectedIds.has(proxy.id))
   const query = proxyQuery.trim().toLocaleLowerCase()
@@ -1058,7 +1038,7 @@ function SubscriptionForm({ user, proxies, nodes, accesses, ready, onClose, onSa
           <div role="tablist" aria-label="订阅入口类型" className="flex gap-2 px-6 pb-4">
             {([ ["proxy", "节点"], ["external", "外部节点"] ] as const).map(([value, label]) => <Button key={value} type="button" role="tab" aria-selected={tab === value} disabled={saving || externalState.saving} variant={tab === value ? "default" : "outline"} onKeyDown={event => { if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) { event.preventDefault(); const buttons = Array.from(event.currentTarget.parentElement!.querySelectorAll<HTMLButtonElement>("[role=tab]")); const index = buttons.indexOf(event.currentTarget); buttons[event.key === "Home" ? 0 : event.key === "End" ? 1 : (index + (event.key === "ArrowRight" ? 1 : 1)) % 2]?.click(); buttons[event.key === "Home" ? 0 : event.key === "End" ? 1 : (index + (event.key === "ArrowRight" ? 1 : 1)) % 2]?.focus() } }} onClick={() => setTab(value)}>{label}（{value === "proxy" ? selectedIds.size : externalState.count}）</Button>)}
           </div>
-          <div hidden={tab !== "external"} className="min-h-0 overflow-y-auto px-6"><ExternalAuthorization userId={user.id} onState={setExternalState} /></div>
+          <div hidden={tab !== "external"} className="min-h-0 flex-1 overflow-y-auto px-6 pb-4"><ExternalAuthorization userId={user.id} onState={setExternalState} saveButtonContainer={externalSaveButtonContainer} /></div>
           <div hidden={tab === "external"} className="shrink-0 space-y-3 px-6 pb-4">
             <div className="flex flex-wrap items-center gap-2">
               <Button type="button" variant="outline" size="sm" disabled={!ready || saving} onClick={() => { setSelectedIds(new Set(proxies.map((proxy) => proxy.id))) }}>全选入口</Button>
@@ -1083,7 +1063,9 @@ function SubscriptionForm({ user, proxies, nodes, accesses, ready, onClose, onSa
           <DialogFooter className="shrink-0 items-center border-t px-6 py-4">
             <span className="mr-auto text-sm text-muted-foreground">{tab === "proxy" ? `已选择 ${selectedProxies.length} 个节点` : "外部节点独立保存"}</span>
             <Button type="button" variant="ghost" disabled={saving || externalState.saving} onClick={close}>关闭</Button>
-            {tab !== "external" && <Button type="submit" disabled={saving || !ready}>{saving ? "保存中..." : "保存节点授权"}</Button>}
+            {tab === "external"
+              ? <div ref={setExternalSaveButtonContainer} className="contents" />
+              : <Button type="submit" disabled={saving || !ready}>{saving ? "保存中..." : "保存节点授权"}</Button>}
           </DialogFooter>
         </form>
       </DialogContent>

@@ -63,14 +63,7 @@ pub async fn create_command(
             Ok(body) => body,
             Err(error) => return error.into_response(),
         };
-        if !matches!(
-            body.method.as_str(),
-            "singbox.status"
-                | "singbox.restart"
-                | "singbox.config.get"
-                | "singbox.config.check"
-                | "singbox.config.apply"
-        ) {
+        if !crate::command::supports(&body.method) {
             return bad("不支持的 Agent 命令");
         }
         if matches!(body.method.as_str(), "singbox.config.check" | "singbox.config.apply") {
@@ -153,6 +146,7 @@ pub struct ProxyTrafficRowsQuery {
     pub(super) order: Option<String>,
     pub(super) page: Option<i64>,
     pub(super) page_size: Option<i64>,
+    pub(super) include_proxies: Option<bool>,
 }
 
 pub(super) fn proxy_traffic_page_args(
@@ -181,6 +175,21 @@ pub async fn proxy_traffic_overview(_: ApiAdmin, State(app): State<Shared>) -> R
     .await
 }
 
+pub async fn proxy_traffic_user_summary_rows(
+    _: ApiAdmin,
+    State(app): State<Shared>,
+    Query(query): Query<ProxyTrafficRowsQuery>,
+) -> Response {
+    crate::blocking::response(move || {
+        let (search, _, _, _, page, page_size) = proxy_traffic_page_args(&query);
+        match app.db.proxy_traffic_user_summary_rows(search, page, page_size, Utc::now().timestamp()) {
+            Ok(result) => Json(result).into_response(),
+            Err(error) => api_internal(error),
+        }
+    })
+    .await
+}
+
 pub async fn proxy_traffic_user_rows(
     _: ApiAdmin,
     State(app): State<Shared>,
@@ -203,7 +212,14 @@ pub async fn proxy_traffic_node_rows(
 ) -> Response {
     crate::blocking::response(move || {
         let (search, node_id, sort, descending, page, page_size) = proxy_traffic_page_args(&query);
-        match app.db.proxy_traffic_node_rows(search, node_id, sort, descending, page, page_size) {
+        match app.db.proxy_traffic_node_rows(
+            search,
+            node_id,
+            sort,
+            descending,
+            (page, page_size),
+            query.include_proxies.unwrap_or(true),
+        ) {
             Ok(result) => Json(result).into_response(),
             Err(error) => api_internal(error),
         }
@@ -573,10 +589,7 @@ pub async fn get_user_authorizations(
     Path(user_id): Path<i64>,
 ) -> Response {
     crate::blocking::response(move || match app.db.authorizations_for_user(user_id) {
-        Ok(Some(items)) => match app.db.realm_authorization_ids(user_id) {
-            Ok(ids) => Json(json!({"items":items,"realm_items":ids})).into_response(),
-            Err(e) => api_internal(e),
-        },
+        Ok(Some(items)) => Json(json!({"items":items})).into_response(),
         Ok(None) => api_error(StatusCode::NOT_FOUND, "USER_NOT_FOUND", "user does not exist"),
         Err(error) => api_internal(error),
     })
@@ -587,7 +600,6 @@ pub async fn get_user_authorizations(
 #[serde(deny_unknown_fields)]
 pub struct ReplaceAuthorizationsRequest {
     pub scope: Option<String>,
-    pub realm_rule_ids: Option<Vec<i64>>,
     pub items: Vec<ReplaceAuthorizationItem>,
     pub auto_authorize_new_proxies: Option<bool>,
 }
@@ -615,14 +627,7 @@ pub async fn replace_user_authorizations(
         if let Err(response) = api_user(&app, user_id) {
             return response;
         }
-        let realm_only = request.scope.as_deref() == Some("realm");
-        if !matches!(request.scope.as_deref(), None | Some("proxy") | Some("realm"))
-            || (realm_only
-                && (request.realm_rule_ids.is_none()
-                    || !request.items.is_empty()
-                    || request.auto_authorize_new_proxies.is_some()))
-            || (request.scope.as_deref() == Some("proxy") && request.realm_rule_ids.is_some())
-        {
+        if !matches!(request.scope.as_deref(), None | Some("proxy")) {
             return api_error(
                 StatusCode::BAD_REQUEST,
                 "INVALID_SCOPE",
@@ -642,16 +647,14 @@ pub async fn replace_user_authorizations(
                 return api_error(
                     StatusCode::BAD_REQUEST,
                     "INVALID_PROXY_PROTOCOL",
-                    "Only VLESS and mieru authorization are supported",
+                    "Unsupported proxy protocol for authorization",
                 );
             }
         }
-        match app.db.replace_scoped_entry_authorizations(
+        match app.db.replace_authorizations_with_policy(
             user_id,
             &request.items.iter().map(|item| (item.proxy_id, item.enabled)).collect::<Vec<_>>(),
             request.auto_authorize_new_proxies,
-            request.realm_rule_ids.as_deref(),
-            realm_only,
         ) {
             Ok(Ok(node_ids)) => {
                 let sync = sync_generated_nodes(&app, node_ids);
@@ -695,7 +698,7 @@ pub async fn put_user_proxy(
             return api_error(
                 StatusCode::BAD_REQUEST,
                 "INVALID_PROXY_PROTOCOL",
-                "Only VLESS and mieru authorization are supported",
+                "Unsupported proxy protocol for authorization",
             );
         }
         match app.db.put_authorization(user_id, proxy_id, &draft) {
@@ -800,14 +803,6 @@ pub(super) fn sync_generated_nodes(app: &Shared, node_ids: Vec<i64>) -> SyncRepo
 }
 
 pub(crate) fn sync_node_config_on_connect(app: &Shared, node_id: i64) -> bool {
-    if app
-        .db
-        .proxies_for_node(node_id)
-        .is_ok_and(|p| !p.is_empty() && p.iter().all(|p| p.protocol == "mieru"))
-        && app.db.get(&format!("singbox_managed_node_{node_id}")).is_none()
-    {
-        return true;
-    }
     let Ok(config) = generated_node_config(app, node_id) else { return false };
     enqueue_generated_config(app, node_id, "singbox.config.apply", config.to_string()).status().is_success()
 }

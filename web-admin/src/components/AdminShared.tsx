@@ -2,6 +2,7 @@ import { Search } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog"
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Input } from "@/components/ui/input"
 
 export function AdminSearchInput({ value, onChange, placeholder, ariaLabel, className = "min-w-0 flex-1 sm:max-w-72" }: {
@@ -43,5 +44,20 @@ export function AdminConfirmDialog({ title, description, confirmLabel, busy = fa
         </DialogFooter>
       </DialogContent>
     </Dialog>
+  )
+}
+
+export function StatusFilter({ value, onChange, labels }: {
+  value: string
+  onChange: (value: string) => void
+  labels: Array<[string, string]>
+}) {
+  return (
+    <Select value={value} onValueChange={onChange}>
+      <SelectTrigger className="w-32" aria-label="按状态筛选"><SelectValue /></SelectTrigger>
+      <SelectContent position="popper">
+        {labels.map(([key, label]) => <SelectItem key={key} value={key}>{label}</SelectItem>)}
+      </SelectContent>
+    </Select>
   )
 }

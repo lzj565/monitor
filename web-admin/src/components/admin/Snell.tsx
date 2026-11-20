@@ -6,6 +6,7 @@ import { createProxy, updateProxy, type Proxy, type ProxyDraft, type AddressType
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { ProxyDialog } from "@/components/ProxyDialog"
+import { ProxyNamePrefix } from "@/components/ProxyNamePrefix"
 import { DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 
 export function SnellForm({ proxy, nodes, onClose, onSaved, onBack, embedded, onBusyChange }: {
@@ -14,6 +15,7 @@ export function SnellForm({ proxy, nodes, onClose, onSaved, onBack, embedded, on
 }) {
   const [node, setNode] = useState(proxy?.node_id ?? nodes[0]?.id ?? 0)
   const [name, setName] = useState(proxy?.name ?? "Snell")
+  const [includeNodeName, setIncludeNodeName] = useState(proxy?.include_node_name ?? true)
   const config = proxy?.config?.snell
   const [version, setVersion] = useState<5 | 6>(config?.version === 5 ? 5 : 6)
   const selectedNode = nodes.find(candidate => candidate.id === node)
@@ -37,7 +39,7 @@ export function SnellForm({ proxy, nodes, onClose, onSaved, onBack, embedded, on
     event.preventDefault(); setBusy(true); onBusyChange?.(true)
     try {
       const draft: ProxyDraft = { name, address, address_type: addressType, port, enabled: proxy?.enabled ?? true,
-        include_node_name: proxy?.include_node_name ?? false, protocol: "snell", flow: "",
+        include_node_name: includeNodeName, protocol: "snell", flow: "",
         config: { snell: { version } } }
       const saved = proxy ? await updateProxy(proxy.id, draft, node) : await createProxy(node, draft)
       if (saved.sync?.needs_sync?.length) toast.warning("已保存，节点配置仍需同步")
@@ -50,6 +52,7 @@ export function SnellForm({ proxy, nodes, onClose, onSaved, onBack, embedded, on
     <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-6 pb-4">
       <label className="block">节点<select aria-label="节点" className="block w-full border p-2" value={node} onChange={e => changeNode(Number(e.target.value))}>{nodes.map(n => <option key={n.id} value={n.id}>{n.name}</option>)}</select></label>
       <label className="block">名称<Input required maxLength={128} value={name} onChange={e => setName(e.target.value)} /></label>
+      <ProxyNamePrefix name={name} node={selectedNode} includeNodeName={includeNodeName} setIncludeNodeName={setIncludeNodeName} />
       <label className="block">协议版本<select className="block w-full border p-2" value={version} onChange={e => setVersion(e.target.value === "5" ? 5 : 6)}>
         <option value={5}>Snell v5</option>
         <option value={6}>Snell v6</option>

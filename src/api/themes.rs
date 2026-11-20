@@ -21,7 +21,7 @@ pub(super) const RELEASES_RETRY: i64 = 600;
 /// is fetched until an administrator opens the panel, so a hub whose panel is
 /// never opened makes no outbound request.
 pub async fn versions(_: Admin, State(app): State<Shared>) -> Response {
-    let cached = app.releases.lock().unwrap().clone();
+    let cached = app.releases.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let latest = if fresh_enough(&cached, Utc::now().timestamp()) {
         cached
     } else {
@@ -34,7 +34,7 @@ pub async fn versions(_: Admin, State(app): State<Shared>) -> Response {
             hub: hub.unwrap_or_default(),
             agent: agent.unwrap_or_default(),
         };
-        *app.releases.lock().unwrap() = read.clone();
+        *app.releases.lock().unwrap_or_else(|e| e.into_inner()) = read.clone();
         read
     };
     let notice_app = app.clone();

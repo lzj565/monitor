@@ -20,7 +20,7 @@ export type Proxy = {
   sort: number
   name: string
   include_node_name: boolean
-  protocol: "vless" | "mieru" | "hysteria2" | "snell"
+  protocol: "vless" | "hysteria2" | "snell"
   address_type: AddressType
   address: string
   port: number
@@ -85,17 +85,6 @@ export type ProxyTrafficOverview = {
   downlink_bytes: number
   total_bytes: number
   active_users: number
-}
-
-export type ProxyTrafficUserRow = {
-  user_id: number
-  username: string
-  node_id: number
-  node_name: string
-  uplink_bytes: number
-  downlink_bytes: number
-  total_bytes: number
-  last_seen_at: number | null
 }
 
 export type ProxyTrafficNodeRow = {
@@ -193,12 +182,22 @@ export function getProxyTrafficOverview() {
   return api<ProxyTrafficOverview>("/proxy-traffic/summary")
 }
 
-export function listProxyTrafficUserRows(options: ProxyTrafficListOptions) {
-  return api<ProxyTrafficPage<ProxyTrafficUserRow>>(`/proxy-traffic/user-rows?${trafficSearch(options)}`)
+export type ProxyTrafficUserSummaryRow = {
+  user_id: number
+  username: string
+  uplink_bytes: number
+  downlink_bytes: number
+  total_bytes: number
+  traffic_limit: number
+  next_reset_date: string | null
+}
+
+export function listProxyTrafficUserSummaryRows(options: ProxyTrafficListOptions) {
+  return api<ProxyTrafficPage<ProxyTrafficUserSummaryRow>>(`/proxy-traffic/user-summary-rows?${trafficSearch(options)}`)
 }
 
 export function listProxyTrafficNodeRows(options: ProxyTrafficListOptions) {
-  return api<ProxyTrafficPage<ProxyTrafficNodeRow>>(`/proxy-traffic/node-rows?${trafficSearch(options)}`)
+  return api<ProxyTrafficPage<ProxyTrafficNodeRow>>(`/proxy-traffic/node-rows?${trafficSearch(options)}&include_proxies=false`)
 }
 
 export function resetProxyNodeTraffic(nodeId: number) {
@@ -241,9 +240,9 @@ export function deleteUserProxy(userId: number, proxyId: number) {
   return api<{ sync: SyncReport }>(`/users/${userId}/proxies/${proxyId}`, { method: "DELETE" })
 }
 
-export function replaceUserAuthorizations(userId: number, items: Array<{ proxy_id: number; enabled: boolean }>, autoAuthorizeNewProxies?: boolean, realmRuleIds?: number[]) {
+export function replaceUserAuthorizations(userId: number, items: Array<{ proxy_id: number; enabled: boolean }>, autoAuthorizeNewProxies?: boolean) {
   return api<{ sync: SyncReport }>(`/users/${userId}/proxies`, {
     method: "PUT",
-    body: JSON.stringify({ items, auto_authorize_new_proxies: autoAuthorizeNewProxies, realm_rule_ids: realmRuleIds }),
+    body: JSON.stringify({ items, auto_authorize_new_proxies: autoAuthorizeNewProxies }),
   })
 }

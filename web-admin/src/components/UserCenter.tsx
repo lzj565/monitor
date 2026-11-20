@@ -30,7 +30,7 @@ type PortalProxy = {
   custom_name: string
   id: string
   entry_key: string
-  source: "proxy" | "realm" | "external"
+  source: "proxy" | "external"
   default_name: string
   node_id: number
   node_name: string
@@ -45,7 +45,6 @@ type PortalProxy = {
   server_port: number
   vless_url: string
   hysteria2_url?: string
-  mieru_url?: string
   subscription_error?: string | null
   mihomo_yaml: string
   online: boolean | null
@@ -264,7 +263,7 @@ export function UserCenter({ siteName, dark, toggleTheme, signOut, returnToAdmin
                       <td className="whitespace-normal px-2 py-3 sm:px-3">
                         <div className="min-w-0">
                           <div className="font-medium text-balance break-keep">
-                            {proxy.name}<Badge variant="outline" className="ml-1 font-normal">{proxy.source === "external" ? "外部代理" : proxy.source === "realm" ? "Realm" : "直连"}</Badge>{proxy.hidden && <Badge>已从订阅隐藏</Badge>}{proxy.node_country && "\u2007"}{proxy.node_country && <Badge variant="outline" className="align-middle font-normal text-muted-foreground">{proxy.node_country}</Badge>}
+                            {proxy.name}<Badge variant="outline" className="ml-1 font-normal">{proxy.source === "external" ? "外部代理" : "直连"}</Badge>{proxy.hidden && <Badge>已从订阅隐藏</Badge>}{proxy.node_country && "\u2007"}{proxy.node_country && <Badge variant="outline" className="align-middle font-normal text-muted-foreground">{proxy.node_country}</Badge>}
                           </div>
                           {proxy.node_group && <div className="text-xs text-balance text-muted-foreground">{proxy.node_group}</div>}
                         </div>
@@ -278,7 +277,7 @@ export function UserCenter({ siteName, dark, toggleTheme, signOut, returnToAdmin
                       <td className="px-1 py-3 sm:px-3"><div className="flex flex-wrap items-center justify-center gap-0 sm:gap-1"><TooltipProvider>
                         <Tooltip><TooltipTrigger asChild><Button variant="ghost" size="icon" className="size-8 shrink-0" aria-label={`修改 ${proxy.name} 的名称`} disabled={savingEntry !== null} onClick={() => { setPreferenceError(""); setEditingName({ proxy, value: proxy.custom_name }) }}><Pencil /></Button></TooltipTrigger><TooltipContent>改名</TooltipContent></Tooltip>
                         <Tooltip><TooltipTrigger asChild><Button variant="ghost" size="icon" className="size-8 shrink-0" aria-label={`${proxy.hidden ? "恢复" : "隐藏"} ${proxy.name} 的订阅条目`} disabled={savingEntry !== null} onClick={() => void savePreference(proxy, { hidden: !proxy.hidden })}>{proxy.hidden ? <Eye /> : <EyeOff />}</Button></TooltipTrigger><TooltipContent>{proxy.hidden ? "恢复订阅" : "从订阅隐藏"}</TooltipContent></Tooltip>
-                        {proxy.source !== "external" && proxy.protocol !== "snell" && <Tooltip><TooltipTrigger asChild><Button type="button" variant="ghost" size="icon" className="size-8 shrink-0" title={proxy.hysteria2_url ? "复制 HY2 分享链接" : proxy.mieru_url ? "复制 mieru 分享链接" : "复制 VLESS URL"} aria-label={`复制 ${proxy.name} 的${proxy.hysteria2_url ? " HY2 分享链接" : proxy.mieru_url ? " mieru 分享链接" : " VLESS URL"}`} onClick={() => void copy(proxy.hysteria2_url ?? proxy.mieru_url ?? proxy.vless_url, proxy.hysteria2_url ? "HY2 分享链接" : proxy.mieru_url ? "mieru 分享链接" : "VLESS URL")}><Link /></Button></TooltipTrigger><TooltipContent>{proxy.hysteria2_url ? "复制 HY2 分享链接" : proxy.mieru_url ? "复制 mieru 分享链接" : "复制 VLESS URL"}</TooltipContent></Tooltip>}
+                        {proxy.source !== "external" && proxy.protocol !== "snell" && <Tooltip><TooltipTrigger asChild><Button type="button" variant="ghost" size="icon" className="size-8 shrink-0" title={proxy.hysteria2_url ? "复制 HY2 分享链接" : "复制 VLESS URL"} aria-label={`复制 ${proxy.name} 的${proxy.hysteria2_url ? " HY2 分享链接" : " VLESS URL"}`} onClick={() => void copy(proxy.hysteria2_url ?? proxy.vless_url, proxy.hysteria2_url ? "HY2 分享链接" : "VLESS URL")}><Link /></Button></TooltipTrigger><TooltipContent>{proxy.hysteria2_url ? "复制 HY2 分享链接" : "复制 VLESS URL"}</TooltipContent></Tooltip>}
                         <Tooltip><TooltipTrigger asChild><Button type="button" variant="ghost" size="icon" className="size-8 shrink-0" title="复制 Mihomo 配置" aria-label={`复制 ${proxy.name} 的 Mihomo 配置`} disabled={!!proxy.subscription_error} onClick={() => void copy(proxy.mihomo_yaml, "Mihomo 配置")}><FileCode /></Button></TooltipTrigger><TooltipContent>{proxy.subscription_error || "复制 Mihomo 配置"}</TooltipContent></Tooltip>
                       </TooltipProvider></div></td>
                     </tr>

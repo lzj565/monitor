@@ -156,20 +156,8 @@ pub async fn agent_register(
         Ok(v) => v,
         Err(r) => return bad(r),
     };
-    let realm = match flag("x-install-realm") {
-        Ok(v) => v,
-        Err(r) => return bad(r),
-    };
-    let mieru = match flag("x-install-mieru") {
-        Ok(v) => v,
-        Err(r) => return bad(r),
-    };
     let token = random_token();
-    match app.db.create_node_with_components(
-        &node,
-        &token,
-        &crate::db::InstallChoices { singbox, realm, mieru },
-    ) {
+    match app.db.create_node_with_components(&node, &token, &crate::db::InstallChoices { singbox }) {
         Ok(_) => {
             app.registrations.clear(ip);
             invalidate_snapshot(&app);

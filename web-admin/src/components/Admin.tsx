@@ -87,7 +87,7 @@ export function Admin({
       <div className="min-w-0 flex-1">
         <Suspense fallback={<p className="p-6 text-sm text-muted-foreground">加载中…</p>}>
         {path === "/admin/traffic" ? (
-          <ProxyTrafficPage nodes={nodes} />
+          <ProxyTrafficPage />
         ) : path === "/admin/proxies" ? (
           <ProxiesPage nodes={nodes} site={site} refusal={refusal} search={search} go={go} />
         ) : path === "/admin/external-proxies" ? (

@@ -123,7 +123,6 @@ fn restore_refuses_anything_that_is_not_a_backup_of_this_hub() {
     let newer = Connection::open(&bad).unwrap();
     newer.execute_batch(SCHEMA).unwrap();
     newer.execute_batch(RESOURCE_SCHEMA).unwrap();
-    newer.execute_batch(REALM_SCHEMA).unwrap();
     migrate(&newer, SCHEMA_VERSION).unwrap();
     newer.execute_batch(&format!("PRAGMA user_version = {}", SCHEMA_VERSION + 1)).unwrap();
     refused("from a newer hub");
@@ -410,6 +409,35 @@ fn version_sixteen_proxy_order_migration_preserves_existing_id_order() {
 }
 
 #[test]
+fn user_summary_rows_aggregate_and_page_with_stable_order() {
+    use chrono::TimeZone;
+    let db = db();
+    let mut draft = user_draft("summary-a");
+    draft.traffic_reset_day = Some(31);
+    let first = db.create_user(&draft).unwrap().unwrap();
+    let second = db.create_user(&user_draft("summary-b")).unwrap().unwrap();
+    let empty = db.create_user(&user_draft("summary-empty")).unwrap().unwrap();
+    let node_a = node(&db, 1);
+    let node_b = node(&db, 1);
+    for (user, node, up, down) in [(first, node_a, 12, 10), (first, node_b, 8, 0), (second, node_a, 5, 25)] {
+        db.conn().execute("INSERT INTO proxy_user_traffic(user_id,node_id,uplink_bytes,downlink_bytes,created_at,updated_at) VALUES(?1,?2,?3,?4,0,0)", params![user,node,up,down]).unwrap();
+    }
+    let now = Local.with_ymd_and_hms(2025, 2, 1, 12, 0, 0).unwrap().timestamp();
+    let load = |page| db.proxy_traffic_user_summary_rows(Some("SUMMARY-"), page, 1, now).unwrap();
+    let page = load(1);
+    assert_eq!(page.total, 3);
+    let row = &page.items[0];
+    assert_eq!((row.user_id, row.uplink_bytes, row.downlink_bytes, row.total_bytes), (first, 20, 10, 30));
+    assert_eq!(row.next_reset_date, chrono::NaiveDate::from_ymd_opt(2025, 2, 28));
+    assert_eq!(load(2).items[0].user_id, second);
+    let page = load(3);
+    assert_eq!(
+        (page.items[0].user_id, page.items[0].total_bytes, page.items[0].next_reset_date),
+        (empty, 0, None)
+    );
+}
+
+#[test]
 fn traffic_node_rows_include_all_proxy_names_without_multiplying_traffic() {
     let db = db();
     let node_id = node(&db, 1);
@@ -421,7 +449,7 @@ fn traffic_node_rows_include_all_proxy_names_without_multiplying_traffic() {
     second.enabled = false;
     let second_id = db.create_proxy(node_id, &second).unwrap().unwrap();
     db.conn().execute("INSERT INTO proxy_node_traffic(node_id,uplink_bytes,downlink_bytes,last_uplink_counter,last_downlink_counter,created_at,updated_at) VALUES(?1,50,70,100,200,0,0)", [node_id]).unwrap();
-    let page = db.proxy_traffic_node_rows(None, None, "total", true, 1, 100).unwrap();
+    let page = db.proxy_traffic_node_rows(None, None, "total", true, (1, 100), true).unwrap();
     assert_eq!(page.total, 1);
     let row = &page.items[0];
     assert_eq!(row.total_bytes, 120);
@@ -430,8 +458,12 @@ fn traffic_node_rows_include_all_proxy_names_without_multiplying_traffic() {
     assert!(row.proxies[0].include_node_name);
     assert!(!row.proxies[1].enabled);
     assert_eq!(row.proxies[0].protocol, "vless");
+    let compact = db.proxy_traffic_node_rows(None, None, "total", true, (1, 100), false).unwrap();
+    assert_eq!(compact.items[0].total_bytes, 120);
+    assert_eq!(compact.items[0].protocols, vec!["vless"]);
+    assert!(compact.items[0].proxies.is_empty());
     db.reset_proxy_node_traffic(node_id, 123).unwrap();
-    let page = db.proxy_traffic_node_rows(None, None, "total", true, 1, 100).unwrap();
+    let page = db.proxy_traffic_node_rows(None, None, "total", true, (1, 100), true).unwrap();
     assert_eq!(page.items[0].total_bytes, 0);
     let baseline: i64 = db
         .conn()
@@ -442,7 +474,7 @@ fn traffic_node_rows_include_all_proxy_names_without_multiplying_traffic() {
     assert_eq!(baseline, 100);
     db.delete_proxy(first_id).unwrap();
     db.delete_proxy(second_id).unwrap();
-    let page = db.proxy_traffic_node_rows(None, None, "total", true, 1, 100).unwrap();
+    let page = db.proxy_traffic_node_rows(None, None, "total", true, (1, 100), true).unwrap();
     assert_eq!(page.total, 1);
     assert!(page.items[0].proxies.is_empty());
 }
@@ -2543,7 +2575,6 @@ fn manual_user_uuid_is_canonical_unique_and_atomic() {
     let bob = db.create_user(&user_draft("manual-bob")).unwrap().unwrap();
     let bob_uuid = db.user(bob).unwrap().unwrap().uuid;
     let token = db.user_subscription_token(alice).unwrap();
-    let password = db.mieru_password(false).unwrap();
     db.create_user_session("uuid-session", Utc::now().timestamp() + 3600, alice).unwrap();
     let mut draft = user_draft("manual-alice");
     draft.password_hash = None;
@@ -2554,7 +2585,6 @@ fn manual_user_uuid_is_canonical_unique_and_atomic() {
     );
     assert_eq!(db.user(alice).unwrap().unwrap().uuid, uuid);
     assert_eq!(db.user_subscription_token(alice).unwrap(), token);
-    assert_eq!(db.mieru_password(false).unwrap(), password);
     assert_eq!(db.session_principal("uuid-session"), Some(SessionPrincipal::User(alice)));
     let mut conflicting = user_draft("unexpected-new-name");
     conflicting.enabled = false;
@@ -2758,7 +2788,16 @@ fn external_metadata_is_optional_and_admin_rename_preserves_chain() {
 
 #[test]
 fn v32_retires_managed_components_and_preserves_external_mieru() {
-    let db = Db::open(":memory:").unwrap();
+    let dir = std::env::temp_dir().join(format!("monitor-retirement-{}", random_secret()));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("legacy.db");
+    let path = path.to_str().unwrap();
+    let db = Db::open(path).unwrap();
+    let user = db.create_user(&user_draft("external-owner")).unwrap().unwrap();
+    let config =
+        serde_json::json!({"name":"external fixture","type":"mieru","server":"example.test","port":443});
+    let external = db.import_external_proxies(std::slice::from_ref(&config)).unwrap()[0];
+    db.replace_external_authorizations(user, &[external]).unwrap();
     let conn = db.conn();
     conn.execute_batch(
         "CREATE TABLE realm_hosts(id INTEGER PRIMARY KEY);
@@ -2766,13 +2805,25 @@ fn v32_retires_managed_components_and_preserves_external_mieru() {
          CREATE TABLE mieru_hosts(id INTEGER PRIMARY KEY);
          INSERT INTO mieru_hosts VALUES(1);
          INSERT INTO setting(key,value) VALUES('mieru_shared_password','fixture');
-         INSERT INTO external_proxies(name,protocol,config,created_at,updated_at)
-         VALUES('external fixture','mieru','{}',0,0);
          PRAGMA user_version = 31;",
     )
     .unwrap();
-    migrate(&conn, 31).unwrap();
-    migrate(&conn, 32).unwrap();
+    drop(conn);
+    drop(db);
+    let restored = Db::open(":memory:").unwrap();
+    let backup = dir.join("restore.db");
+    let backup = backup.to_str().unwrap();
+    Connection::open(path)
+        .unwrap()
+        .backup(rusqlite::MAIN_DB, backup, None::<fn(rusqlite::backup::Progress)>)
+        .unwrap();
+    restored.check_backup(backup).unwrap();
+    restored.restore_from(backup).unwrap();
+    assert_eq!(restored.active_external_configs(user, 1).unwrap(), vec![(external, config.clone())]);
+    drop(Db::open(path).unwrap());
+    let db = Db::open(path).unwrap();
+    assert_eq!(db.active_external_configs(user, 1).unwrap(), vec![(external, config)]);
+    let conn = db.conn();
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
     assert_eq!(version, 32);
     let count: i64 = conn
@@ -2787,4 +2838,7 @@ fn v32_retires_managed_components_and_preserves_external_mieru() {
         .query_row("SELECT count(*) FROM external_proxies WHERE protocol='mieru'", [], |r| r.get(0))
         .unwrap();
     assert_eq!(count, 1);
+    drop(conn);
+    drop(db);
+    std::fs::remove_dir_all(dir).unwrap();
 }

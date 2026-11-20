@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 pub(super) const COMPONENT_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS node_components(
  node_id INTEGER NOT NULL REFERENCES node(id) ON DELETE CASCADE,
- component TEXT NOT NULL CHECK(component IN ('singbox','realm','mieru')),
+ component TEXT NOT NULL CHECK(component IN ('singbox')),
  desired_installed INTEGER NOT NULL CHECK(desired_installed IN (0,1)),
  installed INTEGER NOT NULL DEFAULT 0 CHECK(installed IN (0,1)),
  managed INTEGER NOT NULL DEFAULT 0 CHECK(managed IN (0,1)),
@@ -13,37 +13,20 @@ CREATE TABLE IF NOT EXISTS node_components(
  PRIMARY KEY(node_id,component)
 );
 "#;
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct InstallChoices {
     #[serde(default = "required_singbox")]
     pub singbox: bool,
-    pub realm: bool,
-    pub mieru: bool,
 }
 fn required_singbox() -> bool {
     false
 }
-impl Default for InstallChoices {
-    fn default() -> Self {
-        Self { singbox: false, realm: false, mieru: false }
-    }
-}
-impl InstallChoices {
-    pub fn validate(&self) -> Result<()> {
-        Ok(())
-    }
-}
 pub(super) fn seed_components(conn: &Connection, id: i64, choices: &InstallChoices) -> Result<()> {
-    choices.validate()?;
-    for (component, desired) in
-        [("singbox", choices.singbox), ("realm", choices.realm), ("mieru", choices.mieru)]
-    {
-        conn.execute(
-            "INSERT INTO node_components(node_id,component,desired_installed) VALUES(?1,?2,?3)",
-            params![id, component, desired],
-        )?;
-    }
+    conn.execute(
+        "INSERT INTO node_components(node_id,component,desired_installed) VALUES(?1,'singbox',?2)",
+        params![id, choices.singbox],
+    )?;
     Ok(())
 }
 #[derive(Debug, Deserialize)]
@@ -58,39 +41,22 @@ pub struct ComponentObservation {
 impl Db {
     pub fn component_choices(&self, id: i64) -> Result<Option<InstallChoices>> {
         let conn = self.conn();
-        let mut stmt =
-            conn.prepare("SELECT component,desired_installed FROM node_components WHERE node_id=?1")?;
-        let rows = stmt
-            .query_map([id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?)))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        if rows.is_empty() {
-            return Ok(None);
-        }
-        anyhow::ensure!(
-            rows.iter().any(|(component, _)| component == "singbox"),
-            "incomplete component profile"
-        );
-        let mut choices = InstallChoices::default();
-        for (c, on) in rows {
-            match c.as_str() {
-                "realm" => choices.realm = on,
-                "mieru" => choices.mieru = on,
-                "singbox" => choices.singbox = on,
-                _ => unreachable!(),
-            }
-        }
-        choices.validate()?;
-        Ok(Some(choices))
+        Ok(conn
+            .query_row(
+                "SELECT desired_installed FROM node_components WHERE node_id=?1 AND component='singbox'",
+                [id],
+                |r| Ok(InstallChoices { singbox: r.get(0)? }),
+            )
+            .optional()?)
     }
     pub fn component_profile(&self, id: i64) -> Result<Option<Value>> {
         let Some(install) = self.component_choices(id)? else { return Ok(None) };
         let conn = self.conn();
-        let mut stmt=conn.prepare("SELECT component,desired_installed,installed,managed,running,version,checked_at,last_error FROM node_components WHERE node_id=?1 ORDER BY CASE component WHEN 'singbox' THEN 0 WHEN 'realm' THEN 1 ELSE 2 END")?;
+        let mut stmt=conn.prepare("SELECT component,desired_installed,installed,managed,running,version,checked_at,last_error FROM node_components WHERE node_id=?1")?;
         let components=stmt.query_map([id],|r|Ok(json!({"component":r.get::<_,String>(0)?,"desired_installed":r.get::<_,bool>(1)?,"installed":r.get::<_,bool>(2)?,"managed":r.get::<_,bool>(3)?,"running":r.get::<_,bool>(4)?,"version":r.get::<_,String>(5)?,"checked_at":r.get::<_,Option<i64>>(6)?,"last_error":r.get::<_,String>(7)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(Some(json!({"install":install,"components":components})))
     }
     pub fn save_component_choices(&self, id: i64, choices: &InstallChoices) -> Result<bool> {
-        choices.validate()?;
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let exists: bool =
@@ -98,14 +64,10 @@ impl Db {
         if !exists {
             return Ok(false);
         }
-        for (component, desired) in
-            [("singbox", choices.singbox), ("realm", choices.realm), ("mieru", choices.mieru)]
-        {
-            tx.execute(
-                "UPDATE node_components SET desired_installed=?3 WHERE node_id=?1 AND component=?2",
-                params![id, component, desired],
-            )?;
-        }
+        tx.execute(
+            "UPDATE node_components SET desired_installed=?2 WHERE node_id=?1 AND component='singbox'",
+            params![id, choices.singbox],
+        )?;
         tx.commit()?;
         Ok(true)
     }
@@ -119,7 +81,10 @@ impl Db {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         for (component, o) in observations {
-            anyhow::ensure!(matches!(component.as_str(), "singbox" | "realm" | "mieru"), "invalid component");
+            if matches!(component.as_str(), "realm" | "mieru") {
+                continue;
+            }
+            anyhow::ensure!(component == "singbox", "invalid component");
             anyhow::ensure!(
                 o.version.as_ref().is_none_or(|v| v.len() <= 256)
                     && o.error.as_ref().is_none_or(|v| v.len() <= 512),
@@ -153,13 +118,13 @@ mod tests {
         let (db, id) = fixture();
         assert_eq!(db.component_choices(id).unwrap(), Some(InstallChoices::default()));
         let initial = db.component_profile(id).unwrap().unwrap();
-        assert_eq!(initial["components"].as_array().unwrap().len(), 3);
+        assert_eq!(initial["components"].as_array().unwrap().len(), 1);
         assert!(initial["components"]
             .as_array()
             .unwrap()
             .iter()
             .all(|c| c["installed"] == false && c["checked_at"].is_null()));
-        let wanted = InstallChoices { singbox: true, realm: true, mieru: true };
+        let wanted = InstallChoices { singbox: true };
         assert!(db.save_component_choices(id, &wanted).unwrap());
         let observation=serde_json::from_value(json!({"realm":{"installed":false,"managed":false,"running":false,"version":""},"singbox":{"installed":true,"managed":true,"running":true,"version":"test-v1"}})).unwrap();
         db.record_components(id, &observation, 10).unwrap();
@@ -170,7 +135,7 @@ mod tests {
         assert_eq!(p["components"][0]["installed"], true);
         assert_eq!(p["components"][0]["last_error"], "timed out");
         assert_eq!(p["components"][0]["checked_at"], 20);
-        let disabled = InstallChoices { singbox: false, realm: false, mieru: false };
+        let disabled = InstallChoices { singbox: false };
         assert!(db.save_component_choices(id, &disabled).unwrap());
         assert_eq!(db.component_choices(id).unwrap(), Some(disabled));
     }
@@ -193,11 +158,8 @@ mod tests {
         let (db, id) = fixture();
         db.conn().execute_batch("DROP TABLE node_components; PRAGMA user_version=25;").unwrap();
         migrate(&db.conn(), 25).unwrap();
-        assert_eq!(
-            db.component_choices(id).unwrap(),
-            Some(InstallChoices { singbox: true, realm: false, mieru: false })
-        );
-        let choices = InstallChoices { singbox: false, realm: false, mieru: false };
+        assert_eq!(db.component_choices(id).unwrap(), Some(InstallChoices { singbox: true }));
+        let choices = InstallChoices { singbox: false };
         db.save_component_choices(id, &choices).unwrap();
         migrate(&db.conn(), 25).unwrap();
         assert_eq!(db.component_choices(id).unwrap(), Some(choices));
@@ -205,7 +167,7 @@ mod tests {
     #[test]
     fn registration_stores_choices_atomically() {
         let (db, _) = fixture();
-        let choices = InstallChoices { singbox: true, realm: true, mieru: true };
+        let choices = InstallChoices { singbox: true };
         let id = db
             .create_node_with_components(
                 &Node { name: "registered".into(), ..Default::default() },

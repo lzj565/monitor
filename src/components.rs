@@ -57,16 +57,10 @@ pub async fn installer(State(app): State<Shared>, headers: HeaderMap) -> Respons
             Err(e) => return api::answer(StatusCode::UNAUTHORIZED, e),
         };
         match app.db.component_choices(id) {
-            Ok(Some(c)) => (
-                [(header::CACHE_CONTROL, "no-store")],
-                format!(
-                    "singbox={}\nrealm={}\nmieru={}\n",
-                    u8::from(c.singbox),
-                    u8::from(c.realm),
-                    u8::from(c.mieru)
-                ),
-            )
-                .into_response(),
+            Ok(Some(c)) => {
+                ([(header::CACHE_CONTROL, "no-store")], format!("singbox={}\n", u8::from(c.singbox)))
+                    .into_response()
+            }
             Ok(None) => api::answer(StatusCode::NOT_FOUND, "component profile not found"),
             Err(e) => api::fail(e),
         }

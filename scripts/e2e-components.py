@@ -38,15 +38,14 @@ with tempfile.TemporaryDirectory() as tmp:
  try:
   hub=start_hub();password=re.search(r'Emergency password: (\S+)',logpath.read_text())[1];request('/api/auth/login',{'password':password},'POST')
   node=request('/api/nodes',{'name':'component-fixture'},'POST')['id'];token=request(f'/api/nodes/{node}/token')['token']
-  initial=request(f'/api/nodes/{node}/components');assert initial['install']=={'singbox':True,'realm':False,'mieru':False};assert all(c['checked_at'] is None for c in initial['components'])
-  chosen={'singbox':True,'realm':True,'mieru':True};saved=request(f'/api/nodes/{node}/components',chosen,'PUT');assert saved['install']==chosen and all(not c['installed'] for c in saved['components'])
+  initial=request(f'/api/nodes/{node}/components');assert initial['install']=={'singbox':False};assert all(c['checked_at'] is None for c in initial['components'])
+  chosen={'singbox':True};saved=request(f'/api/nodes/{node}/components',chosen,'PUT');assert saved['install']==chosen and all(not c['installed'] for c in saved['components'])
   request('/api/agent/components',expected=401)
-  assert request('/api/agent/components',headers={'authorization':'Bearer '+token})=='singbox=1\nrealm=1\nmieru=1\n'
+  assert request('/api/agent/components',headers={'authorization':'Bearer '+token})=='singbox=1\n'
   # Exercise the actual installer parser against this live authenticated HTTP endpoint.
-  env=dict(os.environ,SERVER=base,TOKEN=token,TMP_DIR=tmp,REALM_OPTION='',MIERU_OPTION='')
-  shell='set -eu; info() { :; }; fail() { exit 1; }; . /tmp/component-helper.sh; load_component_profile; printf "%s %s %s" "$SINGBOX_OPTION" "$REALM_OPTION" "$MIERU_OPTION"'
-  result=subprocess.run(['/bin/sh','-c',shell],env=env,capture_output=True,text=True);assert result.returncode==0 and result.stdout=='--sing-box --realm --mieru',result.stderr
-  request(f'/api/nodes/{node}/components',{'singbox':False,'realm':False,'mieru':False},'PUT',expected=400)
+  env=dict(os.environ,SERVER=base,TOKEN=token,TMP_DIR=tmp)
+  shell='set -eu; info() { :; }; fail() { exit 1; }; . /tmp/component-helper.sh; load_component_profile; printf "%s" "$SINGBOX_OPTION"'
+  result=subprocess.run(['/bin/sh','-c',shell],env=env,capture_output=True,text=True);assert result.returncode==0 and result.stdout=='--sing-box',result.stderr
   with open(tmp+'/agent.log','w') as agentlog:agent=subprocess.Popen(['/tmp/monitor-agent','--server',base,'--token',token],stdout=agentlog,stderr=agentlog)
   for _ in range(150):
    profile=request(f'/api/nodes/{node}/components')
@@ -55,11 +54,11 @@ with tempfile.TemporaryDirectory() as tmp:
   else:raise AssertionError('component inventory did not arrive')
   state={c['component']:c for c in profile['components']}
   assert state['singbox']['installed'] and state['singbox']['managed'];assert state['singbox']['version']=='sing-box fixture-v1'
-  assert not state['realm']['installed'] and not state['mieru']['installed'];assert profile['install']==chosen
+  assert set(state)=={'singbox'};assert profile['install']==chosen
   public=request('/api/nodes',opener=urllib.request.build_opener());assert 'components' not in json.dumps(public)
   agent.terminate();agent.wait(timeout=10);agent=None;hub.terminate();hub.wait(timeout=10);hub=start_hub()
   assert request(f'/api/nodes/{node}/components')['install']==chosen
-  print('PASS: defaults, saved choices independent of observed files, live installer parser, mandatory sing-box, real Agent inventory, public isolation and Hub restart persistence')
+  print('PASS: defaults, saved choices independent of observed files, live installer parser, optional sing-box, real Agent inventory, public isolation and Hub restart persistence')
  finally:
   if agent is not None:agent.terminate();agent.wait(timeout=10)
   if hub is not None:hub.terminate();hub.wait(timeout=10)

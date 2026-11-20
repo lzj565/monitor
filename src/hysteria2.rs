@@ -1,4 +1,5 @@
 //! Hysteria2 public settings, separate from server-only certificate material.
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -103,8 +104,14 @@ pub fn persisted_config(settings: &Value, previous: Option<&Value>) -> anyhow::R
         config["certificate"] = cert.cert.pem().into();
         config["private_key"] = cert.key_pair.serialize_pem().into();
     }
-    let certificate = config.as_object_mut().unwrap().remove("certificate").unwrap();
-    let private_key = config.as_object_mut().unwrap().remove("private_key").unwrap();
+    let certificate = config
+        .as_object_mut()
+        .and_then(|object| object.remove("certificate"))
+        .context("missing Hysteria2 certificate")?;
+    let private_key = config
+        .as_object_mut()
+        .and_then(|object| object.remove("private_key"))
+        .context("missing Hysteria2 private_key")?;
     Ok(json!({"hysteria2":config,"certificate":certificate,"private_key":private_key}))
 }
 pub fn settings(config: &Value) -> anyhow::Result<Settings> {

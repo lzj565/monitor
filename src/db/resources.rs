@@ -58,15 +58,6 @@ impl Db {
         if !node_exists {
             return Ok(Err(ProxyWriteIssue::NodeNotFound));
         }
-        if draft.protocol == "mieru"
-            && tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM proxies WHERE node_id=?1 AND protocol='mieru' AND id<>?2)",
-                params![node_id, -1],
-                |r| r.get::<_, bool>(0),
-            )?
-        {
-            return Ok(Err(ProxyWriteIssue::MieruInstanceConflict));
-        }
         if proxy_name_in_use(&tx, node_id, draft, None)? {
             return Ok(Err(ProxyWriteIssue::NameConflict));
         }
@@ -122,15 +113,6 @@ impl Db {
             conn.query_row("SELECT EXISTS(SELECT 1 FROM node WHERE id=?1)", [node_id], |r| r.get(0))?;
         if !node_exists {
             return Ok(Err(ProxyWriteIssue::NodeNotFound));
-        }
-        if draft.protocol == "mieru"
-            && conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM proxies WHERE node_id=?1 AND protocol='mieru' AND id<>?2)",
-                params![node_id, id],
-                |r| r.get::<_, bool>(0),
-            )?
-        {
-            return Ok(Err(ProxyWriteIssue::MieruInstanceConflict));
         }
         if proxy_name_in_use(&conn, node_id, draft, Some(id))? {
             return Ok(Err(ProxyWriteIssue::NameConflict));
@@ -221,6 +203,47 @@ impl Db {
             })?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
+    }
+
+    pub fn proxy_traffic_user_summary_rows(
+        &self,
+        query: Option<&str>,
+        page: i64,
+        page_size: i64,
+        now: i64,
+    ) -> Result<ProxyTrafficPage<ProxyTrafficUserSummaryRow>> {
+        let conn = self.conn();
+        let pattern = query.map(|q| format!("%{q}%"));
+        let today =
+            DateTime::from_timestamp(now, 0).context("invalid timestamp")?.with_timezone(&Local).date_naive();
+        let total = conn.query_row(
+            "SELECT COUNT(*) FROM users WHERE (?1 IS NULL OR username LIKE ?1 COLLATE NOCASE)",
+            [&pattern],
+            |r| r.get(0),
+        )?;
+        let mut stmt = conn.prepare(
+            "SELECT u.id,u.username,COALESCE(SUM(t.uplink_bytes),0) AS up,
+                    COALESCE(SUM(t.downlink_bytes),0) AS down,u.traffic_limit,u.traffic_reset_day
+             FROM users u LEFT JOIN proxy_user_traffic t ON t.user_id=u.id
+             WHERE (?1 IS NULL OR u.username LIKE ?1 COLLATE NOCASE)
+             GROUP BY u.id ORDER BY up+down DESC,u.id LIMIT ?2 OFFSET ?3",
+        )?;
+        let items = stmt
+            .query_map(params![pattern, page_size, (page - 1).saturating_mul(page_size)], |r| {
+                let uplink_bytes: i64 = r.get(2)?;
+                let downlink_bytes: i64 = r.get(3)?;
+                Ok(ProxyTrafficUserSummaryRow {
+                    user_id: r.get(0)?,
+                    username: r.get(1)?,
+                    uplink_bytes,
+                    downlink_bytes,
+                    total_bytes: uplink_bytes.saturating_add(downlink_bytes),
+                    traffic_limit: r.get(4)?,
+                    next_reset_date: next_user_reset_date(today, r.get(5)?),
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(ProxyTrafficPage { items, page, page_size, total })
     }
 
     pub fn proxy_user_traffic_by_node(&self, user_id: i64) -> Result<Vec<ProxyUserTrafficByNode>> {
@@ -346,9 +369,10 @@ impl Db {
         node_id: Option<i64>,
         sort: &str,
         descending: bool,
-        page: i64,
-        page_size: i64,
+        pagination: (i64, i64),
+        include_proxies: bool,
     ) -> Result<ProxyTrafficPage<ProxyTrafficNodeRow>> {
+        let (page, page_size) = pagination;
         let conn = self.conn();
         let pattern = query.map(str::trim).filter(|q| !q.is_empty()).map(|q| format!("%{q}%"));
         let scope = "(EXISTS(SELECT 1 FROM proxies p0 WHERE p0.node_id=n.id) OR t.node_id IS NOT NULL)";
@@ -391,21 +415,32 @@ impl Db {
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
-        let mut proxies = conn.prepare(
-            "SELECT id,name,protocol,enabled,include_node_name FROM proxies WHERE node_id=?1 ORDER BY id",
-        )?;
-        for row in &mut items {
-            row.proxies = proxies
-                .query_map([row.node_id], |r| {
-                    Ok(TrafficProxySummary {
-                        id: r.get(0)?,
-                        name: r.get(1)?,
-                        protocol: r.get(2)?,
-                        enabled: r.get(3)?,
-                        include_node_name: r.get(4)?,
-                    })
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
+        if include_proxies && !items.is_empty() {
+            let ids = items.iter().map(|row| row.node_id.to_string()).collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT node_id,id,name,protocol,enabled,include_node_name
+                 FROM proxies WHERE node_id IN ({ids}) ORDER BY id"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let mut proxies = HashMap::<i64, Vec<TrafficProxySummary>>::new();
+            for row in stmt.query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    TrafficProxySummary {
+                        id: r.get(1)?,
+                        name: r.get(2)?,
+                        protocol: r.get(3)?,
+                        enabled: r.get(4)?,
+                        include_node_name: r.get(5)?,
+                    },
+                ))
+            })? {
+                let (id, proxy) = row?;
+                proxies.entry(id).or_default().push(proxy);
+            }
+            for row in &mut items {
+                row.proxies = proxies.remove(&row.node_id).unwrap_or_default();
+            }
         }
         Ok(ProxyTrafficPage { items, page, page_size, total })
     }
@@ -635,13 +670,7 @@ impl Db {
             [user_id], |r| Ok((r.get(0)?,r.get(1)?)))?;
         let today =
             DateTime::from_timestamp(now, 0).context("invalid timestamp")?.with_timezone(&Local).date_naive();
-        let next = if reset_day == 0 {
-            None
-        } else {
-            (1..=32)
-                .map(|days| today + chrono::Days::new(days))
-                .find(|date| period_start(*date, reset_day) == *date)
-        };
+        let next = next_user_reset_date(today, reset_day);
         Ok(serde_json::json!({
             "uplink_bytes": up, "downlink_bytes": down,
             "next_reset_date": next.map(|date| date.to_string()),
@@ -673,7 +702,6 @@ impl Db {
                     hysteria2: None,
                     snell_psk: None,
                     snell_version: None,
-                    mieru_password: None,
                     id: r.get(0)?,
                     node_id: r.get(1)?,
                     node_name: r.get(2)?,
@@ -692,7 +720,6 @@ impl Db {
                     short_id: r.get::<_, Option<String>>(15)?.unwrap_or_default(),
                     flow: r.get::<_, Option<String>>(16)?.unwrap_or_default(),
                     online: false,
-                    realm_target_node_id: None,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -714,9 +741,6 @@ impl Db {
                         Some(crate::proxy::snell_psk(&self.proxies_for_node(stored.node_id)?).to_owned());
                     proxy.snell_version = Some(crate::proxy::snell_version(&stored.config));
                 }
-            }
-            if proxy.protocol == "mieru" {
-                proxy.mieru_password = Some(self.mieru_password(false)?);
             }
         }
         let direct_ids: std::collections::HashSet<i64> = {
@@ -1072,30 +1096,6 @@ impl Db {
         items: &[(i64, bool)],
         auto_authorize_new_proxies: Option<bool>,
     ) -> Result<std::result::Result<Vec<i64>, AuthorizationWriteIssue>> {
-        self.replace_entry_authorizations(user_id, items, auto_authorize_new_proxies, None)
-    }
-    pub fn realm_authorization_ids(&self, user: i64) -> Result<Vec<i64>> {
-        let _ = user;
-        Ok(Vec::new())
-    }
-    pub fn replace_entry_authorizations(
-        &self,
-        user_id: i64,
-        items: &[(i64, bool)],
-        auto_authorize_new_proxies: Option<bool>,
-        realm_ids: Option<&[i64]>,
-    ) -> Result<std::result::Result<Vec<i64>, AuthorizationWriteIssue>> {
-        self.replace_scoped_entry_authorizations(user_id, items, auto_authorize_new_proxies, realm_ids, false)
-    }
-
-    pub fn replace_scoped_entry_authorizations(
-        &self,
-        user_id: i64,
-        items: &[(i64, bool)],
-        auto_authorize_new_proxies: Option<bool>,
-        _realm_ids: Option<&[i64]>,
-        realm_only: bool,
-    ) -> Result<std::result::Result<Vec<i64>, AuthorizationWriteIssue>> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let user_exists: bool =
@@ -1124,15 +1124,13 @@ impl Db {
         }
 
         let now = Utc::now().timestamp();
-        if !realm_only {
-            tx.execute("DELETE FROM user_proxy_authorizations WHERE user_id=?1", [user_id])?;
-            for (proxy_id, enabled) in items {
-                tx.execute(
-                    "INSERT INTO user_proxy_authorizations(user_id,proxy_id,enabled,auth,created_at,updated_at)
-                     VALUES(?1,?2,?3,'{}',?4,?4)",
-                    params![user_id, proxy_id, enabled, now],
-                )?;
-            }
+        tx.execute("DELETE FROM user_proxy_authorizations WHERE user_id=?1", [user_id])?;
+        for (proxy_id, enabled) in items {
+            tx.execute(
+                "INSERT INTO user_proxy_authorizations(user_id,proxy_id,enabled,auth,created_at,updated_at)
+                 VALUES(?1,?2,?3,'{}',?4,?4)",
+                params![user_id, proxy_id, enabled, now],
+            )?;
         }
         {
             let mut stmt=tx.prepare("SELECT DISTINCT p.node_id FROM user_proxy_authorizations a JOIN proxies p ON p.id=a.proxy_id WHERE a.user_id=?1")?;
@@ -1208,7 +1206,6 @@ impl Db {
         token: &str,
         choices: &InstallChoices,
     ) -> Result<i64> {
-        choices.validate()?;
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let id = next_id(&tx, "node")?;
@@ -1545,4 +1542,11 @@ impl Db {
         }
         self.write_entry_preference(user, &super::external::internal_entry_key(id), hidden, name)
     }
+}
+
+fn next_user_reset_date(today: chrono::NaiveDate, reset_day: u32) -> Option<chrono::NaiveDate> {
+    if reset_day == 0 {
+        return None;
+    }
+    (1..=32).map(|days| today + chrono::Days::new(days)).find(|date| period_start(*date, reset_day) == *date)
 }

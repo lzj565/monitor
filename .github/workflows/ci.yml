@@ -46,8 +46,6 @@ jobs:
       - run: cargo test
 
       - run: sh scripts/check-component-profile.sh
-      - run: sh scripts/check-mieru-install.sh
-      - run: sh scripts/check-realm-install.sh
       - run: sh scripts/check-agent-unit.sh
       - run: sh scripts/check-api-port-selection.sh
 

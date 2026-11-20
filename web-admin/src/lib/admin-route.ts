@@ -7,10 +7,5 @@ export function normaliseRoute(path: string, search: string) {
     params.delete("type")
     return { path: "/admin/external-proxies", search: params.size ? `?${params}` : "" }
   }
-  if (next === "/admin/realm") {
-    const params = new URLSearchParams(search)
-    params.set("type", "realm")
-    return { path: "/admin/proxies", search: `?${params}` }
-  }
   return { path: next, search }
 }

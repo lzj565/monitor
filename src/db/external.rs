@@ -129,18 +129,13 @@ impl Db {
 }
 
 pub fn internal_entry_key(id: i64) -> String {
-    if id > 0 {
-        format!("proxy:{id}")
-    } else {
-        format!("realm:{}", -id)
-    }
+    format!("proxy:{id}")
 }
 pub fn internal_entry_id(key: &str) -> Option<i64> {
     let (kind, id) = key.split_once(':')?;
     let id = id.parse::<i64>().ok().filter(|id| *id > 0)?;
     match kind {
         "proxy" => Some(id),
-        "realm" => Some(-id),
         _ => None,
     }
 }

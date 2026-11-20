@@ -219,8 +219,6 @@ fn client_subscriptions_default_empty_flow_to_vision() {
         short_id: p.short_id,
         flow: p.flow,
         online: false,
-        mieru_password: None,
-        realm_target_node_id: None,
     };
     let clash = clash_subscription(1, &proxies.iter().cloned().map(portal_proxy).collect::<Vec<_>>());
     assert!(clash.contains("flow: xtls-rprx-vision"));
@@ -2148,30 +2146,13 @@ async fn a_history_window_stops_at_the_retention_window() {
 }
 
 #[tokio::test]
-async fn deleting_last_vless_still_clears_singbox_on_a_mixed_node() {
+async fn deleting_last_vless_still_clears_singbox() {
     let app = std::sync::Arc::new(app());
     let node = app
         .db
         .create_node(&crate::db::Node { name: "mixed".into(), ..Default::default() }, "mixed-test")
         .unwrap();
     let vless=app.db.create_proxy(node,&crate::db::ProxyDraft{name:"vless".into(),include_node_name:false,protocol:"vless".into(),address_type:"domain".into(),address:"proxy.example.com".into(),port:24060,enabled:true,flow:None,config:json!({"reality":{"enabled":true,"server_name":"example.com","server_port":443,"private_key":"A".repeat(43),"public_key":"B".repeat(43),"short_id":"abcd"}})}).unwrap().unwrap();
-    app.db
-        .create_proxy(
-            node,
-            &crate::db::ProxyDraft {
-                name: "mieru".into(),
-                include_node_name: false,
-                protocol: "mieru".into(),
-                address_type: "domain".into(),
-                address: "proxy.example.com".into(),
-                port: 24061,
-                enabled: true,
-                flow: None,
-                config: json!({"transport":"tcp"}),
-            },
-        )
-        .unwrap()
-        .unwrap();
     let (tx, mut rx) = tokio::sync::mpsc::channel(8);
     app.agents.write().unwrap().insert(node, crate::agent_ws::Agent::new(1, tx));
     assert_eq!(sync_generated_nodes(&app, vec![node]).queued.len(), 1);
@@ -2192,13 +2173,13 @@ async fn component_profile_api_and_installer_token_are_scoped_to_the_node() {
         .db
         .create_node(&crate::db::Node { name: "profile".into(), ..Default::default() }, "profile-token")
         .unwrap();
-    let body = serde_json::from_value(json!({"singbox":true,"realm":true,"mieru":false})).unwrap();
+    let body = serde_json::from_value(json!({"singbox":true})).unwrap();
     let saved =
         portal_json(crate::components::save(Admin, State(app.clone()), Path(node), Ok(Json(body))).await)
             .await;
-    assert_eq!(saved["install"], json!({"singbox":true,"realm":true,"mieru":false}));
-    assert_eq!(saved["components"][1]["installed"], false);
-    let all_disabled = serde_json::from_value(json!({"singbox":false,"realm":false,"mieru":false})).unwrap();
+    assert_eq!(saved["install"], json!({"singbox":true}));
+    assert_eq!(saved["components"][0]["installed"], false);
+    let all_disabled = serde_json::from_value(json!({"singbox":false})).unwrap();
     assert_eq!(
         crate::components::save(Admin, State(app.clone()), Path(node), Ok(Json(all_disabled))).await.status(),
         StatusCode::OK
@@ -2211,12 +2192,9 @@ async fn component_profile_api_and_installer_token_are_scoped_to_the_node() {
     headers.insert(header::AUTHORIZATION, "Bearer profile-token".parse().unwrap());
     let response = crate::components::installer(State(app.clone()), headers).await;
     assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
-    assert_eq!(
-        axum::body::to_bytes(response.into_body(), 4096).await.unwrap(),
-        "singbox=0\nrealm=0\nmieru=0\n"
-    );
+    assert_eq!(axum::body::to_bytes(response.into_body(), 4096).await.unwrap(), "singbox=0\n");
     let loaded = portal_json(crate::components::get(Admin, State(app.clone()), Path(node)).await).await;
-    assert_eq!(loaded["install"], json!({"singbox":false,"realm":false,"mieru":false}));
+    assert_eq!(loaded["install"], json!({"singbox":false}));
 }
 #[tokio::test]
 async fn registration_records_batch_choices_and_reruns_do_not_reset_them() {
@@ -2240,10 +2218,7 @@ async fn registration_records_batch_choices_and_reruns_do_not_reset_them() {
     let token =
         String::from_utf8(axum::body::to_bytes(result.into_body(), 4096).await.unwrap().to_vec()).unwrap();
     let id = app.db.node_by_token(&token).unwrap().unwrap();
-    assert_eq!(
-        app.db.component_choices(id).unwrap(),
-        Some(crate::db::InstallChoices { singbox: false, realm: true, mieru: true })
-    );
+    assert_eq!(app.db.component_choices(id).unwrap(), Some(crate::db::InstallChoices { singbox: false }));
     headers.insert("x-node-token", token.parse().unwrap());
     headers.insert("x-install-realm", "0".parse().unwrap());
     headers.insert("x-install-mieru", "0".parse().unwrap());
@@ -2258,8 +2233,6 @@ async fn registration_records_batch_choices_and_reruns_do_not_reset_them() {
         .status(),
         StatusCode::OK
     );
-    assert!(app.db.component_choices(id).unwrap().unwrap().realm);
-    assert!(app.db.component_choices(id).unwrap().unwrap().mieru);
 }
 
 #[tokio::test]
@@ -2267,7 +2240,6 @@ async fn manual_uuid_updates_exports_and_online_offline_sync() {
     let app = std::sync::Arc::new(app());
     let user = app.db.user_login_record("admin").unwrap().unwrap().id;
     let token = app.db.user_subscription_token(user).unwrap().unwrap();
-    let password = app.db.mieru_password(false).unwrap();
     let mut nodes = Vec::new();
     for port in [24461, 24462] {
         let id = node(&app, &format!("uuid-node-{port}"), false);
@@ -2293,7 +2265,6 @@ async fn manual_uuid_updates_exports_and_online_offline_sync() {
     let command: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
     assert!(command["params"]["content"].as_str().unwrap().contains(uuid));
     assert_eq!(app.db.user_subscription_token(user).unwrap().unwrap(), token);
-    assert_eq!(app.db.mieru_password(false).unwrap(), password);
     let portal = portal_json(user_proxies(UserAuth(user), State(app.clone())).await).await;
     assert!(portal["items"][0]["vless_url"].as_str().unwrap().contains(uuid));
     for format in ["clash", "sing-box"] {

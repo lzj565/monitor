@@ -1,43 +1,26 @@
-import { useEffect, useRef, useState } from "react"
+import { Fragment, useEffect, useRef, useState } from "react"
 import { Activity, Download, RefreshCw, Upload, Users } from "lucide-react"
+import { toast } from "sonner"
 
 import { AdminConfirmDialog } from "@/components/AdminShared"
+import { ProxyProtocolBadge } from "@/components/ProxyBadges"
 import { TrafficUsage } from "@/components/TrafficUsage"
-import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
-import { Skeleton } from "@/components/ui/skeleton"
+import { Input } from "@/components/ui/input"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { ProxyProtocolBadge } from "@/components/ProxyBadges"
-import type { Node } from "@/lib/api"
-import { toast } from "sonner"
-import { displayProxyName } from "@/lib/proxy-name"
 import { bytes } from "@/lib/format"
 import {
-  resetProxyUserTraffic,
-  resetProxyNodeTraffic,
-  getProxyTrafficOverview,
-  listProxyTrafficNodeRows,
-  listProxyUserTraffic,
-  type ProxyTrafficNodeRow,
-  type ProxyTrafficOverview,
-  type ProxyTrafficListOptions,
+  getProxyTrafficOverview, getProxyUserTraffic, listProxyTrafficNodeRows,
+  listProxyTrafficUserSummaryRows, resetProxyNodeTraffic, resetProxyUserTraffic,
+  type ProxyTrafficOverview, type ProxyTrafficSummary,
 } from "@/lib/resources"
 
-const NODE_PAGE_SIZE = 100
+const PAGE_SIZE = 25
 const REFRESH_MS = 5_000
-type UserTrafficRow = Awaited<ReturnType<typeof listProxyUserTraffic>>[number]
-
-async function listAllProxyTrafficNodeRows(options: Omit<ProxyTrafficListOptions, "page" | "page_size">): Promise<ProxyTrafficNodeRow[]> {
-  const first = await listProxyTrafficNodeRows({ ...options, page: 1, page_size: NODE_PAGE_SIZE })
-  const pageCount = Math.ceil(first.total / NODE_PAGE_SIZE)
-  if (pageCount <= 1) return first.items
-
-  const rest = await Promise.all(Array.from({ length: pageCount - 1 }, (_, index) =>
-    listProxyTrafficNodeRows({ ...options, page: index + 2, page_size: NODE_PAGE_SIZE }),
-  ))
-  return [...first.items, ...rest.flatMap((page) => page.items)]
-}
+type View = "user" | "node"
+type ResetTarget = { kind: View; id: number; name: string }
+type TrafficList = Awaited<ReturnType<typeof listProxyTrafficNodeRows | typeof listProxyTrafficUserSummaryRows>>
 
 function StatCard({ label, value, icon: Icon }: { label: string; value: string; icon: typeof Upload }) {
   return <Card className="gap-2 p-4">
@@ -46,171 +29,230 @@ function StatCard({ label, value, icon: Icon }: { label: string; value: string; 
   </Card>
 }
 
-export function ProxyTrafficPage({ nodes }: { nodes: Node[] }) {
+function ByteCells({ row }: { row: { uplink_bytes: number; downlink_bytes: number; total_bytes: number } }) {
+  return <>
+    <TableCell className="tnum text-right">{bytes(row.uplink_bytes)}</TableCell>
+    <TableCell className="tnum text-right">{bytes(row.downlink_bytes)}</TableCell>
+    <TableCell className="tnum text-right">{bytes(row.total_bytes)}</TableCell>
+  </>
+}
+
+function UserNodeDetails({ id }: { id: number }) {
+  const [rows, setRows] = useState<ProxyTrafficSummary[] | null>(null)
+  const [error, setError] = useState(false)
+  const [retry, setRetry] = useState(0)
+
+  useEffect(() => {
+    let current = true
+    getProxyUserTraffic(id).then((items) => {
+      if (current) setRows(items)
+    }).catch(() => {
+      if (current) setError(true)
+    })
+    return () => { current = false }
+  }, [id, retry])
+
+  if (error) return <Button variant="outline" size="sm" onClick={() => {
+    setError(false)
+    setRetry((value) => value + 1)
+  }}>重试加载节点明细</Button>
+  if (!rows) return <span role="status">正在加载节点明细…</span>
+  if (!rows.length) return <span>暂无节点用量记录</span>
+  return <Table>
+    <TableHeader><TableRow>
+      <TableHead>节点</TableHead>
+      <TableHead className="text-right">上传</TableHead>
+      <TableHead className="text-right">下载</TableHead>
+      <TableHead className="text-right">合计</TableHead>
+    </TableRow></TableHeader>
+    <TableBody>{rows.map((row) => <TableRow key={row.node_id}>
+      <TableCell>{row.node_name}</TableCell>
+      <ByteCells row={{ ...row, total_bytes: row.uplink_bytes + row.downlink_bytes }} />
+    </TableRow>)}</TableBody>
+  </Table>
+}
+
+export function ProxyTrafficPage() {
+  const [view, setView] = useState<View>("user")
+  const [search, setSearch] = useState("")
+  const [query, setQuery] = useState("")
+  const [page, setPage] = useState(1)
   const [overview, setOverview] = useState<ProxyTrafficOverview | null>(null)
-  const [userRows, setUserRows] = useState<UserTrafficRow[] | null>(null)
-  const [nodeRows, setNodeRows] = useState<ProxyTrafficNodeRow[] | null>(null)
+  const [result, setResult] = useState<{ key: string; data: TrafficList } | null>(null)
   const [error, setError] = useState("")
-  const [loading, setLoading] = useState(true)
-  const [refreshKey, setRefreshKey] = useState(0)
-  const loaded = useRef(false)
-  const [resetTarget, setResetTarget] = useState<{ kind: "user" | "node"; id: number; name: string } | null>(null)
+  const [loading, setLoading] = useState(false)
+  const [revision, setRevision] = useState(0)
+  const [expanded, setExpanded] = useState<number | null>(null)
+  const [resetRevision, setResetRevision] = useState(0)
+  const [resetTarget, setResetTarget] = useState<ResetTarget | null>(null)
   const [resetting, setResetting] = useState(false)
   const resettingRef = useRef(false)
-  const generation = useRef(0)
+  const requestKey = JSON.stringify([view, query, page])
+  const currentList = result?.key === requestKey ? result.data : null
+  const columns = view === "user" ? 7 : 6
 
-  async function resetTraffic() {
-    if (!resetTarget || resettingRef.current) return
-    resettingRef.current = true
-    setResetting(true)
-    generation.current += 1
-    try {
-      if (resetTarget.kind === "user") await resetProxyUserTraffic(resetTarget.id)
-      else await resetProxyNodeTraffic(resetTarget.id)
-      toast.success("流量已重置")
-      setResetTarget(null)
-    } catch (cause) {
-      toast.error((cause as Error).message || "重置流量失败")
-    } finally {
-      resettingRef.current = false
-      setResetting(false)
-      setRefreshKey((value) => value + 1)
-    }
-  }
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      if (search.trim() !== query) {
+        setQuery(search.trim())
+        setPage(1)
+        setExpanded(null)
+      }
+    }, 300)
+    return () => window.clearTimeout(timer)
+  }, [search, query])
 
   useEffect(() => {
     let current = true
     let busy = false
     async function load() {
-      if (busy || resettingRef.current) return
+      if (busy || document.hidden) return
       busy = true
-      const requestGeneration = generation.current
-      if (!loaded.current) setLoading(true)
-      try {
-        const [nextOverview, nextUsers, nextNodes] = await Promise.all([
-          getProxyTrafficOverview(),
-          listProxyUserTraffic(),
-          listAllProxyTrafficNodeRows({
-            q: "",
-            node_id: null,
-            sort: "total",
-            order: "desc",
-          }),
-        ])
-        if (!current || requestGeneration !== generation.current) return
-        setOverview(nextOverview)
-        setUserRows(nextUsers)
-        setNodeRows(nextNodes)
-        setError("")
-        loaded.current = true
-      } catch (cause) {
-        if (current && requestGeneration === generation.current) setError((cause as Error).message || "读取流量统计失败")
-      } finally {
-        busy = false
-        if (current) setLoading(false)
+      setLoading(true)
+      const options = { q: query, node_id: null, sort: "total", order: "desc", page, page_size: PAGE_SIZE } as const
+      const [summary, list] = await Promise.allSettled([
+        getProxyTrafficOverview(),
+        view === "user" ? listProxyTrafficUserSummaryRows(options) : listProxyTrafficNodeRows(options),
+      ])
+      busy = false
+      if (!current) return
+      setLoading(false)
+      if (summary.status === "fulfilled") setOverview(summary.value)
+      if (list.status === "fulfilled") {
+        const lastPage = Math.max(1, Math.ceil(list.value.total / PAGE_SIZE))
+        if (page > lastPage) setPage(lastPage)
+        else setResult({ key: requestKey, data: list.value })
       }
+      setError(summary.status === "rejected" || list.status === "rejected" ? "读取流量统计失败" : "")
     }
     void load()
-    const timer = window.setInterval(() => void load(), REFRESH_MS)
+    const interval = window.setInterval(() => void load(), REFRESH_MS)
+    const onVisibilityChange = () => { if (!document.hidden) void load() }
+    document.addEventListener("visibilitychange", onVisibilityChange)
     return () => {
       current = false
-      window.clearInterval(timer)
+      window.clearInterval(interval)
+      document.removeEventListener("visibilitychange", onVisibilityChange)
     }
-  }, [refreshKey])
+  }, [view, query, page, requestKey, revision])
 
-  const nodesById = new Map(nodes.map((node) => [node.id, node]))
-  const users = [...(userRows ?? [])].sort((a, b) => (b.uplink_bytes + b.downlink_bytes) - (a.uplink_bytes + a.downlink_bytes)
-    || (a.username ?? "").localeCompare(b.username ?? ""))
+  function changeView(next: View) {
+    if (view === next) return
+    setView(next)
+    setSearch("")
+    setQuery("")
+    setPage(1)
+    setExpanded(null)
+  }
+
+  async function resetTraffic() {
+    if (!resetTarget || resettingRef.current) return
+    resettingRef.current = true
+    setResetting(true)
+    try {
+      if (resetTarget.kind === "user") {
+        await resetProxyUserTraffic(resetTarget.id)
+        if (expanded === resetTarget.id) setResetRevision((value) => value + 1)
+      } else {
+        await resetProxyNodeTraffic(resetTarget.id)
+      }
+      setResetTarget(null)
+      setRevision((value) => value + 1)
+      toast.success("流量已重置")
+    } catch (cause) {
+      toast.error(cause instanceof Error ? cause.message : "重置流量失败")
+    } finally {
+      resettingRef.current = false
+      setResetting(false)
+    }
+  }
 
   return <div className="space-y-5">
-    <div className="flex items-center gap-3">
-      <div className="mr-auto">
-        <h1 className="text-lg font-semibold">流量统计</h1>
-        <p className="mt-1 text-xs text-muted-foreground">代理业务累计 · 自建立基线或上次清零以来</p>
-      </div>
-      <Button variant="outline" size="sm" onClick={() => setRefreshKey((value) => value + 1)} disabled={loading}>
-        <RefreshCw className={loading ? "animate-spin" : ""} /> 刷新
+    <div className="flex items-center justify-between gap-3">
+      <h1 className="text-lg font-semibold">流量统计</h1>
+      <Button variant="outline" size="sm" onClick={() => setRevision((value) => value + 1)} disabled={loading}>
+        <RefreshCw className={loading ? "animate-spin" : undefined} /> 刷新
       </Button>
     </div>
 
     {overview && <div className="grid grid-cols-2 gap-3 xl:grid-cols-4">
-      <StatCard label="总流量" value={bytes(overview.total_bytes)} icon={Activity} />
-      <StatCard label="上传流量" value={bytes(overview.uplink_bytes)} icon={Upload} />
-      <StatCard label="下载流量" value={bytes(overview.downlink_bytes)} icon={Download} />
-      <StatCard label="最近采集用户" value={String(overview.active_users)} icon={Users} />
-    </div>}
-    {!overview && loading && <div className="grid grid-cols-2 gap-3 xl:grid-cols-4">{Array.from({ length: 4 }, (_, i) => <Skeleton key={i} className="h-20" />)}</div>}
-
-    <p className="text-xs text-muted-foreground">用户流量汇总所有服务器；代理流量按服务器统计启用代理的 inbound 流量，两种视角不会相加。代理进度以累计业务流量对比节点额度，两者的重置周期可能不同。</p>
-    {error && <div className="flex flex-wrap items-center gap-2 text-sm text-destructive" role="alert">
-      <span>读取流量统计失败：{error}</span>
-      <Button variant="outline" size="sm" onClick={() => setRefreshKey((value) => value + 1)}>重试</Button>
+      <StatCard label="用户累计代理流量" value={bytes(overview.total_bytes)} icon={Activity} />
+      <StatCard label="累计上传" value={bytes(overview.uplink_bytes)} icon={Upload} />
+      <StatCard label="累计下载" value={bytes(overview.downlink_bytes)} icon={Download} />
+      <StatCard label="近 60 秒采集用户" value={String(overview.active_users)} icon={Users} />
     </div>}
 
-    <section className="space-y-3">
-      <h2 className="text-base font-semibold">用户流量</h2>
-      <Card className="overflow-x-auto p-0">
-        <Table className="min-w-[900px] table-fixed">
-          <colgroup><col style={{ width: "26%" }} /><col style={{ width: "14%" }} /><col style={{ width: "14%" }} /><col style={{ width: "34%" }} /><col style={{ width: "12%" }} /></colgroup>
-          <TableHeader className="bg-muted/50"><TableRow>
-            <TableHead>用户名</TableHead><TableHead className="text-right">上传流量</TableHead>
-            <TableHead className="text-right">下载流量</TableHead><TableHead>流量使用情况</TableHead><TableHead className="text-right">操作</TableHead>
-          </TableRow></TableHeader>
-          <TableBody>
-            {users.map((row) => {
-              const total = row.uplink_bytes + row.downlink_bytes
-              const admin = row.username === "admin"
-              return <TableRow key={`${row.user_id ?? row.username}`} className="h-12">
-                <TableCell className="whitespace-normal"><div className="flex flex-wrap items-center gap-2 font-medium">
-                  <span className="min-w-0 [overflow-wrap:anywhere]">{row.username ?? "未知用户"}</span>
-                  <Badge variant={admin ? "default" : "secondary"} className="font-normal">{admin ? "管理员" : "普通用户"}</Badge>
-                </div></TableCell>
-                <TableCell className="tnum text-right">{bytes(row.uplink_bytes)}</TableCell>
-                <TableCell className="tnum text-right">{bytes(row.downlink_bytes)}</TableCell>
-                <TableCell className="min-w-64 py-2"><TrafficUsage used={total} limit={row.traffic_limit} /></TableCell>
-                <TableCell className="text-right"><Button variant="ghost" size="sm" className="px-2" disabled={resetting || row.user_id === undefined} onClick={() => setResetTarget({ kind: "user", id: row.user_id!, name: row.username ?? "未知用户" })}>重置流量</Button></TableCell>
+    <div className="flex flex-wrap items-center gap-3">
+      <div role="group" aria-label="统计维度" className="flex gap-2">
+        <Button size="sm" variant={view === "user" ? "default" : "outline"} aria-pressed={view === "user"} onClick={() => changeView("user")}>按用户</Button>
+        <Button size="sm" variant={view === "node" ? "default" : "outline"} aria-pressed={view === "node"} onClick={() => changeView("node")}>按节点</Button>
+      </div>
+      <Input className="w-full sm:w-60" aria-label={view === "user" ? "搜索用户名" : "搜索节点名"}
+        placeholder={view === "user" ? "搜索用户名" : "搜索节点名"} value={search}
+        onChange={(event) => setSearch(event.target.value)} />
+    </div>
+    {error && <div role="alert" className="flex items-center gap-2 text-sm text-destructive">
+      {error}
+      <Button variant="outline" size="sm" onClick={() => setRevision((value) => value + 1)}>重试</Button>
+    </div>}
+    <Card className="overflow-hidden p-0">
+      <Table className={view === "user" ? "min-w-[800px]" : "min-w-[680px]"} aria-label={view === "user" ? "用户流量" : "节点代理流量"}>
+        <TableHeader><TableRow>
+          <TableHead>{view === "user" ? "用户" : "节点及代理协议"}</TableHead>
+          <TableHead className="text-right">上传</TableHead>
+          <TableHead className="text-right">下载</TableHead>
+          <TableHead className="text-right">合计</TableHead>
+          {view === "user" && <TableHead>额度</TableHead>}
+          <TableHead>{view === "user" ? "下次重置日" : "最近采集"}</TableHead>
+          <TableHead className="text-right">操作</TableHead>
+        </TableRow></TableHeader>
+        <TableBody>
+          {currentList?.items.map((row) => {
+            const isUser = "user_id" in row
+            const id = isUser ? row.user_id : row.node_id
+            const name = isUser ? row.username : row.node_name
+            return <Fragment key={id}>
+              <TableRow>
+                <TableCell className="whitespace-normal">
+                  {isUser ? <Button variant="link" size="sm" className="h-auto max-w-full whitespace-normal p-0 text-left [overflow-wrap:anywhere]"
+                    aria-expanded={expanded === id} onClick={() => setExpanded(expanded === id ? null : id)}>
+                    {name}
+                  </Button> : <div className="flex flex-wrap items-center gap-2">
+                    <span className="[overflow-wrap:anywhere]">{name}</span>
+                    {row.protocols.map((protocol) => <ProxyProtocolBadge key={protocol} protocol={protocol} />)}
+                  </div>}
+                </TableCell>
+                <ByteCells row={row} />
+                {isUser && <TableCell>{row.traffic_limit > 0
+                  ? <TrafficUsage used={row.total_bytes} limit={row.traffic_limit} /> : "不限额"}</TableCell>}
+                <TableCell>{isUser ? row.next_reset_date ?? "未设置"
+                  : row.last_seen_at == null ? "尚未采集" : new Date(row.last_seen_at * 1000).toLocaleString()}</TableCell>
+                <TableCell className="text-right">
+                  <Button variant="ghost" size="sm" disabled={resetting} onClick={() => setResetTarget({ kind: view, id, name })}>重置流量</Button>
+                </TableCell>
               </TableRow>
-            })}
-            {!loading && users.length === 0 && <TableRow><TableCell colSpan={5} className="py-10 text-center text-sm text-muted-foreground">尚无用户流量记录</TableCell></TableRow>}
-            {loading && !userRows && <TableRow><TableCell colSpan={5} className="p-4"><Skeleton className="h-10 w-full" /></TableCell></TableRow>}
-          </TableBody>
-        </Table>
-      </Card>
-    </section>
-
-    <section className="space-y-3">
-      <h2 className="text-base font-semibold">代理流量</h2>
-      <Card className="overflow-x-auto p-0">
-        <Table className="min-w-[900px] table-fixed">
-          <colgroup><col style={{ width: "26%" }} /><col style={{ width: "14%" }} /><col style={{ width: "14%" }} /><col style={{ width: "34%" }} /><col style={{ width: "12%" }} /></colgroup>
-          <TableHeader className="bg-muted/50"><TableRow>
-            <TableHead>代理</TableHead><TableHead className="text-right">上传流量</TableHead>
-            <TableHead className="text-right">下载流量</TableHead><TableHead>流量使用情况</TableHead><TableHead className="text-right">操作</TableHead>
-          </TableRow></TableHeader>
-          <TableBody>
-            {nodeRows?.map((row) => <TableRow key={row.node_id} className="h-12">
-              <TableCell className="whitespace-normal"><div className="space-y-1.5">
-                {row.proxies.length ? row.proxies.map((proxy) => <div key={proxy.id} className="flex flex-wrap items-center gap-2">
-                  <span className={`min-w-0 font-medium [overflow-wrap:anywhere] ${proxy.enabled ? "" : "text-muted-foreground"}`} title={proxy.enabled ? undefined : "已停用"}>{displayProxyName({ ...proxy, node_id: row.node_id }, nodesById.get(row.node_id))}</span>
-                  <ProxyProtocolBadge protocol={proxy.protocol} />
-                </div>) : <span className="text-muted-foreground [overflow-wrap:anywhere]">{row.node_name}（无现存代理）</span>}
-              </div></TableCell>
-              <TableCell className="tnum text-right">{bytes(row.uplink_bytes)}</TableCell>
-              <TableCell className="tnum text-right">{bytes(row.downlink_bytes)}</TableCell>
-              <TableCell className="min-w-64 py-2"><TrafficUsage used={row.total_bytes} limit={nodesById.get(row.node_id)?.traffic_limit} /></TableCell>
-              <TableCell className="text-right"><Button variant="ghost" size="sm" className="px-2" disabled={resetting} onClick={() => setResetTarget({ kind: "node", id: row.node_id, name: row.node_name })}>重置流量</Button></TableCell>
-            </TableRow>)}
-            {!loading && nodeRows?.length === 0 && <TableRow><TableCell colSpan={5} className="py-10 text-center text-sm text-muted-foreground">尚无代理节点流量记录</TableCell></TableRow>}
-            {loading && !nodeRows && <TableRow><TableCell colSpan={5} className="p-4"><Skeleton className="h-10 w-full" /></TableCell></TableRow>}
-          </TableBody>
-        </Table>
-      </Card>
-    </section>
+              {isUser && expanded === id && <TableRow>
+                <TableCell colSpan={columns} className="bg-muted/40 p-4">
+                  <UserNodeDetails key={resetRevision} id={id} />
+                </TableCell>
+              </TableRow>}
+            </Fragment>
+          })}
+          {!currentList?.items.length && <TableRow><TableCell colSpan={columns} className="py-8 text-center text-muted-foreground">
+            {currentList ? "暂无匹配记录" : error ? "暂时无法读取流量记录" : "正在加载流量记录…"}
+          </TableCell></TableRow>}
+        </TableBody>
+      </Table>
+    </Card>
+    {currentList && <div className="flex flex-wrap items-center justify-end gap-2 text-sm">
+      <span className="mr-auto text-muted-foreground">共 {currentList.total} 条 · 第 {page} 页</span>
+      <Button size="sm" variant="outline" disabled={page <= 1} onClick={() => { setExpanded(null); setPage(page - 1) }}>上一页</Button>
+      <Button size="sm" variant="outline" disabled={page * PAGE_SIZE >= currentList.total} onClick={() => { setExpanded(null); setPage(page + 1) }}>下一页</Button>
+    </div>}
     {resetTarget && <AdminConfirmDialog
       title={`重置「${resetTarget.name}」的流量？`}
-      description={resetTarget.kind === "user" ? "将清零该用户在所有节点的累计业务流量，月度重置计划保持不变。" : "将清零该节点所有代理汇总的累计业务流量，不会清零用户流量或节点本月计费用量。"}
-      confirmLabel="重置流量"
-      busy={resetting}
+      description={resetTarget.kind === "user" ? "将清零该用户在所有节点的累计业务流量。" : "将清零该节点的累计代理业务流量。"}
+      confirmLabel="重置流量" busy={resetting}
       onClose={() => { if (!resettingRef.current) setResetTarget(null) }}
       onConfirm={() => void resetTraffic()}
     />}

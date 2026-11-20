@@ -71,13 +71,11 @@ pub(super) fn user_portal_items(app: &App, user: i64) -> anyhow::Result<Vec<Valu
         let online = {
             let agents = app.agents.read().unwrap_or_else(|e| e.into_inner());
             agents.contains_key(&proxy.node_id)
-                && proxy.realm_target_node_id.is_none_or(|id| agents.contains_key(&id))
         };
         let mut item = serde_json::to_value(&proxy)?;
-        item.as_object_mut().unwrap().remove("mieru_password");
         item["default_name"] = json!(default);
         item["online"] = json!(online);
-        item["source"] = json!(if proxy.id > 0 { "proxy" } else { "realm" });
+        item["source"] = json!("proxy");
         entries.push((key, item, Some(proxy)));
     }
     for (id, config) in app.db.active_external_configs(user, now)? {
@@ -100,7 +98,7 @@ pub(super) fn user_portal_items(app: &App, user: i64) -> anyhow::Result<Vec<Valu
             item["mihomo_yaml"]=json!(mihomo_proxy(user,&proxy));
             let host=if proxy.address.contains(':'){format!("[{}]",proxy.address)}else{proxy.address.clone()};
             if proxy.protocol=="hysteria2" {
-                let settings = proxy.hysteria2.as_ref().unwrap();
+                let settings = proxy.hysteria2.as_ref().ok_or_else(|| anyhow::anyhow!("missing Hysteria2 settings"))?;
                 let mut link = format!("hysteria2://{}@{}:{}?sni={}&insecure=1", uri_component(&proxy.uuid),host,proxy.port,uri_component(&proxy.server_name));
                 if let Some(password) = settings["obfs_password"].as_str().filter(|s| !s.is_empty()) {
                     link.push_str(&format!("&obfs=salamander&obfs-password={}",uri_component(password)));
@@ -108,14 +106,12 @@ pub(super) fn user_portal_items(app: &App, user: i64) -> anyhow::Result<Vec<Valu
                 if let Some(pin) = settings["pin_sha256"].as_str() { link.push_str(&format!("&pinSHA256={pin}")); }
                 link.push_str(&format!("#{}",uri_component(&name)));
                 item["hysteria2_url"]=json!(link);
-            } else if proxy.protocol=="mieru" {
-                item["mieru_url"]=json!(format!("mierus://{}:{}@{}?profile={}&port={}&protocol=TCP",uri_component(&format!("user-{user}")),uri_component(proxy.mieru_password.as_deref().unwrap_or("")),host,uri_component(&name),proxy.port));
             } else if proxy.protocol == "vless" {
                 let flow=if proxy.flow.is_empty(){proxy::DEFAULT_FLOW}else{&proxy.flow};
                 item["vless_url"]=json!(format!("vless://{}@{}:{}?encryption=none&security=reality&sni={}&fp=chrome&pbk={}&sid={}&type=tcp&flow={}#{}",proxy.uuid,host,proxy.port,uri_component(&proxy.server_name),proxy.public_key,proxy.short_id,uri_component(flow),uri_component(&name)));
             }
         } else {
-            let mut config=item.as_object_mut().unwrap().remove("external_config").unwrap();config["name"]=json!(name);
+            let mut config=item.as_object_mut().and_then(|object| object.remove("external_config")).ok_or_else(|| anyhow::anyhow!("missing external proxy config"))?;config["name"]=json!(name);
             item["mihomo_yaml"]=json!(serde_yaml_ng::to_string(&vec![config])?.trim_end());
         }
         Ok(item)
@@ -331,7 +327,7 @@ pub(super) fn yaml_ip_or_string(value: &str) -> String {
     }
 }
 
-pub(super) fn mihomo_proxy(user_id: i64, proxy: &crate::db::UserPortalProxy) -> String {
+pub(super) fn mihomo_proxy(_user_id: i64, proxy: &crate::db::UserPortalProxy) -> String {
     let name = crate::db::displayed_proxy_name(&proxy.name, proxy.include_node_name, &proxy.node_country);
     if proxy.protocol == "snell" {
         return format!(
@@ -349,13 +345,6 @@ pub(super) fn mihomo_proxy(user_id: i64, proxy: &crate::db::UserPortalProxy) -> 
             text.push_str(&format!("\n  obfs: salamander\n  obfs-password: {}", yaml_string(password)));
         }
         return text;
-    }
-    if proxy.protocol == "mieru" {
-        return format!(
-            "- name: {}\n  type: mieru\n  server: {}\n  port: {}\n  transport: TCP\n  udp: true\n  username: {}\n  password: {}\n  multiplexing: MULTIPLEXING_OFF\n  handshake-mode: HANDSHAKE_NO_WAIT",
-            yaml_string(&name), yaml_ip_or_string(&proxy.address), proxy.port,
-            yaml_string(&format!("user-{user_id}")), yaml_string(proxy.mieru_password.as_deref().expect("authorized mieru proxy has credentials")),
-        );
     }
     let flow = if proxy.flow.is_empty() { proxy::DEFAULT_FLOW } else { &proxy.flow };
     format!(
@@ -471,7 +460,9 @@ pub async fn subscription(
                 }
                 proxies.retain(|p| names.iter().any(|item| item["entry_key"] == db::internal_entry_key(p.id) && item["protocol"] == "vless"));
                 let mut config = sing_box_subscription(&uuid, &proxies);
-                let outbounds = config["outbounds"].as_array_mut().unwrap();
+                let Some(outbounds) = config["outbounds"].as_array_mut() else {
+                    return api_internal(anyhow::anyhow!("missing subscription outbounds"));
+                };
                 let mut hy2_tags = Vec::new();
                 for item in names.iter().filter(|item| item["protocol"] == "hysteria2" && item["hidden"] != true) {
                     let settings = &item["hysteria2"];
@@ -482,7 +473,10 @@ pub async fn subscription(
                 }
                 if !hy2_tags.is_empty() {
                     if let Some(selector) = outbounds.iter_mut().find(|o| o["type"] == "selector") {
-                        selector["outbounds"].as_array_mut().unwrap().extend(hy2_tags);
+                        let Some(tags) = selector["outbounds"].as_array_mut() else {
+                            return api_internal(anyhow::anyhow!("missing selector outbounds"));
+                        };
+                        tags.extend(hy2_tags);
                     } else {
                         outbounds.push(json!({"type":"selector","tag":"Proxy","default":hy2_tags[0],"outbounds":hy2_tags}));
                     }

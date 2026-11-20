@@ -655,10 +655,13 @@ pub(super) fn migrate(conn: &Connection, from: i64) -> Result<()> {
             r.get(0)
         })
         .optional()?;
-    if component_sql.as_deref().is_some_and(|sql| sql.contains("component<>'singbox'")) {
+    if component_sql
+        .as_deref()
+        .is_some_and(|sql| sql.contains("component<>'singbox'") || sql.contains("'realm'"))
+    {
         tx.execute_batch("ALTER TABLE node_components RENAME TO node_components_required;")?;
         tx.execute_batch(COMPONENT_SCHEMA)?;
-        tx.execute_batch("INSERT INTO node_components SELECT * FROM node_components_required; DROP TABLE node_components_required;")?;
+        tx.execute_batch("INSERT INTO node_components SELECT * FROM node_components_required WHERE component='singbox'; DROP TABLE node_components_required;")?;
     }
     tx.execute_batch(COMPONENT_SCHEMA)?;
     tx.execute_batch("INSERT OR IGNORE INTO node_components(node_id,component,desired_installed) SELECT id,'singbox',1 FROM node")?;

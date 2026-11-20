@@ -154,7 +154,7 @@ pub async fn db_backup(_: Admin, State(app): State<Shared>) -> Response {
         Ok::<_, anyhow::Error>((file, size))
     })
     .await;
-    match copied.map_err(anyhow::Error::from).and_then(|r| r) {
+    match copied.and_then(|r| r) {
         Ok((file, size)) => (
             [
                 (header::CONTENT_TYPE, "application/octet-stream".to_owned()),

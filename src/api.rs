@@ -19,7 +19,7 @@ use crate::agent_ws::Agent;
 use crate::auth::{
     authed, client_ip, current_session, hash_password, issue_session, issued_at, random_token, with_cookies,
 };
-use crate::command::{self, StartError};
+use crate::command::StartError;
 use crate::db::{
     self, AuthorizationDraft, AuthorizationWriteIssue, Db, Node, NodePatch, PingTask, Proxy, ProxyWriteIssue,
     Traffic, TrafficPatch, User, UserDeleteResult, UserWriteIssue,
@@ -200,11 +200,6 @@ fn map_proxy_issue(issue: ProxyWriteIssue) -> Response {
         ProxyWriteIssue::ProxyNotFound => {
             api_error(StatusCode::NOT_FOUND, "PROXY_NOT_FOUND", "proxy does not exist")
         }
-        ProxyWriteIssue::MieruInstanceConflict => api_error(
-            StatusCode::CONFLICT,
-            "MIERU_INSTANCE_CONFLICT",
-            "每个节点最多一条 mieru 代理，请编辑已有代理或选择其他节点",
-        ),
         ProxyWriteIssue::PortConflict => api_error(
             StatusCode::CONFLICT,
             "PROXY_PORT_CONFLICT",
@@ -345,9 +340,6 @@ pub async fn same_origin_writes(request: Request, next: Next) -> Response {
     }
     next.run(request).await
 }
-
-mod realm;
-pub(super) use realm::*;
 
 mod external;
 pub(super) use external::*;

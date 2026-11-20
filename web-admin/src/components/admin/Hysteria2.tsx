@@ -6,6 +6,7 @@ import { createProxy, updateProxy, type Proxy, type ProxyDraft, type AddressType
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { ProxyDialog } from "@/components/ProxyDialog"
+import { ProxyNamePrefix } from "@/components/ProxyNamePrefix"
 import { DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 
 export function Hysteria2Form({ proxy, nodes, onClose, onSaved, onBack, embedded, onBusyChange }: {
@@ -15,6 +16,7 @@ export function Hysteria2Form({ proxy, nodes, onClose, onSaved, onBack, embedded
   const config = proxy?.config.hysteria2
   const [node, setNode] = useState(proxy?.node_id ?? nodes[0]?.id ?? 0)
   const [name, setName] = useState(proxy?.name ?? "HY2")
+  const [includeNodeName, setIncludeNodeName] = useState(proxy?.include_node_name ?? true)
   const selectedNode = nodes.find(candidate => candidate.id === node)
   const [customAddress, setCustomAddress] = useState(proxy?.address_type === "domain" ? proxy.address : "")
   const [addressType, setAddressType] = useState<AddressType>(proxy?.address_type ?? defaultAddressType(selectedNode))
@@ -41,7 +43,7 @@ export function Hysteria2Form({ proxy, nodes, onClose, onSaved, onBack, embedded
     event.preventDefault(); setBusy(true); onBusyChange?.(true)
     try {
       const draft: ProxyDraft = { name, address, address_type: addressType, port, enabled: proxy?.enabled ?? true,
-        include_node_name: proxy?.include_node_name ?? false, protocol: "hysteria2", flow: "",
+        include_node_name: includeNodeName, protocol: "hysteria2", flow: "",
         config: { hysteria2: { server_name: sni, obfs_password: obfs, bandwidth_mbps: bandwidth } } }
       const saved = proxy ? await updateProxy(proxy.id, draft, node) : await createProxy(node, draft)
       if (saved.sync?.needs_sync?.length) toast.warning("已保存，节点配置仍需同步")
@@ -55,6 +57,7 @@ export function Hysteria2Form({ proxy, nodes, onClose, onSaved, onBack, embedded
       <p className="text-sm text-muted-foreground">使用节点 sing-box 和自动自签证书，连接密码为用户 UUID。请放行 UDP 端口。</p>
       <label className="block">节点<select aria-label="节点" className="block w-full border p-2" value={node} onChange={e => changeNode(Number(e.target.value))}>{nodes.map(n => <option key={n.id} value={n.id}>{n.name}</option>)}</select></label>
       <label className="block">名称<Input required maxLength={128} value={name} onChange={e => setName(e.target.value)} /></label>
+      <ProxyNamePrefix name={name} node={selectedNode} includeNodeName={includeNodeName} setIncludeNodeName={setIncludeNodeName} />
       <ProxyAddressField selectedNode={selectedNode} addressType={addressType} address={address} changeAddressType={setAddressType} setCustomAddress={setCustomAddress} />
       <label className="block">UDP 端口<Input required type="number" min={1} max={65535} value={port} onChange={e => setPort(Number(e.target.value))} /></label>
       <label className="block">SNI<Input required value={sni} onChange={e => setSni(e.target.value)} /><span className="text-xs text-muted-foreground">用于生成自签证书，可直接使用默认域名。</span></label>
