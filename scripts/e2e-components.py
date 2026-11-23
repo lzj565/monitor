@@ -5,7 +5,7 @@ root=pathlib.Path('/opt/monitor');assert not root.exists(), 'refusing existing i
 (root/'config').mkdir(parents=True);pathlib.Path('/run/systemd/system').mkdir(parents=True,exist_ok=True);pathlib.Path('/etc/systemd/system').mkdir(exist_ok=True)
 (root/'sing-box').write_text('#!/bin/sh\ncase "$1" in version) echo "sing-box fixture-v1" ;; esac\nexit 0\n');(root/'sing-box').chmod(0o755)
 (root/'config/sb.json').write_text('{}')
-pathlib.Path('/etc/systemd/system/sing-box.service').write_text('ExecStart=/opt/monitor/sing-box run -c /opt/monitor/config/sb.json\n')
+pathlib.Path('/etc/systemd/system/sb.service').write_text('ExecStart=/opt/monitor/sing-box run -c /opt/monitor/config/sb.json\n')
 pathlib.Path('/usr/bin/systemctl').write_text('''#!/bin/sh
 case "$1" in
  is-active) test -f /opt/monitor/sing-box.running && { test "$2" = sing-box || { test "$2" = --quiet && test "$3" = sing-box; }; } ;;

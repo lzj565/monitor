@@ -21,8 +21,10 @@ LOG_FILE="/var/log/monitor-agent.log"
 SING_BOX_VERSION="1.14.4"
 SING_BOX="$ROOT/sing-box"
 SING_BOX_CONFIG="$CONFIG_DIR/sb.json"
-SING_BOX_UNIT="/etc/systemd/system/sing-box.service"
-SING_BOX_RC="/etc/init.d/sing-box"
+SING_BOX_UNIT="/etc/systemd/system/sb.service"
+SING_BOX_RC="/etc/init.d/sb"
+LEGACY_SING_BOX_UNIT="/etc/systemd/system/sing-box.service"
+LEGACY_SING_BOX_RC="/etc/init.d/sing-box"
 SING_BOX_UNIT_BACKUP="$ROOT/sing-box.service.before-monitor"
 SING_BOX_RC_BACKUP="$ROOT/sing-box.openrc.before-monitor"
 CURRENT_STEP=""
@@ -309,7 +311,7 @@ print_summary() {
 	detail "Version" "${SING_BOX_VER:-未知}"
 	detail "Config" "$SING_BOX_CONFIG"
 	if [ "$SING_BOX_SOURCE" = installer ]; then
-		if [ "$INIT" = systemd ]; then SERVICE_NAME=sing-box.service; else SERVICE_NAME=sing-box; fi
+		if [ "$INIT" = systemd ]; then SERVICE_NAME=sb.service; else SERVICE_NAME=sb; fi
 		detail "Service" "$SERVICE_NAME"
 	fi
 	detail "Status" "$SING_BOX_STATUS"
@@ -318,14 +320,14 @@ print_summary() {
 		detail "Agent 状态" "systemctl status monitor-agent"
 		detail "Agent 日志" "journalctl -u monitor-agent -f"
 		detail "Agent 重启" "systemctl restart monitor-agent"
-		detail "sing-box 状态" "systemctl status sing-box"
-		detail "sing-box 日志" "journalctl -u sing-box -f"
-		detail "sing-box 重启" "systemctl restart sing-box"
+		detail "sing-box 状态" "systemctl status sb"
+		detail "sing-box 日志" "journalctl -u sb -f"
+		detail "sing-box 重启" "systemctl restart sb"
 	else
 		detail "Agent 状态" "rc-service monitor-agent status"
 		detail "Agent 重启" "rc-service monitor-agent restart"
-		detail "sing-box 状态" "rc-service sing-box status"
-		detail "sing-box 重启" "rc-service sing-box restart"
+		detail "sing-box 状态" "rc-service sb status"
+		detail "sing-box 重启" "rc-service sb restart"
 	fi
 	detail "配置检查" "$SING_BOX check -c $SING_BOX_CONFIG"
 }
@@ -796,6 +798,34 @@ fi
 
 load_component_profile
 
+if [ "$INIT" = systemd ]; then
+	service_file=$SING_BOX_UNIT
+	legacy_service_file=$LEGACY_SING_BOX_UNIT
+	legacy_backup=$SING_BOX_UNIT_BACKUP
+	owner_marker="ExecStart=$SING_BOX run "
+else
+	service_file=$SING_BOX_RC
+	legacy_service_file=$LEGACY_SING_BOX_RC
+	legacy_backup=$SING_BOX_RC_BACKUP
+	owner_marker="command=\"$SING_BOX\""
+fi
+owns_singbox_service() {
+	[ ! -L "$1" ] && [ -f "$1" ] && grep -Fq "$owner_marker" "$1"
+}
+if [ "$SINGBOX_OPTION" = --sing-box ]; then
+	"$TMP_AGENT" internal supports-sb-service ||
+		fail "升级托管 sing-box 需要支持 sb.service 的新版 Agent，请等待 Agent 发布后重试"
+	if [ "$INIT" = systemd ]; then
+		existing_unit=$(systemctl list-unit-files --no-legend --no-pager sb.service) ||
+			fail "cannot inspect sb.service"
+		[ -z "$existing_unit" ] || owns_singbox_service "$SING_BOX_UNIT" ||
+			fail "sb.service already exists"
+	fi
+	if [ -e "$service_file" ] || [ -L "$service_file" ]; then
+		owns_singbox_service "$service_file" || fail "service already exists: $service_file"
+	fi
+fi
+
 # Keep the existing registration and credential flow above intact. Stage the
 # validated agent beside its destination and rename atomically so a failed copy
 # cannot truncate the currently installed executable.
@@ -903,29 +933,23 @@ success "自构建 sing-box 安装及配置校验完成"
 
 else
     SING_BOX_SOURCE=skipped
-    if [ -f "$SING_BOX_UNIT" ] && grep -F "ExecStart=$SING_BOX run" "$SING_BOX_UNIT" >/dev/null; then
-        systemctl disable --now sing-box.service || fail "cannot stop sing-box"
-        rm -f "$SING_BOX_UNIT" "$SING_BOX"
-        [ ! -f "$SING_BOX_UNIT_BACKUP" ] || mv "$SING_BOX_UNIT_BACKUP" "$SING_BOX_UNIT"
-        systemctl daemon-reload
-    elif [ -f "$SING_BOX_RC" ] && grep -F "command=\"$SING_BOX\"" "$SING_BOX_RC" >/dev/null; then
-        rc-service sing-box stop || fail "cannot stop sing-box"
-        rc-update del sing-box default || true
-        rm -f "$SING_BOX_RC" "$SING_BOX"
-        [ ! -f "$SING_BOX_RC_BACKUP" ] || mv "$SING_BOX_RC_BACKUP" "$SING_BOX_RC"
-    fi
 fi
 retire_legacy_components
 
 step 3 "初始化系统服务"
+if [ "$SINGBOX_OPTION" != --sing-box ] && owns_singbox_service "$service_file"; then
+	if [ "$INIT" = systemd ]; then
+		systemctl disable --now sb.service || fail "cannot stop sb.service"
+	else
+		rc-service sb stop || fail "cannot stop sb"
+		rc-update del sb default || true
+	fi
+	rm -f "$service_file" "$SING_BOX"
+fi
+
+
 if [ "$SINGBOX_OPTION" = --sing-box ]; then
 if [ "$INIT" = systemd ]; then
-	if { [ -e "$SING_BOX_UNIT" ] || [ -L "$SING_BOX_UNIT" ]; } &&
-		! grep -F "$SING_BOX" "$SING_BOX_UNIT" >/dev/null 2>&1 &&
-		[ ! -e "$SING_BOX_UNIT_BACKUP" ]; then
-		cp -p "$SING_BOX_UNIT" "$SING_BOX_UNIT_BACKUP"
-	fi
-	[ ! -L "$SING_BOX_UNIT" ] || rm -f "$SING_BOX_UNIT"
 	cat >"$SING_BOX_UNIT" <<UNIT
 [Unit]
 Description=sing-box service
@@ -944,12 +968,6 @@ WantedBy=multi-user.target
 UNIT
 	chmod 0644 "$SING_BOX_UNIT"
 else
-	if { [ -e "$SING_BOX_RC" ] || [ -L "$SING_BOX_RC" ]; } &&
-		! grep -F "$SING_BOX" "$SING_BOX_RC" >/dev/null 2>&1 &&
-		[ ! -e "$SING_BOX_RC_BACKUP" ]; then
-		cp -p "$SING_BOX_RC" "$SING_BOX_RC_BACKUP"
-	fi
-	[ ! -L "$SING_BOX_RC" ] || rm -f "$SING_BOX_RC"
 	cat >"$SING_BOX_RC" <<RC
 #!/sbin/openrc-run
 description="sing-box service"
@@ -968,6 +986,25 @@ fi
 
 rm -f "$ROOT/.skip-sing-box"
 fi
+
+if owns_singbox_service "$legacy_service_file"; then
+	info "迁移 Monitor 托管的旧 sing-box 服务"
+	if [ "$INIT" = systemd ]; then
+		systemctl disable --now sing-box.service || fail "cannot stop legacy sing-box.service"
+	else
+		rc-service sing-box stop || fail "cannot stop legacy sing-box"
+		rc-update del sing-box default || true
+	fi
+	if [ -f "$legacy_backup" ]; then
+		mv -f "$legacy_backup" "$legacy_service_file"
+	else
+		rm -f "$legacy_service_file"
+	fi
+	if [ "$SINGBOX_OPTION" != --sing-box ]; then
+		rm -f "$SING_BOX"
+	fi
+fi
+
 
 # The token lives in a root-only environment file rather than the unit, keeping
 # it out of `systemctl cat` and the world-readable journal. 0600 root is what
@@ -1036,11 +1073,11 @@ RC
 	success "系统服务定义已初始化"
 	step 4 "启动服务"
 	if [ "$SING_BOX_SOURCE" = installer ]; then
-		rc-update add sing-box default >/dev/null
-		rc-service sing-box restart || { FAIL_REASON="sing-box 启动失败"; fail "$FAIL_REASON"; }
-		rc-service sing-box status >/dev/null 2>&1 || { FAIL_REASON="sing-box 未能进入运行状态"; fail "$FAIL_REASON"; }
+		rc-update add sb default >/dev/null
+		rc-service sb restart || { FAIL_REASON="sing-box 启动失败"; fail "$FAIL_REASON"; }
+		rc-service sb status >/dev/null 2>&1 || { FAIL_REASON="sing-box 未能进入运行状态"; fail "$FAIL_REASON"; }
 	elif [ "$SING_BOX_SOURCE" != skipped ]; then
-		rc-service sing-box status >/dev/null 2>&1 || warn "sing-box 已安装，但当前未检测到运行状态"
+		rc-service sb status >/dev/null 2>&1 || warn "sing-box 已安装，但当前未检测到运行状态"
 	fi
 	rc-update add monitor-agent default >/dev/null
 	rc-service monitor-agent restart || not_started "$LOG_FILE"
@@ -1054,7 +1091,7 @@ RC
 	AGENT_STATUS=running
 	SING_BOX_STATUS=unknown
 	if [ "$SING_BOX_SOURCE" != skipped ]; then
-		if rc-service sing-box status >/dev/null 2>&1; then SING_BOX_STATUS=running; else SING_BOX_STATUS=not-running; fi
+		if rc-service sb status >/dev/null 2>&1; then SING_BOX_STATUS=running; else SING_BOX_STATUS=not-running; fi
 	fi
 	success "monitor-agent 安装并启动完成"
 	CURRENT_STEP=""
@@ -1097,11 +1134,11 @@ success "系统服务定义已初始化"
 step 4 "启动服务"
 if [ "$SING_BOX_SOURCE" = installer ]; then
 	systemctl daemon-reload
-	systemctl enable sing-box.service >/dev/null
-	systemctl restart sing-box.service || { FAIL_REASON="sing-box 启动失败"; fail "$FAIL_REASON"; }
-	if systemctl is-active --quiet sing-box.service; then SING_BOX_STATUS=running; else FAIL_REASON="sing-box 未能进入 active 状态"; fail "$FAIL_REASON"; fi
+	systemctl enable sb.service >/dev/null
+	systemctl restart sb.service || { FAIL_REASON="sing-box 启动失败"; fail "$FAIL_REASON"; }
+	if systemctl is-active --quiet sb.service; then SING_BOX_STATUS=running; else FAIL_REASON="sing-box 未能进入 active 状态"; fail "$FAIL_REASON"; fi
 elif [ "$SING_BOX_SOURCE" != skipped ]; then
-	if systemctl is-active --quiet sing-box.service; then SING_BOX_STATUS=running; else SING_BOX_STATUS=not-running; warn "sing-box 已安装，但当前未检测到运行状态"; fi
+	if systemctl is-active --quiet sb.service; then SING_BOX_STATUS=running; else SING_BOX_STATUS=not-running; warn "sing-box 已安装，但当前未检测到运行状态"; fi
 fi
 systemctl daemon-reload
 systemctl enable monitor-agent.service >/dev/null
