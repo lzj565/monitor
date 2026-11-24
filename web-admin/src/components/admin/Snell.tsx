@@ -18,6 +18,7 @@ export function SnellForm({ proxy, nodes, onClose, onSaved, onBack, embedded, on
   const [includeNodeName, setIncludeNodeName] = useState(proxy?.include_node_name ?? true)
   const config = proxy?.config?.snell
   const [version, setVersion] = useState<5 | 6>(config?.version === 5 ? 5 : 6)
+  const [psk, setPsk] = useState(config?.psk_override ?? "")
   const selectedNode = nodes.find(candidate => candidate.id === node)
   const [customAddress, setCustomAddress] = useState(proxy?.address_type === "domain" ? proxy.address : "")
   const [addressType, setAddressType] = useState<AddressType>(proxy?.address_type ?? defaultAddressType(selectedNode))
@@ -40,7 +41,7 @@ export function SnellForm({ proxy, nodes, onClose, onSaved, onBack, embedded, on
     try {
       const draft: ProxyDraft = { name, address, address_type: addressType, port, enabled: proxy?.enabled ?? true,
         include_node_name: includeNodeName, protocol: "snell", flow: "",
-        config: { snell: { version } } }
+        config: { snell: { version, psk_override: psk.trim() ? psk : null } } }
       const saved = proxy ? await updateProxy(proxy.id, draft, node) : await createProxy(node, draft)
       if (saved.sync?.needs_sync?.length) toast.warning("已保存，节点配置仍需同步")
       else toast.success("Snell 已保存，请确认节点同步结果")
@@ -57,6 +58,10 @@ export function SnellForm({ proxy, nodes, onClose, onSaved, onBack, embedded, on
         <option value={5}>Snell v5</option>
         <option value={6}>Snell v6</option>
       </select></label>
+      <label className="block">Snell PSK
+        <Input type="password" autoComplete="new-password" value={psk} onChange={e => setPsk(e.target.value)} />
+        <span className="text-sm text-muted-foreground">留空时使用节点的共享 PSK。</span>
+      </label>
       <ProxyAddressField selectedNode={selectedNode} addressType={addressType} address={address} changeAddressType={setAddressType} setCustomAddress={setCustomAddress} />
       <label className="block">TCP 端口<Input required type="number" min={1} max={65535} value={port} onChange={e => setPort(Number(e.target.value))} /></label>
     </div>

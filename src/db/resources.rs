@@ -1,5 +1,22 @@
 use super::*;
+use serde_json::Value;
+
 type EntryPreferences = std::collections::HashMap<i64, (Option<i64>, bool, String)>;
+
+fn stored_snell_config(draft: &Value, previous: Option<&Value>) -> Value {
+    let version = draft["snell"]["version"]
+        .as_u64()
+        .or_else(|| previous.map(crate::proxy::snell_version))
+        .unwrap_or(6);
+    let mut config = serde_json::json!({"snell":{"version":version}});
+    let psk = draft["snell"]
+        .get("psk_override")
+        .or_else(|| previous.and_then(|config| config["snell"].get("psk_override")));
+    if let Some(psk) = psk.and_then(Value::as_str) {
+        config["snell"]["psk_override"] = psk.into();
+    }
+    config
+}
 
 impl Db {
     // ---- desired proxy and user state ----
@@ -46,7 +63,7 @@ impl Db {
         let stored = if draft.protocol == "hysteria2" {
             crate::hysteria2::persisted_config(&draft.config, None)?
         } else if draft.protocol == "snell" {
-            serde_json::json!({"snell":{"version":crate::proxy::snell_version(&draft.config)}})
+            stored_snell_config(&draft.config, None)
         } else {
             draft.config.clone()
         };
@@ -93,11 +110,7 @@ impl Db {
             crate::hysteria2::persisted_config(&draft.config, previous.as_ref().map(|p| &p.config))?
         } else if draft.protocol == "snell" {
             let old = previous.as_ref().filter(|proxy| proxy.protocol == "snell").map(|proxy| &proxy.config);
-            let version = draft.config["snell"]["version"]
-                .as_u64()
-                .or_else(|| old.map(crate::proxy::snell_version))
-                .unwrap_or(6);
-            serde_json::json!({"snell":{"version":version}})
+            stored_snell_config(&draft.config, old)
         } else {
             draft.config.clone()
         };
@@ -737,8 +750,8 @@ impl Db {
             }
             if proxy.protocol == "snell" {
                 if let Some(stored) = self.proxy(proxy.id)? {
-                    proxy.snell_psk =
-                        Some(crate::proxy::snell_psk(&self.proxies_for_node(stored.node_id)?).to_owned());
+                    let node_proxies = self.proxies_for_node(stored.node_id)?;
+                    proxy.snell_psk = Some(crate::proxy::snell_psk(&stored.config, &node_proxies).to_owned());
                     proxy.snell_version = Some(crate::proxy::snell_version(&stored.config));
                 }
             }

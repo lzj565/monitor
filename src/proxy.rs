@@ -84,6 +84,12 @@ impl ProxyRequest {
             if let Some(version) = version {
                 config["snell"]["version"] = version.into();
             }
+            if let Some(value) = self.config["snell"].get("psk_override") {
+                if !value.is_null() && !value.as_str().is_some_and(|psk| !psk.trim().is_empty()) {
+                    return Err(InputError::new("INVALID_PROXY_CONFIG", "Snell PSK must be a nonblank string"));
+                }
+                config["snell"]["psk_override"] = value.clone();
+            }
             return Ok(ProxyDraft {
                 name: name.into(),
                 include_node_name: self.include_node_name,
@@ -308,7 +314,11 @@ impl AuthorizationRequest {
     }
 }
 
-pub(crate) fn snell_psk(proxies: &[crate::db::Proxy]) -> &str {
+pub(crate) fn snell_psk<'a>(config: &'a Value, proxies: &'a [crate::db::Proxy]) -> &'a str {
+    config["snell"]["psk_override"].as_str().unwrap_or_else(|| shared_snell_psk(proxies))
+}
+
+fn shared_snell_psk(proxies: &[crate::db::Proxy]) -> &str {
     proxies
         .iter()
         .filter(|proxy| proxy.enabled && proxy.protocol == "hysteria2")
@@ -331,13 +341,13 @@ pub fn generate_config(db: &Db, node_id: i64, now: i64) -> anyhow::Result<Value>
     let mut stats_inbounds = Vec::new();
     let mut stats_users = BTreeSet::new();
     let proxies = db.proxies_for_node(node_id)?;
-    let psk = snell_psk(&proxies);
     for proxy in
         proxies.iter().filter(|p| p.enabled && matches!(p.protocol.as_str(), "vless" | "hysteria2" | "snell"))
     {
         if proxy.protocol == "snell" {
             let tag = format!("proxy-{}", proxy.id);
             let version = snell_version(&proxy.config);
+            let psk = snell_psk(&proxy.config, &proxies);
             let mut inbound = json!({
                 "type": "snell", "tag": tag, "listen": listen, "listen_port": proxy.port,
                 "version": version, "psk": psk

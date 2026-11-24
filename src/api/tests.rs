@@ -2600,6 +2600,8 @@ fn snell_shared_psk_survives_edit_and_is_exported_only_when_authorized() {
     hy2.config = json!({"hysteria2":{"server_name":"example.com","obfs_password":"custom-psk"}});
     let hy2_id = app.db.create_proxy(node, &hy2).unwrap().unwrap();
     let mut v5 = draft.clone();
+    v5.config = json!({"snell": {"version": 5, "psk_override": "custom-psk"}});
+    app.db.update_proxy(id, None, &v5).unwrap().unwrap();
     v5.config = json!({"snell": {"version": 5}});
     app.db.update_proxy(id, None, &v5).unwrap().unwrap();
     let generated = crate::proxy::generate_config(&app.db, node, Utc::now().timestamp()).unwrap();
@@ -2611,6 +2613,10 @@ fn snell_shared_psk_survives_edit_and_is_exported_only_when_authorized() {
     let yaml: Vec<Value> = serde_yaml_ng::from_str(entries[0]["mihomo_yaml"].as_str().unwrap()).unwrap();
     assert_eq!(yaml[0]["version"], 5);
     assert_eq!(yaml[0]["psk"], psk);
+    v5.config = json!({"snell": {"psk_override": null}});
+    app.db.update_proxy(id, None, &v5).unwrap().unwrap();
+    let config = crate::proxy::generate_config(&app.db, node, Utc::now().timestamp()).unwrap();
+    assert_eq!(config["inbounds"][0]["psk"], "custom-psk");
     hy2.config["hysteria2"]["obfs_password"] = json!("");
     app.db.update_proxy(hy2_id, None, &hy2).unwrap().unwrap();
     let config = crate::proxy::generate_config(&app.db, node, Utc::now().timestamp()).unwrap();

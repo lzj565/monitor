@@ -26,7 +26,7 @@ export type Proxy = {
   port: number
   enabled: boolean
   flow: Flow
-  config: ({ snell?: { version?: 5 | 6 }; reality?: never; transport?: never } | { hysteria2: { server_name: string; obfs_password: string; bandwidth_mbps?: number; up_mbps?: number; down_mbps?: number }; reality?: never; transport?: never } | { reality: RealityConfig; transport?: never } | { transport: "tcp"; reality?: never }) & { snell?: { version?: 5 | 6 }; hysteria2?: { server_name: string; obfs_password: string; bandwidth_mbps?: number; up_mbps?: number; down_mbps?: number } }
+  config: ({ snell?: { version?: 5 | 6; psk_override?: string | null }; reality?: never; transport?: never } | { hysteria2: { server_name: string; obfs_password: string; bandwidth_mbps?: number; up_mbps?: number; down_mbps?: number }; reality?: never; transport?: never } | { reality: RealityConfig; transport?: never } | { transport: "tcp"; reality?: never }) & { snell?: { version?: 5 | 6; psk_override?: string | null }; hysteria2?: { server_name: string; obfs_password: string; bandwidth_mbps?: number; up_mbps?: number; down_mbps?: number } }
   created_at: number
   updated_at: number
   sync?: SyncReport
