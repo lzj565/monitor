@@ -29,7 +29,6 @@ SING_BOX_UNIT_BACKUP="$ROOT/sing-box.service.before-monitor"
 SING_BOX_RC_BACKUP="$ROOT/sing-box.openrc.before-monitor"
 CURRENT_STEP=""
 FAIL_REASON="command failed"
-TMP_AGENT=""
 TMP_DIR=""
 AGENT_CANDIDATE=""
 SING_BOX_STAGED=""
@@ -72,7 +71,6 @@ success() { printf '%s✓%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
 warn() { printf '%s!%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
 error() { printf '%s✗%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
 cleanup() {
-	[ -z "$TMP_AGENT" ] || rm -f "$TMP_AGENT"
 	[ -z "$TMP_DIR" ] || rm -rf "$TMP_DIR"
 	[ -z "$AGENT_CANDIDATE" ] || rm -f "$AGENT_CANDIDATE"
 	[ -z "$SING_BOX_STAGED" ] || rm -f "$SING_BOX_STAGED"
@@ -664,7 +662,10 @@ step 1 "安装 monitor-agent"
 detail "架构" "$ARCH"
 detail "安装位置" "$BIN"
 URL="${SERVER%/}/agent/$ARCH"
-TMP_AGENT=$(mktemp)
+# Stage beside the destination so the candidate can run even with /tmp
+# mounted noexec, and can replace the installed Agent with an atomic rename.
+install -d -m 0755 "$ROOT" || fail "cannot create $ROOT"
+AGENT_CANDIDATE=$(mktemp "$ROOT/.monitor-agent.XXXXXX") || fail "cannot stage monitor-agent"
 
 # A machine whose link to the hub cannot carry the binary in time installs one
 # uploaded beforehand: registration and the service then need only a few small
@@ -672,7 +673,7 @@ TMP_AGENT=$(mktemp)
 # itself.
 if [ -n "$BINARY" ]; then
 	echo "installing $BINARY instead of downloading"
-	cp "$BINARY" "$TMP_AGENT"
+	cp "$BINARY" "$AGENT_CANDIDATE"
 else
 	echo "downloading monitor-agent ($ARCH)"
 	# The hub relays four downloads at once and queues the rest for 30 seconds. A
@@ -693,7 +694,7 @@ else
 	TRIES=0
 	while :; do
 		RC=0 WHY=""
-		OUT=$(curl -sSL --max-time 300 -w '%{http_code} %{size_download}' "$URL" -o "$TMP_AGENT") || RC=$?
+		OUT=$(curl -sSL --max-time 300 -w '%{http_code} %{size_download}' "$URL" -o "$AGENT_CANDIDATE") || RC=$?
 		CODE=${OUT% *} GOT=${OUT#* }
 		case "$RC:$CODE:$GOT" in
 		0:503:*) WHY="the hub is busy relaying to other machines" ;;
@@ -714,27 +715,22 @@ else
 		exit 1
 	fi
 	[ "$CODE" = 200 ] ||
-		{ printf 'download failed (HTTP %s): %s\n' "$CODE" "$(head -n 1 "$TMP_AGENT" | cut -c1-500)" >&2; exit 1; }
+		{ printf 'download failed (HTTP %s): %s\n' "$CODE" "$(head -n 1 "$AGENT_CANDIDATE" | cut -c1-500)" >&2; exit 1; }
 fi
 # A relay can answer 200 with something other than the program, such as a
 # mirror's error page. Checked before the running agent is stopped, so a batch
 # run through such a relay leaves each machine on the agent it had, rather than
 # on bytes that cannot start while this script reports success.
-[ "$(head -c 4 "$TMP_AGENT")" = "$(printf '\177ELF')" ] ||
-	{ echo "${BINARY:-the download} is not a Linux executable: $(head -n 1 "$TMP_AGENT" | tr -cd '[:print:]' | cut -c1-200)" >&2; exit 1; }
+[ "$(head -c 4 "$AGENT_CANDIDATE")" = "$(printf '\177ELF')" ] ||
+	{ echo "${BINARY:-the download} is not a Linux executable: $(head -n 1 "$AGENT_CANDIDATE" | tr -cd '[:print:]' | cut -c1-200)" >&2; exit 1; }
 # e_machine, as the hub checks what it relays: a file uploaded for the other
 # architecture is refused here, before a key is spent or the old agent stops.
-case "$ARCH:$(od -An -tu2 -j18 -N2 "$TMP_AGENT" | tr -d ' ')" in
+case "$ARCH:$(od -An -tu2 -j18 -N2 "$AGENT_CANDIDATE" | tr -d ' ')" in
 x86_64:62 | aarch64:183) ;;
 *) echo "${BINARY:-the download} is not built for $ARCH; use monitor-agent-$ARCH-unknown-linux-musl" >&2; exit 1 ;;
 esac
+chmod 0755 "$AGENT_CANDIDATE" || fail "cannot prepare executable monitor-agent"
 success "安装文件已就绪"
-# Resolve the local API port before registration or replacing the installed
-# Agent. A full range must fail without spending a registration key or leaving
-# a machine half-upgraded.
-API_PORT_HELPER=$TMP_AGENT
-info "checking sing-box V2Ray API port..."
-: # API port is selected after loading saved choices
 
 # Downloaded before the registration below, because that step spends a node: the
 # key returns a token and the panel gains a row, while the env file recording it
@@ -798,6 +794,7 @@ fi
 
 load_component_profile
 
+API_PORT_HELPER=$AGENT_CANDIDATE
 if [ "$INIT" = systemd ]; then
 	service_file=$SING_BOX_UNIT
 	legacy_service_file=$LEGACY_SING_BOX_UNIT
@@ -813,27 +810,33 @@ owns_singbox_service() {
 	[ ! -L "$1" ] && [ -f "$1" ] && grep -Fq "$owner_marker" "$1"
 }
 if [ "$SINGBOX_OPTION" = --sing-box ]; then
-	"$TMP_AGENT" internal supports-sb-service ||
-		fail "升级托管 sing-box 需要支持 sb.service 的新版 Agent，请等待 Agent 发布后重试"
+	probe_status=0
+	"$AGENT_CANDIDATE" internal supports-sb-service || probe_status=$?
+	case "$probe_status" in
+	0) ;;
+	2) fail "升级托管 sing-box 需要支持 sb.service 的新版 Agent" ;;
+	126 | 127) fail "无法执行 $AGENT_CANDIDATE（退出码 $probe_status），请检查安装目录的执行权限及挂载选项" ;;
+	*) fail "无法执行新版 Agent 的兼容性检查（退出码 $probe_status）" ;;
+	esac
 	if [ "$INIT" = systemd ]; then
-		existing_unit=$(systemctl list-unit-files --no-legend --no-pager sb.service) ||
-			fail "cannot inspect sb.service"
-		[ -z "$existing_unit" ] || owns_singbox_service "$SING_BOX_UNIT" ||
-			fail "sb.service already exists"
+		unit_files=$(systemctl list-unit-files --type=service --no-legend --no-pager) ||
+			fail "cannot inspect systemd service files"
+		if printf '%s\n' "$unit_files" | grep -q '^sb\.service[[:space:]]'; then
+			owns_singbox_service "$SING_BOX_UNIT" || fail "sb.service already exists"
+		fi
 	fi
 	if [ -e "$service_file" ] || [ -L "$service_file" ]; then
 		owns_singbox_service "$service_file" || fail "service already exists: $service_file"
 	fi
+	info "checking sing-box V2Ray API port..."
+	select_singbox_api_port || fail "$FAIL_REASON"
 fi
 
-# Keep the existing registration and credential flow above intact. Stage the
-# validated agent beside its destination and rename atomically so a failed copy
-# cannot truncate the currently installed executable.
-install -d -m 0755 "$ROOT"
-AGENT_CANDIDATE="$ROOT/.monitor-agent.$$"
-install -m 0755 "$TMP_AGENT" "$AGENT_CANDIDATE"
+# Replace the installed executable atomically after validating the candidate.
 [ ! -f "$BIN" ] || [ -f "$BIN.old" ] || cp "$BIN" "$BIN.old"
 mv -f "$AGENT_CANDIDATE" "$BIN"
+AGENT_CANDIDATE=""
+API_PORT_HELPER=$BIN
 success "monitor-agent binary 安装完成"
 
 # The system package binary is left in place, while the Agent and service use
@@ -842,7 +845,6 @@ SING_BOX_SOURCE=installer
 SING_BOX_STATUS=unknown
 SING_BOX_VER=""
 if [ "$SINGBOX_OPTION" = --sing-box ]; then
-select_singbox_api_port || fail "$FAIL_REASON"
 step 2 "检查 sing-box"
 set_singbox_memory_limit
 SING_BOX_SOURCE="installer"
