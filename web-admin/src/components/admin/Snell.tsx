@@ -59,7 +59,7 @@ export function SnellForm({ proxy, nodes, onClose, onSaved, onBack, embedded, on
         <option value={6}>Snell v6</option>
       </select></label>
       <label className="block">Snell PSK
-        <Input type="password" autoComplete="new-password" value={psk} onChange={e => setPsk(e.target.value)} />
+        <Input type="text" autoComplete="off" spellCheck={false} value={psk} onChange={e => setPsk(e.target.value)} />
         <span className="text-sm text-muted-foreground">留空时使用节点的共享 PSK。</span>
       </label>
       <ProxyAddressField selectedNode={selectedNode} addressType={addressType} address={address} changeAddressType={setAddressType} setCustomAddress={setCustomAddress} />
